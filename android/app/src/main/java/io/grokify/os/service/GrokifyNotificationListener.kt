@@ -1,4 +1,4 @@
-package io.grokpot.grokify.service
+package io.grokify.os.service
 
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification

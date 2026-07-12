@@ -1,0 +1,28 @@
+[Unit]
+Description=GrokifyOS bridge HA gateway
+Documentation=file:///root/grokifyos/bridge/gateway.js
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/grokifyos/bridge
+EnvironmentFile=-/etc/grokifyos/bridge.env
+ExecStart=/usr/bin/node /root/grokifyos/bridge/gateway.js
+Restart=always
+RestartSec=2
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Environment=NODE_ENV=production
+Environment=GROKIFY_WORKSPACE=/root/grokifyos
+Environment=GROKIFY_BRIDGE_PORT=8876
+Environment=GROKIFY_BRIDGE_BACKENDS=127.0.0.1:8878,127.0.0.1:8879
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=grokifyos-bridge-gateway
+
+[Install]
+WantedBy=multi-user.target

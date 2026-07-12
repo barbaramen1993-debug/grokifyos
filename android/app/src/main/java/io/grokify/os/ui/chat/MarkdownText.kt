@@ -1,4 +1,4 @@
-package io.grokpot.grokify.ui.chat
+package io.grokify.os.ui.chat
 
 import android.util.Base64
 import androidx.compose.foundation.background

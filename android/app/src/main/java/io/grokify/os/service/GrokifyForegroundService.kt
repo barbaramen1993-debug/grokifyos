@@ -1,4 +1,4 @@
-package io.grokpot.grokify.service
+package io.grokify.os.service
 
 import android.app.Notification
 import android.app.PendingIntent
@@ -6,9 +6,9 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import io.grokpot.grokify.GrokifyApp
-import io.grokpot.grokify.MainActivity
-import io.grokpot.grokify.R
+import io.grokify.os.GrokifyApp
+import io.grokify.os.MainActivity
+import io.grokify.os.R
 
 /**
  * Keeps the assistant bridge alive for background chat / hardware hooks.

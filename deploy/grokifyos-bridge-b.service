@@ -1,0 +1,29 @@
+[Unit]
+Description=GrokifyOS bridge worker B
+Documentation=file:///root/grokifyos/bridge/server.js
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/grokifyos/bridge
+EnvironmentFile=-/etc/grokifyos/bridge.env
+ExecStart=/usr/bin/node /root/grokifyos/bridge/server.js
+Restart=always
+RestartSec=3
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Environment=NODE_ENV=production
+Environment=GROKIFY_WORKSPACE=/root/grokifyos
+Environment=GROKIFY_BRIDGE_PORT=8879
+Environment=GROKIFY_BRIDGE_INSTANCE=b
+Environment=GROKIFY_BRIDGE_DETACH=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=grokifyos-bridge-b
+
+[Install]
+WantedBy=multi-user.target

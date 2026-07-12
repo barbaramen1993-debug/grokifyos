@@ -8,43 +8,53 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const mysql = require('mysql2/promise');
 
-const WORKSPACE = process.env.GROKPOT_WORKSPACE || '/root/grokpot';
+/** Prefer GROKIFY_* (GrokifyOS); fall back to GROKPOT_* for monorepo parity. */
+function envFirst(...keys) {
+    for (const k of keys) {
+        const v = process.env[k];
+        if (v !== undefined && v !== '') return v;
+    }
+    return undefined;
+}
+
+const WORKSPACE = envFirst('GROKIFY_WORKSPACE', 'GROKPOT_WORKSPACE') || '/root/grokifyos';
 require('dotenv').config({ path: path.join(WORKSPACE, '.env') });
 
-const PORT = parseInt(process.env.GROKPOT_BRIDGE_PORT || '8766', 10);
-const INSTANCE_ID = process.env.GROKPOT_BRIDGE_INSTANCE || 'a';
-const GROK_BIN = process.env.GROKPOT_GROK_BIN || '/root/.grok/bin/grok';
-const DEFAULT_GROK_MODEL = process.env.GROKPOT_GROK_DEFAULT_MODEL || 'grok-4.5';
+const PORT = parseInt(envFirst('GROKIFY_BRIDGE_PORT', 'GROKPOT_BRIDGE_PORT') || '8876', 10);
+const INSTANCE_ID = envFirst('GROKIFY_BRIDGE_INSTANCE', 'GROKPOT_BRIDGE_INSTANCE') || 'a';
+const GROK_BIN = envFirst('GROKIFY_GROK_BIN', 'GROKPOT_GROK_BIN') || '/root/.grok/bin/grok';
+const DEFAULT_GROK_MODEL = envFirst('GROKIFY_GROK_DEFAULT_MODEL', 'GROKPOT_GROK_DEFAULT_MODEL') || 'grok-4.5';
 const LOG_FILE = path.join(WORKSPACE, 'storage', 'logs', 'bridge.log');
 const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_PROMPT_BYTES = 120000;
 // When true (default), CLI agents are detached + file-tailed so they survive bridge restarts
-const DETACH_AGENTS = process.env.GROKPOT_BRIDGE_DETACH !== '0';
+const DETACH_AGENTS = (envFirst('GROKIFY_BRIDGE_DETACH', 'GROKPOT_BRIDGE_DETACH') || '1') !== '0';
 function wsSecret() {
-    if (process.env.GROKPOT_WS_AUTH_SECRET) return process.env.GROKPOT_WS_AUTH_SECRET;
-    const pepper = process.env.GROKPOT_SECRETS_PEPPER || '';
-    if (pepper) return crypto.createHash('sha256').update('grokpot_system_chat_ws:' + pepper).digest('hex');
-    return crypto.createHash('sha256').update('grokpot_system_chat_ws_fallback').digest('hex');
+    const explicit = envFirst('GROKIFY_WS_AUTH_SECRET', 'GROKPOT_WS_AUTH_SECRET');
+    if (explicit) return explicit;
+    const pepper = envFirst('GROKIFY_SECRETS_PEPPER', 'GROKPOT_SECRETS_PEPPER') || '';
+    if (pepper) return crypto.createHash('sha256').update('grokifyos_system_chat_ws:' + pepper).digest('hex');
+    return crypto.createHash('sha256').update('grokifyos_system_chat_ws_fallback').digest('hex');
 }
 const WS_SECRET = wsSecret();
 
-const DB_SOCKET = process.env.GROKPOT_DB_SOCKET || '/var/run/mysqld/mysqld.sock';
+const DB_SOCKET = envFirst('GROKIFY_DB_SOCKET', 'GROKPOT_DB_SOCKET') || '/var/run/mysqld/mysqld.sock';
 
 /** Match PHP PDO: localhost / 127.0.0.1 use the Unix socket, not TCP loopback. */
 function buildDbConfig() {
     const base = {
-        user: process.env.GROKPOT_DB_USER || 'grokpot',
-        password: process.env.GROKPOT_DB_PASS || '',
-        database: process.env.GROKPOT_DB_NAME || 'grokpot',
+        user: envFirst('GROKIFY_DB_USER', 'GROKPOT_DB_USER') || 'grokifyos',
+        password: envFirst('GROKIFY_DB_PASS', 'GROKPOT_DB_PASS') || '',
+        database: envFirst('GROKIFY_DB_NAME', 'GROKPOT_DB_NAME') || 'grokifyos',
     };
-    const host = (process.env.GROKPOT_DB_HOST || process.env.GROKPOT_DB_HOSTNAME || '').trim();
+    const host = (envFirst('GROKIFY_DB_HOST', 'GROKPOT_DB_HOST', 'GROKPOT_DB_HOSTNAME') || '').trim();
     if (!host || host === 'localhost' || host === '127.0.0.1') {
         return { ...base, socketPath: DB_SOCKET };
     }
     return {
         ...base,
         host,
-        port: parseInt(process.env.GROKPOT_DB_PORT || '3306', 10),
+        port: parseInt(envFirst('GROKIFY_DB_PORT', 'GROKPOT_DB_PORT') || '3306', 10),
     };
 }
 

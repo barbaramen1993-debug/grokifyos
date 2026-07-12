@@ -19,8 +19,16 @@
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 
-const PORT = parseInt(process.env.GROKPOT_BRIDGE_PORT || '8766', 10);
-const BACKENDS = (process.env.GROKPOT_BRIDGE_BACKENDS || '127.0.0.1:8768,127.0.0.1:8769')
+function envFirst(...keys) {
+    for (const k of keys) {
+        const v = process.env[k];
+        if (v !== undefined && v !== '') return v;
+    }
+    return undefined;
+}
+
+const PORT = parseInt(envFirst('GROKIFY_BRIDGE_PORT', 'GROKPOT_BRIDGE_PORT') || '8876', 10);
+const BACKENDS = (envFirst('GROKIFY_BRIDGE_BACKENDS', 'GROKPOT_BRIDGE_BACKENDS') || '127.0.0.1:8878,127.0.0.1:8879')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);

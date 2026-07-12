@@ -1,4 +1,4 @@
-package io.grokpot.grokify.data
+package io.grokify.os.data
 
 import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey

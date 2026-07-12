@@ -1,4 +1,4 @@
-package io.grokpot.grokify
+package io.grokify.os
 
 import android.Manifest
 import android.content.Intent
@@ -20,11 +20,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
-import io.grokpot.grokify.service.GrokifyForegroundService
-import io.grokpot.grokify.ui.GrokifyAppRoot
-import io.grokpot.grokify.ui.GrokifyViewModel
-import io.grokpot.grokify.ui.theme.GrokifyColors
-import io.grokpot.grokify.ui.theme.GrokifyTheme
+import io.grokify.os.service.GrokifyForegroundService
+import io.grokify.os.ui.GrokifyAppRoot
+import io.grokify.os.ui.GrokifyViewModel
+import io.grokify.os.ui.theme.GrokifyColors
+import io.grokify.os.ui.theme.GrokifyTheme
 
 class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(

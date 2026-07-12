@@ -59,8 +59,8 @@
 
     # Agent WebSocket (dedicated bridge preferred on 8876; temporarily may share gateway)
     ProxyPreserveHost On
-    ProxyPass /grokify-ws/ ws://127.0.0.1:8766/
-    ProxyPassReverse /grokify-ws/ ws://127.0.0.1:8766/
+    ProxyPass /grokify-ws/ ws://127.0.0.1:8876/
+    ProxyPassReverse /grokify-ws/ ws://127.0.0.1:8876/
 
     <IfModule mod_headers.c>
         Header always unset Server

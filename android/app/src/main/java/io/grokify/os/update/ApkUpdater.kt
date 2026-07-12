@@ -1,4 +1,4 @@
-package io.grokpot.grokify.update
+package io.grokify.os.update
 
 import android.content.Context
 import android.content.Intent
@@ -6,7 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
-import io.grokpot.grokify.BuildConfig
+import io.grokify.os.BuildConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File

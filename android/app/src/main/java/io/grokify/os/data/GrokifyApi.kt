@@ -1,6 +1,6 @@
-package io.grokpot.grokify.data
+package io.grokify.os.data
 
-import io.grokpot.grokify.BuildConfig
+import io.grokify.os.BuildConfig
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -30,17 +30,17 @@ class GrokifyApi(
         obj.toString().toRequestBody(jsonMedia)
 
     fun me(): JSONObject {
-        val req = authRequest("/grokify-me.php").get().build()
+        val req = authRequest("/me.php").get().build()
         return executeJson(req)
     }
 
     fun status(): JSONObject {
-        val req = authRequest("/grokify-status.php").get().build()
+        val req = authRequest("/status.php").get().build()
         return executeJson(req)
     }
 
     fun checkUpdate(versionCode: Int, versionName: String): JSONObject {
-        val path = "/grokify-update.php?version_code=$versionCode&version_name=${
+        val path = "/update.php?version_code=$versionCode&version_name=${
             java.net.URLEncoder.encode(versionName, "UTF-8")
         }"
         val req = authRequest(path).get().build()
@@ -48,13 +48,13 @@ class GrokifyApi(
     }
 
     /** Absolute download URL for the latest published APK (auth required on request). */
-    fun apkDownloadUrl(): String = BuildConfig.API_BASE.trimEnd('/') + "/grokify-apk-download.php"
+    fun apkDownloadUrl(): String = BuildConfig.API_BASE.trimEnd('/') + "/apk-download.php"
 
     fun heartbeat(versionCode: Int, versionName: String): JSONObject {
         val body = JSONObject()
             .put("app_version_code", versionCode)
             .put("app_version_name", versionName)
-        val req = authRequest("/grokify-devices.php?action=heartbeat")
+        val req = authRequest("/devices.php?action=heartbeat")
             .post(jsonBody(body))
             .build()
         return executeJson(req)

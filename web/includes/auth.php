@@ -239,3 +239,40 @@ function gos_create_device(int $userId, string $deviceName = 'Android'): array
     }
     return ['token' => $raw, 'device' => $device];
 }
+
+/**
+ * @return array<string, mixed>|null
+ */
+function gos_device_by_id(int $id): ?array
+{
+    if ($id <= 0 || !gos_table_exists('grokify_devices')) {
+        return null;
+    }
+    $stmt = gos_pdo()->prepare('SELECT * FROM grokify_devices WHERE id = ? LIMIT 1');
+    $stmt->execute([$id]);
+    $row = $stmt->fetch();
+    return is_array($row) ? $row : null;
+}
+
+function gos_touch_device(int $deviceId, ?string $versionName = null, ?int $versionCode = null): void
+{
+    if ($deviceId <= 0 || !gos_table_exists('grokify_devices')) {
+        return;
+    }
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    $stmt = gos_pdo()->prepare(
+        'UPDATE grokify_devices
+         SET last_seen_at = NOW(),
+             last_ip = COALESCE(?, last_ip),
+             app_version_name = COALESCE(?, app_version_name),
+             app_version_code = COALESCE(?, app_version_code)
+         WHERE id = ?'
+    );
+    $stmt->execute([
+        $ip !== '' ? $ip : null,
+        $versionName !== null && $versionName !== '' ? $versionName : null,
+        $versionCode !== null && $versionCode > 0 ? $versionCode : null,
+        $deviceId,
+    ]);
+}
+

@@ -5,18 +5,18 @@ plugins {
 }
 
 android {
-    namespace = "io.grokpot.grokify"
+    namespace = "io.grokify.os"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "io.grokpot.grokify"
+        applicationId = "io.grokify.os"
         minSdk = 26
         targetSdk = 35
         versionCode = 20
         versionName = "0.1.20"
-        buildConfigField("String", "API_BASE", "\"https://grokify.grokpot.io/api\"")
-        buildConfigField("String", "WS_URL", "\"wss://grokify.grokpot.io/grokpot-ws/\"")
-        buildConfigField("String", "SITE_URL", "\"https://grokify.grokpot.io\"")
+        buildConfigField("String", "API_BASE", "\"https://grokifyos.grokpot.io/api\"")
+        buildConfigField("String", "WS_URL", "\"wss://grokifyos.grokpot.io/grokify-ws/\"")
+        buildConfigField("String", "SITE_URL", "\"https://grokifyos.grokpot.io\"")
     }
 
     buildTypes {

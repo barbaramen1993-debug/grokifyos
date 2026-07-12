@@ -50,7 +50,7 @@ Private production (this server’s **grokpot** monorepo) and **GrokifyOS** are 
 |-------|--------|
 | 1 — bootstrap, password auth, schema, devices | Done |
 | 2 — chat REST + dashboard (production DB, real usage) | Done |
-| 3 — dedicated bridge unit + Android `io.grokify.os` | Pending |
+| 3 — dedicated bridge unit + Android `io.grokify.os` | Done |
 
 ## Non-goals
 

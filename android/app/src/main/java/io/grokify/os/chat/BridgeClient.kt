@@ -1,6 +1,6 @@
-package io.grokpot.grokify.chat
+package io.grokify.os.chat
 
-import io.grokpot.grokify.BuildConfig
+import io.grokify.os.BuildConfig
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -117,7 +117,7 @@ class BridgeClient(
 
     companion object {
         /**
-         * Keep trailing slash on path (Apache ProxyPass is `/grokpot-ws/`) and
+         * Keep trailing slash on path (Apache ProxyPass is `/grokify-ws/`) and
          * URL-encode the token (base64 may contain `+`, `/`, `=`).
          *
          * OkHttp's HttpUrl only parses http/https — map ws/wss first, restore after.

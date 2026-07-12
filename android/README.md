@@ -41,7 +41,7 @@ source /etc/profile.d/android-sdk.sh
 Output:
 
 `app/build/outputs/apk/debug/app-debug.apk`  
-Package id (debug): `io.grokpot.grokify.debug`
+Package id (debug): `io.grokify.os.debug`
 
 ## Deploy to your phone
 
@@ -115,4 +115,4 @@ Camera, mic, speech, precise location (+ background), Bluetooth scan/connect, Wi
 
 ## Package
 
-`io.grokpot.grokify` · minSdk 26 · targetSdk 35 · compileSdk 35 · AGP 8.7.3 · Kotlin 2.0.21
+`io.grokify.os` · minSdk 26 · targetSdk 35 · compileSdk 35 · AGP 8.7.3 · Kotlin 2.0.21

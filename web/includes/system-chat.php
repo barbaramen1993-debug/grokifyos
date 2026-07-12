@@ -175,7 +175,7 @@ function gos_system_chat_bridge_url(): string
         return rtrim($url, '/');
     }
 
-    return 'http://127.0.0.1:8766';
+    return 'http://127.0.0.1:8876';
 }
 
 function gos_system_chat_ws_path(): string

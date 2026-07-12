@@ -46,7 +46,7 @@ No OAuth in v1. Optional providers may appear later as pure config.
 |-------|---------|
 | Health + setup + login + me | ✅ |
 | Device token create/list/revoke | ✅ |
-| Chat REST + full dashboard UI | ⏳ port next |
-| Bridge HA units renamed | ⏳ |
-| Android package + API base | ⏳ |
+| Chat REST + full dashboard UI | ✅ |
+| Bridge HA units (8876) | ✅ |
+| Android `io.grokify.os` + API base | ✅ |
 | Public release polish | ⏳ |

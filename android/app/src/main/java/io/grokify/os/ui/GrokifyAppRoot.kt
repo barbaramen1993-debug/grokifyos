@@ -1,4 +1,4 @@
-package io.grokpot.grokify.ui
+package io.grokify.os.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -126,9 +126,9 @@ import android.content.Intent
 import android.net.Uri
 import android.widget.VideoView
 import coil.compose.AsyncImage
-import io.grokpot.grokify.BuildConfig
-import io.grokpot.grokify.ui.chat.MarkdownText
-import io.grokpot.grokify.ui.theme.GrokifyColors
+import io.grokify.os.BuildConfig
+import io.grokify.os.ui.chat.MarkdownText
+import io.grokify.os.ui.theme.GrokifyColors
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -498,7 +498,7 @@ private fun HomePane(
             Text("DEVICE TOKEN", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
             Spacer(Modifier.height(6.dp))
             Text(
-                "Paste a token from grokify.grokpot.io → Devices.",
+                "Paste a token from grokifyos.grokpot.io → Devices.",
                 color = GrokifyColors.TextMuted,
                 fontSize = 13.sp,
             )

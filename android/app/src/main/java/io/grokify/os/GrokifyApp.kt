@@ -1,10 +1,10 @@
-package io.grokpot.grokify
+package io.grokify.os
 
 import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
-import io.grokpot.grokify.data.TokenStore
+import io.grokify.os.data.TokenStore
 
 class GrokifyApp : Application() {
     lateinit var tokenStore: TokenStore

@@ -1,13 +1,13 @@
-package io.grokpot.grokify.ui
+package io.grokify.os.ui
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import io.grokpot.grokify.BuildConfig
-import io.grokpot.grokify.GrokifyApp
-import io.grokpot.grokify.chat.BridgeClient
-import io.grokpot.grokify.data.GrokifyApi
-import io.grokpot.grokify.update.ApkUpdater
+import io.grokify.os.BuildConfig
+import io.grokify.os.GrokifyApp
+import io.grokify.os.chat.BridgeClient
+import io.grokify.os.data.GrokifyApi
+import io.grokify.os.update.ApkUpdater
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
