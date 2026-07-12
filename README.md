@@ -2,9 +2,11 @@
 
 Self-hosted AI assistant (web dashboard + Android + agent bridge).
 
-**Phase 2:** password-only auth, production chat dashboard + REST APIs, device tokens, APK releases, real Grok Build usage. **No mock/demo seed data.**
+**Phase 2 + public test host:** password-only auth, production chat dashboard + REST APIs, device tokens, APK releases, real Grok Build usage. **No mock/demo seed data.**
 
 This repository is independent of the private Grokpot monorepo. Production Grokify-on-Grokpot is unchanged.
+
+**Live VPS (TLS):** https://grokifyos.grokpot.io
 
 ## Quick start
 

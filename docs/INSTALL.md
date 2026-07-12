@@ -45,6 +45,32 @@ Or point Apache/nginx DocumentRoot at `web/public` and alias `/api` → `web/api
 | **Local / LAN** | Same network only |
 | **VPS + DNS + TLS** | Anywhere |
 
+### VPS example (this host)
+
+Live test host on the Contabo VPS:
+
+| Item | Value |
+|------|--------|
+| URL | https://grokifyos.grokpot.io |
+| App path | `/var/www/grokifyos` → `/root/grokifyos` |
+| Apache | `sites-available/grokifyos.grokpot.io.conf` + `-le-ssl.conf` |
+| Env (Apache) | `/etc/grokifyos/php.env` (mode `640`, group `www-data`) — **not** in git |
+| TLS | Let’s Encrypt via `certbot --apache -d grokifyos.grokpot.io` |
+
+```bash
+# DNS A record → VPS IP, then:
+sudo ln -sfn /path/to/grokifyos /var/www/grokifyos
+sudo cp deploy/apache-vhost.conf.example /etc/apache2/sites-available/grokifyos.grokpot.io.conf
+# edit ServerName / paths if needed
+sudo a2ensite grokifyos.grokpot.io.conf
+sudo apache2ctl configtest && sudo systemctl reload apache2
+sudo certbot --apache -d grokifyos.grokpot.io --redirect
+# put secrets in /etc/grokifyos/php.env; chown root:www-data; chmod 640
+# storage must be writable: chown -R www-data:www-data storage/
+```
+
+HTTP redirects to HTTPS (ACME challenge path excluded). Auto-renew is handled by certbot’s timer.
+
 ## 4. Bridge (real agents)
 
 Chat **persists** without a bridge (sessions/messages in MySQL). **Streaming agents** need the Node bridge:

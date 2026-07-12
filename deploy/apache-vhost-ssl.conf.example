@@ -1,16 +1,9 @@
-# GrokifyOS Apache vhost (HTTP → ACME + redirect; TLS added by certbot --apache)
-# Domain used on this VPS: grokifyos.grokpot.io
-# Paths assume symlink: /var/www/grokifyos → install root
-
-<VirtualHost *:80>
+<IfModule mod_ssl.c>
+<VirtualHost *:443>
     ServerName grokifyos.grokpot.io
     ServerAdmin webmaster@grokpot.io
 
     DocumentRoot /var/www/grokifyos/web/public
-
-    RewriteEngine On
-    RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
-    RewriteRule ^ https://grokifyos.grokpot.io%{REQUEST_URI} [R=301,L,NE]
 
     Alias /api /var/www/grokifyos/web/api
     Alias /assets /var/www/grokifyos/web/assets
@@ -63,6 +56,27 @@
         Require all denied
     </Directory>
 
+
+    # Agent WebSocket (dedicated bridge preferred on 8876; temporarily may share gateway)
+    ProxyPreserveHost On
+    ProxyPass /grokify-ws/ ws://127.0.0.1:8766/
+    ProxyPassReverse /grokify-ws/ ws://127.0.0.1:8766/
+
+    <IfModule mod_headers.c>
+        Header always unset Server
+        Header always set X-Content-Type-Options "nosniff"
+        Header always set Referrer-Policy "strict-origin-when-cross-origin"
+        Header always set Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+        Header always set X-Frame-Options "SAMEORIGIN"
+        Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        Header always set Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' wss: https:; form-action 'self'"
+    </IfModule>
+
     ErrorLog ${APACHE_LOG_DIR}/grokifyos.grokpot.io_error.log
     CustomLog ${APACHE_LOG_DIR}/grokifyos.grokpot.io_access.log combined
+
+SSLCertificateFile /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem
+SSLCertificateKeyFile /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem
+Include/etc/letsencrypt/options-ssl-apache.conf
 </VirtualHost>
+</IfModule>
