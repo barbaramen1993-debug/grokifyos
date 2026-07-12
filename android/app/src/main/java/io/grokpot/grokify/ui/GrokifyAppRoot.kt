@@ -1,0 +1,2291 @@
+package io.grokpot.grokify.ui
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.automirrored.filled.Notes
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.ScreenLockPortrait
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.outlined.Link
+import androidx.compose.material.icons.outlined.LinkOff
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import android.content.Intent
+import android.net.Uri
+import android.widget.VideoView
+import coil.compose.AsyncImage
+import io.grokpot.grokify.BuildConfig
+import io.grokpot.grokify.ui.chat.MarkdownText
+import io.grokpot.grokify.ui.theme.GrokifyColors
+import kotlinx.coroutines.delay
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun GrokifyAppRoot(
+    state: UiState,
+    onSaveToken: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onSend: (String) -> Unit,
+    onCheckUpdate: () -> Unit,
+    onDownloadInstallUpdate: () -> Unit = {},
+    onToggleExpand: (String) -> Unit = {},
+    onSetPanel: (ChatPanel) -> Unit = {},
+    onToggleHistory: () -> Unit = {},
+    onToggleKeepScreenOn: () -> Unit = {},
+    onToggleEnterForNewline: () -> Unit = {},
+    onNewChat: () -> Unit = {},
+    onSelectSession: (String) -> Unit = {},
+    onDeleteSession: (String) -> Unit = {},
+    onAddNote: (String) -> Unit = {},
+    onToggleNote: (Int, Boolean) -> Unit = { _, _ -> },
+    onDeleteNote: (Int) -> Unit = {},
+    onSelectModel: (String) -> Unit = {},
+    onToggleMessageExclude: (String) -> Unit = {},
+    onDeleteMessage: (String) -> Unit = {},
+    onEditMessage: (String, String) -> Unit = { _, _ -> },
+    onRenameSession: (String) -> Unit = {},
+    onLoadOlder: () -> Unit = {},
+    onRefreshUsage: () -> Unit = {},
+) {
+    var tab by remember { mutableIntStateOf(1) } // default Chat
+    var tokenDraft by remember { mutableStateOf(state.token) }
+    var chatDraft by remember { mutableStateOf("") }
+    var renameOpen by remember { mutableStateOf(false) }
+    var renameDraft by remember { mutableStateOf("") }
+    val density = LocalDensity.current
+    val imeBottom = WindowInsets.ime.getBottom(density)
+    val keyboardOpen = imeBottom > 0
+
+    fun openRename() {
+        renameDraft = state.sessionTitle.ifBlank { "New Chat" }
+        renameOpen = true
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(GrokifyColors.Void)
+            .drawBehind {
+                // Soft ambient glow
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            GrokifyColors.GlowCyan.copy(alpha = 0.07f),
+                            Color.Transparent,
+                        ),
+                        center = Offset(size.width * 0.15f, size.height * 0.05f),
+                        radius = size.minDimension * 0.7f,
+                    ),
+                    radius = size.minDimension * 0.7f,
+                    center = Offset(size.width * 0.15f, size.height * 0.05f),
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            GrokifyColors.GlowViolet.copy(alpha = 0.05f),
+                            Color.Transparent,
+                        ),
+                        center = Offset(size.width * 0.9f, size.height * 0.3f),
+                        radius = size.minDimension * 0.55f,
+                    ),
+                    radius = size.minDimension * 0.55f,
+                    center = Offset(size.width * 0.9f, size.height * 0.3f),
+                )
+            }
+    ) {
+        Scaffold(
+            containerColor = Color.Transparent,
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
+            topBar = {
+                if (!(tab == 1 && keyboardOpen)) {
+                    TopChrome(
+                        state = state,
+                        tab = tab,
+                        onRenameSession = { openRename() },
+                    )
+                }
+            },
+            bottomBar = {
+                if (!keyboardOpen) {
+                    NavigationBar(
+                        containerColor = GrokifyColors.VoidElevated.copy(alpha = 0.96f),
+                        tonalElevation = 0.dp,
+                        modifier = Modifier
+                            .navigationBarsPadding()
+                            .border(
+                                width = 0.5.dp,
+                                color = GrokifyColors.PanelBorder,
+                                shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
+                            ),
+                    ) {
+                        val colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = GrokifyColors.GlowCyan,
+                            selectedTextColor = GrokifyColors.GlowCyan,
+                            unselectedIconColor = GrokifyColors.TextDim,
+                            unselectedTextColor = GrokifyColors.TextDim,
+                            indicatorColor = GrokifyColors.GlowCyan.copy(alpha = 0.12f),
+                        )
+                        NavigationBarItem(
+                            selected = tab == 0,
+                            onClick = { tab = 0; onSetPanel(ChatPanel.None) },
+                            icon = { Icon(Icons.Default.Home, null) },
+                            label = { Text("Home", fontSize = 11.sp) },
+                            colors = colors,
+                        )
+                        NavigationBarItem(
+                            selected = tab == 1,
+                            onClick = { tab = 1 },
+                            icon = { Icon(Icons.AutoMirrored.Filled.Chat, null) },
+                            label = { Text("Chat", fontSize = 11.sp) },
+                            colors = colors,
+                        )
+                        NavigationBarItem(
+                            selected = tab == 2,
+                            onClick = { tab = 2; onSetPanel(ChatPanel.None) },
+                            icon = { Icon(Icons.Default.SystemUpdate, null) },
+                            label = { Text("Update", fontSize = 11.sp) },
+                            colors = colors,
+                        )
+                    }
+                }
+            },
+        ) { pad ->
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .padding(pad)
+                    .imePadding()
+            ) {
+                when (tab) {
+                    0 -> HomePane(
+                        state = state,
+                        tokenDraft = tokenDraft,
+                        onTokenChange = { tokenDraft = it },
+                        onSaveToken = { onSaveToken(tokenDraft) },
+                        onRefresh = onRefresh,
+                        onOpenSettings = {
+                            tab = 1
+                            onSetPanel(ChatPanel.Settings)
+                        },
+                    )
+                    1 -> ChatPane(
+                        state = state,
+                        draft = chatDraft,
+                        keyboardOpen = keyboardOpen,
+                        onDraft = { chatDraft = it },
+                        onSend = {
+                            onSend(chatDraft)
+                            chatDraft = ""
+                        },
+                        onToggleExpand = onToggleExpand,
+                        onRefresh = onRefresh,
+                        onSetPanel = onSetPanel,
+                        onToggleHistory = onToggleHistory,
+                        onToggleKeepScreenOn = onToggleKeepScreenOn,
+                        onToggleEnterForNewline = onToggleEnterForNewline,
+                        onNewChat = onNewChat,
+                        onSelectSession = onSelectSession,
+                        onDeleteSession = onDeleteSession,
+                        onAddNote = onAddNote,
+                        onToggleNote = onToggleNote,
+                        onDeleteNote = onDeleteNote,
+                        onSelectModel = onSelectModel,
+                        onToggleMessageExclude = onToggleMessageExclude,
+                        onDeleteMessage = onDeleteMessage,
+                        onEditMessage = onEditMessage,
+                        onRenameSession = { openRename() },
+                        onLoadOlder = onLoadOlder,
+                        onRefreshUsage = onRefreshUsage,
+                    )
+                    2 -> UpdatePane(
+                        state = state,
+                        onCheckUpdate = onCheckUpdate,
+                        onDownloadInstall = onDownloadInstallUpdate,
+                        onRefresh = onRefresh,
+                    )
+                }
+            }
+        }
+
+        if (renameOpen) {
+            AlertDialog(
+                onDismissRequest = { renameOpen = false },
+                title = {
+                    Text("Rename chat", color = GrokifyColors.TextPrimary)
+                },
+                text = {
+                    OutlinedTextField(
+                        value = renameDraft,
+                        onValueChange = { renameDraft = it },
+                        singleLine = true,
+                        label = { Text("Session name") },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = GrokifyColors.TextPrimary,
+                            unfocusedTextColor = GrokifyColors.TextPrimary,
+                            focusedBorderColor = GrokifyColors.GlowCyan,
+                            unfocusedBorderColor = GrokifyColors.PanelBorder,
+                            focusedLabelColor = GrokifyColors.GlowCyan,
+                            unfocusedLabelColor = GrokifyColors.TextMuted,
+                            cursorColor = GrokifyColors.GlowCyan,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            onRenameSession(renameDraft)
+                            renameOpen = false
+                        },
+                    ) {
+                        Text("Save", color = GrokifyColors.GlowCyan)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { renameOpen = false }) {
+                        Text("Cancel", color = GrokifyColors.TextMuted)
+                    }
+                },
+                containerColor = GrokifyColors.Panel,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TopChrome(
+    state: UiState,
+    tab: Int,
+    onRenameSession: () -> Unit = {},
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(GrokifyColors.HeaderGradient)
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 10.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                Modifier
+                    .weight(1f)
+                    .padding(end = 10.dp),
+            ) {
+                Text(
+                    "GROKIFY",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = GrokifyColors.GlowCyan,
+                    letterSpacing = 2.sp,
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = if (tab == 1) {
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(onClick = onRenameSession, role = Role.Button)
+                            .padding(vertical = 2.dp)
+                    } else {
+                        Modifier
+                    },
+                ) {
+                    Text(
+                        when (tab) {
+                            0 -> "Command center"
+                            1 -> shortenTitle(state.sessionTitle.ifBlank { "Chat" })
+                            else -> "Deploy"
+                        },
+                        style = MaterialTheme.typography.titleSmall,
+                        color = GrokifyColors.TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    if (tab == 1) {
+                        Spacer(Modifier.width(4.dp))
+                        Icon(
+                            Icons.Default.Edit,
+                            contentDescription = "Rename chat",
+                            tint = GrokifyColors.TextDim,
+                            modifier = Modifier.size(13.dp),
+                        )
+                    }
+                }
+            }
+            StatusPill(connected = state.connected, label = state.statusText)
+        }
+        if (!state.connected && !state.bridgeDetail.isNullOrBlank()) {
+            Text(
+                state.bridgeDetail,
+                color = GrokifyColors.GlowRose,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+/** Compact header title so long session names don't collide with the status pill. */
+private fun shortenTitle(title: String, maxChars: Int = 22): String {
+    val t = title.trim().replace('\n', ' ')
+    if (t.length <= maxChars) return t
+    return t.take(maxChars - 1).trimEnd() + "…"
+}
+
+@Composable
+private fun StatusPill(connected: Boolean, label: String) {
+    val color = if (connected) GrokifyColors.GlowMint else GrokifyColors.GlowAmber
+    val pulse = rememberInfiniteTransition(label = "pulse")
+    val alpha by pulse.animateFloat(
+        initialValue = 0.55f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "alpha",
+    )
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(color.copy(alpha = 0.1f))
+            .border(1.dp, color.copy(alpha = 0.35f), RoundedCornerShape(999.dp))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+    ) {
+        Box(
+            Modifier
+                .size(7.dp)
+                .clip(CircleShape)
+                .background(color.copy(alpha = if (connected) alpha else 1f))
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(label.take(18), color = color, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
+@Composable
+private fun HomePane(
+    state: UiState,
+    tokenDraft: String,
+    onTokenChange: (String) -> Unit,
+    onSaveToken: () -> Unit,
+    onRefresh: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .navigationBarsPadding()
+    ) {
+        GlassCard {
+            Text("DEVICE TOKEN", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Paste a token from grokify.grokpot.io → Devices.",
+                color = GrokifyColors.TextMuted,
+                fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = tokenDraft,
+                onValueChange = onTokenChange,
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("gf_…", color = GrokifyColors.TextDim) },
+                singleLine = true,
+                colors = fieldColors(),
+                shape = RoundedCornerShape(12.dp),
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = onSaveToken,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = GrokifyColors.GlowCyan,
+                        contentColor = Color(0xFF041016),
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                ) { Text("Save", fontWeight = FontWeight.SemiBold) }
+                IconButton(
+                    onClick = onRefresh,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(GrokifyColors.PanelSoft)
+                        .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(10.dp)),
+                ) {
+                    Icon(Icons.Default.Refresh, "Refresh", tint = GrokifyColors.GlowMint)
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        MetricGrid(state)
+        Spacer(Modifier.height(12.dp))
+        Button(
+            onClick = onOpenSettings,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = GrokifyColors.PanelSoft),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Icon(Icons.Default.Settings, null, tint = GrokifyColors.GlowCyan)
+            Spacer(Modifier.width(8.dp))
+            Text("Chat settings & models", color = GrokifyColors.TextPrimary)
+        }
+        state.error?.let {
+            Spacer(Modifier.height(10.dp))
+            Text(it, color = GrokifyColors.GlowRose, fontSize = 13.sp)
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun MetricGrid(state: UiState) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MetricTile("USER", state.userLabel.ifBlank { "—" }, Modifier.weight(1f))
+            MetricTile("MODEL", state.model, Modifier.weight(1f), mono = true)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            MetricTile(
+                "BRIDGE",
+                if (state.connected) "ONLINE" else "OFFLINE",
+                Modifier.weight(1f),
+                accent = if (state.connected) GrokifyColors.GlowMint else GrokifyColors.GlowAmber,
+            )
+            MetricTile(
+                "SESSION",
+                state.sessionId.take(8).ifBlank { "—" },
+                Modifier.weight(1f),
+                mono = true,
+            )
+        }
+        MetricTile(
+            "CONTEXT",
+            if (state.useHistory) "HISTORY ON" else "HISTORY OFF",
+            Modifier.fillMaxWidth(),
+            accent = if (state.useHistory) GrokifyColors.GlowCyan else GrokifyColors.TextMuted,
+        )
+    }
+}
+
+@Composable
+private fun MetricTile(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    accent: Color = GrokifyColors.TextPrimary,
+    mono: Boolean = false,
+) {
+    Column(
+        modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp))
+            .padding(12.dp)
+    ) {
+        Text(label, style = MaterialTheme.typography.labelSmall, color = GrokifyColors.TextDim)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            value,
+            color = accent,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            fontFamily = if (mono) FontFamily.Monospace else FontFamily.SansSerif,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun GlassCard(content: @Composable () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(GrokifyColors.Panel.copy(alpha = 0.9f))
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(16.dp))
+            .padding(14.dp)
+    ) { content() }
+}
+
+@Composable
+private fun ChatPane(
+    state: UiState,
+    draft: String,
+    keyboardOpen: Boolean,
+    onDraft: (String) -> Unit,
+    onSend: () -> Unit,
+    onToggleExpand: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onSetPanel: (ChatPanel) -> Unit,
+    onToggleHistory: () -> Unit,
+    onToggleKeepScreenOn: () -> Unit,
+    onToggleEnterForNewline: () -> Unit,
+    onNewChat: () -> Unit,
+    onSelectSession: (String) -> Unit,
+    onDeleteSession: (String) -> Unit,
+    onAddNote: (String) -> Unit,
+    onToggleNote: (Int, Boolean) -> Unit,
+    onDeleteNote: (Int) -> Unit,
+    onSelectModel: (String) -> Unit,
+    onToggleMessageExclude: (String) -> Unit,
+    onDeleteMessage: (String) -> Unit,
+    onEditMessage: (String, String) -> Unit,
+    onRenameSession: () -> Unit = {},
+    onLoadOlder: () -> Unit = {},
+    onRefreshUsage: () -> Unit = {},
+) {
+    val listState = rememberLazyListState()
+    val clipboard = LocalClipboardManager.current
+    var menuMsgId by remember { mutableStateOf<String?>(null) }
+    var editMsg by remember { mutableStateOf<ChatLine?>(null) }
+    var editDraft by remember { mutableStateOf("") }
+
+    // Auto-scroll only when the user is already near the bottom (or list grew while pinned)
+    var pinToBottom by remember { mutableStateOf(true) }
+    var prevMessageCount by remember { mutableIntStateOf(0) }
+
+    fun listPrefixCount(): Int {
+        var n = 0
+        if (state.hasMoreMessages || state.loadingOlder) n++
+        if (state.messages.isEmpty() && !state.busy) n++
+        return n
+    }
+
+    LaunchedEffect(listState, state.hasMoreMessages, state.loadingOlder) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            val first = info.visibleItemsInfo.firstOrNull()
+            val total = info.totalItemsCount
+            Triple(
+                last != null && total > 0 && last.index >= total - 2,
+                first?.index ?: -1,
+                total,
+            )
+        }.collect { (nearEnd, firstIndex, total) ->
+            pinToBottom = nearEnd
+            // Load older when scrolled near the top of a non-empty list
+            if (total > 0 && firstIndex in 0..2 && state.hasMoreMessages && !state.loadingOlder) {
+                onLoadOlder()
+            }
+        }
+    }
+
+    // Session open / initial page load → jump to bottom immediately
+    LaunchedEffect(state.scrollToBottomNonce, state.messages.size) {
+        if (state.scrollToBottomNonce > 0 && state.messages.isNotEmpty()) {
+            pinToBottom = true
+            val index = listPrefixCount() + state.messages.lastIndex
+            listState.scrollToItem(index)
+            delay(48)
+            if (state.messages.isNotEmpty()) {
+                listState.scrollToItem(listPrefixCount() + state.messages.lastIndex)
+            }
+        }
+    }
+
+    // Streaming / new messages while pinned; preserve anchor when prepending older pages
+    LaunchedEffect(
+        state.messages.size,
+        state.messages.lastOrNull()?.id,
+        state.messages.lastOrNull()?.text?.length,
+        state.messages.lastOrNull()?.toolResult?.length,
+        state.loadingOlder,
+    ) {
+        val size = state.messages.size
+        // Detect prepend: size grew while not at bottom (user reading history)
+        if (size > prevMessageCount && !pinToBottom && prevMessageCount > 0) {
+            val added = size - prevMessageCount
+            val firstIdx = listState.firstVisibleItemIndex
+            if (firstIdx <= 4 && added > 0 && added <= GrokifyViewModel.MESSAGE_PAGE_SIZE + 8) {
+                val offset = listState.firstVisibleItemScrollOffset
+                listState.scrollToItem(firstIdx + added, offset)
+                prevMessageCount = size
+                return@LaunchedEffect
+            }
+        }
+        prevMessageCount = size
+        if (state.messages.isNotEmpty() && menuMsgId == null && pinToBottom) {
+            listState.scrollToItem(listPrefixCount() + state.messages.lastIndex)
+        }
+    }
+
+    // Drop selection if message was deleted
+    LaunchedEffect(state.messages) {
+        val id = menuMsgId
+        if (id != null && state.messages.none { it.id == id }) {
+            menuMsgId = null
+        }
+    }
+
+    fun toggleMenu(msg: ChatLine) {
+        if (msg.streaming) return
+        menuMsgId = if (menuMsgId == msg.id) null else msg.id
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            // Toolbar
+            ChatToolbar(
+                state = state,
+                keyboardOpen = keyboardOpen,
+                onSetPanel = onSetPanel,
+                onToggleHistory = onToggleHistory,
+                onToggleKeepScreenOn = onToggleKeepScreenOn,
+                onNewChat = onNewChat,
+                onRefresh = onRefresh,
+                onRefreshUsage = onRefreshUsage,
+            )
+
+            // Messages
+            Box(
+                Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 12.dp)
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                        ) { menuMsgId = null },
+                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    if (state.hasMoreMessages || state.loadingOlder) {
+                        item(key = "history_header") {
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 6.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (state.loadingOlder) {
+                                    CircularProgressIndicator(
+                                        color = GrokifyColors.GlowCyan,
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        "Loading earlier messages…",
+                                        color = GrokifyColors.TextDim,
+                                        fontSize = 12.sp,
+                                    )
+                                } else {
+                                    Text(
+                                        "Scroll up for earlier messages",
+                                        color = GrokifyColors.TextDim,
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.clickable { onLoadOlder() },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (state.messages.isEmpty() && !state.busy) {
+                        item {
+                            Text(
+                                "No messages yet — say hello.",
+                                color = GrokifyColors.TextMuted,
+                                fontSize = 14.sp,
+                                modifier = Modifier.padding(vertical = 24.dp, horizontal = 8.dp),
+                            )
+                        }
+                    }
+                    items(state.messages, key = { it.id }) { msg ->
+                        val selected = menuMsgId == msg.id
+                        when (msg.role) {
+                            ChatRole.User -> UserBubble(
+                                msg = msg,
+                                selected = selected,
+                                onTap = { toggleMenu(msg) },
+                                actions = {
+                                    BubbleActionBar(
+                                        alignEnd = true,
+                                        excluded = msg.excludedFromContext,
+                                        showEdit = true,
+                                        onCopy = {
+                                            clipboard.setText(AnnotatedString(msg.text))
+                                            menuMsgId = null
+                                        },
+                                        onToggleExclude = {
+                                            onToggleMessageExclude(msg.id)
+                                            menuMsgId = null
+                                        },
+                                        onDelete = {
+                                            onDeleteMessage(msg.id)
+                                            menuMsgId = null
+                                        },
+                                        onEdit = {
+                                            editDraft = msg.text
+                                            editMsg = msg
+                                            menuMsgId = null
+                                        },
+                                    )
+                                },
+                            )
+                            ChatRole.Assistant -> AssistantBubble(
+                                msg = msg,
+                                selected = selected,
+                                onTap = { toggleMenu(msg) },
+                                actions = {
+                                    BubbleActionBar(
+                                        alignEnd = false,
+                                        excluded = msg.excludedFromContext,
+                                        showEdit = false,
+                                        onCopy = {
+                                            clipboard.setText(AnnotatedString(msg.text))
+                                            menuMsgId = null
+                                        },
+                                        onToggleExclude = {
+                                            onToggleMessageExclude(msg.id)
+                                            menuMsgId = null
+                                        },
+                                        onDelete = {
+                                            onDeleteMessage(msg.id)
+                                            menuMsgId = null
+                                        },
+                                        onEdit = {},
+                                    )
+                                },
+                            )
+                            ChatRole.Thinking -> ThinkingCard(msg) { onToggleExpand(msg.id) }
+                            ChatRole.Tool -> ToolCard(msg) { onToggleExpand(msg.id) }
+                            ChatRole.Media -> MediaCard(msg)
+                            ChatRole.System -> SystemLine(
+                                msg = msg,
+                                selected = selected,
+                                onTap = { toggleMenu(msg) },
+                                actions = {
+                                    BubbleActionBar(
+                                        alignEnd = false,
+                                        excluded = msg.excludedFromContext,
+                                        showEdit = false,
+                                        onCopy = {
+                                            clipboard.setText(AnnotatedString(msg.text))
+                                            menuMsgId = null
+                                        },
+                                        onToggleExclude = {
+                                            onToggleMessageExclude(msg.id)
+                                            menuMsgId = null
+                                        },
+                                        onDelete = {
+                                            onDeleteMessage(msg.id)
+                                            menuMsgId = null
+                                        },
+                                        onEdit = {},
+                                    )
+                                },
+                            )
+                        }
+                    }
+                }
+                if (state.busy && state.messages.isEmpty()) {
+                    CircularProgressIndicator(
+                        color = GrokifyColors.GlowCyan,
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(28.dp),
+                        strokeWidth = 2.dp,
+                    )
+                }
+            }
+
+            state.error?.let {
+                Text(
+                    it,
+                    color = GrokifyColors.GlowRose,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                )
+            }
+
+            // Composer — stays above keyboard via parent imePadding
+            ComposerBar(
+                draft = draft,
+                busy = state.busy,
+                connected = state.connected,
+                enterForNewline = state.enterForNewline,
+                onDraft = onDraft,
+                onSend = onSend,
+            )
+        }
+
+        // Side panels as overlays
+        AnimatedVisibility(
+            visible = state.panel != ChatPanel.None,
+            enter = fadeIn() + slideInVertically { it / 3 },
+            exit = fadeOut() + slideOutVertically { it / 3 },
+        ) {
+            when (state.panel) {
+                ChatPanel.History -> HistoryPanel(
+                    state = state,
+                    onClose = { onSetPanel(ChatPanel.None) },
+                    onSelect = onSelectSession,
+                    onDelete = onDeleteSession,
+                    onNew = onNewChat,
+                )
+                ChatPanel.Notes -> NotesPanel(
+                    state = state,
+                    onClose = { onSetPanel(ChatPanel.None) },
+                    onAdd = onAddNote,
+                    onToggle = onToggleNote,
+                    onDelete = onDeleteNote,
+                )
+                ChatPanel.Settings -> SettingsPanel(
+                    state = state,
+                    onRefreshUsage = onRefreshUsage,
+                    onClose = { onSetPanel(ChatPanel.None) },
+                    onSelectModel = onSelectModel,
+                    onToggleHistory = onToggleHistory,
+                    onToggleKeepScreenOn = onToggleKeepScreenOn,
+                    onToggleEnterForNewline = onToggleEnterForNewline,
+                )
+                ChatPanel.None -> {}
+            }
+        }
+
+        // Edit user message dialog
+        val editing = editMsg
+        if (editing != null) {
+            AlertDialog(
+                onDismissRequest = { editMsg = null },
+                containerColor = GrokifyColors.VoidElevated,
+                titleContentColor = GrokifyColors.TextPrimary,
+                textContentColor = GrokifyColors.TextPrimary,
+                title = { Text("Edit message") },
+                text = {
+                    OutlinedTextField(
+                        value = editDraft,
+                        onValueChange = { editDraft = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        minLines = 3,
+                        maxLines = 8,
+                        colors = fieldColors(),
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            onEditMessage(editing.id, editDraft)
+                            editMsg = null
+                        },
+                        enabled = editDraft.trim().isNotEmpty(),
+                    ) {
+                        Text("Save", color = GrokifyColors.GlowMint)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { editMsg = null }) {
+                        Text("Cancel", color = GrokifyColors.TextMuted)
+                    }
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun BubbleActionBar(
+    alignEnd: Boolean,
+    excluded: Boolean,
+    showEdit: Boolean,
+    onCopy: () -> Unit,
+    onToggleExclude: () -> Unit,
+    onDelete: () -> Unit,
+    onEdit: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        horizontalArrangement = if (alignEnd) Arrangement.End else Arrangement.Start,
+    ) {
+        Row(
+            Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(GrokifyColors.VoidElevated.copy(alpha = 0.98f))
+                .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(999.dp))
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(0.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BubbleIconBtn(
+                icon = Icons.Default.ContentCopy,
+                label = "Copy",
+                tint = GrokifyColors.GlowCyan,
+                onClick = onCopy,
+            )
+            BubbleIconBtn(
+                icon = if (excluded) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                label = if (excluded) "Show in context" else "Hide from context",
+                tint = GrokifyColors.GlowViolet,
+                onClick = onToggleExclude,
+            )
+            BubbleIconBtn(
+                icon = Icons.Default.Delete,
+                label = "Delete from context",
+                tint = GrokifyColors.GlowRose,
+                onClick = onDelete,
+            )
+            if (showEdit) {
+                BubbleIconBtn(
+                    icon = Icons.Default.Edit,
+                    label = "Edit message",
+                    tint = GrokifyColors.GlowMint,
+                    onClick = onEdit,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BubbleIconBtn(
+    icon: ImageVector,
+    label: String,
+    tint: Color,
+    onClick: () -> Unit,
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = Modifier.size(34.dp),
+    ) {
+        Icon(
+            icon,
+            contentDescription = label,
+            tint = tint,
+            modifier = Modifier.size(16.dp),
+        )
+    }
+}
+
+@Composable
+private fun ChatToolbar(
+    state: UiState,
+    keyboardOpen: Boolean,
+    onSetPanel: (ChatPanel) -> Unit,
+    onToggleHistory: () -> Unit,
+    onToggleKeepScreenOn: () -> Unit,
+    onNewChat: () -> Unit,
+    onRefresh: () -> Unit,
+    onRefreshUsage: () -> Unit = {},
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 4.dp)
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ToolbarChip(
+                label = "History",
+                icon = Icons.Default.History,
+                active = state.panel == ChatPanel.History,
+                onClick = {
+                    onSetPanel(if (state.panel == ChatPanel.History) ChatPanel.None else ChatPanel.History)
+                },
+            )
+            ToolbarChip(
+                label = if (state.useHistory) "Context" else "No ctx",
+                icon = if (state.useHistory) Icons.Outlined.Link else Icons.Outlined.LinkOff,
+                active = state.useHistory,
+                onClick = onToggleHistory,
+            )
+            ToolbarChip(
+                label = if (state.keepScreenOn) "Screen on" else "Screen off",
+                icon = Icons.Default.ScreenLockPortrait,
+                active = state.keepScreenOn,
+                onClick = onToggleKeepScreenOn,
+            )
+            ToolbarChip(
+                label = "Notes${state.notes.count { it.enabled }.let { if (it > 0) " · $it" else "" }}",
+                icon = Icons.AutoMirrored.Filled.Notes,
+                active = state.panel == ChatPanel.Notes,
+                onClick = {
+                    onSetPanel(if (state.panel == ChatPanel.Notes) ChatPanel.None else ChatPanel.Notes)
+                },
+            )
+            ToolbarChip(
+                label = "Settings",
+                icon = Icons.Default.Settings,
+                active = state.panel == ChatPanel.Settings,
+                onClick = {
+                    onSetPanel(if (state.panel == ChatPanel.Settings) ChatPanel.None else ChatPanel.Settings)
+                },
+            )
+            ToolbarChip(
+                label = "New",
+                icon = Icons.Default.Add,
+                active = false,
+                onClick = onNewChat,
+            )
+            if (!state.connected) {
+                ToolbarChip(
+                    label = "Reconnect",
+                    icon = Icons.Default.Refresh,
+                    active = false,
+                    onClick = onRefresh,
+                )
+            }
+        }
+        if (!keyboardOpen) {
+            val usage = state.usage
+            val usageText = when {
+                state.usageLoading && usage == null -> "Usage …"
+                usage?.error != null && usage.label.isBlank() -> "Usage unavailable"
+                usage != null && usage.label.isNotBlank() -> usage.label
+                else -> null
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 4.dp, top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    state.model.removePrefix("gb:").ifBlank { state.model },
+                    color = GrokifyColors.TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (usageText != null) {
+                    Text(
+                        usageText,
+                        color = when {
+                            (usage?.usagePercent ?: 0.0) >= 90 -> GrokifyColors.GlowRose
+                            (usage?.usagePercent ?: 0.0) >= 70 -> GrokifyColors.GlowViolet
+                            else -> GrokifyColors.GlowCyan
+                        }.copy(alpha = 0.9f),
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .padding(start = 8.dp)
+                            .clickable { onRefreshUsage() },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToolbarChip(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    active: Boolean,
+    onClick: () -> Unit,
+) {
+    val border = if (active) GrokifyColors.GlowCyan.copy(alpha = 0.55f) else GrokifyColors.PanelBorder
+    val bg = if (active) GrokifyColors.GlowCyan.copy(alpha = 0.12f) else GrokifyColors.Panel
+    val fg = if (active) GrokifyColors.GlowCyan else GrokifyColors.TextMuted
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(bg)
+            .border(1.dp, border, RoundedCornerShape(999.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Icon(icon, null, tint = fg, modifier = Modifier.size(14.dp))
+        Spacer(Modifier.width(4.dp))
+        Text(label, color = fg, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
+@Composable
+private fun ComposerBar(
+    draft: String,
+    busy: Boolean,
+    connected: Boolean,
+    enterForNewline: Boolean,
+    onDraft: (String) -> Unit,
+    onSend: () -> Unit,
+) {
+    val canSend = draft.isNotBlank() && !busy
+    val hint = when {
+        !connected -> "Bridge offline — reconnect first"
+        enterForNewline -> "Message Grok… (Enter = new line)"
+        else -> "Message Grok… (Enter = send)"
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(GrokifyColors.VoidElevated.copy(alpha = 0.95f))
+            .border(0.5.dp, GrokifyColors.PanelBorder)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        OutlinedTextField(
+            value = draft,
+            onValueChange = onDraft,
+            modifier = Modifier.weight(1f),
+            placeholder = {
+                Text(hint, color = GrokifyColors.TextDim)
+            },
+            minLines = 1,
+            maxLines = 8,
+            keyboardOptions = KeyboardOptions(
+                imeAction = if (enterForNewline) ImeAction.Default else ImeAction.Send,
+                keyboardType = androidx.compose.ui.text.input.KeyboardType.Text,
+            ),
+            keyboardActions = KeyboardActions(
+                onSend = {
+                    if (canSend && !enterForNewline) onSend()
+                },
+            ),
+            colors = fieldColors(),
+            shape = RoundedCornerShape(16.dp),
+        )
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+                .background(
+                    if (canSend) {
+                        Brush.linearGradient(
+                            listOf(GrokifyColors.GlowCyan, GrokifyColors.GlowMint)
+                        )
+                    } else {
+                        Brush.linearGradient(
+                            listOf(GrokifyColors.PanelSoft, GrokifyColors.PanelSoft)
+                        )
+                    }
+                )
+                .clickable(enabled = canSend, onClick = onSend),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (busy) {
+                CircularProgressIndicator(
+                    Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                    color = GrokifyColors.GlowCyan,
+                )
+            } else {
+                Icon(
+                    Icons.AutoMirrored.Filled.Send,
+                    contentDescription = "Send",
+                    tint = if (draft.isNotBlank()) Color(0xFF041016) else GrokifyColors.TextDim,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+    }
+}
+
+// ─── Panels ───────────────────────────────────────────────────────────
+
+@Composable
+private fun PanelScaffold(
+    title: String,
+    onClose: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Box(Modifier.fillMaxSize()) {
+        // Scrim sits behind the sheet so row taps never hit dismiss
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(GrokifyColors.Scrim)
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = onClose,
+                ),
+        )
+        Column(
+            Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .fillMaxHeight(0.78f)
+                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                .background(GrokifyColors.VoidElevated)
+                .border(
+                    1.dp,
+                    GrokifyColors.PanelBorder,
+                    RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+                )
+                .navigationBarsPadding()
+                .imePadding()
+        ) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = GrokifyColors.TextPrimary,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = onClose) {
+                    Icon(Icons.Default.Close, "Close", tint = GrokifyColors.TextMuted)
+                }
+            }
+            HorizontalDivider(color = GrokifyColors.PanelBorder)
+            Box(Modifier.weight(1f).fillMaxWidth().padding(12.dp)) {
+                content()
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryPanel(
+    state: UiState,
+    onClose: () -> Unit,
+    onSelect: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onNew: () -> Unit,
+) {
+    PanelScaffold(title = "Session history", onClose = onClose) {
+        Column(Modifier.fillMaxSize()) {
+            Button(
+                onClick = onNew,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GrokifyColors.GlowCyan,
+                    contentColor = Color(0xFF041016),
+                ),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("New chat", fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.height(10.dp))
+            if (state.loadingPanel && state.sessions.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = GrokifyColors.GlowCyan)
+                }
+            } else if (state.sessions.isEmpty()) {
+                Text("No sessions yet.", color = GrokifyColors.TextMuted)
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(state.sessions, key = { it.id }) { s ->
+                        val active = s.id.equals(state.sessionId, ignoreCase = true)
+                        val countLabel = when {
+                            s.messageCount <= 0 -> "Empty"
+                            s.messageCount == 1 -> "1 msg"
+                            else -> "${s.messageCount} msgs"
+                        }
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(
+                                    if (active) GrokifyColors.GlowCyan.copy(alpha = 0.1f)
+                                    else GrokifyColors.Panel
+                                )
+                                .border(
+                                    1.dp,
+                                    if (active) GrokifyColors.GlowCyan.copy(alpha = 0.4f)
+                                    else GrokifyColors.PanelBorder,
+                                    RoundedCornerShape(12.dp),
+                                )
+                                .clickable(role = Role.Button) { onSelect(s.id) }
+                                .padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    s.title,
+                                    color = GrokifyColors.TextPrimary,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    "${s.updatedAt.take(16)} · $countLabel",
+                                    color = if (s.messageCount <= 0) GrokifyColors.TextDim
+                                    else GrokifyColors.GlowMint.copy(alpha = 0.85f),
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                            }
+                            IconButton(onClick = { onDelete(s.id) }) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    "Delete",
+                                    tint = GrokifyColors.GlowRose,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NotesPanel(
+    state: UiState,
+    onClose: () -> Unit,
+    onAdd: (String) -> Unit,
+    onToggle: (Int, Boolean) -> Unit,
+    onDelete: (Int) -> Unit,
+) {
+    var draft by remember { mutableStateOf("") }
+    PanelScaffold(title = "System notes", onClose = onClose) {
+        Column(Modifier.fillMaxSize()) {
+            Text(
+                "Active notes are injected into every prompt (shared with admin System Chat).",
+                color = GrokifyColors.TextMuted,
+                fontSize = 12.sp,
+            )
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Add note…", color = GrokifyColors.TextDim) },
+                    singleLine = true,
+                    colors = fieldColors(),
+                    shape = RoundedCornerShape(10.dp),
+                )
+                Button(
+                    onClick = {
+                        onAdd(draft)
+                        draft = ""
+                    },
+                    enabled = draft.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = GrokifyColors.GlowCyan,
+                        contentColor = Color(0xFF041016),
+                    ),
+                ) { Text("Add") }
+            }
+            Spacer(Modifier.height(12.dp))
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(state.notes, key = { it.id }) { note ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(GrokifyColors.Panel)
+                            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Switch(
+                            checked = note.enabled,
+                            onCheckedChange = { onToggle(note.id, it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = GrokifyColors.GlowCyan,
+                                checkedTrackColor = GrokifyColors.GlowCyan.copy(alpha = 0.35f),
+                            ),
+                        )
+                        Text(
+                            note.text,
+                            color = if (note.enabled) GrokifyColors.TextPrimary else GrokifyColors.TextDim,
+                            fontSize = 13.sp,
+                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                        )
+                        IconButton(onClick = { onDelete(note.id) }) {
+                            Icon(Icons.Default.Delete, null, tint = GrokifyColors.GlowRose, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsPanel(
+    state: UiState,
+    onClose: () -> Unit,
+    onSelectModel: (String) -> Unit,
+    onToggleHistory: () -> Unit,
+    onToggleKeepScreenOn: () -> Unit,
+    onToggleEnterForNewline: () -> Unit,
+    onRefreshUsage: () -> Unit = {},
+) {
+    PanelScaffold(title = "Settings", onClose = onClose) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            UsageCard(state = state, onRefresh = onRefreshUsage)
+            SettingRow(
+                title = "Send history / context",
+                subtitle = "Include prior session messages with each prompt",
+                checked = state.useHistory,
+                onToggle = onToggleHistory,
+            )
+            SettingRow(
+                title = "Keep screen on",
+                subtitle = "Prevent sleep while Grokify is open",
+                checked = state.keepScreenOn,
+                onToggle = onToggleKeepScreenOn,
+            )
+            SettingRow(
+                title = "Enter for newline",
+                subtitle = if (state.enterForNewline) {
+                    "Enter inserts a new line; send with the send button"
+                } else {
+                    "Enter sends the message"
+                },
+                checked = state.enterForNewline,
+                onToggle = onToggleEnterForNewline,
+            )
+            Text("MODEL", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+            if (state.loadingPanel && state.models.isEmpty()) {
+                CircularProgressIndicator(color = GrokifyColors.GlowCyan, modifier = Modifier.size(24.dp))
+            } else if (state.models.isEmpty()) {
+                Text("No models loaded — reconnect.", color = GrokifyColors.TextMuted, fontSize = 13.sp)
+            } else {
+                state.models.forEach { m ->
+                    val selected = m.id == state.model
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(
+                                if (selected) GrokifyColors.GlowCyan.copy(alpha = 0.1f)
+                                else GrokifyColors.Panel
+                            )
+                            .border(
+                                1.dp,
+                                if (selected) GrokifyColors.GlowCyan.copy(alpha = 0.45f)
+                                else GrokifyColors.PanelBorder,
+                                RoundedCornerShape(10.dp),
+                            )
+                            .clickable { onSelectModel(m.id) }
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(m.name, color = GrokifyColors.TextPrimary, fontWeight = FontWeight.Medium)
+                            Text(
+                                m.id.removePrefix("gb:"),
+                                color = GrokifyColors.TextDim,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                        }
+                        if (selected) {
+                            Icon(Icons.Default.CheckCircle, null, tint = GrokifyColors.GlowMint, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UsageCard(
+    state: UiState,
+    onRefresh: () -> Unit,
+) {
+    val usage = state.usage
+    val pct = usage?.usagePercent ?: 0.0
+    val progress = (pct / 100.0).toFloat().coerceIn(0f, 1f)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "WEEKLY USAGE",
+                style = MaterialTheme.typography.labelSmall,
+                color = GrokifyColors.GlowCyan,
+            )
+            TextButton(onClick = onRefresh, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                Text(
+                    if (state.usageLoading) "Refreshing…" else "Refresh",
+                    color = GrokifyColors.GlowCyan,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+        if (usage?.error != null && usage.label.isBlank()) {
+            Text(usage.error, color = GrokifyColors.GlowRose, fontSize = 12.sp)
+        } else {
+            val pctLabel = if (pct == pct.toLong().toDouble()) {
+                "${pct.toLong()}%"
+            } else {
+                String.format("%.1f%%", pct)
+            }
+            Text(
+                "$pctLabel of weekly pool used",
+                color = GrokifyColors.TextPrimary,
+                fontWeight = FontWeight.Medium,
+                fontSize = 14.sp,
+            )
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(999.dp)),
+                color = when {
+                    pct >= 90 -> GrokifyColors.GlowRose
+                    pct >= 70 -> GrokifyColors.GlowViolet
+                    else -> GrokifyColors.GlowCyan
+                },
+                trackColor = GrokifyColors.PanelBorder,
+            )
+            if (usage != null) {
+                Text(
+                    usage.label.ifBlank { "Resets: ${usage.resetAt}" },
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 12.sp,
+                )
+                if (usage.subscriptionTier.isNotBlank()) {
+                    Text(
+                        usage.subscriptionTier,
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                    )
+                }
+                val active = usage.products.filter { it.usagePercent != null && (it.usagePercent ?: 0.0) > 0 }
+                if (active.isNotEmpty()) {
+                    Text(
+                        active.joinToString(" · ") { p ->
+                            val pPct = p.usagePercent ?: 0.0
+                            val s = if (pPct == pPct.toLong().toDouble()) {
+                                "${pPct.toLong()}%"
+                            } else {
+                                String.format("%.1f%%", pPct)
+                            }
+                            "${p.product}: $s"
+                        },
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                    )
+                }
+            } else if (state.usageLoading) {
+                Text("Loading usage…", color = GrokifyColors.TextMuted, fontSize = 12.sp)
+            } else {
+                Text("Tap Refresh to load Grok Build usage", color = GrokifyColors.TextMuted, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = GrokifyColors.TextPrimary, fontWeight = FontWeight.Medium)
+            Text(subtitle, color = GrokifyColors.TextMuted, fontSize = 12.sp)
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = { onToggle() },
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = GrokifyColors.GlowCyan,
+                checkedTrackColor = GrokifyColors.GlowCyan.copy(alpha = 0.35f),
+            ),
+        )
+    }
+}
+
+// ─── Message bubbles ──────────────────────────────────────────────────
+
+@Composable
+private fun UserBubble(
+    msg: ChatLine,
+    selected: Boolean,
+    onTap: () -> Unit,
+    actions: @Composable () -> Unit,
+) {
+    val shape = RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp)
+    val borderColor = when {
+        selected -> GrokifyColors.GlowBlue.copy(alpha = 0.55f)
+        msg.excludedFromContext -> GrokifyColors.TextDim.copy(alpha = 0.5f)
+        else -> GrokifyColors.GlowBlue.copy(alpha = 0.2f)
+    }
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+        Column(Modifier.fillMaxWidth(0.88f), horizontalAlignment = Alignment.End) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .alpha(if (msg.excludedFromContext) 0.55f else 1f)
+                    .clip(shape)
+                    .background(GrokifyColors.UserBubble)
+                    .border(
+                        width = if (selected || msg.excludedFromContext) 1.5.dp else 1.dp,
+                        color = borderColor,
+                        shape = shape,
+                    )
+                    .clickable(
+                        enabled = !msg.streaming,
+                        onClick = onTap,
+                        role = Role.Button,
+                    )
+                    .padding(12.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("YOU", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowBlue)
+                    if (msg.excludedFromContext) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "hidden",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(msg.text, color = GrokifyColors.TextPrimary, fontSize = 14.sp, lineHeight = 20.sp)
+            }
+            AnimatedVisibility(
+                visible = selected,
+                enter = fadeIn() + slideInVertically { -it / 2 },
+                exit = fadeOut() + slideOutVertically { -it / 2 },
+            ) {
+                actions()
+            }
+        }
+    }
+}
+
+@Composable
+private fun AssistantBubble(
+    msg: ChatLine,
+    selected: Boolean,
+    onTap: () -> Unit,
+    actions: @Composable () -> Unit,
+) {
+    val shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp)
+    val borderColor = when {
+        selected -> GrokifyColors.GlowMint.copy(alpha = 0.5f)
+        msg.excludedFromContext -> GrokifyColors.TextDim.copy(alpha = 0.5f)
+        else -> GrokifyColors.GlowMint.copy(alpha = 0.18f)
+    }
+    Column(Modifier.fillMaxWidth()) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .alpha(if (msg.excludedFromContext) 0.55f else 1f)
+                .clip(shape)
+                .background(GrokifyColors.AssistantBubble)
+                .border(
+                    width = if (selected || msg.excludedFromContext) 1.5.dp else 1.dp,
+                    color = borderColor,
+                    shape = shape,
+                )
+                .clickable(
+                    enabled = !msg.streaming,
+                    onClick = onTap,
+                    role = Role.Button,
+                )
+                .padding(12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("GROK", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowMint)
+                if (msg.streaming) {
+                    Spacer(Modifier.width(8.dp))
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(10.dp),
+                        strokeWidth = 1.5.dp,
+                        color = GrokifyColors.GlowMint,
+                    )
+                }
+                if (msg.excludedFromContext) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "hidden",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GrokifyColors.TextDim,
+                        fontSize = 10.sp,
+                    )
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            if (msg.text.isBlank() && msg.streaming) {
+                Text("…", color = GrokifyColors.TextMuted, fontSize = 14.sp)
+            } else {
+                MarkdownText(msg.text, textColor = GrokifyColors.TextPrimary)
+            }
+        }
+        AnimatedVisibility(
+            visible = selected,
+            enter = fadeIn() + slideInVertically { -it / 2 },
+            exit = fadeOut() + slideOutVertically { -it / 2 },
+        ) {
+            actions()
+        }
+    }
+}
+
+@Composable
+private fun ThinkingCard(msg: ChatLine, onToggle: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .alpha(if (msg.excludedFromContext) 0.55f else 1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color(0xFF0C0E16))
+            .border(1.dp, GrokifyColors.GlowViolet.copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+            .clickable(onClick = onToggle)
+            .animateContentSize()
+            .padding(10.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Psychology, null, tint = GrokifyColors.GlowViolet, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (msg.streaming) "Thinking…" else "Thoughts",
+                color = GrokifyColors.GlowViolet,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f),
+            )
+            if (msg.streaming) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(12.dp),
+                    strokeWidth = 1.5.dp,
+                    color = GrokifyColors.GlowViolet,
+                )
+                Spacer(Modifier.width(6.dp))
+            }
+            Icon(
+                if (msg.expanded || msg.streaming) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                null,
+                tint = GrokifyColors.TextDim,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+        if (msg.expanded || msg.streaming) {
+            Spacer(Modifier.height(6.dp))
+            if (msg.text.isBlank() && msg.streaming) {
+                Text("…", color = GrokifyColors.TextMuted, fontSize = 12.sp)
+            } else {
+                MarkdownText(
+                    msg.text,
+                    textColor = GrokifyColors.TextMuted,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MediaCard(msg: ChatLine) {
+    val context = LocalContext.current
+    val url = msg.mediaUrl
+    if (url.isBlank()) return
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .alpha(if (msg.excludedFromContext) 0.55f else 1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(GrokifyColors.CodeBg)
+            .border(1.dp, GrokifyColors.GlowCyan.copy(alpha = 0.28f), RoundedCornerShape(12.dp))
+            .padding(8.dp)
+    ) {
+        val label = buildString {
+            if (msg.toolName.isNotBlank()) append(msg.toolName)
+            if (msg.text.isNotBlank()) {
+                if (isNotEmpty()) append(" · ")
+                append(msg.text)
+            }
+            if (isEmpty()) append(if (msg.mediaKind == "video") "Video" else "Image")
+        }
+        Text(
+            label,
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.padding(bottom = 6.dp),
+        )
+        if (msg.mediaKind == "video") {
+            AndroidView(
+                factory = { ctx ->
+                    VideoView(ctx).apply {
+                        setVideoURI(Uri.parse(url))
+                        setOnPreparedListener { mp ->
+                            mp.isLooping = true
+                            start()
+                        }
+                        setOnClickListener {
+                            if (isPlaying) pause() else start()
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(220.dp)
+                    .clip(RoundedCornerShape(8.dp)),
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Tap video to play/pause · long-press opens externally",
+                color = GrokifyColors.TextDim,
+                fontSize = 10.sp,
+                modifier = Modifier
+                    .clickable {
+                        try {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                    setDataAndType(Uri.parse(url), "video/*")
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                            )
+                        } catch (_: Exception) {
+                        }
+                    },
+            )
+        } else {
+            AsyncImage(
+                model = url,
+                contentDescription = msg.text.ifBlank { "Generated image" },
+                contentScale = ContentScale.FillWidth,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable {
+                        try {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                            )
+                        } catch (_: Exception) {
+                        }
+                    },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ToolCard(msg: ChatLine, onToggle: () -> Unit) {
+    val accent = when (msg.toolSuccess) {
+        true -> GrokifyColors.GlowMint
+        false -> GrokifyColors.GlowRose
+        null -> GrokifyColors.GlowBlue
+    }
+    val statusIcon = when (msg.toolSuccess) {
+        true -> Icons.Default.CheckCircle
+        false -> Icons.Default.Error
+        null -> Icons.Default.Build
+    }
+    val input = msg.toolDetail
+    val result = msg.toolResult.ifBlank {
+        // Older rows stored result in text/toolDetail only
+        if (msg.toolSuccess != null) msg.text else ""
+    }
+    val preview = (input.ifBlank { result })
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .let { if (it.length > 100) it.take(100) + "…" else it }
+    val hasBody = input.isNotBlank() || result.isNotBlank()
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .alpha(if (msg.excludedFromContext) 0.55f else 1f)
+            .clip(RoundedCornerShape(12.dp))
+            .background(GrokifyColors.CodeBg)
+            .border(1.dp, accent.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+            .clickable(enabled = hasBody, onClick = onToggle)
+            .animateContentSize()
+            .padding(10.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(statusIcon, null, tint = accent, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                msg.toolName.ifBlank { "tool" },
+                color = accent,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                fontFamily = FontFamily.Monospace,
+            )
+            if (preview.isNotBlank() && !msg.expanded && msg.toolSuccess != null) {
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    preview,
+                    color = GrokifyColors.TextDim,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                Spacer(Modifier.weight(1f))
+            }
+            if (msg.toolSuccess == null) {
+                CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = accent)
+            } else if (hasBody) {
+                Icon(
+                    if (msg.expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    null,
+                    tint = GrokifyColors.TextDim,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+        // While running: show input; when done + expanded: input + result
+        val showBody = msg.toolSuccess == null || msg.expanded
+        if (showBody && hasBody) {
+            if (input.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "INPUT",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.6.sp,
+                )
+                Text(
+                    input.take(12000),
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 15.sp,
+                )
+            }
+            if (result.isNotBlank() && msg.toolSuccess != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "RESULT",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.6.sp,
+                )
+                Text(
+                    result.take(16000),
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 15.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SystemLine(
+    msg: ChatLine,
+    selected: Boolean = false,
+    onTap: () -> Unit = {},
+    actions: @Composable (() -> Unit)? = null,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Text(
+            msg.text,
+            color = GrokifyColors.TextDim,
+            fontSize = 12.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .fillMaxWidth()
+                .alpha(if (msg.excludedFromContext) 0.55f else 1f)
+                .clip(RoundedCornerShape(8.dp))
+                .background(GrokifyColors.Panel)
+                .border(
+                    1.dp,
+                    if (selected) GrokifyColors.GlowCyan.copy(alpha = 0.35f)
+                    else Color.Transparent,
+                    RoundedCornerShape(8.dp),
+                )
+                .clickable(onClick = onTap, role = Role.Button)
+                .padding(8.dp),
+        )
+        if (actions != null) {
+            AnimatedVisibility(
+                visible = selected,
+                enter = fadeIn() + slideInVertically { -it / 2 },
+                exit = fadeOut() + slideOutVertically { -it / 2 },
+            ) {
+                actions()
+            }
+        }
+    }
+}
+
+@Composable
+private fun UpdatePane(
+    state: UiState,
+    onCheckUpdate: () -> Unit,
+    onDownloadInstall: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        GlassCard {
+            Text("IN-APP UPDATE", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Installed: ${BuildConfig.VERSION_NAME} (code ${BuildConfig.VERSION_CODE})",
+                color = GrokifyColors.TextPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Download the latest APK from the server and install it here — no browser needed. Your device token is kept.",
+                color = GrokifyColors.TextMuted,
+                fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(14.dp))
+            Button(
+                onClick = onCheckUpdate,
+                enabled = !state.updateDownloading,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GrokifyColors.GlowCyan,
+                    contentColor = Color(0xFF041016),
+                    disabledContainerColor = GrokifyColors.PanelBorder,
+                ),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Check for updates", fontWeight = FontWeight.SemiBold) }
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onDownloadInstall,
+                enabled = !state.updateDownloading && state.tokenSaved,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GrokifyColors.GlowMint,
+                    contentColor = Color(0xFF041016),
+                    disabledContainerColor = GrokifyColors.PanelBorder,
+                ),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    when {
+                        state.updateDownloading -> "Downloading…"
+                        state.updateAvailable -> "Download & install ${state.updateVersionName}"
+                        else -> "Download & install latest"
+                    },
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            if (state.updateDownloading || state.updateProgress > 0f) {
+                Spacer(Modifier.height(12.dp))
+                LinearProgressIndicator(
+                    progress = { state.updateProgress.coerceIn(0f, 1f) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp),
+                    color = GrokifyColors.GlowCyan,
+                    trackColor = GrokifyColors.PanelBorder,
+                )
+            }
+            if (state.updateAvailable && state.updateChangelog.isNotBlank()) {
+                Spacer(Modifier.height(12.dp))
+                Text("CHANGELOG", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.TextDim)
+                Spacer(Modifier.height(4.dp))
+                Text(state.updateChangelog, color = GrokifyColors.TextMuted, fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = onRefresh, enabled = !state.updateDownloading, modifier = Modifier.fillMaxWidth()) {
+                Text("Refresh session / bridge", color = GrokifyColors.GlowMint)
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                state.updateInfo.ifBlank { "No check yet — tap Check or Download & install" },
+                color = if (state.error != null && state.updateInfo.startsWith("Update failed")) {
+                    Color(0xFFFF8A80)
+                } else {
+                    GrokifyColors.GlowMint
+                },
+                fontSize = 14.sp,
+            )
+            if (!state.tokenSaved) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Save a device token on Home first so the download can authenticate.",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 12.sp,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "First install may ask to allow “Install unknown apps” for Grokify — enable it, then tap Download & install again.",
+                color = GrokifyColors.TextDim,
+                fontSize = 12.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun fieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor = GrokifyColors.GlowCyan,
+    unfocusedBorderColor = GrokifyColors.PanelBorder,
+    focusedTextColor = GrokifyColors.TextPrimary,
+    unfocusedTextColor = GrokifyColors.TextPrimary,
+    cursorColor = GrokifyColors.GlowCyan,
+    focusedContainerColor = GrokifyColors.Panel,
+    unfocusedContainerColor = GrokifyColors.Panel,
+    focusedPlaceholderColor = GrokifyColors.TextDim,
+    unfocusedPlaceholderColor = GrokifyColors.TextDim,
+)

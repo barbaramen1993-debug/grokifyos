@@ -1,0 +1,2014 @@
+package io.grokpot.grokify.ui
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import io.grokpot.grokify.BuildConfig
+import io.grokpot.grokify.GrokifyApp
+import io.grokpot.grokify.chat.BridgeClient
+import io.grokpot.grokify.data.GrokifyApi
+import io.grokpot.grokify.update.ApkUpdater
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.util.UUID
+
+enum class ChatRole { User, Assistant, System, Tool, Thinking, Media }
+
+data class ChatLine(
+    val id: String = UUID.randomUUID().toString(),
+    val role: ChatRole,
+    val text: String,
+    val streaming: Boolean = false,
+    val toolName: String = "",
+    /** Tool call input / args (pretty-printed when possible). */
+    val toolDetail: String = "",
+    /** Tool result body (pretty-printed when possible). */
+    val toolResult: String = "",
+    val toolSuccess: Boolean? = null,
+    val expanded: Boolean = false,
+    val serverMsgId: Int = 0,
+    /** When true, message stays in the thread but is not sent as agent context. */
+    val excludedFromContext: Boolean = false,
+    /** Absolute or site-relative URL for Imagine media. */
+    val mediaUrl: String = "",
+    /** "image" or "video" */
+    val mediaKind: String = "",
+)
+
+data class SessionItem(
+    val id: String,
+    val title: String,
+    val updatedAt: String,
+    val messageCount: Int = 0,
+)
+
+data class NoteItem(
+    val id: Int,
+    val text: String,
+    val enabled: Boolean,
+)
+
+data class ModelItem(
+    val id: String,
+    val name: String,
+    val provider: String,
+)
+
+data class UsageProduct(
+    val product: String,
+    val usagePercent: Double? = null,
+)
+
+/** SuperGrok / Grok Build weekly usage pool (CLI `/usage`). */
+data class UsageInfo(
+    val usagePercent: Double = 0.0,
+    val remainingPercent: Double = 100.0,
+    val resetAt: String = "",
+    val periodStart: String = "",
+    val subscriptionTier: String = "",
+    val products: List<UsageProduct> = emptyList(),
+    val prepaidBalance: Double = 0.0,
+    val fetchedAt: String = "",
+    val label: String = "",
+    val error: String? = null,
+)
+
+enum class ChatPanel { None, History, Notes, Settings }
+
+data class UiState(
+    val token: String = "",
+    val tokenSaved: Boolean = false,
+    val connected: Boolean = false,
+    val statusText: String = "Not connected",
+    val bridgeDetail: String? = null,
+    val userLabel: String = "",
+    val model: String = "",
+    val models: List<ModelItem> = emptyList(),
+    val messages: List<ChatLine> = emptyList(),
+    /** True when older messages exist above the currently loaded window. */
+    val hasMoreMessages: Boolean = false,
+    val loadingOlder: Boolean = false,
+    /** Smallest server message id currently in memory (for older-page cursor). */
+    val oldestServerMsgId: Int = 0,
+    /**
+     * Incremented when the UI should jump to the latest message
+     * (session open / initial history load). Streaming uses pin-to-bottom instead.
+     */
+    val scrollToBottomNonce: Int = 0,
+    val draft: String = "",
+    val updateInfo: String = "",
+    /** True when server has a newer version_code than this install. */
+    val updateAvailable: Boolean = false,
+    val updateVersionName: String = "",
+    val updateVersionCode: Int = 0,
+    val updateChangelog: String = "",
+    val updateSizeBytes: Long = 0L,
+    val updateSha256: String = "",
+    val updateDownloadUrl: String = "",
+    val updateDownloading: Boolean = false,
+    /** 0f..1f while downloading; -1f indeterminate; 0 when idle. */
+    val updateProgress: Float = 0f,
+    val busy: Boolean = false,
+    val error: String? = null,
+    val sessionId: String = "",
+    val sessionTitle: String = "New chat",
+    val sessions: List<SessionItem> = emptyList(),
+    val notes: List<NoteItem> = emptyList(),
+    val useHistory: Boolean = true,
+    val keepScreenOn: Boolean = true,
+    /** When true, Enter inserts a newline; when false, Enter sends. */
+    val enterForNewline: Boolean = true,
+    val panel: ChatPanel = ChatPanel.None,
+    val loadingPanel: Boolean = false,
+    val usage: UsageInfo? = null,
+    val usageLoading: Boolean = false,
+)
+
+class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
+    private val store = (app as GrokifyApp).tokenStore
+    private val api = GrokifyApi { _token }
+    private val apkUpdater = ApkUpdater(app.applicationContext) { _token }
+    private var _token: String? = null
+    private var wsToken: String = ""
+    private var sessionId: String = ""
+    private var lastWsUrl: String = BuildConfig.WS_URL
+
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> = _state.asStateFlow()
+
+    private var bridge: BridgeClient? = null
+    private var streamBuf = StringBuilder()
+    private var thinkingBuf = StringBuilder()
+    private var reconnectJob: Job? = null
+    private var reconnectAttempts = 0
+    private var updateJob: Job? = null
+    private var usageJob: Job? = null
+    private var loadOlderJob: Job? = null
+
+    companion object {
+        /** Initial + page size for chat history windows (memory). */
+        const val MESSAGE_PAGE_SIZE = 40
+    }
+
+    init {
+        viewModelScope.launch {
+            val t = store.tokenFlow.first()
+            val useHist = store.useHistoryFlow.first()
+            val keepOn = store.keepScreenOnFlow.first()
+            val enterNl = store.enterForNewlineFlow.first()
+            val savedModel = store.modelFlow.first()
+            val savedSession = store.sessionIdFlow.first()
+            if (!savedSession.isNullOrBlank()) sessionId = savedSession
+            _state.update {
+                it.copy(
+                    useHistory = useHist,
+                    keepScreenOn = keepOn,
+                    enterForNewline = enterNl,
+                    model = savedModel?.takeIf { it.startsWith("gb:") || it.startsWith("grok:") } ?: "",
+                    sessionId = sessionId,
+                )
+            }
+            if (!t.isNullOrBlank()) {
+                _token = t
+                _state.update { it.copy(token = t, tokenSaved = true) }
+                refresh()
+            }
+        }
+    }
+
+    fun saveToken(token: String) {
+        viewModelScope.launch {
+            val cleaned = token.trim()
+            store.setToken(cleaned)
+            _token = cleaned
+            _state.update { it.copy(token = cleaned, tokenSaved = true, error = null) }
+            refresh()
+        }
+    }
+
+    fun setPanel(panel: ChatPanel) {
+        _state.update { it.copy(panel = panel) }
+        when (panel) {
+            ChatPanel.History -> loadSessions()
+            ChatPanel.Notes -> loadNotes()
+            ChatPanel.Settings -> loadModels()
+            ChatPanel.None -> {}
+        }
+    }
+
+    fun toggleUseHistory() {
+        viewModelScope.launch {
+            val next = !_state.value.useHistory
+            store.setUseHistory(next)
+            _state.update { it.copy(useHistory = next) }
+        }
+    }
+
+    fun toggleKeepScreenOn() {
+        viewModelScope.launch {
+            val next = !_state.value.keepScreenOn
+            store.setKeepScreenOn(next)
+            _state.update { it.copy(keepScreenOn = next) }
+        }
+    }
+
+    fun toggleEnterForNewline() {
+        viewModelScope.launch {
+            val next = !_state.value.enterForNewline
+            store.setEnterForNewline(next)
+            _state.update { it.copy(enterForNewline = next) }
+        }
+    }
+
+    fun refresh() {
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, error = null) }
+            try {
+                val me = withContext(Dispatchers.IO) { api.me() }
+                if (me.optBoolean("ok")) {
+                    val user = me.optJSONObject("user")
+                    val name = user?.optString("display_name")
+                        ?: user?.optString("username")
+                        ?: "admin"
+                    wsToken = me.optString("ws_token")
+                    val models = withContext(Dispatchers.IO) { api.models() }
+                    if (models.optBoolean("ok")) {
+                        wsToken = models.optString("ws_token", wsToken)
+                        parseModels(models)
+                    }
+                    if (sessionId.isBlank() || !isValidSessionId(sessionId)) {
+                        ensureSession("New Chat")
+                    } else {
+                        val title = resolveSessionTitle(sessionId)
+                        _state.update {
+                            it.copy(
+                                sessionId = sessionId,
+                                sessionTitle = title?.ifBlank { it.sessionTitle } ?: it.sessionTitle,
+                            )
+                        }
+                        loadMessagesInternal(sessionId, clearError = false)
+                    }
+                    if (wsToken.isBlank()) {
+                        _state.update {
+                            it.copy(
+                                busy = false,
+                                error = "No WS token from server",
+                                statusText = "Auth incomplete",
+                            )
+                        }
+                        return@launch
+                    }
+                    lastWsUrl = me.optString("ws_url", BuildConfig.WS_URL).ifBlank { BuildConfig.WS_URL }
+                    _state.update {
+                        it.copy(
+                            userLabel = name,
+                            statusText = "API OK · connecting…",
+                            sessionId = sessionId,
+                            busy = false,
+                        )
+                    }
+                    reconnectAttempts = 0
+                    connectBridge(lastWsUrl)
+                    loadNotes()
+                    refreshUsage()
+                } else {
+                    _state.update {
+                        it.copy(
+                            busy = false,
+                            error = me.optString("error", "auth_failed"),
+                            statusText = "Auth failed",
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(busy = false, error = e.message, statusText = "Network error")
+                }
+            }
+        }
+    }
+
+    private fun parseModels(json: JSONObject) {
+        val arr = json.optJSONArray("models") ?: return
+        val list = mutableListOf<ModelItem>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            val provider = o.optString("provider")
+            // Grok Build only — skip any legacy Cursor entries
+            if (provider == "cursor") continue
+            if (provider.isNotBlank() && provider != "grok-build" && !id.startsWith("gb:")) continue
+            list += ModelItem(
+                id = id,
+                name = o.optString("name").ifBlank { id.removePrefix("gb:") },
+                provider = if (provider.isBlank()) "grok-build" else provider,
+            )
+        }
+        val defaultModel = json.optString("default_model").ifBlank {
+            list.firstOrNull()?.id.orEmpty()
+        }
+        val current = _state.value.model
+        val resolved = when {
+            current.isNotBlank() && list.any { it.id == current } -> current
+            else -> json.optString("selected").ifBlank { defaultModel }
+        }
+        _state.update { it.copy(models = list, model = resolved) }
+        if (resolved.isNotBlank() && resolved != current) {
+            viewModelScope.launch { store.setModel(resolved) }
+        }
+    }
+
+    private fun isValidSessionId(id: String) = Regex("^[a-f0-9]{32}$").matches(id)
+
+    private suspend fun ensureSession(title: String = "New Chat"): Boolean {
+        return try {
+            val sess = withContext(Dispatchers.IO) { api.createChatSession(title) }
+            if (sess.optBoolean("ok")) {
+                sessionId = sess.optString("id")
+                store.setSessionId(sessionId)
+                _state.update {
+                    it.copy(
+                        sessionId = sessionId,
+                        sessionTitle = sess.optString("title", title).ifBlank { "New Chat" },
+                        messages = emptyList(),
+                        hasMoreMessages = false,
+                        oldestServerMsgId = 0,
+                        loadingOlder = false,
+                        scrollToBottomNonce = it.scrollToBottomNonce + 1,
+                    )
+                }
+                true
+            } else false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun newChat() {
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, error = null) }
+            if (ensureSession("New Chat")) {
+                _state.update { it.copy(busy = false, panel = ChatPanel.None) }
+            } else {
+                _state.update { it.copy(busy = false, error = "Could not create session") }
+            }
+        }
+    }
+
+    fun renameSession(title: String) {
+        viewModelScope.launch {
+            val cleaned = title.trim().take(255)
+            if (cleaned.isEmpty()) {
+                _state.update { it.copy(error = "Title cannot be empty") }
+                return@launch
+            }
+            val sid = sessionId
+            if (sid.isBlank() || !isValidSessionId(sid)) {
+                _state.update { it.copy(error = "No active session") }
+                return@launch
+            }
+            try {
+                val res = withContext(Dispatchers.IO) { api.renameChatSession(sid, cleaned) }
+                if (res.optBoolean("ok")) {
+                    val next = res.optString("title", cleaned).ifBlank { cleaned }
+                    applySessionTitle(sid, next)
+                } else {
+                    _state.update {
+                        it.copy(error = res.optString("error", "rename_failed"))
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    private fun applySessionTitle(sid: String, title: String) {
+        val t = title.ifBlank { "Chat" }
+        _state.update { st ->
+            st.copy(
+                sessionTitle = if (st.sessionId.equals(sid, true)) t else st.sessionTitle,
+                sessions = st.sessions.map {
+                    if (it.id.equals(sid, true)) it.copy(title = t) else it
+                },
+            )
+        }
+    }
+
+    /** Resolve title for the active session from the sessions list (or keep current). */
+    private suspend fun resolveSessionTitle(sid: String): String? {
+        return try {
+            val data = withContext(Dispatchers.IO) { api.listChatSessions() }
+            if (!data.optBoolean("ok", true) && data.has("error")) return null
+            val arr = data.optJSONArray("sessions") ?: return null
+            val list = mutableListOf<SessionItem>()
+            var found: String? = null
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("id").trim()
+                if (id.isBlank()) continue
+                val title = o.optString("title").ifBlank { "Chat" }
+                list += SessionItem(
+                    id = id,
+                    title = title,
+                    updatedAt = o.optString("updated_at"),
+                    messageCount = o.optInt("message_count", 0),
+                )
+                if (id.equals(sid, true)) found = title
+            }
+            _state.update { it.copy(sessions = list) }
+            found
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun loadSessions() {
+        viewModelScope.launch {
+            _state.update { it.copy(loadingPanel = true, error = null) }
+            try {
+                val data = withContext(Dispatchers.IO) { api.listChatSessions() }
+                if (!data.optBoolean("ok", false) && data.has("error")) {
+                    _state.update {
+                        it.copy(
+                            loadingPanel = false,
+                            error = "History: ${data.optString("error", "load_failed")}",
+                        )
+                    }
+                    return@launch
+                }
+                val arr = data.optJSONArray("sessions")
+                val list = mutableListOf<SessionItem>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val sid = o.optString("id").trim()
+                        if (sid.isBlank()) continue
+                        list += SessionItem(
+                            id = sid,
+                            title = o.optString("title").ifBlank { "Chat" },
+                            updatedAt = o.optString("updated_at"),
+                            messageCount = o.optInt("message_count", 0),
+                        )
+                    }
+                }
+                _state.update { it.copy(sessions = list, loadingPanel = false) }
+            } catch (e: Exception) {
+                _state.update { it.copy(loadingPanel = false, error = e.message) }
+            }
+        }
+    }
+
+    fun selectSession(id: String) {
+        viewModelScope.launch {
+            val sid = id.trim().lowercase()
+            if (!isValidSessionId(sid)) {
+                _state.update { it.copy(error = "Invalid session id") }
+                return@launch
+            }
+            val prevId = sessionId
+            val prevEmpty = _state.value.messages.isEmpty() &&
+                (_state.value.sessions.find { it.id == prevId }?.messageCount ?: 0) == 0
+
+            // Drop empty shell sessions (same as web System Chat)
+            if (prevId.isNotBlank() && prevId != sid && prevEmpty && isValidSessionId(prevId)) {
+                try {
+                    withContext(Dispatchers.IO) { api.deleteChatSession(prevId) }
+                } catch (_: Exception) { /* ignore */ }
+            }
+
+            val known = _state.value.sessions.find { it.id == sid || it.id.equals(sid, true) }
+            sessionId = sid
+            store.setSessionId(sid)
+            _state.update {
+                it.copy(
+                    sessionId = sid,
+                    sessionTitle = known?.title?.ifBlank { "Chat" } ?: "Chat",
+                    busy = true,
+                    panel = ChatPanel.None,
+                    messages = emptyList(),
+                    hasMoreMessages = false,
+                    oldestServerMsgId = 0,
+                    loadingOlder = false,
+                    error = null,
+                )
+            }
+            val loaded = loadMessagesInternal(sid)
+            if (!loaded) {
+                // keep error from loader; still leave session selected
+            }
+            _state.update { it.copy(busy = false) }
+            // refresh list counts in background
+            loadSessions()
+        }
+    }
+
+    fun deleteSession(id: String) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { api.deleteChatSession(id.trim()) }
+                if (sessionId == id.trim() || sessionId.equals(id.trim(), true)) {
+                    ensureSession("New Chat")
+                }
+                loadSessions()
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    /**
+     * Load the latest page of messages for a session (memory-friendly).
+     * @return true if the API call succeeded (even when the session has 0 messages)
+     */
+    private suspend fun loadMessagesInternal(
+        id: String,
+        clearError: Boolean = true,
+        jumpToBottom: Boolean = true,
+    ): Boolean {
+        return try {
+            val data = withContext(Dispatchers.IO) {
+                api.listMessages(id, limit = MESSAGE_PAGE_SIZE)
+            }
+            if (!data.optBoolean("ok", false)) {
+                val err = data.optString("error", "load_failed")
+                _state.update {
+                    it.copy(error = "Could not load conversation: $err")
+                }
+                return false
+            }
+            val arr = data.optJSONArray("messages")
+            val lines = mutableListOf<ChatLine>()
+            var oldestId = 0
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val m = arr.optJSONObject(i) ?: continue
+                    val sid = m.optInt("id", 0)
+                    if (sid > 0 && (oldestId == 0 || sid < oldestId)) oldestId = sid
+                    lines += mapServerMessage(m)
+                }
+            }
+            if (oldestId == 0) {
+                oldestId = data.optInt("oldest_id", 0)
+            }
+            val hasMore = data.optBoolean("has_more", false)
+            var title = _state.value.sessions.find {
+                it.id == id || it.id.equals(id, ignoreCase = true)
+            }?.title
+            // If sessions list is stale/empty, resolve title from API
+            if (title.isNullOrBlank() || isDefaultSessionTitle(title)) {
+                val resolved = resolveSessionTitle(id)
+                if (!resolved.isNullOrBlank()) title = resolved
+            }
+            // History is always finalized; live stream is rebuilt from WS events
+            val finalized = lines.map { line ->
+                when {
+                    line.streaming -> line.copy(streaming = false)
+                    line.role == ChatRole.Tool && line.toolSuccess == null ->
+                        line.copy(toolSuccess = true)
+                    else -> line
+                }
+            }
+            _state.update {
+                it.copy(
+                    messages = finalized,
+                    hasMoreMessages = hasMore,
+                    oldestServerMsgId = oldestId,
+                    loadingOlder = false,
+                    scrollToBottomNonce = if (jumpToBottom) it.scrollToBottomNonce + 1 else it.scrollToBottomNonce,
+                    sessionTitle = title?.ifBlank { it.sessionTitle } ?: it.sessionTitle,
+                    error = if (clearError) null else it.error,
+                )
+            }
+            true
+        } catch (e: Exception) {
+            _state.update { it.copy(error = "Could not load conversation: ${e.message}") }
+            false
+        }
+    }
+
+    /** Prepend older history when the user scrolls near the top. */
+    fun loadOlderMessages() {
+        val sid = sessionId.ifBlank { _state.value.sessionId }
+        if (sid.isBlank() || !isValidSessionId(sid)) return
+        val st = _state.value
+        if (!st.hasMoreMessages || st.loadingOlder || st.busy) return
+        val beforeId = st.oldestServerMsgId
+        if (beforeId < 1) return
+        if (loadOlderJob?.isActive == true) return
+        loadOlderJob = viewModelScope.launch {
+            _state.update { it.copy(loadingOlder = true) }
+            try {
+                val data = withContext(Dispatchers.IO) {
+                    api.listMessages(sid, limit = MESSAGE_PAGE_SIZE, beforeId = beforeId)
+                }
+                if (!data.optBoolean("ok", false)) {
+                    _state.update {
+                        it.copy(
+                            loadingOlder = false,
+                            error = "Could not load older messages: ${data.optString("error")}",
+                        )
+                    }
+                    return@launch
+                }
+                val arr = data.optJSONArray("messages")
+                val older = mutableListOf<ChatLine>()
+                var newOldest = beforeId
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val m = arr.optJSONObject(i) ?: continue
+                        val mid = m.optInt("id", 0)
+                        if (mid > 0 && mid < newOldest) newOldest = mid
+                        older += mapServerMessage(m).map { line ->
+                            when {
+                                line.streaming -> line.copy(streaming = false)
+                                line.role == ChatRole.Tool && line.toolSuccess == null ->
+                                    line.copy(toolSuccess = true)
+                                else -> line
+                            }
+                        }
+                    }
+                }
+                if (data.optInt("oldest_id", 0) > 0) {
+                    newOldest = data.optInt("oldest_id")
+                }
+                val hasMore = data.optBoolean("has_more", false)
+                _state.update { cur ->
+                    // Avoid duplicating server messages already present
+                    val existingIds = cur.messages.map { it.serverMsgId }.filter { it > 0 }.toSet()
+                    val filtered = older.filter { it.serverMsgId == 0 || it.serverMsgId !in existingIds }
+                    cur.copy(
+                        messages = filtered + cur.messages,
+                        hasMoreMessages = hasMore,
+                        oldestServerMsgId = if (filtered.isNotEmpty()) newOldest else cur.oldestServerMsgId,
+                        loadingOlder = false,
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(loadingOlder = false, error = "Could not load older messages: ${e.message}")
+                }
+            }
+        }
+    }
+
+    fun refreshUsage(force: Boolean = false) {
+        if (usageJob?.isActive == true && !force) return
+        usageJob = viewModelScope.launch {
+            _state.update { it.copy(usageLoading = true) }
+            try {
+                val data = withContext(Dispatchers.IO) { api.usage(refresh = force) }
+                if (!data.optBoolean("ok", false)) {
+                    _state.update {
+                        it.copy(
+                            usageLoading = false,
+                            usage = (it.usage ?: UsageInfo()).copy(
+                                error = data.optString("message", data.optString("error", "usage_failed")),
+                            ),
+                        )
+                    }
+                    return@launch
+                }
+                val products = mutableListOf<UsageProduct>()
+                val arr = data.optJSONArray("products")
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val p = arr.optJSONObject(i) ?: continue
+                        val pct = if (p.has("usage_percent") && !p.isNull("usage_percent")) {
+                            p.optDouble("usage_percent")
+                        } else {
+                            null
+                        }
+                        products += UsageProduct(
+                            product = p.optString("product"),
+                            usagePercent = pct,
+                        )
+                    }
+                }
+                val pct = data.optDouble("usage_percent", 0.0)
+                val resetAt = data.optString("reset_at")
+                val tier = data.optString("subscription_tier")
+                val label = formatUsageLabel(pct, resetAt, tier)
+                _state.update {
+                    it.copy(
+                        usageLoading = false,
+                        usage = UsageInfo(
+                            usagePercent = pct,
+                            remainingPercent = data.optDouble("remaining_percent", 100.0 - pct),
+                            resetAt = resetAt,
+                            periodStart = data.optString("period_start"),
+                            subscriptionTier = tier,
+                            products = products,
+                            prepaidBalance = data.optDouble("prepaid_balance", 0.0),
+                            fetchedAt = data.optString("fetched_at"),
+                            label = label,
+                            error = null,
+                        ),
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        usageLoading = false,
+                        usage = (it.usage ?: UsageInfo()).copy(error = e.message),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun formatUsageLabel(percent: Double, resetAt: String, tier: String): String {
+        val pctStr = if (percent == percent.toLong().toDouble()) {
+            "${percent.toLong()}%"
+        } else {
+            String.format("%.1f%%", percent)
+        }
+        val resetPart = formatResetRelative(resetAt)
+        val tierPart = tier.trim().takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
+        return "Usage $pctStr$tierPart · $resetPart"
+    }
+
+    private fun formatResetRelative(resetAt: String): String {
+        if (resetAt.isBlank()) return "reset unknown"
+        return try {
+            // e.g. 2026-07-16T18:39:23.720146+00:00
+            val cleaned = resetAt
+                .replace("Z", "+00:00")
+                .let { if (it.contains('.')) it.replace(Regex("\\.\\d+"), "") else it }
+            val instant = java.time.OffsetDateTime.parse(cleaned).toInstant()
+            val now = java.time.Instant.now()
+            val secs = java.time.Duration.between(now, instant).seconds
+            when {
+                secs <= 0 -> "resets soon"
+                secs < 3600 -> "resets in ${secs / 60}m"
+                secs < 86400 -> "resets in ${secs / 3600}h"
+                else -> {
+                    val days = secs / 86400
+                    val hours = (secs % 86400) / 3600
+                    if (hours > 0) "resets in ${days}d ${hours}h" else "resets in ${days}d"
+                }
+            }
+        } catch (_: Exception) {
+            "resets $resetAt"
+        }
+    }
+
+    private fun isDefaultSessionTitle(title: String): Boolean {
+        val t = title.trim()
+        return t.isEmpty() || t.equals("New Chat", true) || t.equals("Grokify", true) || t.equals("Chat", true)
+    }
+
+    /** Expand a server row into one or more UI lines (thinking / tools / text). */
+    private fun mapServerMessage(m: JSONObject): List<ChatLine> {
+        val roleStr = m.optString("role")
+        val content = m.optString("content")
+        val serverId = m.optInt("id", 0)
+        val excluded = m.optInt("excluded_from_context", 0) != 0
+        val meta = m.optJSONObject("metadata")
+        // Never leave historical rows in a "live streaming" spinner state.
+        // Active turns are driven by WebSocket events after agent_resume / send.
+        val streaming = false
+
+        when (roleStr) {
+            "user" -> return listOf(
+                ChatLine(
+                    role = ChatRole.User,
+                    text = content,
+                    serverMsgId = serverId,
+                    excludedFromContext = excluded,
+                ),
+            )
+            "system" -> return listOf(
+                ChatLine(
+                    role = ChatRole.System,
+                    text = content,
+                    serverMsgId = serverId,
+                    excludedFromContext = excluded,
+                ),
+            )
+            "assistant" -> {
+                val out = mutableListOf<ChatLine>()
+                val timeline = meta?.optJSONArray("timeline")
+                if (timeline != null && timeline.length() > 0) {
+                    for (i in 0 until timeline.length()) {
+                        val seg = timeline.optJSONObject(i) ?: continue
+                        when (seg.optString("type")) {
+                            "thinking" -> {
+                                val t = seg.optString("content")
+                                if (t.isNotBlank()) {
+                                    out += ChatLine(
+                                        role = ChatRole.Thinking,
+                                        text = t,
+                                        expanded = false,
+                                        serverMsgId = serverId,
+                                        excludedFromContext = excluded,
+                                    )
+                                }
+                            }
+                            "tool" -> {
+                                val detail = prettyToolText(seg.optString("detail"))
+                                val result = prettyToolText(seg.optString("info"))
+                                val success: Boolean? = when {
+                                    !seg.has("success") || seg.isNull("success") -> true
+                                    else -> seg.optBoolean("success")
+                                }
+                                out += ChatLine(
+                                    role = ChatRole.Tool,
+                                    text = result.ifBlank { detail },
+                                    toolName = seg.optString("tool", "tool"),
+                                    toolDetail = detail,
+                                    toolResult = result,
+                                    toolSuccess = success,
+                                    expanded = false,
+                                    serverMsgId = serverId,
+                                    excludedFromContext = excluded,
+                                )
+                            }
+                            "media" -> {
+                                val url = resolveMediaUrl(seg.optString("url"))
+                                if (url.isNotBlank()) {
+                                    out += ChatLine(
+                                        role = ChatRole.Media,
+                                        text = seg.optString("name"),
+                                        toolName = seg.optString("tool"),
+                                        mediaUrl = url,
+                                        mediaKind = if (seg.optString("kind") == "video") "video" else "image",
+                                        serverMsgId = serverId,
+                                        excludedFromContext = excluded,
+                                    )
+                                }
+                            }
+                            "text" -> {
+                                val t = seg.optString("content")
+                                if (t.isNotBlank()) {
+                                    out += ChatLine(
+                                        role = ChatRole.Assistant,
+                                        text = t,
+                                        serverMsgId = serverId,
+                                        streaming = streaming && i == timeline.length() - 1,
+                                        excludedFromContext = excluded,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    // Attach metadata.media if timeline omitted some
+                    appendMediaFromMeta(out, meta, serverId, excluded)
+                    if (out.none { it.role == ChatRole.Assistant } && content.isNotBlank()) {
+                        out += ChatLine(
+                            role = ChatRole.Assistant,
+                            text = content,
+                            serverMsgId = serverId,
+                            streaming = streaming,
+                            excludedFromContext = excluded,
+                        )
+                    }
+                    if (out.isNotEmpty()) return out
+                }
+                // Legacy metadata (thinking + tools + content)
+                val thinking = meta?.optString("thinking").orEmpty()
+                if (thinking.isNotBlank()) {
+                    out += ChatLine(
+                        role = ChatRole.Thinking,
+                        text = thinking,
+                        expanded = false,
+                        serverMsgId = serverId,
+                        excludedFromContext = excluded,
+                    )
+                }
+                val tools = meta?.optJSONArray("tools")
+                if (tools != null) {
+                    for (i in 0 until tools.length()) {
+                        val t = tools.optJSONObject(i) ?: continue
+                        val detail = prettyToolText(
+                            t.optString("detail").ifBlank { t.optString("input") },
+                        )
+                        val result = prettyToolText(
+                            t.optString("info").ifBlank {
+                                t.optString("result").ifBlank { t.optString("content") }
+                            },
+                        )
+                        out += ChatLine(
+                            role = ChatRole.Tool,
+                            text = result.ifBlank { detail },
+                            toolName = t.optString("tool", t.optString("name", "tool")),
+                            toolDetail = detail,
+                            toolResult = result,
+                            toolSuccess = if (t.has("success") && !t.isNull("success")) {
+                                t.optBoolean("success")
+                            } else {
+                                true
+                            },
+                            expanded = false,
+                            serverMsgId = serverId,
+                            excludedFromContext = excluded,
+                        )
+                    }
+                }
+                appendMediaFromMeta(out, meta, serverId, excluded)
+                val body = content.ifBlank {
+                    expandAssistantContent(content, meta ?: JSONObject())
+                }
+                if (body.isNotBlank() || out.isEmpty()) {
+                    out += ChatLine(
+                        role = ChatRole.Assistant,
+                        text = body.ifBlank { content },
+                        serverMsgId = serverId,
+                        streaming = streaming,
+                        excludedFromContext = excluded,
+                    )
+                }
+                return out
+            }
+            else -> return listOf(
+                ChatLine(
+                    role = ChatRole.System,
+                    text = content,
+                    serverMsgId = serverId,
+                    excludedFromContext = excluded,
+                ),
+            )
+        }
+    }
+
+    private fun resolveMediaUrl(raw: String): String {
+        val u = raw.trim()
+        if (u.isEmpty()) return ""
+        if (u.startsWith("http://") || u.startsWith("https://")) return u
+        val base = BuildConfig.SITE_URL.trimEnd('/')
+        return if (u.startsWith("/")) base + u else "$base/$u"
+    }
+
+    private fun appendMediaFromMeta(
+        out: MutableList<ChatLine>,
+        meta: JSONObject?,
+        serverId: Int,
+        excluded: Boolean,
+    ) {
+        val media = meta?.optJSONArray("media") ?: return
+        val existing = out.filter { it.role == ChatRole.Media }.map { it.mediaUrl }.toSet()
+        for (i in 0 until media.length()) {
+            val m = media.optJSONObject(i) ?: continue
+            val url = resolveMediaUrl(m.optString("url"))
+            if (url.isBlank() || existing.contains(url)) continue
+            out += ChatLine(
+                role = ChatRole.Media,
+                text = m.optString("name"),
+                toolName = m.optString("tool"),
+                mediaUrl = url,
+                mediaKind = if (m.optString("kind") == "video") "video" else "image",
+                serverMsgId = serverId,
+                excludedFromContext = excluded,
+            )
+        }
+    }
+
+    /**
+     * Hide / show a message from future agent context (same as admin System Chat exclude).
+     * Applies to every UI segment that shares the same server message id.
+     */
+    fun toggleMessageExclude(lineId: String) {
+        viewModelScope.launch {
+            val line = _state.value.messages.find { it.id == lineId } ?: return@launch
+            if (line.streaming) return@launch
+            val next = !line.excludedFromContext
+            val sid = line.serverMsgId
+            _state.update { st ->
+                st.copy(
+                    messages = st.messages.map { m ->
+                        when {
+                            sid > 0 && m.serverMsgId == sid -> m.copy(excludedFromContext = next)
+                            m.id == lineId -> m.copy(excludedFromContext = next)
+                            else -> m
+                        }
+                    },
+                )
+            }
+            if (sid > 0) {
+                try {
+                    val res = withContext(Dispatchers.IO) {
+                        api.toggleMessageExclude(sid, next)
+                    }
+                    if (!res.optBoolean("ok", false)) {
+                        // Revert on failure
+                        _state.update { st ->
+                            st.copy(
+                                messages = st.messages.map { m ->
+                                    when {
+                                        m.serverMsgId == sid -> m.copy(excludedFromContext = !next)
+                                        m.id == lineId -> m.copy(excludedFromContext = !next)
+                                        else -> m
+                                    }
+                                },
+                                error = res.optString("error", "exclude_failed"),
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    _state.update { st ->
+                        st.copy(
+                            messages = st.messages.map { m ->
+                                when {
+                                    m.serverMsgId == sid -> m.copy(excludedFromContext = !next)
+                                    m.id == lineId -> m.copy(excludedFromContext = !next)
+                                    else -> m
+                                }
+                            },
+                            error = e.message,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** Permanently delete message from session (DB + UI). */
+    fun deleteMessage(lineId: String) {
+        viewModelScope.launch {
+            val line = _state.value.messages.find { it.id == lineId } ?: return@launch
+            if (line.streaming) return@launch
+            val sid = line.serverMsgId
+            _state.update { st ->
+                st.copy(
+                    messages = if (sid > 0) {
+                        st.messages.filterNot { it.serverMsgId == sid }
+                    } else {
+                        st.messages.filterNot { it.id == lineId }
+                    },
+                )
+            }
+            if (sid > 0) {
+                try {
+                    val res = withContext(Dispatchers.IO) { api.deleteMessage(sid) }
+                    if (!res.optBoolean("ok", false)) {
+                        _state.update {
+                            it.copy(error = res.optString("error", "delete_failed"))
+                        }
+                        // Reload so UI matches server
+                        if (sessionId.isNotBlank()) loadMessagesInternal(sessionId, clearError = false)
+                    }
+                } catch (e: Exception) {
+                    _state.update { it.copy(error = e.message) }
+                    if (sessionId.isNotBlank()) loadMessagesInternal(sessionId, clearError = false)
+                }
+            }
+        }
+    }
+
+    /** Edit a user message body (server + local). */
+    fun editMessage(lineId: String, newText: String) {
+        val trimmed = newText.trim()
+        if (trimmed.isEmpty()) return
+        viewModelScope.launch {
+            val line = _state.value.messages.find { it.id == lineId } ?: return@launch
+            if (line.role != ChatRole.User || line.streaming) return@launch
+            val prev = line.text
+            val sid = line.serverMsgId
+            _state.update { st ->
+                st.copy(
+                    messages = st.messages.map {
+                        if (it.id == lineId) it.copy(text = trimmed) else it
+                    },
+                )
+            }
+            if (sid > 0) {
+                try {
+                    val res = withContext(Dispatchers.IO) { api.editMessage(sid, trimmed) }
+                    if (!res.optBoolean("ok", false)) {
+                        _state.update { st ->
+                            st.copy(
+                                messages = st.messages.map {
+                                    if (it.id == lineId) it.copy(text = prev) else it
+                                },
+                                error = res.optString("error", "edit_failed"),
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    _state.update { st ->
+                        st.copy(
+                            messages = st.messages.map {
+                                if (it.id == lineId) it.copy(text = prev) else it
+                            },
+                            error = e.message,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadNotes() {
+        viewModelScope.launch {
+            try {
+                val data = withContext(Dispatchers.IO) { api.listNotes() }
+                val arr = data.optJSONArray("notes")
+                val list = mutableListOf<NoteItem>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        list += NoteItem(
+                            id = o.optInt("id"),
+                            text = o.optString("note_text"),
+                            enabled = o.optInt("enabled", 1) == 1,
+                        )
+                    }
+                }
+                _state.update { it.copy(notes = list, loadingPanel = false) }
+            } catch (e: Exception) {
+                _state.update { it.copy(loadingPanel = false, error = e.message) }
+            }
+        }
+    }
+
+    fun addNote(text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { api.createNote(t) }
+                loadNotes()
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    fun toggleNote(id: Int, enabled: Boolean) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { api.toggleNote(id, enabled) }
+                _state.update { st ->
+                    st.copy(notes = st.notes.map {
+                        if (it.id == id) it.copy(enabled = enabled) else it
+                    })
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    fun deleteNote(id: Int) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { api.deleteNote(id) }
+                _state.update { st -> st.copy(notes = st.notes.filter { it.id != id }) }
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    fun loadModels() {
+        viewModelScope.launch {
+            _state.update { it.copy(loadingPanel = true) }
+            try {
+                val models = withContext(Dispatchers.IO) { api.models() }
+                if (models.optBoolean("ok")) {
+                    parseModels(models)
+                    val t = models.optString("ws_token")
+                    if (t.isNotBlank()) wsToken = t
+                }
+                _state.update { it.copy(loadingPanel = false) }
+            } catch (e: Exception) {
+                _state.update { it.copy(loadingPanel = false, error = e.message) }
+            }
+        }
+    }
+
+    fun selectModel(modelId: String) {
+        viewModelScope.launch {
+            try {
+                store.setModel(modelId)
+                _state.update { it.copy(model = modelId) }
+                withContext(Dispatchers.IO) { api.setModel(modelId) }
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    private fun connectBridge(wsUrl: String) {
+        if (wsToken.isBlank()) return
+        reconnectJob?.cancel()
+        bridge?.disconnect(notify = false)
+        bridge = BridgeClient(
+            onEvent = { evt -> viewModelScope.launch { handleEvent(evt) } },
+            onState = { ok, detail ->
+                viewModelScope.launch {
+                    _state.update {
+                        it.copy(
+                            connected = ok,
+                            statusText = if (ok) "Bridge connected" else "Bridge disconnected",
+                            bridgeDetail = detail,
+                        )
+                    }
+                    if (ok) {
+                        reconnectAttempts = 0
+                        reconnectJob?.cancel()
+                        // Re-attach to in-flight agent after worker/gateway failover
+                        if (sessionId.isNotBlank() && isValidSessionId(sessionId)) {
+                            bridge?.reconnect(sessionId)
+                        }
+                    } else if (!ok && _token != null && wsToken.isNotBlank()) {
+                        scheduleReconnect()
+                    }
+                }
+            },
+        ).also { it.connect(wsToken, wsUrl.ifBlank { BuildConfig.WS_URL }) }
+    }
+
+    private fun scheduleReconnect() {
+        reconnectJob?.cancel()
+        reconnectJob = viewModelScope.launch {
+            reconnectAttempts++
+            val wait = minOf(30_000L, 2_000L * reconnectAttempts)
+            _state.update {
+                it.copy(statusText = "Reconnecting in ${wait / 1000}s…")
+            }
+            delay(wait)
+            try {
+                val me = withContext(Dispatchers.IO) { api.me() }
+                if (me.optBoolean("ok")) {
+                    val t = me.optString("ws_token")
+                    if (t.isNotBlank()) wsToken = t
+                    lastWsUrl = me.optString("ws_url", lastWsUrl).ifBlank { lastWsUrl }
+                }
+            } catch (_: Exception) { /* use existing token */ }
+            connectBridge(lastWsUrl)
+        }
+    }
+
+    private fun handleEvent(evt: JSONObject) {
+        when (evt.optString("type")) {
+            "chunk", "text_delta" -> {
+                val c = evt.optString("content")
+                if (c.isNotEmpty()) {
+                    // Text after thinking: collapse open thought so order stays chronological
+                    if (thinkingBuf.isNotEmpty() ||
+                        _state.value.messages.any { it.role == ChatRole.Thinking && it.streaming }
+                    ) {
+                        finalizeThinking(thinkingBuf.toString())
+                    }
+                    streamBuf.append(c)
+                    pushStream()
+                }
+            }
+            "thinking_delta" -> {
+                val c = evt.optString("content")
+                if (c.isNotEmpty()) {
+                    // New thought block after text: seal the prior text segment
+                    sealOpenAssistantSegment()
+                    thinkingBuf.append(c)
+                    pushThinking()
+                }
+            }
+            "thinking_done" -> {
+                val final = evt.optString("content").ifBlank { thinkingBuf.toString() }
+                finalizeThinking(final)
+            }
+            "text_replace" -> {
+                // Seal thinking so text appears after tools/thoughts in order
+                if (thinkingBuf.isNotEmpty() ||
+                    _state.value.messages.any { it.role == ChatRole.Thinking && it.streaming }
+                ) {
+                    finalizeThinking(thinkingBuf.toString())
+                }
+                streamBuf = StringBuilder(fixSentenceSpacing(evt.optString("content")))
+                pushStream()
+            }
+            "partial_msg_id" -> {
+                val mid = evt.optInt("message_id", 0)
+                if (mid > 0) {
+                    _state.update { st ->
+                        val msgs = st.messages.toMutableList()
+                        val idx = msgs.indexOfLast { it.role == ChatRole.Assistant && it.streaming }
+                        if (idx >= 0) {
+                            msgs[idx] = msgs[idx].copy(serverMsgId = mid)
+                            st.copy(messages = msgs)
+                        } else st
+                    }
+                }
+            }
+            "init" -> {
+                // New agent started — keep busy flag
+                _state.update { it.copy(busy = true, statusText = "Agent running…") }
+            }
+            "tool_start" -> {
+                // Seal prior text/thinking so tools land *after* them chronologically
+                if (thinkingBuf.isNotEmpty() ||
+                    _state.value.messages.any { it.role == ChatRole.Thinking && it.streaming }
+                ) {
+                    finalizeThinking(thinkingBuf.toString())
+                }
+                sealOpenAssistantSegment()
+                val tool = evt.optString("tool", "tool")
+                val detail = prettyToolText(evt.optString("detail"))
+                _state.update {
+                    it.copy(
+                        messages = it.messages + ChatLine(
+                            role = ChatRole.Tool,
+                            text = detail,
+                            toolName = tool,
+                            toolDetail = detail,
+                            toolResult = "",
+                            toolSuccess = null,
+                            expanded = false,
+                        ),
+                        busy = true,
+                    )
+                }
+            }
+            "tool_done" -> {
+                val tool = evt.optString("tool", "tool")
+                val ok = if (evt.has("success")) evt.optBoolean("success") else true
+                val result = prettyToolText(
+                    evt.optString("result").ifBlank {
+                        evt.optString("info").ifBlank { evt.optString("content") }
+                    },
+                )
+                _state.update { st ->
+                    val msgs = st.messages.toMutableList()
+                    // Prefer matching open tool by name; fall back to any open tool
+                    var idx = msgs.indexOfLast {
+                        it.role == ChatRole.Tool && it.toolName == tool && it.toolSuccess == null
+                    }
+                    if (idx < 0) {
+                        idx = msgs.indexOfLast {
+                            it.role == ChatRole.Tool && it.toolSuccess == null
+                        }
+                    }
+                    if (idx >= 0) {
+                        val prev = msgs[idx]
+                        msgs[idx] = prev.copy(
+                            toolSuccess = ok,
+                            text = result.ifBlank { prev.text },
+                            toolResult = result.ifBlank { prev.toolResult },
+                            // Keep original input args in toolDetail
+                            toolDetail = prev.toolDetail,
+                        )
+                    } else {
+                        msgs += ChatLine(
+                            role = ChatRole.Tool,
+                            text = result,
+                            toolName = tool,
+                            toolDetail = "",
+                            toolResult = result,
+                            toolSuccess = ok,
+                        )
+                    }
+                    st.copy(messages = msgs)
+                }
+            }
+            "media" -> {
+                val url = resolveMediaUrl(evt.optString("url"))
+                if (url.isNotBlank()) {
+                    _state.update { st ->
+                        if (st.messages.any { it.role == ChatRole.Media && it.mediaUrl == url }) st
+                        else st.copy(
+                            messages = st.messages + ChatLine(
+                                role = ChatRole.Media,
+                                text = evt.optString("name"),
+                                toolName = evt.optString("tool"),
+                                mediaUrl = url,
+                                mediaKind = if (evt.optString("kind") == "video") "video" else "image",
+                            )
+                        )
+                    }
+                }
+            }
+            "done" -> {
+                // Always seal thinking (even if buffer empty — cards may still be streaming)
+                if (thinkingBuf.isNotEmpty()) {
+                    finalizeThinking(thinkingBuf.toString())
+                } else {
+                    finalizeThinking("")
+                }
+                // Keep interleaved segments — only seal remaining streamBuf, do NOT
+                // replace earlier text bubbles with the full agent output (that scrambled order).
+                finalizeAssistant(streamBuf.toString())
+            }
+            // Keep partial text across bridge restarts / WS drops
+            "interrupted", "bridge_stopping" -> {
+                val agentsSurvive = evt.optBoolean("agents_survive", false) ||
+                    evt.optString("reason") == "worker_restart"
+                if (thinkingBuf.isNotEmpty()) {
+                    finalizeThinking(thinkingBuf.toString())
+                }
+                val content = evt.optString("content")
+                if (content.isNotEmpty() && content.length > streamBuf.length) {
+                    streamBuf = StringBuilder(fixSentenceSpacing(content))
+                }
+                // Detached agents keep running — stay in streaming mode and reconnect
+                if (agentsSurvive && (streamBuf.isNotEmpty() || _state.value.busy)) {
+                    pushStream()
+                    _state.update {
+                        it.copy(
+                            busy = true,
+                            statusText = "Bridge failing over — agent still running…",
+                        )
+                    }
+                    appendSystem("Bridge worker restarting — agent keeps going; reconnecting…")
+                    scheduleReconnect()
+                    return
+                }
+                val final = streamBuf.toString().ifBlank { content }
+                if (final.isNotBlank()) {
+                    finalizeAssistant(fixSentenceSpacing(final))
+                    appendSystem(
+                        if (evt.optString("type") == "bridge_stopping") {
+                            "Bridge restarting — reply saved so far."
+                        } else {
+                            "Stream interrupted — reply kept."
+                        },
+                    )
+                } else {
+                    // Seal any dangling spinners even with empty content
+                    finalizeAssistant("")
+                    if (sessionId.isNotBlank()) {
+                        viewModelScope.launch {
+                            loadMessagesInternal(sessionId, clearError = false)
+                        }
+                    }
+                }
+            }
+            "no_agent" -> {
+                // Agent died with bridge; keep whatever we already streamed locally
+                if (streamBuf.isNotEmpty() || thinkingBuf.isNotEmpty() ||
+                    _state.value.messages.any { it.streaming || (it.role == ChatRole.Tool && it.toolSuccess == null) }
+                ) {
+                    if (thinkingBuf.isNotEmpty()) finalizeThinking(thinkingBuf.toString())
+                    else finalizeThinking("")
+                    finalizeAssistant(streamBuf.toString())
+                    appendSystem("Bridge restarted — kept partial reply.")
+                } else {
+                    finalizeAssistant("")
+                    // Reload session so server-persisted partial (if any) appears
+                    if (sessionId.isNotBlank()) {
+                        viewModelScope.launch {
+                            loadMessagesInternal(sessionId, clearError = false)
+                        }
+                    }
+                }
+            }
+            "agent_resume" -> {
+                // Live agent still running after reconnect — clear partial bubble for replay
+                streamBuf = StringBuilder()
+                thinkingBuf = StringBuilder()
+                _state.update { st ->
+                    st.copy(
+                        busy = true,
+                        statusText = "Resumed live agent",
+                        messages = st.messages.filterNot { it.streaming || it.role == ChatRole.Thinking && it.streaming },
+                    )
+                }
+            }
+            "error" -> {
+                finalizeAssistant("Error: " + evt.optString("content", "unknown"))
+            }
+            "status" -> {
+                val msg = evt.optString("content").ifBlank { evt.optString("message") }
+                if (msg.isNotBlank()) {
+                    appendSystem(msg)
+                }
+            }
+        }
+    }
+
+    private fun pushStream() {
+        val text = streamBuf.toString()
+        _state.update { st ->
+            val msgs = st.messages.toMutableList()
+            // Only update an assistant bubble that is still the latest open segment
+            // (after tools/thinking we seal prior text so a new bubble is created)
+            val idx = msgs.indexOfLast { it.role == ChatRole.Assistant && it.streaming }
+            if (idx >= 0 && idx == msgs.lastIndex) {
+                msgs[idx] = msgs[idx].copy(text = text)
+            } else if (idx >= 0) {
+                // Stale open assistant behind tools — seal it and append fresh
+                msgs[idx] = msgs[idx].copy(streaming = false)
+                msgs += ChatLine(role = ChatRole.Assistant, text = text, streaming = true)
+            } else {
+                msgs += ChatLine(role = ChatRole.Assistant, text = text, streaming = true)
+            }
+            st.copy(messages = msgs, busy = true)
+        }
+    }
+
+    /**
+     * Close the current assistant text segment so later tools/thoughts appear after it
+     * in the list (mirrors web timeline closeActiveTextSegment).
+     */
+    private fun sealOpenAssistantSegment() {
+        val pending = streamBuf.toString()
+        streamBuf = StringBuilder()
+        _state.update { st ->
+            val msgs = st.messages.toMutableList()
+            val idx = msgs.indexOfLast { it.role == ChatRole.Assistant && it.streaming }
+            if (idx >= 0) {
+                val existing = msgs[idx]
+                val finalText = pending.ifBlank { existing.text }
+                if (finalText.isBlank()) {
+                    msgs.removeAt(idx)
+                } else {
+                    msgs[idx] = existing.copy(text = finalText, streaming = false)
+                }
+            } else if (pending.isNotBlank()) {
+                msgs += ChatLine(role = ChatRole.Assistant, text = pending, streaming = false)
+            }
+            st.copy(messages = msgs)
+        }
+    }
+
+    /** Pretty-print JSON tool payloads when possible. */
+    private fun prettyToolText(raw: String): String {
+        val text = raw.trim()
+        if (text.isEmpty()) return ""
+        if ((text.startsWith("{") && text.endsWith("}")) ||
+            (text.startsWith("[") && text.endsWith("]"))
+        ) {
+            return try {
+                org.json.JSONTokener(text).nextValue().let { value ->
+                    when (value) {
+                        is org.json.JSONObject -> value.toString(2)
+                        is org.json.JSONArray -> value.toString(2)
+                        else -> raw
+                    }
+                }
+            } catch (_: Exception) {
+                raw
+            }
+        }
+        return raw
+    }
+
+    private fun pushThinking() {
+        val text = thinkingBuf.toString()
+        _state.update { st ->
+            val msgs = st.messages.toMutableList()
+            val idx = msgs.indexOfLast { it.role == ChatRole.Thinking && it.streaming }
+            if (idx >= 0) {
+                msgs[idx] = msgs[idx].copy(text = text)
+            } else {
+                msgs += ChatLine(role = ChatRole.Thinking, text = text, streaming = true, expanded = true)
+            }
+            st.copy(messages = msgs, busy = true)
+        }
+    }
+
+    private fun finalizeThinking(text: String) {
+        thinkingBuf = StringBuilder()
+        if (text.isBlank()) {
+            // Still collapse any dangling streaming thinking cards
+            _state.update { st ->
+                st.copy(
+                    messages = st.messages.map { m ->
+                        if (m.role == ChatRole.Thinking && m.streaming) {
+                            m.copy(streaming = false, expanded = false)
+                        } else m
+                    },
+                )
+            }
+            return
+        }
+        _state.update { st ->
+            val msgs = st.messages.toMutableList()
+            val idx = msgs.indexOfLast { it.role == ChatRole.Thinking && it.streaming }
+            if (idx >= 0) {
+                msgs[idx] = msgs[idx].copy(text = text, streaming = false, expanded = false)
+            } else {
+                // Prefer updating the most recent thinking card if present
+                val anyIdx = msgs.indexOfLast { it.role == ChatRole.Thinking }
+                if (anyIdx >= 0 && msgs[anyIdx].streaming) {
+                    msgs[anyIdx] = msgs[anyIdx].copy(text = text, streaming = false, expanded = false)
+                } else if (anyIdx < 0) {
+                    msgs += ChatLine(role = ChatRole.Thinking, text = text, streaming = false, expanded = false)
+                }
+            }
+            st.copy(messages = msgs)
+        }
+    }
+
+    /**
+     * End the assistant turn: seal text, collapse thinking, stop tool spinners.
+     * Must clear *all* live indicators even when tools/thinking are not the last row.
+     * Does not rewrite earlier text segments with the full agent dump (preserves order).
+     */
+    private fun finalizeAssistant(text: String) {
+        streamBuf = StringBuilder()
+        thinkingBuf = StringBuilder()
+        _state.update { st ->
+            val msgs = st.messages.toMutableList()
+            var appliedText = false
+            for (i in msgs.indices.reversed()) {
+                val m = msgs[i]
+                when {
+                    m.role == ChatRole.Assistant && m.streaming -> {
+                        // Keep segmented text; only fill if the open bubble is still empty
+                        msgs[i] = m.copy(
+                            text = m.text.ifBlank { text },
+                            streaming = false,
+                        )
+                        appliedText = true
+                    }
+                    m.role == ChatRole.Thinking && m.streaming -> {
+                        msgs[i] = m.copy(streaming = false, expanded = false)
+                    }
+                    m.role == ChatRole.Tool && m.toolSuccess == null -> {
+                        msgs[i] = m.copy(toolSuccess = true)
+                    }
+                }
+            }
+            if (!appliedText && text.isNotBlank()) {
+                msgs += ChatLine(role = ChatRole.Assistant, text = text, streaming = false)
+            }
+            val sealed = msgs.map { m ->
+                when {
+                    m.streaming -> m.copy(streaming = false)
+                    m.role == ChatRole.Tool && m.toolSuccess == null -> m.copy(toolSuccess = true)
+                    else -> m
+                }
+            }
+            st.copy(
+                messages = sealed,
+                busy = false,
+                statusText = if (st.connected) "Bridge connected" else st.statusText,
+            )
+        }
+    }
+
+    private fun clientAutoTitle(prompt: String): String {
+        val cleaned = prompt.trim().replace(Regex("\\s+"), " ")
+        if (cleaned.isEmpty()) return "Chat"
+        return if (cleaned.length <= 48) cleaned else cleaned.take(47).trimEnd() + "…"
+    }
+
+    private fun appendSystem(text: String) {
+        _state.update {
+            it.copy(messages = it.messages + ChatLine(role = ChatRole.System, text = text))
+        }
+    }
+
+    /** Mirror web system-chat.js fixSentenceSpacing — periods need a following space. */
+    private fun fixSentenceSpacing(text: String): String {
+        if (text.isEmpty()) return text
+        var s = text
+        // "end.Next" → "end. Next" (skip decimals / common abbreviations)
+        s = s.replace(
+            Regex("""(?<!\d)([.!?])(["')\]]*)(?=[A-Za-z*_"'(\[])"""),
+        ) { m ->
+            val before = s.substring(0, m.range.first).takeLast(8)
+            if (Regex("""\b(?:Mr|Mrs|Ms|Dr|Prof|vs|etc|e\.g|i\.e|U\.S)$""", RegexOption.IGNORE_CASE)
+                    .containsMatchIn(before + m.groupValues[1])
+            ) {
+                m.value
+            } else {
+                m.groupValues[1] + m.groupValues[2] + " "
+            }
+        }
+        return s
+    }
+
+    fun toggleExpand(id: String) {
+        _state.update { st ->
+            st.copy(
+                messages = st.messages.map {
+                    if (it.id == id) it.copy(expanded = !it.expanded) else it
+                }
+            )
+        }
+    }
+
+    fun sendMessage(text: String) {
+        val prompt = text.trim()
+        if (prompt.isEmpty()) return
+        viewModelScope.launch {
+            val localUserId = UUID.randomUUID().toString()
+            _state.update {
+                it.copy(
+                    messages = it.messages + ChatLine(
+                        id = localUserId,
+                        role = ChatRole.User,
+                        text = prompt,
+                    ),
+                    draft = "",
+                    busy = true,
+                    error = null,
+                )
+            }
+            if (sessionId.isBlank() || !isValidSessionId(sessionId)) {
+                ensureSession("New Chat")
+            }
+            if (sessionId.isBlank() || !isValidSessionId(sessionId)) {
+                _state.update {
+                    it.copy(busy = false, error = "Could not create chat session — check token")
+                }
+                return@launch
+            }
+            if (bridge == null || !_state.value.connected) {
+                try {
+                    val me = withContext(Dispatchers.IO) { api.me() }
+                    if (me.optBoolean("ok")) {
+                        wsToken = me.optString("ws_token", wsToken)
+                        lastWsUrl = me.optString("ws_url", lastWsUrl).ifBlank { lastWsUrl }
+                        connectBridge(lastWsUrl)
+                        delay(800)
+                    }
+                } catch (_: Exception) { /* fall through */ }
+            }
+
+            // Persist user message (same as admin System Chat) and attach server id
+            try {
+                val saved = withContext(Dispatchers.IO) {
+                    api.createMessage(sessionId, "user", prompt)
+                }
+                val mid = saved.optInt("id", 0)
+                if (mid > 0) {
+                    _state.update { st ->
+                        st.copy(
+                            messages = st.messages.map {
+                                if (it.id == localUserId) it.copy(serverMsgId = mid) else it
+                            },
+                        )
+                    }
+                }
+                // Server auto-names on first user message — reflect it in the chrome
+                val autoTitle = saved.optString("session_title")
+                if (autoTitle.isNotBlank()) {
+                    applySessionTitle(sessionId, autoTitle)
+                } else if (isDefaultSessionTitle(_state.value.sessionTitle)) {
+                    // Offline fallback: mirror server auto-title client-side
+                    applySessionTitle(sessionId, clientAutoTitle(prompt))
+                }
+            } catch (_: Exception) {
+                if (isDefaultSessionTitle(_state.value.sessionTitle)) {
+                    applySessionTitle(sessionId, clientAutoTitle(prompt))
+                }
+            }
+
+            // Build history for context (exclude current user msg already saved)
+            var historyPayload = emptyList<JSONObject>()
+            if (_state.value.useHistory) {
+                historyPayload = buildHistoryPayload(sessionId)
+            }
+            val notes = _state.value.notes.filter { it.enabled }.map { it.text }
+
+            streamBuf = StringBuilder()
+            thinkingBuf = StringBuilder()
+            val ok = bridge?.sendPrompt(
+                prompt = prompt,
+                sessionId = sessionId,
+                model = _state.value.model,
+                notes = notes,
+                history = historyPayload,
+            ) == true
+            if (!ok) {
+                _state.update {
+                    it.copy(
+                        busy = false,
+                        error = "Not connected to bridge — ${_state.value.bridgeDetail ?: "tap Refresh on Home"}",
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun buildHistoryPayload(sid: String): List<JSONObject> {
+        return try {
+            val h = withContext(Dispatchers.IO) { api.listMessages(sid) }
+            val arr = h.optJSONArray("messages") ?: return emptyList()
+            val out = mutableListOf<JSONObject>()
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                if (m.optInt("excluded_from_context", 0) != 0) continue
+                val role = m.optString("role")
+                if (role != "user" && role != "assistant" && role != "system") continue
+                val meta = m.optJSONObject("metadata")
+                if (role == "assistant" && meta?.optBoolean("streaming") == true) continue
+                var content = m.optString("content")
+                if (role == "assistant" && meta != null) {
+                    content = expandAssistantContent(content, meta)
+                }
+                // Skip trailing user message we just saved (same text last)
+                out += JSONObject().put("role", role).put("content", content)
+            }
+            // Drop last if it's the just-sent user message (keep prior context)
+            if (out.isNotEmpty() && out.last().optString("role") == "user") {
+                out.removeAt(out.lastIndex)
+            }
+            out
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun expandAssistantContent(content: String, meta: JSONObject): String {
+        val timeline = meta.optJSONArray("timeline")
+        if (timeline != null && timeline.length() > 0) {
+            val parts = mutableListOf<String>()
+            for (i in 0 until timeline.length()) {
+                val seg = timeline.optJSONObject(i) ?: continue
+                when (seg.optString("type")) {
+                    "thinking" -> {
+                        val c = seg.optString("content")
+                        if (c.isNotBlank()) parts += "<thinking>\n$c\n</thinking>"
+                    }
+                    "tool" -> {
+                        parts += "[${seg.optString("tool")}] ${seg.optString("detail")} → ${
+                            seg.optString("info").ifBlank {
+                                if (seg.optBoolean("success")) "ok" else ""
+                            }
+                        }"
+                    }
+                    "text" -> {
+                        val c = seg.optString("content")
+                        if (c.isNotBlank()) parts += c
+                    }
+                }
+            }
+            if (parts.isNotEmpty()) return parts.joinToString("\n\n")
+        }
+        var result = content
+        val thinking = meta.optString("thinking")
+        if (thinking.isNotBlank()) {
+            result = "<thinking>\n$thinking\n</thinking>\n\n$result"
+        }
+        return result
+    }
+
+    fun checkUpdate() {
+        viewModelScope.launch {
+            try {
+                val json = withContext(Dispatchers.IO) {
+                    api.checkUpdate(BuildConfig.VERSION_CODE, BuildConfig.VERSION_NAME)
+                }
+                if (json.optBoolean("update_available")) {
+                    val latest = json.optJSONObject("latest")
+                    val name = latest?.optString("version_name") ?: "?"
+                    val code = latest?.optInt("version_code") ?: 0
+                    val changelog = latest?.optString("changelog").orEmpty()
+                    val size = latest?.optLong("file_size") ?: 0L
+                    val sha = latest?.optString("sha256").orEmpty()
+                    val url = latest?.optString("download_url").orEmpty().ifBlank {
+                        api.apkDownloadUrl()
+                    }
+                    val sizeLabel = formatBytes(size)
+                    _state.update {
+                        it.copy(
+                            updateAvailable = true,
+                            updateVersionName = name,
+                            updateVersionCode = code,
+                            updateChangelog = changelog,
+                            updateSizeBytes = size,
+                            updateSha256 = sha,
+                            updateDownloadUrl = url,
+                            updateInfo = "Update available: $name (code $code) · $sizeLabel",
+                        )
+                    }
+                } else {
+                    _state.update {
+                        it.copy(
+                            updateAvailable = false,
+                            updateVersionName = "",
+                            updateVersionCode = 0,
+                            updateChangelog = "",
+                            updateSizeBytes = 0L,
+                            updateSha256 = "",
+                            updateDownloadUrl = "",
+                            updateInfo = "Up to date (${BuildConfig.VERSION_NAME})",
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        updateInfo = "Update check failed: ${e.message}",
+                        updateAvailable = false,
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Download latest APK over the device token and open the system installer.
+     * User must approve the install prompt (and “Install unknown apps” once if needed).
+     */
+    fun downloadAndInstallUpdate() {
+        if (updateJob?.isActive == true) return
+        updateJob = viewModelScope.launch {
+            val st = _state.value
+            if (!st.updateAvailable && st.updateDownloadUrl.isBlank()) {
+                // Re-check first so Install works even before a manual check.
+                try {
+                    val json = withContext(Dispatchers.IO) {
+                        api.checkUpdate(BuildConfig.VERSION_CODE, BuildConfig.VERSION_NAME)
+                    }
+                    if (!json.optBoolean("update_available")) {
+                        _state.update {
+                            it.copy(updateInfo = "Already on latest (${BuildConfig.VERSION_NAME})")
+                        }
+                        return@launch
+                    }
+                    val latest = json.optJSONObject("latest")
+                    _state.update {
+                        it.copy(
+                            updateAvailable = true,
+                            updateVersionName = latest?.optString("version_name") ?: "?",
+                            updateVersionCode = latest?.optInt("version_code") ?: 0,
+                            updateChangelog = latest?.optString("changelog").orEmpty(),
+                            updateSizeBytes = latest?.optLong("file_size") ?: 0L,
+                            updateSha256 = latest?.optString("sha256").orEmpty(),
+                            updateDownloadUrl = latest?.optString("download_url").orEmpty()
+                                .ifBlank { api.apkDownloadUrl() },
+                        )
+                    }
+                } catch (e: Exception) {
+                    _state.update { it.copy(updateInfo = "Update check failed: ${e.message}") }
+                    return@launch
+                }
+            }
+
+            val meta = _state.value
+            val versionLabel = meta.updateVersionName.ifBlank { "update" }
+            _state.update {
+                it.copy(
+                    updateDownloading = true,
+                    updateProgress = 0f,
+                    updateInfo = "Downloading $versionLabel…",
+                    error = null,
+                )
+            }
+            try {
+                val downloadUrl = meta.updateDownloadUrl.ifBlank { api.apkDownloadUrl() }
+                val expectedSha = meta.updateSha256.ifBlank { null }
+                val result = withContext(Dispatchers.IO) {
+                    apkUpdater.download(
+                        downloadUrl = downloadUrl,
+                        expectedSha256 = expectedSha,
+                    ) { progress ->
+                        // OkHttp callback thread — StateFlow is thread-safe
+                        _state.update {
+                            it.copy(
+                                updateProgress = if (progress < 0f) 0f else progress.coerceIn(0f, 1f),
+                                updateInfo = if (progress < 0f) {
+                                    "Downloading…"
+                                } else {
+                                    "Downloading… ${(progress * 100).toInt()}%"
+                                },
+                            )
+                        }
+                    }
+                }
+                _state.update {
+                    it.copy(
+                        updateProgress = 1f,
+                        updateInfo = "Opening installer…",
+                    )
+                }
+                withContext(Dispatchers.Main) {
+                    apkUpdater.install(result.file)
+                }
+                _state.update {
+                    it.copy(
+                        updateDownloading = false,
+                        updateInfo = "Install prompt opened — approve to update to $versionLabel",
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        updateDownloading = false,
+                        updateProgress = 0f,
+                        updateInfo = "Update failed: ${e.message}",
+                        error = e.message,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes <= 0L) return "—"
+        val kb = bytes / 1024.0
+        val mb = kb / 1024.0
+        return if (mb >= 1.0) String.format("%.1f MB", mb) else String.format("%.0f KB", kb)
+    }
+
+    override fun onCleared() {
+        reconnectJob?.cancel()
+        updateJob?.cancel()
+        bridge?.disconnect()
+        super.onCleared()
+    }
+}

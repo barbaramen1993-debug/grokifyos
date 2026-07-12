@@ -1,0 +1,30 @@
+# Example Apache vhost for GrokifyOS (Phase 1)
+# Replace ServerName, paths, and certs. Do not reuse production grokpot DocumentRoot.
+
+<VirtualHost *:80>
+    ServerName grokifyos.example.com
+    DocumentRoot /var/www/grokifyos/web/public
+
+    Alias /api /var/www/grokifyos/web/api
+    Alias /assets /var/www/grokifyos/web/assets
+
+    <Directory /var/www/grokifyos/web/public>
+        AllowOverride All
+        Require all granted
+    </Directory>
+    <Directory /var/www/grokifyos/web/api>
+        AllowOverride None
+        Require all granted
+    </Directory>
+    <Directory /var/www/grokifyos/web/assets>
+        AllowOverride None
+        Require all granted
+    </Directory>
+
+    # Bridge WS (own port — not production 8766)
+    # ProxyPass /ws/ ws://127.0.0.1:8876/
+    # ProxyPassReverse /ws/ ws://127.0.0.1:8876/
+
+    ErrorLog ${APACHE_LOG_DIR}/grokifyos-error.log
+    CustomLog ${APACHE_LOG_DIR}/grokifyos-access.log combined
+</VirtualHost>

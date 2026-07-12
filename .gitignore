@@ -1,0 +1,16 @@
+.env
+/storage/sessions/*
+!/storage/sessions/.gitkeep
+/storage/bridge-runtime/*
+!/storage/bridge-runtime/.gitkeep
+/storage/apk/*
+!/storage/apk/.gitkeep
+/storage/logs/*
+!/storage/logs/.gitkeep
+/bridge/node_modules/
+/android/.gradle/
+/android/**/build/
+/android/local.properties
+*.apk
+*.log
+.DS_Store

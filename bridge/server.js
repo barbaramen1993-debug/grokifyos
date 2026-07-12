@@ -1,0 +1,1459 @@
+'use strict';
+
+const crypto = require('crypto');
+const { spawn, execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const { WebSocketServer } = require('ws');
+const mysql = require('mysql2/promise');
+
+const WORKSPACE = process.env.GROKPOT_WORKSPACE || '/root/grokpot';
+require('dotenv').config({ path: path.join(WORKSPACE, '.env') });
+
+const PORT = parseInt(process.env.GROKPOT_BRIDGE_PORT || '8766', 10);
+const INSTANCE_ID = process.env.GROKPOT_BRIDGE_INSTANCE || 'a';
+const GROK_BIN = process.env.GROKPOT_GROK_BIN || '/root/.grok/bin/grok';
+const DEFAULT_GROK_MODEL = process.env.GROKPOT_GROK_DEFAULT_MODEL || 'grok-4.5';
+const LOG_FILE = path.join(WORKSPACE, 'storage', 'logs', 'bridge.log');
+const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_PROMPT_BYTES = 120000;
+// When true (default), CLI agents are detached + file-tailed so they survive bridge restarts
+const DETACH_AGENTS = process.env.GROKPOT_BRIDGE_DETACH !== '0';
+function wsSecret() {
+    if (process.env.GROKPOT_WS_AUTH_SECRET) return process.env.GROKPOT_WS_AUTH_SECRET;
+    const pepper = process.env.GROKPOT_SECRETS_PEPPER || '';
+    if (pepper) return crypto.createHash('sha256').update('grokpot_system_chat_ws:' + pepper).digest('hex');
+    return crypto.createHash('sha256').update('grokpot_system_chat_ws_fallback').digest('hex');
+}
+const WS_SECRET = wsSecret();
+
+const DB_SOCKET = process.env.GROKPOT_DB_SOCKET || '/var/run/mysqld/mysqld.sock';
+
+/** Match PHP PDO: localhost / 127.0.0.1 use the Unix socket, not TCP loopback. */
+function buildDbConfig() {
+    const base = {
+        user: process.env.GROKPOT_DB_USER || 'grokpot',
+        password: process.env.GROKPOT_DB_PASS || '',
+        database: process.env.GROKPOT_DB_NAME || 'grokpot',
+    };
+    const host = (process.env.GROKPOT_DB_HOST || process.env.GROKPOT_DB_HOSTNAME || '').trim();
+    if (!host || host === 'localhost' || host === '127.0.0.1') {
+        return { ...base, socketPath: DB_SOCKET };
+    }
+    return {
+        ...base,
+        host,
+        port: parseInt(process.env.GROKPOT_DB_PORT || '3306', 10),
+    };
+}
+
+const DB_CONFIG = buildDbConfig();
+
+let ALLOWED_MODELS = new Set();
+let GROK_MODELS_FULL = [];
+
+const agents = new Map();
+
+const { createRuntime } = require('./agent-runtime');
+const runtime = createRuntime({
+    workspace: WORKSPACE,
+    instanceId: INSTANCE_ID,
+    log: (level, category, msg, ctx) => log(level, category, msg, ctx),
+});
+
+const { createMediaIngest } = require('./media-ingest');
+const mediaIngest = createMediaIngest({
+    workspace: WORKSPACE,
+    log: (level, category, msg, ctx) => log(level, category, msg, ctx),
+});
+
+function ensureLogDir() {
+    const dir = path.dirname(LOG_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function redactSecrets(text) {
+    if (typeof text !== 'string') return text;
+    text = text.replace(/0x[0-9a-fA-F]{64}\b/g, '[REDACTED_KEY]');
+    text = text.replace(/\b[0-9a-fA-F]{64}\b/g, '[REDACTED_KEY]');
+    return text;
+}
+
+function log(level, category, msg, ctx) {
+    ensureLogDir();
+    const line = JSON.stringify({
+        ts: new Date().toISOString(),
+        level,
+        category,
+        msg: redactSecrets(msg),
+        ctx: ctx ? redactSecrets(JSON.stringify(ctx)) : undefined,
+    });
+    try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (_) {}
+    auditDb(level, category, msg, ctx || {}, ctx?.user_id, ctx?.session_id).catch(() => {});
+}
+
+async function auditDb(level, category, message, context, userId, sessionId) {
+    let conn;
+    try {
+        conn = await mysql.createConnection(DB_CONFIG);
+        await conn.execute(
+            `INSERT INTO system_chat_events (level, category, message, context, user_id, session_id)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+                level,
+                category,
+                String(message).substring(0, 512),
+                Object.keys(context).length ? JSON.stringify(context) : null,
+                userId || null,
+                sessionId || null,
+            ]
+        );
+    } catch (_) {
+        /* table may not exist yet */
+    } finally {
+        if (conn) await conn.end();
+    }
+}
+
+function verifyWsToken(token) {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    let json;
+    try {
+        json = Buffer.from(parts[0], 'base64').toString('utf8');
+    } catch {
+        return null;
+    }
+    const expected = crypto.createHmac('sha256', WS_SECRET).update(json).digest('hex');
+    try {
+        if (!crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(parts[1], 'hex'))) return null;
+    } catch {
+        if (expected !== parts[1]) return null;
+    }
+    let data;
+    try { data = JSON.parse(json); } catch { return null; }
+    if (!data.uid || !data.exp || data.exp < Math.floor(Date.now() / 1000)) return null;
+    return { uid: parseInt(data.uid, 10), role: data.role || '' };
+}
+
+function refreshGrokModels() {
+    try {
+        const raw = execSync(`"${GROK_BIN}" models 2>/dev/null`, {
+            timeout: 20000,
+            env: { ...process.env, HOME: process.env.HOME || '/root' },
+        }).toString();
+        const models = [];
+        const nextAllowed = new Set();
+        for (const line of raw.split('\n')) {
+            // Only bullet lines under "Available models:" — not the "You are logged in..." banner
+            const match = line.match(/^\s*[-*]\s+([a-z0-9][a-z0-9._-]+)(?:\s+\(default\))?\s*$/i);
+            if (!match) continue;
+            const id = match[1].trim();
+            if (!id || !id.includes('-')) continue;
+            models.push({ id, name: id });
+            nextAllowed.add('gb:' + id);
+        }
+        if (models.length) {
+            GROK_MODELS_FULL = models;
+            ALLOWED_MODELS = nextAllowed;
+            log('info', 'agent', `Loaded ${models.length} Grok Build models`, { sample: models.map((m) => m.id) });
+        }
+    } catch (err) {
+        log('warning', 'error', `Grok model list failed: ${err.message}`, {});
+    }
+}
+
+refreshGrokModels();
+setInterval(refreshGrokModels, 6 * 60 * 60 * 1000);
+
+function isGrokModel(model) {
+    return !!(model && (model.startsWith('gb:') || model.startsWith('grok:')));
+}
+
+function grokRealModel(model) {
+    if (!model || typeof model !== 'string') return DEFAULT_GROK_MODEL;
+    if (model.startsWith('gb:')) return model.slice(3);
+    if (model.startsWith('grok:')) return model.slice(5);
+    return model;
+}
+
+/** Resolve client model id to a known Grok Build model (legacy cursor ids → default). */
+function resolveGrokModel(model) {
+    let real = isGrokModel(model) ? grokRealModel(model) : '';
+    if (real && GROK_MODELS_FULL.length && !GROK_MODELS_FULL.some((m) => m.id === real)) {
+        real = '';
+    }
+    if (!real) {
+        real = GROK_MODELS_FULL[0]?.id || DEFAULT_GROK_MODEL;
+    }
+    return 'gb:' + real;
+}
+
+/**
+ * Heal stream-join artifacts in text before save / history replay.
+ * Mirrors assets/system-chat.js healMidwordSpaces (keep in sync).
+ */
+function healChatText(text) {
+    if (!text) return text || '';
+    let s = String(text);
+
+    s = s.replace(/\bI\s+Ds\b/g, 'IDs');
+    s = s.replace(/\bI\s+D\b/g, 'ID');
+    s = s.replace(/\b([A-Z]{1,3})\s+([A-Z]{1,3})\b/g, (m, a, b) =>
+        a.length + b.length <= 5 ? a + b : m
+    );
+
+    const KEEP = new Set(
+        (
+            'a an the and or but if in on at to of for from by as is it be we he she ' +
+            'they you me my our your his her its are was were has had have will can ' +
+            'may not no yes so up out off all any new old via per with this that than ' +
+            'then when what who how why which into onto over under about after before ' +
+            'between through during without within also just more most some such only ' +
+            'other upon like back even well very much many own same too still need ' +
+            'each few plus vs mode dark light full real next last first both once'
+        ).split(/\s+/)
+    );
+
+    const SUFF =
+        'izers?|izing|ized|ifies|ify|ifying|able|ible|ables|ibles|apsible|apsible|' +
+        'ates|ating|ated|ation|ations|ments?|ness|less|ful|ings?|edly|tions?|sions?|' +
+        'ests?|wards?|ures?|ences?|ances?|ents?|ants?|ous|ives?|icals?|ials?|ying|' +
+        'ened|ships?|hoods?|isms?|ists?|izes?|ises?|ories?|aries?|uals?|iests?|iers?|' +
+        'ies|ied|ily|iness|ably|ibly|atives?|ators?|ability|ibility|' +
+        'oring|aring|ering|uring|oping|aping|uting|oting|isting|asting|esting|' +
+        'igned|igning|ifying|ified|ifier|ifiers|ocket|ockets|erver|ervers|' +
+        'ession|essions|essage|essages|istory|istories|ermission|ermissions|' +
+        'ersion|ersions|ackage|ackages|evice|evices|otals|ounts?|okens?|pot|ify|kify';
+    const suffRe = new RegExp('\\b([A-Za-z]{2,})\\s+(' + SUFF + ')\\b', 'gi');
+    for (let n = 0; n < 8; n++) {
+        const next = s.replace(suffRe, '$1$2');
+        if (next === s) break;
+        s = next;
+    }
+
+    for (let n = 0; n < 4; n++) {
+        const next = s.replace(/\b([B-HJ-Z])\s+([a-z]{2,12})\b/g, (m, a, b) =>
+            KEEP.has(b) ? m : a + b
+        );
+        if (next === s) break;
+        s = next;
+    }
+
+    const CAMEL =
+        'Http|Https|Url|Uri|Json|Xml|Html|Sql|Api|Uuid|Null|True|False|Socket|' +
+        'Stream|Client|Server|Token|Header|Request|Response|Config|Object|Array|' +
+        'String|Number|Boolean|Integer|Double|Float|Class|Method|Field|Error|' +
+        'Exception|Status|Code|Type|Name|Value|Key|Path|File|Dir|Query|Param|' +
+        'Params|Body|Auth|User|Session|Device|Bridge|Model|Prompt|Chunk|Delta';
+    const camelRe = new RegExp('([a-z0-9])\\s+(' + CAMEL + ')\\b', 'g');
+    for (let n = 0; n < 6; n++) {
+        const next = s.replace(camelRe, '$1$2');
+        if (next === s) break;
+        s = next;
+    }
+
+    // Missing space after .!? before a new sentence ("sleep.Checking")
+    s = s.replace(/(.?)([A-Za-z0-9)\]"'”’»])([.!?])([A-Z])/g, (all, pre, before, punct, after) => {
+        const singleLetterAbbr =
+            /[A-Z]/.test(before) && (pre === '' || /[^A-Za-z]/.test(pre));
+        if (singleLetterAbbr) return all;
+        return pre + before + punct + ' ' + after;
+    });
+    s = s.replace(/([a-z0-9)\]"'”’])([.!?])(\*{1,2})(?=[A-Za-z])/g, '$1$2 $3');
+    s = s.replace(/(\*{1,2})([.!?])([A-Z])/g, '$1$2 $3');
+
+    // Drop unpaired ** (keep inner text) — same idea as web normalizer
+    let out = '';
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] === '*' && s[i + 1] === '*') {
+            let j = i + 2;
+            let found = -1;
+            while (j < s.length - 1) {
+                if (s[j] === '*' && s[j + 1] === '*') {
+                    found = j;
+                    break;
+                }
+                j++;
+            }
+            if (found > i + 2) {
+                const inner = s.slice(i + 2, found).trim();
+                if (inner) out += '**' + inner + '**';
+                i = found + 2;
+            } else if (found === i + 2) {
+                i = found + 2;
+            } else {
+                i += 2;
+            }
+        } else {
+            out += s[i];
+            i++;
+        }
+    }
+    return out;
+}
+
+/** Pretty-print JSON-looking tool payloads; leave plain text alone. */
+function formatToolPayload(value, maxLen) {
+    const limit = maxLen || 12000;
+    if (value == null) return '';
+    let text;
+    if (typeof value === 'object') {
+        try {
+            text = JSON.stringify(value, null, 2);
+        } catch (_) {
+            text = String(value);
+        }
+    } else {
+        text = String(value);
+        const trimmed = text.trim();
+        if (
+            (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+            (trimmed.startsWith('[') && trimmed.endsWith(']'))
+        ) {
+            try {
+                text = JSON.stringify(JSON.parse(trimmed), null, 2);
+            } catch (_) {
+                /* keep raw */
+            }
+        }
+    }
+    if (text.length > limit) {
+        return text.slice(0, limit) + '\n… [truncated, ' + text.length + ' chars]';
+    }
+    return text;
+}
+
+function sealOpenThinkingEvents(agent) {
+    if (!agent || !agent.events || !agent.events.length) return;
+    for (let i = agent.events.length - 1; i >= 0; i--) {
+        const t = agent.events[i].type;
+        if (t === 'thinking_done') return;
+        if (t === 'thinking_delta') {
+            const evt = { type: 'thinking_done' };
+            agent.events.push(evt);
+            sendToClient(agent, evt);
+            return;
+        }
+        if (t === 'chunk' || t === 'tool_start' || t === 'tool_done' || t === 'media' || t === 'text_replace') {
+            return;
+        }
+    }
+}
+
+function markToolEventDone(agent, toolName, success, info) {
+    if (!agent.toolEventLog || !agent.toolEventLog.length) return;
+    // Prefer last open tool with matching name (parallel tool batches)
+    let idx = -1;
+    for (let i = agent.toolEventLog.length - 1; i >= 0; i--) {
+        const t = agent.toolEventLog[i];
+        if (t.success != null) continue;
+        if (toolName && t.tool === toolName) {
+            idx = i;
+            break;
+        }
+        if (idx < 0) idx = i;
+    }
+    if (idx < 0) return;
+    agent.toolEventLog[idx].success = success;
+    agent.toolEventLog[idx].info = info || '';
+    if (toolName) agent.toolEventLog[idx].tool = toolName;
+}
+
+function healTimeline(timeline, { seal = false } = {}) {
+    if (!Array.isArray(timeline)) return timeline;
+    return timeline.map((seg) => {
+        if (!seg || typeof seg !== 'object') return seg;
+        const copy = { ...seg };
+        if (typeof copy.content === 'string') copy.content = healChatText(copy.content);
+        if (typeof copy.detail === 'string') copy.detail = healChatText(copy.detail);
+        if (typeof copy.info === 'string') copy.info = healChatText(copy.info);
+        // On finalize / history: never leave thinking open or tools spinning
+        if (seal) {
+            if (copy.type === 'thinking') copy.done = true;
+            if (copy.type === 'tool' && (copy.success === null || copy.success === undefined)) {
+                copy.success = true;
+            }
+        }
+        return copy;
+    });
+}
+
+function buildPromptWithHistory(prompt, history, notes) {
+    let ctx = 'When you reply, write only your new answer. Do not repeat prior lines unless asked.\n\n';
+    if (notes && notes.length) {
+        ctx += '<additional_notes>\n';
+        for (const n of notes) ctx += `- ${n}\n`;
+        ctx += '</additional_notes>\n\n';
+    }
+    if (history && history.length) {
+        const recent = history.slice(-30);
+        ctx += '<conversation_history>\n';
+        for (const msg of recent) {
+            const role = msg.role === 'user' ? 'User' : 'Assistant';
+            const body = healChatText(msg.content || '');
+            ctx += `[${role}]: ${body}\n\n`;
+        }
+        ctx += '</conversation_history>\n\n';
+    }
+    ctx += `[User]: ${prompt}`;
+    return ctx;
+}
+
+function sendToClient(agent, obj) {
+    if (agent?._suppressSend) return;
+    try {
+        if (agent.client && agent.client.readyState === 1) {
+            agent.client.send(JSON.stringify(obj));
+        }
+    } catch (_) {}
+}
+
+function replayEvents(agent, ws) {
+    for (const evt of agent.events) {
+        if (ws.readyState === 1) ws.send(JSON.stringify(evt));
+    }
+}
+
+async function sessionOwned(sessionId, userId) {
+    let conn;
+    try {
+        conn = await mysql.createConnection(DB_CONFIG);
+        const [rows] = await conn.execute(
+            'SELECT user_id FROM system_chat_sessions WHERE id = ? LIMIT 1',
+            [sessionId]
+        );
+        if (!rows.length) return false;
+        return Number(rows[0].user_id) === Number(userId);
+    } catch (err) {
+        log('error', 'error', `Session lookup failed: ${err.message}`, { session_id: sessionId });
+        return false;
+    } finally {
+        if (conn) await conn.end();
+    }
+}
+
+function buildTimelineFromEvents(events) {
+    const timeline = [];
+    if (!events || !events.length) return timeline;
+
+    function sealOpenThinking() {
+        for (let i = timeline.length - 1; i >= 0; i--) {
+            if (timeline[i].type === 'thinking') {
+                timeline[i].done = true;
+                return;
+            }
+            if (timeline[i].type === 'text' || timeline[i].type === 'tool' || timeline[i].type === 'media') {
+                return;
+            }
+        }
+    }
+
+    function applyToolDone(evt) {
+        const toolName = evt.tool || '';
+        let fallback = -1;
+        for (let i = timeline.length - 1; i >= 0; i--) {
+            const seg = timeline[i];
+            if (seg.type !== 'tool' || seg.success != null) continue;
+            if (toolName && seg.tool === toolName) {
+                seg.success = evt.success !== false;
+                if (evt.info) seg.info = evt.info;
+                if (evt.detail) seg.detail = evt.detail;
+                return;
+            }
+            if (fallback < 0) fallback = i;
+        }
+        // Name mismatch (or missing name): close most recent open tool
+        if (fallback >= 0) {
+            timeline[fallback].success = evt.success !== false;
+            if (evt.info) timeline[fallback].info = evt.info;
+            if (evt.detail) timeline[fallback].detail = evt.detail;
+            if (toolName) timeline[fallback].tool = toolName;
+        }
+    }
+
+    for (const evt of events) {
+        if (evt.type === 'thinking_delta' && evt.content) {
+            const last = timeline[timeline.length - 1];
+            if (last && last.type === 'thinking' && !last.done) {
+                last.content += evt.content;
+            } else {
+                sealOpenThinking();
+                timeline.push({ type: 'thinking', content: evt.content, done: false });
+            }
+            continue;
+        }
+        if (evt.type === 'thinking_done') {
+            sealOpenThinking();
+            continue;
+        }
+        if (evt.type === 'tool_start') {
+            sealOpenThinking();
+            timeline.push({
+                type: 'tool',
+                tool: evt.tool || 'tool',
+                detail: evt.detail || '',
+                success: null,
+                info: '',
+            });
+            continue;
+        }
+        if (evt.type === 'tool_done') {
+            applyToolDone(evt);
+            continue;
+        }
+        if (evt.type === 'media' && evt.url) {
+            sealOpenThinking();
+            timeline.push({
+                type: 'media',
+                kind: evt.kind || 'image',
+                url: evt.url,
+                name: evt.name || '',
+                tool: evt.tool || null,
+            });
+            continue;
+        }
+        if (evt.type === 'chunk' && evt.content) {
+            sealOpenThinking();
+            const last = timeline[timeline.length - 1];
+            if (last && last.type === 'text') {
+                last.content += evt.content;
+            } else {
+                timeline.push({ type: 'text', content: evt.content });
+            }
+            continue;
+        }
+        if (evt.type === 'text_replace' && evt.content != null) {
+            sealOpenThinking();
+            while (timeline.length && timeline[timeline.length - 1].type === 'text') {
+                timeline.pop();
+            }
+            timeline.push({ type: 'text', content: String(evt.content) });
+        }
+    }
+    return timeline;
+}
+
+function buildAgentMetadata(agent, finalize) {
+    const metadata = {
+        model: agent?.model || null,
+        duration: agent ? Date.now() - agent.startTime : null,
+        tool_count: agent?.toolCount || 0,
+        tools: agent?.toolEventLog?.length ? agent.toolEventLog : null,
+        thinking: agent?.thinkingSummary ? healChatText(agent.thinkingSummary) : null,
+        input_tokens: agent?.estimatedInputTokens || 0,
+        output_tokens: agent?.estimatedOutputTokens || 0,
+        tokens_estimated: true,
+    };
+    const media = mediaIngest.mediaForMetadata(agent);
+    if (media && media.length) metadata.media = media;
+    if (agent?.events?.length) {
+        const tl = buildTimelineFromEvents(agent.events);
+        metadata.timeline = healTimeline(tl, { seal: !!finalize });
+    }
+    // Finalize: seal any open tools in the legacy tools array too
+    if (finalize && Array.isArray(metadata.tools)) {
+        metadata.tools = metadata.tools.map((t) => {
+            if (!t || typeof t !== 'object') return t;
+            if (t.success === null || t.success === undefined) {
+                return { ...t, success: true };
+            }
+            return t;
+        });
+    }
+    if (!finalize) metadata.streaming = true;
+    if (finalize && agent?._interrupted) metadata.interrupted = true;
+    return metadata;
+}
+
+async function createPartialMessage(sessionId, agent) {
+    if (!sessionId || agent._partialMsgId) return;
+    let conn;
+    try {
+        conn = await mysql.createConnection(DB_CONFIG);
+        const metadata = buildAgentMetadata(agent, false);
+        const [result] = await conn.execute(
+            'INSERT INTO system_chat_messages (session_id, role, content, metadata) VALUES (?, ?, ?, ?)',
+            [sessionId, 'assistant', '', JSON.stringify(metadata)]
+        );
+        agent._partialMsgId = result.insertId;
+        await conn.execute('UPDATE system_chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [sessionId]);
+    } catch (err) {
+        log('warning', 'error', `Partial msg create failed: ${err.message}`, { session_id: sessionId?.substring(0, 8) });
+    } finally {
+        if (conn) await conn.end();
+    }
+}
+
+async function updatePartialInDB(sessionId, agent, finalize) {
+    if (!sessionId || !agent) return;
+    // Only mutate fullOutput on finalize — mid-stream healing breaks fragment joins
+    if (finalize && agent.fullOutput) {
+        agent.fullOutput = healChatText(agent.fullOutput);
+    }
+    const content = agent.fullOutput || '';
+    const hasThinking = !!(agent.thinkingSummary && String(agent.thinkingSummary).trim());
+    const hasTools = !!(agent.toolCount || (agent.toolEventLog && agent.toolEventLog.length));
+    const hasMedia = !!(agent.media && agent.media.length);
+    const hasAnything = !!(content || hasThinking || hasTools || hasMedia);
+    // Never leave empty stub rows (common on restart before first chunk)
+    if (!hasAnything && !agent._partialMsgId) return;
+    if (finalize && !hasAnything && agent._partialMsgId) {
+        let conn;
+        try {
+            conn = await mysql.createConnection(DB_CONFIG);
+            await conn.execute('DELETE FROM system_chat_messages WHERE id = ? AND role = ? AND content = ?', [
+                agent._partialMsgId,
+                'assistant',
+                '',
+            ]);
+            agent._partialMsgId = null;
+        } catch (err) {
+            log('warning', 'error', `Empty partial delete failed: ${err.message}`, {
+                session_id: sessionId?.substring(0, 8),
+            });
+        } finally {
+            if (conn) await conn.end();
+        }
+        return;
+    }
+    if (!content && !agent._partialMsgId && !finalize) return;
+
+    let conn;
+    try {
+        const metadata = buildAgentMetadata(agent, finalize);
+        conn = await mysql.createConnection(DB_CONFIG);
+        if (agent._partialMsgId) {
+            await conn.execute(
+                'UPDATE system_chat_messages SET content = ?, metadata = ?, input_tokens = ?, output_tokens = ? WHERE id = ?',
+                [content, JSON.stringify(metadata), metadata.input_tokens, metadata.output_tokens, agent._partialMsgId]
+            );
+        } else if (content || finalize) {
+            const [result] = await conn.execute(
+                'INSERT INTO system_chat_messages (session_id, role, content, metadata, input_tokens, output_tokens) VALUES (?, ?, ?, ?, ?, ?)',
+                [sessionId, 'assistant', content, JSON.stringify(metadata), metadata.input_tokens, metadata.output_tokens]
+            );
+            agent._partialMsgId = result.insertId;
+        }
+        await conn.execute('UPDATE system_chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [sessionId]);
+    } catch (err) {
+        log('warning', 'error', `DB save failed: ${err.message}`, { session_id: sessionId?.substring(0, 8) });
+    } finally {
+        if (conn) await conn.end();
+    }
+}
+
+function schedulePartialSave(agent) {
+    if (!agent || agent.done) return;
+    if (agent._partialSaveTimer) return;
+    // Fast checkpoints so a bridge restart loses at most ~0.8s of text
+    agent._partialSaveTimer = setTimeout(() => {
+        agent._partialSaveTimer = null;
+        if (!agent.done) updatePartialInDB(agent.sessionId, agent, false).catch(() => {});
+    }, 800);
+}
+
+async function flushPartialSave(agent, finalize) {
+    if (!agent) return;
+    if (agent._partialSaveTimer) {
+        clearTimeout(agent._partialSaveTimer);
+        agent._partialSaveTimer = null;
+    }
+    await updatePartialInDB(agent.sessionId, agent, !!finalize);
+}
+
+async function saveResponseToDB(sessionId, content, agent) {
+    if (!sessionId) return;
+    if (content) agent.fullOutput = content;
+    await updatePartialInDB(sessionId, agent, true);
+}
+
+function cleanupAgent(sessionId, { killProcess = true } = {}) {
+    const agent = agents.get(sessionId);
+    if (!agent) return;
+    try {
+        mediaIngest.stopWatcher(agent);
+    } catch (_) {}
+    if (!agent.done) {
+        agent._interrupted = true;
+        // Fire-and-forget best-effort save before kill (shutdown path awaits explicitly)
+        try {
+            mediaIngest.finalize(agent, sendToClient, mediaProcessHelpers(agent));
+        } catch (_) {}
+        flushPartialSave(agent, true).catch(() => {});
+        try {
+            sendToClient(agent, {
+                type: 'interrupted',
+                content: agent.fullOutput || '',
+                message_id: agent._partialMsgId || null,
+                reason: 'superseded',
+            });
+        } catch (_) {}
+    }
+    if (killProcess && !agent.done) {
+        try {
+            if (agent.process) agent.process.kill('SIGTERM');
+            else if (agent.pid) process.kill(agent.pid, 'SIGTERM');
+        } catch (_) {}
+    }
+    if (agent._stopTail) {
+        try { agent._stopTail(); } catch (_) {}
+    }
+    if (agent.timeout) clearTimeout(agent.timeout);
+    if (killProcess) {
+        try { runtime.releaseClaim(sessionId); } catch (_) {}
+    }
+    agents.delete(sessionId);
+}
+
+let shuttingDown = false;
+
+async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log('info', 'connection', `Bridge shutting down (${signal})`, {
+        agents: agents.size,
+        detach: DETACH_AGENTS,
+        instance: INSTANCE_ID,
+    });
+
+    const list = [...agents.values()];
+
+    // 1) Tell clients first (while sockets still open)
+    try {
+        wss.clients.forEach((ws) => {
+            try {
+                ws.send(JSON.stringify({
+                    type: 'bridge_stopping',
+                    reason: signal,
+                    agents_survive: DETACH_AGENTS,
+                    instance: INSTANCE_ID,
+                }));
+            } catch (_) {}
+        });
+    } catch (_) {}
+
+    // With detached agents: do NOT mark interrupted / kill CLI — peer or restarted
+    // instance will reattach and continue streaming after client reconnects.
+    if (!DETACH_AGENTS) {
+        for (const agent of list) {
+            if (agent.done) continue;
+            agent._interrupted = true;
+            if (agent.timeout) clearTimeout(agent.timeout);
+            try {
+                sendToClient(agent, {
+                    type: 'interrupted',
+                    content: agent.fullOutput || '',
+                    message_id: agent._partialMsgId || null,
+                    reason: 'bridge_restart',
+                    duration: Date.now() - agent.startTime,
+                    tools: agent.toolCount,
+                    model: agent.model,
+                });
+            } catch (_) {}
+        }
+    } else {
+        for (const agent of list) {
+            if (agent.done) continue;
+            try {
+                sendToClient(agent, {
+                    type: 'status',
+                    content: 'Bridge worker restarting — agent keeps running; reconnecting…',
+                });
+            } catch (_) {}
+            // Persist meta so the next process can recover
+            try { runtime.writeMeta(agent); } catch (_) {}
+        }
+    }
+
+    // 2) Persist every in-flight reply (non-final when agents survive)
+    await Promise.all(
+        list.map((agent) =>
+            flushPartialSave(agent, !DETACH_AGENTS || !!agent.done).catch((err) => {
+                log('warning', 'error', `Shutdown flush failed: ${err.message}`, {
+                    session_id: agent.sessionId?.substring(0, 8),
+                });
+            })
+        )
+    );
+
+    // 3) Stop tails/timeouts but keep CLI processes alive when detached
+    for (const agent of list) {
+        if (agent.timeout) clearTimeout(agent.timeout);
+        if (agent._stopTail) {
+            try { agent._stopTail(); } catch (_) {}
+        }
+        if (!DETACH_AGENTS) {
+            agent.done = true;
+            try {
+                if (agent.process) agent.process.kill('SIGTERM');
+                else if (agent.pid) process.kill(agent.pid, 'SIGTERM');
+            } catch (_) {}
+            try { runtime.releaseClaim(agent.sessionId); } catch (_) {}
+        }
+        // Release claim so the recovering process can take ownership
+        if (DETACH_AGENTS && !agent.done) {
+            try { runtime.releaseClaim(agent.sessionId); } catch (_) {}
+        }
+    }
+
+    try {
+        wss.clients.forEach((ws) => {
+            try {
+                ws.close(1012, 'service restart');
+            } catch (_) {}
+        });
+    } catch (_) {}
+
+    try {
+        httpServer.close();
+    } catch (_) {}
+
+    // Brief moment for sockets; agents (if detached) keep running outside this cgroup kill
+    setTimeout(() => process.exit(0), DETACH_AGENTS ? 200 : 350);
+}
+
+function processGrokEvent(agent, json) {
+    const t = json.type;
+    const data = json.data || json.content || '';
+
+    if (t === 'thought' && data) {
+        agent.thinkingSummary += data;
+        const evt = { type: 'thinking_delta', content: data };
+        agent.events.push(evt);
+        sendToClient(agent, evt);
+        schedulePartialSave(agent);
+        log('debug', 'process', 'grok thought', { len: String(data).length, session_id: agent.sessionId, user_id: agent.userId });
+        return;
+    }
+
+    if (t === 'text' && data) {
+        sealOpenThinkingEvents(agent);
+        agent.fullOutput += data;
+        const evt = { type: 'chunk', content: data };
+        agent.events.push(evt);
+        sendToClient(agent, evt);
+        schedulePartialSave(agent);
+        return;
+    }
+
+    if (t === 'tool_call' || t === 'tool_start') {
+        sealOpenThinkingEvents(agent);
+        agent.toolCount++;
+        const tool = json.name || json.tool || 'tool';
+        const detail = formatToolPayload(json.args != null ? json.args : json.input || json.parameters || {}, 8000);
+        const evt = { type: 'tool_start', tool, detail, index: agent.toolCount };
+        agent.toolEventLog.push({ tool, detail: evt.detail, success: null, info: '' });
+        agent.events.push(evt);
+        sendToClient(agent, evt);
+        schedulePartialSave(agent);
+        log('info', 'process', `Grok tool: ${tool}`, { session_id: agent.sessionId, user_id: agent.userId });
+        return;
+    }
+
+    if (t === 'tool_result' || t === 'tool_done') {
+        const toolName = json.name || json.tool || 'tool';
+        const rawInfo = json.error
+            ? json.error
+            : (json.result != null ? json.result : (json.data != null ? json.data : json.content));
+        const info = formatToolPayload(rawInfo, 16000);
+        const ok = !json.error;
+        markToolEventDone(agent, toolName, ok, info);
+        const evt = { type: 'tool_done', tool: toolName, success: ok, info };
+        agent.events.push(evt);
+        sendToClient(agent, evt);
+        // Harvest Imagine outputs from tool payload when streaming-json includes them
+        try {
+            const payload = json.result || json.data || json.content || json;
+            mediaIngest.ingestSource(agent, payload?.path || '', { tool: toolName });
+            if (typeof payload === 'string' || (payload && typeof payload === 'object')) {
+                const paths = mediaIngest.extractPathsFromText(
+                    typeof payload === 'string' ? payload : JSON.stringify(payload)
+                );
+                for (const p of paths) {
+                    if (/^https?:\/\//i.test(p)) {
+                        mediaIngest.ingestHttpUrl(agent, p, { tool: toolName }).then((media) => {
+                            if (media && !media._emitted) {
+                                media._emitted = true;
+                                const mevt = {
+                                    type: 'media',
+                                    kind: media.kind,
+                                    url: media.url,
+                                    name: media.name,
+                                    tool: toolName,
+                                };
+                                agent.events.push(mevt);
+                                sendToClient(agent, mevt);
+                            }
+                        });
+                    } else {
+                        const media = mediaIngest.ingestSource(agent, p, { tool: toolName });
+                        if (media && !media._emitted) {
+                            media._emitted = true;
+                            const mevt = {
+                                type: 'media',
+                                kind: media.kind,
+                                url: media.url,
+                                name: media.name,
+                                tool: toolName,
+                            };
+                            agent.events.push(mevt);
+                            sendToClient(agent, mevt);
+                        }
+                    }
+                }
+            }
+        } catch (_) {}
+        schedulePartialSave(agent);
+        return;
+    }
+
+    if (t === 'end') {
+        if (json.sessionId) agent._grokCliSessionId = json.sessionId;
+        // Final media harvest + rewrite happens in finalizeAgentClose so paths are durable
+        // before the done event is sent (avoid double-done here).
+    }
+}
+
+function mediaProcessHelpers(agent) {
+    return {
+        onToolStart(tool, detail) {
+            sealOpenThinkingEvents(agent);
+            const formatted = formatToolPayload(detail, 8000);
+            // Deduplicate against streaming-json tool_start if both fire
+            const already =
+                agent.toolEventLog &&
+                agent.toolEventLog.some(
+                    (t) => t.tool === tool && t.success == null && (
+                        t.detail === formatted ||
+                        (!t.detail && !formatted) ||
+                        (t.detail && formatted && t.detail.slice(0, 80) === formatted.slice(0, 80))
+                    )
+                );
+            if (already) return;
+            agent.toolCount = (agent.toolCount || 0) + 1;
+            const evt = {
+                type: 'tool_start',
+                tool,
+                detail: formatted,
+                index: agent.toolCount,
+            };
+            if (!agent.toolEventLog) agent.toolEventLog = [];
+            agent.toolEventLog.push({ tool, detail: evt.detail, success: null, info: '' });
+            agent.events.push(evt);
+            sendToClient(agent, evt);
+            schedulePartialSave(agent);
+        },
+        onToolDone(tool, success, info) {
+            const formatted = formatToolPayload(info, 16000);
+            markToolEventDone(agent, tool || 'tool', success, formatted);
+            const evt = {
+                type: 'tool_done',
+                tool: tool || 'tool',
+                success,
+                info: formatted,
+            };
+            agent.events.push(evt);
+            sendToClient(agent, evt);
+            schedulePartialSave(agent);
+        },
+    };
+}
+
+function attachAgentLineHandlers(agent) {
+    const ANSI_RE = /\x1b\[\??[0-9;]*[a-zA-Z]|\r/g;
+    return (trimmed) => {
+        const clean = trimmed.replace(ANSI_RE, '');
+        if (!clean) return;
+        try {
+            const json = JSON.parse(clean);
+            processGrokEvent(agent, json);
+        } catch {
+            // Grok Build streams JSON lines only; ignore non-JSON noise.
+        }
+    };
+}
+
+function finalizeAgentClose(agent, code) {
+    if (agent.done) return;
+    agent.done = true;
+    if (agent.timeout) clearTimeout(agent.timeout);
+    if (agent._stopTail) {
+        try { agent._stopTail(); } catch (_) {}
+    }
+
+    // Harvest Imagine assets from Grok session dir (local paths / temp URLs → durable uploads)
+    try {
+        mediaIngest.finalize(agent, sendToClient, mediaProcessHelpers(agent));
+    } catch (err) {
+        log('warning', 'media', `Final harvest failed: ${err.message}`, {
+            session_id: agent.sessionId?.substring(0, 8),
+        });
+    }
+
+    if (!agent.events.some((e) => e.type === 'done')) {
+        const media = mediaIngest.mediaForMetadata(agent);
+        const evt = {
+            type: 'done',
+            content: agent.fullOutput,
+            duration: Date.now() - agent.startTime,
+            tools: agent.toolCount,
+            model: agent.model,
+            tokens_estimated: true,
+            media: media || undefined,
+        };
+        agent.events.push(evt);
+        sendToClient(agent, evt);
+    }
+    log('info', 'agent_done', `${agent.provider || 'agent'} finished`, {
+        session_id: agent.sessionId,
+        code,
+        output_len: agent.fullOutput.length,
+        tools: agent.toolCount,
+        media: agent.media?.length || 0,
+        user_id: agent.userId,
+        instance: INSTANCE_ID,
+    });
+    if (agent.fullOutput || (agent.media && agent.media.length)) {
+        saveResponseToDB(agent.sessionId, agent.fullOutput, agent);
+    } else {
+        updatePartialInDB(agent.sessionId, agent, true).catch(() => {});
+    }
+    try { runtime.writeMeta(agent); } catch (_) {}
+    try { runtime.releaseClaim(agent.sessionId); } catch (_) {}
+    setTimeout(() => agents.delete(agent.sessionId), 60000);
+}
+
+function startAgentWatchers(agent) {
+    const onLine = attachAgentLineHandlers(agent);
+    if (DETACH_AGENTS) {
+        runtime.startFileTail(agent, {
+            onLine,
+            onExit: (code) => finalizeAgentClose(agent, code),
+        });
+    } else if (agent.process) {
+        let buffer = '';
+        const ANSI_RE = /\x1b\[\??[0-9;]*[a-zA-Z]|\r/g;
+        agent.process.stdout.on('data', (chunk) => {
+            buffer += chunk.toString().replace(ANSI_RE, '');
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed) onLine(trimmed);
+            }
+        });
+        agent.process.stderr.on('data', (chunk) => {
+            const text = chunk.toString().trim();
+            if (text) {
+                log('warning', 'process', `stderr: ${text.substring(0, 300)}`, {
+                    session_id: agent.sessionId,
+                    user_id: agent.userId,
+                });
+            }
+        });
+        agent.process.on('close', (code) => finalizeAgentClose(agent, code));
+        agent.process.on('error', (err) => {
+            agent.done = true;
+            log('error', 'error', `Spawn error: ${err.message}`, {
+                session_id: agent.sessionId,
+                user_id: agent.userId,
+            });
+            sendToClient(agent, { type: 'error', content: err.message });
+            updatePartialInDB(agent.sessionId, agent, true).catch(() => {});
+        });
+    }
+
+    agent.timeout = setTimeout(() => {
+        if (!agent.done) {
+            log('warning', 'error', 'Agent timeout', {
+                session_id: agent.sessionId,
+                user_id: agent.userId,
+            });
+            try {
+                if (agent.process) agent.process.kill('SIGTERM');
+                else if (agent.pid) process.kill(agent.pid, 'SIGTERM');
+            } catch (_) {}
+        }
+    }, AGENT_TIMEOUT_MS);
+}
+
+function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId) {
+    const existing = agents.get(sessionId);
+    if (existing && !existing.done) cleanupAgent(sessionId, { killProcess: true });
+
+    if (DETACH_AGENTS && !runtime.tryClaim(sessionId)) {
+        try {
+            client.send(JSON.stringify({ type: 'error', content: 'Session busy on another bridge worker' }));
+        } catch (_) {}
+        return;
+    }
+
+    const resolved = resolveGrokModel(model);
+    const realModel = grokRealModel(resolved);
+    let fullPrompt = buildPromptWithHistory(prompt, history, notes);
+    if (Buffer.byteLength(fullPrompt) > MAX_PROMPT_BYTES) {
+        fullPrompt = buildPromptWithHistory(prompt, (history || []).slice(-10), notes);
+    }
+
+    log('info', 'agent', 'Spawning Grok Build', {
+        session_id: sessionId,
+        model: realModel,
+        user_id: userId,
+        prompt_bytes: Buffer.byteLength(fullPrompt),
+        detach: DETACH_AGENTS,
+        instance: INSTANCE_ID,
+    });
+
+    const args = [
+        '--output-format', 'streaming-json',
+        '--always-approve',
+        '-m', realModel,
+        '-p', fullPrompt,
+    ];
+
+    const env = { ...process.env, HOME: process.env.HOME || '/root' };
+    let proc = null;
+    let pid = null;
+    let outPath = null;
+
+    if (DETACH_AGENTS) {
+        const spawned = runtime.spawnDetached(GROK_BIN, args, env, sessionId, { truncate: true });
+        proc = spawned.proc;
+        pid = spawned.pid;
+        outPath = spawned.outPath;
+    } else {
+        proc = spawn(GROK_BIN, args, {
+            cwd: WORKSPACE,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env,
+        });
+        pid = proc.pid;
+    }
+
+    const agent = {
+        process: proc,
+        proc,
+        pid,
+        outPath,
+        _fileOffset: 0,
+        sessionId,
+        userId,
+        events: [],
+        fullOutput: '',
+        toolCount: 0,
+        toolEventLog: [],
+        thinkingSummary: '',
+        startTime: Date.now(),
+        done: false,
+        client,
+        model: resolved,
+        provider: 'grok-build',
+    };
+    agents.set(sessionId, agent);
+    runtime.writeMeta(agent);
+    createPartialMessage(sessionId, agent)
+        .then(() => {
+            runtime.writeMeta(agent);
+            if (agent._partialMsgId) {
+                sendToClient(agent, { type: 'partial_msg_id', message_id: agent._partialMsgId });
+            }
+        })
+        .catch(() => {});
+
+    const initEvt = { type: 'init', model: agent.model };
+    agent.events.push(initEvt);
+    sendToClient(agent, initEvt);
+    startAgentWatchers(agent);
+    // Poll Grok session dir for image_gen / video tools (not always in streaming-json)
+    try {
+        mediaIngest.startWatcher(agent, sendToClient, mediaProcessHelpers(agent));
+    } catch (err) {
+        log('warning', 'media', `Watcher start failed: ${err.message}`, {
+            session_id: sessionId?.substring(0, 8),
+        });
+    }
+}
+
+/**
+ * Reattach one detached CLI agent (if its process is still alive).
+ * @returns {object|null} agent entry or null
+ */
+function recoverOneDetachedAgent(sessionId) {
+    if (!DETACH_AGENTS || !sessionId || agents.has(sessionId)) {
+        return agents.get(sessionId) || null;
+    }
+    const meta = runtime.readMeta(sessionId);
+    if (!meta || meta.done) return null;
+    if (!runtime.isPidAlive(meta.pid)) return null;
+    if (!runtime.tryClaim(sessionId)) return null;
+
+    // Only Grok Build agents are supported; skip any legacy Cursor runtimes.
+    const provider = meta.provider || 'grok-build';
+    if (provider !== 'grok-build') {
+        log('info', 'agent', 'Skipping non-Grok detached agent', {
+            session_id: sessionId,
+            provider,
+            instance: INSTANCE_ID,
+        });
+        return null;
+    }
+
+    const agent = {
+        process: null,
+        proc: null,
+        pid: meta.pid,
+        outPath: runtime.stdoutPath(sessionId),
+        _fileOffset: 0,
+        sessionId,
+        userId: meta.userId || null,
+        events: [],
+        fullOutput: '',
+        toolCount: 0,
+        toolEventLog: [],
+        thinkingSummary: '',
+        currentThinking: '',
+        startTime: meta.startTime || Date.now(),
+        done: false,
+        client: null,
+        model: resolveGrokModel(meta.model),
+        provider: 'grok-build',
+        _partialMsgId: meta.partialMsgId || null,
+        _suppressSend: true,
+    };
+    agents.set(sessionId, agent);
+
+    // Rebuild state from stdout without notifying clients (they'll reconnect + replay)
+    const onLine = attachAgentLineHandlers(agent);
+    try {
+        runtime.rebuildFromStdout(agent, onLine);
+    } catch (err) {
+        log('warning', 'error', `recover rebuild failed: ${err.message}`, {
+            session_id: sessionId.substring(0, 8),
+        });
+    }
+    agent._suppressSend = false;
+    runtime.writeMeta(agent);
+    startAgentWatchers(agent);
+    try {
+        mediaIngest.startWatcher(agent, sendToClient, mediaProcessHelpers(agent));
+    } catch (_) {}
+    log('info', 'agent', 'Recovered detached agent', {
+        session_id: sessionId,
+        pid: agent.pid,
+        output_len: agent.fullOutput.length,
+        events: agent.events.length,
+        instance: INSTANCE_ID,
+    });
+    return agent;
+}
+
+/**
+ * Reattach to detached CLI agents left running after a prior worker exit.
+ */
+function recoverDetachedAgents() {
+    if (!DETACH_AGENTS) return;
+    runtime.ensureRoot();
+    runtime.cleanupStale();
+    const sessions = runtime.listSessionDirs();
+    let recovered = 0;
+    for (const sessionId of sessions) {
+        if (agents.has(sessionId)) continue;
+        if (recoverOneDetachedAgent(sessionId)) recovered++;
+    }
+    if (recovered) {
+        log('info', 'connection', `Recovered ${recovered} detached agent(s)`, { instance: INSTANCE_ID });
+    }
+}
+
+const httpServer = http.createServer((req, res) => {
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    if (url.pathname === '/models' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            grok_models: GROK_MODELS_FULL,
+            allowed: [...ALLOWED_MODELS],
+            default_model: resolveGrokModel(null),
+        }));
+        return;
+    }
+    if (url.pathname === '/health' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'healthy',
+            port: PORT,
+            agents: agents.size,
+            instance: INSTANCE_ID,
+            detach: DETACH_AGENTS,
+            role: 'worker',
+        }));
+        return;
+    }
+    // Gateway uses this to sticky-route reconnects to the worker that owns the agent
+    const agentMatch = url.pathname.match(/^\/agent\/([a-f0-9]{32})$/i);
+    if (agentMatch && req.method === 'GET') {
+        const sid = agentMatch[1].toLowerCase();
+        const agent = agents.get(sid);
+        const present = !!(agent && !agent.done);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            present,
+            done: !!(agent && agent.done),
+            session_id: sid,
+            instance: INSTANCE_ID,
+            pid: agent?.pid || null,
+            model: agent?.model || null,
+            output_len: agent?.fullOutput?.length || 0,
+        }));
+        return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'not_found' }));
+});
+
+const wss = new WebSocketServer({ noServer: true });
+
+httpServer.on('upgrade', (request, socket, head) => {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+    });
+});
+
+wss.on('connection', (ws, req) => {
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    const token = url.searchParams.get('token') || '';
+    const auth = verifyWsToken(token);
+    if (!auth) {
+        ws.close(4001, 'unauthorized');
+        log('warning', 'connection', 'WS auth failed', {});
+        return;
+    }
+    ws.userId = auth.uid;
+    ws.isAlive = true;
+    log('info', 'connection', 'WS connected', { user_id: auth.uid });
+
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    ws.on('message', async (raw) => {
+        let data;
+        try {
+            data = JSON.parse(raw.toString());
+        } catch {
+            ws.send(JSON.stringify({ type: 'error', content: 'Invalid JSON' }));
+            return;
+        }
+
+        if (data.type === 'reconnect') {
+            const sid = data.session_id;
+            // Prefer in-memory agent; if this worker just came up, reclaim detached CLI
+            let agent = sid ? agents.get(sid) : null;
+            if (sid && !agent) {
+                try {
+                    agent = recoverOneDetachedAgent(sid);
+                } catch (err) {
+                    log('warning', 'error', `reconnect reclaim failed: ${err.message}`, {
+                        session_id: sid,
+                        user_id: ws.userId,
+                    });
+                }
+            }
+            if (sid && agent && !agent.done) {
+                agent.client = ws;
+                // Tell client to clear bubble before replay so partial DOM is not wiped on dead agents
+                try {
+                    ws.send(JSON.stringify({
+                        type: 'agent_resume',
+                        session_id: sid,
+                        message_id: agent._partialMsgId || null,
+                        done: !!agent.done,
+                        instance: INSTANCE_ID,
+                    }));
+                } catch (_) {}
+                replayEvents(agent, ws);
+                if (agent._partialMsgId) {
+                    ws.send(JSON.stringify({ type: 'partial_msg_id', message_id: agent._partialMsgId }));
+                }
+                log('info', 'connection', 'WS reconnected to agent', {
+                    session_id: sid,
+                    user_id: ws.userId,
+                    instance: INSTANCE_ID,
+                });
+            } else {
+                ws.send(JSON.stringify({
+                    type: 'no_agent',
+                    session_id: sid || null,
+                    instance: INSTANCE_ID,
+                }));
+            }
+            return;
+        }
+
+        if (shuttingDown) {
+            ws.send(JSON.stringify({ type: 'error', content: 'Bridge is restarting — retry in a moment' }));
+            return;
+        }
+
+        const { prompt, model, session_id, history, notes } = data;
+        if (!prompt || typeof prompt !== 'string' || prompt.length > 50000) {
+            ws.send(JSON.stringify({ type: 'error', content: 'Invalid prompt' }));
+            return;
+        }
+        const sessionId = session_id || '';
+        if (!/^[a-f0-9]{32}$/.test(sessionId)) {
+            ws.send(JSON.stringify({ type: 'error', content: 'Invalid session' }));
+            return;
+        }
+        if (!(await sessionOwned(sessionId, ws.userId))) {
+            ws.send(JSON.stringify({ type: 'error', content: 'Session not found' }));
+            log('warning', 'error', 'Session ownership denied', { session_id: sessionId, user_id: ws.userId });
+            return;
+        }
+
+        log('info', 'message', 'Prompt received', {
+            session_id: sessionId,
+            user_id: ws.userId,
+            model: resolveGrokModel(model),
+            prompt_len: prompt.length,
+        });
+
+        spawnGrokBuild(sessionId, prompt, model, ws, history, notes, ws.userId);
+    });
+
+    ws.on('close', () => {
+        log('info', 'connection', 'WS disconnected', { user_id: ws.userId });
+        for (const agent of agents.values()) {
+            if (agent.client === ws) agent.client = null;
+        }
+    });
+});
+
+setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        try { ws.ping(); } catch (_) {}
+    });
+}, 25000);
+
+httpServer.listen(PORT, () => {
+    ensureLogDir();
+    try {
+        recoverDetachedAgents();
+    } catch (err) {
+        log('warning', 'error', `Agent recovery failed: ${err.message}`, { instance: INSTANCE_ID });
+    }
+    log('info', 'connection', `Bridge listening on ${PORT}`, {
+        workspace: WORKSPACE,
+        instance: INSTANCE_ID,
+        detach: DETACH_AGENTS,
+    });
+    console.log(`grokpot-bridge ${INSTANCE_ID} on :${PORT} (detach=${DETACH_AGENTS})`);
+});
+
+// Flush in-flight assistant messages to MySQL before process exit (systemd restart, etc.)
+process.on('SIGTERM', () => { gracefulShutdown('SIGTERM').catch(() => process.exit(1)); });
+process.on('SIGINT', () => { gracefulShutdown('SIGINT').catch(() => process.exit(1)); });
+process.on('SIGHUP', () => { gracefulShutdown('SIGHUP').catch(() => process.exit(1)); });
