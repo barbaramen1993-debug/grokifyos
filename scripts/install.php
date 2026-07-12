@@ -14,10 +14,12 @@ $root = dirname(__DIR__);
 require_once $root . '/web/includes/paths.php';
 
 $settings = require $root . '/web/includes/settings.php';
-$sqlFile = $root . '/schema/001_init.sql';
+$schemaDir = $root . '/schema';
+$schemaFiles = glob($schemaDir . '/*.sql') ?: [];
+sort($schemaFiles, SORT_STRING);
 
-if (!is_readable($sqlFile)) {
-    fwrite(STDERR, "Missing schema file: {$sqlFile}\n");
+if ($schemaFiles === []) {
+    fwrite(STDERR, "Missing schema files in {$schemaDir}\n");
     exit(1);
 }
 
@@ -46,24 +48,26 @@ try {
 $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
 $pdo->exec("USE `{$name}`");
 
-$sql = file_get_contents($sqlFile);
-if ($sql === false) {
-    fwrite(STDERR, "Could not read schema\n");
-    exit(1);
-}
-
-// Split on semicolons carefully enough for our schema file
-$parts = array_filter(array_map('trim', explode(';', $sql)));
-foreach ($parts as $stmt) {
-    if ($stmt === '' || str_starts_with($stmt, '--')) {
-        continue;
+foreach ($schemaFiles as $sqlFile) {
+    $label = basename($sqlFile);
+    $sql = file_get_contents($sqlFile);
+    if ($sql === false) {
+        fwrite(STDERR, "Could not read schema {$label}\n");
+        exit(1);
     }
-    // Skip pure comment blocks
-    $noComments = preg_replace('/^--.*$/m', '', $stmt);
-    if (trim((string) $noComments) === '') {
-        continue;
+    $parts = array_filter(array_map('trim', explode(';', $sql)));
+    foreach ($parts as $stmt) {
+        if ($stmt === '') {
+            continue;
+        }
+        // Strip full-line SQL comments, then skip empty leftovers
+        $noComments = trim((string) preg_replace('/^\s*--.*$/m', '', $stmt));
+        if ($noComments === '') {
+            continue;
+        }
+        $pdo->exec($noComments);
     }
-    $pdo->exec($stmt);
+    echo "  applied {$label}\n";
 }
 
 echo "Schema applied.\n";

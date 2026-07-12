@@ -1,0 +1,28 @@
+/* Minimal utilities used by dashboard + system-chat markup (no Tailwind build). */
+.hidden { display: none !important; }
+.relative { position: relative; }
+.flex { display: flex; }
+.flex-1 { flex: 1 1 0%; }
+.items-center { align-items: center; }
+.gap-1 { gap: 0.25rem; }
+.gap-2 { gap: 0.5rem; }
+.p-2 { padding: 0.5rem; }
+.mt-2 { margin-top: 0.5rem; }
+.space-y-2 > * + * { margin-top: 0.5rem; }
+.text-xs { font-size: 0.75rem; line-height: 1rem; }
+.text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+.text-\[10px\] { font-size: 10px; }
+.text-white { color: #fff; }
+.text-\[\#9ca3af\] { color: #9ca3af; }
+.bg-white { background: #fff; }
+.bg-white\/20 { background: rgba(255, 255, 255, 0.2); }
+.bg-\[\#0f1115\] { background: #0f1115; }
+.border-t { border-top-width: 1px; border-top-style: solid; }
+.border-\[\#272b31\] { border-color: #272b31; }
+.rounded { border-radius: 0.25rem; }
+.px-1 { padding-left: 0.25rem; padding-right: 0.25rem; }
+.px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
+.py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+.w-full { width: 100%; }
+.max-w-none { max-width: none; }
+.font-semibold { font-weight: 600; }

@@ -1,5 +1,5 @@
 /**
- * Admin System Chat — Grok Build via WebSocket bridge
+ * GrokifyOS Chat — Grok Build via WebSocket bridge
  */
 (function (global) {
   'use strict';
@@ -11,8 +11,8 @@
   let currentSessionId = null;
   let sessionHasMessages = false;
   let isStreaming = false;
-  let useHistory = localStorage.getItem('gp_sc_use_history') !== 'false';
-  let ctrlEnterSend = localStorage.getItem('gp_sc_ctrl_enter') !== 'false';
+  let useHistory = localStorage.getItem('gos_sc_use_history') !== 'false';
+  let ctrlEnterSend = localStorage.getItem('gos_sc_ctrl_enter') !== 'false';
   let dbNotes = [];
 
   let streamContainer = null;
@@ -36,7 +36,7 @@
   let hideMessageActions = function () {};
   let uiInitialized = false;
   let bridgeHealthy = true;
-  let keepScreenOn = localStorage.getItem('gp_sc_keep_awake') !== 'false';
+  let keepScreenOn = localStorage.getItem('gos_sc_keep_awake') !== 'false';
   let wakeLock = null;
   let wakeLockListenersBound = false;
   let wakeLockHeld = false;
@@ -2207,7 +2207,7 @@
       ws.send(JSON.stringify(payload));
     } else {
       removeTyping();
-      appendMessage('assistant', 'Connection lost. Check that grokpot-bridge is running on port 8766.');
+      appendMessage('assistant', 'Connection lost. Check that GrokifyOS bridge is running (check GROKIFY_BRIDGE_URL).');
       isStreaming = false;
       updateSendState();
     }
@@ -2463,7 +2463,7 @@
     $('sc-context-toggle') &&
       $('sc-context-toggle').addEventListener('click', () => {
         useHistory = !useHistory;
-        localStorage.setItem('gp_sc_use_history', useHistory);
+        localStorage.setItem('gos_sc_use_history', useHistory);
         $('sc-context-toggle').classList.toggle('active', useHistory);
       });
     if ($('sc-context-toggle')) $('sc-context-toggle').classList.toggle('active', useHistory);
@@ -2472,7 +2472,7 @@
     $('sc-keep-awake') &&
       $('sc-keep-awake').addEventListener('click', async () => {
         keepScreenOn = !keepScreenOn;
-        localStorage.setItem('gp_sc_keep_awake', keepScreenOn);
+        localStorage.setItem('gos_sc_keep_awake', keepScreenOn);
         updateKeepAwakeButton();
         if (keepScreenOn) {
           await requestWakeLock();
@@ -2486,7 +2486,7 @@
       ($('sc-ctrl-enter').checked = ctrlEnterSend) &&
       $('sc-ctrl-enter').addEventListener('change', () => {
         ctrlEnterSend = $('sc-ctrl-enter').checked;
-        localStorage.setItem('gp_sc_ctrl_enter', ctrlEnterSend);
+        localStorage.setItem('gos_sc_ctrl_enter', ctrlEnterSend);
         updatePlaceholder();
       });
 

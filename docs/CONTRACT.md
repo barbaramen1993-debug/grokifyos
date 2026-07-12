@@ -44,8 +44,17 @@ Private production (this server’s **grokpot** monorepo) and **GrokifyOS** are 
 | DB | existing | fresh `grokifyos` |
 | Env | `GROKPOT_*` | `GROKIFY_*` only |
 
-## Non-goals for Phase 1
+## Phase status
 
-- No cutover of your live chat data
+| Phase | Status |
+|-------|--------|
+| 1 — bootstrap, password auth, schema, devices | Done |
+| 2 — chat REST + dashboard (production DB, real usage) | Done |
+| 3 — dedicated bridge unit + Android `io.grokify.os` | Pending |
+
+## Non-goals
+
+- No cutover of your live private Grokify chat data
 - No changes required in the private monorepo to “enable” OSS
+- No synthetic chat sessions or fake usage numbers
 - No public release until INSTALL + license + secret scrub are done

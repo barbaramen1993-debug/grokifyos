@@ -34,6 +34,10 @@ gos_api_json([
     'auth' => 'password',
     'needs_setup' => gos_needs_setup(),
     'db' => ['ok' => $dbOk, 'users' => $userCount],
+    'chat' => [
+        'ready' => gos_system_chat_tables_ready(),
+        'settings' => gos_table_exists('app_settings'),
+    ],
     'bridge' => $bridge,
     'time' => gmdate('c'),
 ]);

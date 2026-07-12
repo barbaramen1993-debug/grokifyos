@@ -1,80 +1,108 @@
-# GrokifyOS install (Phase 1)
+# GrokifyOS install
 
-Password-only admin auth. Dedicated MySQL database. Does **not** touch your private Grokpot/Grokify stack.
+Password-only admin auth. Dedicated MySQL database. Production chat (sessions, messages, notes, audit, Grok Build usage) — **no demo seed data**.
+
+Does **not** touch your private Grokpot/Grokify stack.
 
 ## Requirements
 
-- PHP 8.2+ with `pdo_mysql`, `json`, `session`
-- MySQL 8+ / MariaDB 10.6+
-- Node 20+ (bridge; optional for login shell only)
-- Apache or nginx (document root → `web/public`)
+| Component | Notes |
+|-----------|--------|
+| PHP 8.1+ | `pdo_mysql`, `curl`, `json`, `mbstring`, `session` |
+| MySQL 8+ / MariaDB 10.5+ | Dedicated database |
+| Node 18+ | Optional — only if you run the agent bridge |
+| Android SDK | Optional — only to build the APK |
 
-## 1. Configure
+## 1. Clone & configure
 
 ```bash
-cd /path/to/grokifyos
+git clone git@github.com:iBerry420/grokifyos.git
+cd grokifyos
 cp .env.example .env
-# edit GROKIFY_DB_* and GROKIFY_SITE_URL
+# Edit .env: DB credentials, bridge URL, WS secret, auth.json path
 ```
 
-Create a MySQL user/database (example):
-
-```sql
-CREATE DATABASE grokifyos CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'grokifyos'@'localhost' IDENTIFIED BY 'strong-password';
-GRANT ALL ON grokifyos.* TO 'grokifyos'@'localhost';
-FLUSH PRIVILEGES;
-```
-
-## 2. Schema + optional admin CLI
+## 2. Database
 
 ```bash
-php scripts/install.php
-# or:
-php scripts/install.php --admin=admin --password='your-long-password'
+# Create MySQL user + database first, then:
+php scripts/install.php --admin=YOUR_USER --password=YOUR_LONG_PASSWORD
 ```
 
-If you skip CLI admin create, open the site once and use **Create admin** in the UI.
+Applies `schema/*.sql` (idempotent). Creates the first admin only when the users table is empty.
 
-## 3. Web server
-
-Point the vhost document root at `web/public`, and alias:
-
-| URL path | Filesystem |
-|----------|------------|
-| `/` | `web/public/` |
-| `/api` | `web/api/` |
-| `/assets` | `web/assets/` |
-
-Example Apache snippet: `deploy/apache-vhost.conf.example`.
-
-## 4. Smoke test
+## 3. Run web (local LAN)
 
 ```bash
-curl -sS https://your-host/api/health.php | jq .
-# → ok, needs_setup, db.ok
+# Dev server (LAN-only; phones on the same Wi‑Fi can use http://YOUR_LAN_IP:8787)
+php -S 0.0.0.0:8787 scripts/dev-router.php
 ```
 
-Login UI: `/`  
-Device token: after login, **Create device token** (shown once).
+Or point Apache/nginx DocumentRoot at `web/public` and alias `/api` → `web/api`, `/assets` → `web/assets` (see `deploy/apache-vhost.conf.example`).
 
-## 5. Bridge (later phase)
+| Mode | Reachability |
+|------|----------------|
+| **Local / LAN** | Same network only |
+| **VPS + DNS + TLS** | Anywhere |
 
-`bridge/` is copied from the private stack and still needs env renames (`GROKIFY_*`) and its own systemd unit + port (default suggestion: **8876** so it never collides with production 8766). Do not point Phase 1 at production bridge/DB.
+## 4. Bridge (real agents)
 
-## 6. Android (later phase)
+Chat **persists** without a bridge (sessions/messages in MySQL). **Streaming agents** need the Node bridge:
 
-`android/` is a source copy. For OSS:
+```bash
+cd bridge
+npm ci
+# Configure env for GrokifyOS (own port, e.g. 8876 — do not steal production 8766 long-term)
+export GROKIFY_BRIDGE_PORT=8876   # or project-specific vars your bridge expects
+node server.js
+```
 
-- `applicationId` → `io.grokify.os`
-- API base → your GrokifyOS URL
-- Token prefix expectation → `gos_`
+Set in `.env`:
 
-Your private APK (`io.grokpot.grokify`) stays on the monorepo path.
+```env
+GROKIFY_BRIDGE_URL=http://127.0.0.1:8876
+GROKIFY_BRIDGE_HEALTH=http://127.0.0.1:8876/health
+GROKIFY_WS_PATH=/grokify-ws/
+GROKIFY_WS_AUTH_SECRET=long-random-string
+```
 
-## Security notes
+Proxy `GROKIFY_WS_PATH` (WebSocket) from your reverse proxy to the bridge.
 
-- Never commit `.env`
-- Use HTTPS in production
-- Device tokens are shown once; store hashed only (`token_hash`)
-- Phase 1 has no rate limiting beyond a short login delay — add reverse-proxy limits before public internet exposure
+## 5. Grok Build usage (optional but real)
+
+Usage chip calls xAI billing with a real OAuth token:
+
+```env
+GROKIFY_GROK_AUTH_JSON=/path/to/auth.json   # from `grok login`
+```
+
+If auth is missing, the API returns a clear error — it does **not** invent usage numbers.
+
+## 6. Android APK
+
+- Source: `android/` (package rename to `io.grokify.os` is a later phase)
+- Upload a real APK from the dashboard **Build** tab, or place via `web/api/apk-upload.php`
+- Download: `/api/apk-download.php`
+- Device tokens: dashboard **Devices** → `gos_…` tokens
+
+## API surface (Phase 2)
+
+| Path | Role |
+|------|------|
+| `/api/health.php` | Health + chat readiness |
+| `/api/setup.php` / `login.php` / `logout.php` / `me.php` | Password auth |
+| `/api/devices.php` | Device token mint/list/revoke |
+| `/api/admin-system-chat-sessions.php` | Chat sessions |
+| `/api/admin-system-chat-messages.php` | Messages (CRUD + stream_upsert) |
+| `/api/admin-system-chat-notes.php` | Instruction notes |
+| `/api/admin-system-chat-models.php` | Models + WS token |
+| `/api/admin-system-chat-audit.php` | Audit list / SSE stream |
+| `/api/admin-system-chat-usage.php` | Live Grok Build usage |
+| `/api/apk-upload.php` / `apk-download.php` | APK releases |
+
+## Security checklist
+
+- Never commit `.env`, `storage/sessions/*`, `storage/apk/*`, or `auth.json`
+- Use HTTPS on any public host
+- Keep `GROKIFY_WS_AUTH_SECRET` and DB password strong
+- Private repo recommended until you intentionally open-source

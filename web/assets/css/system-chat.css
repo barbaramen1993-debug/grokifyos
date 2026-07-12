@@ -901,3 +901,17 @@
         max-height: 96px;
     }
 }
+/* Last column fills remaining table width */
+.sc-md-content table {
+  width: 100%;
+  table-layout: auto;
+}
+.sc-md-content table th:not(:last-child),
+.sc-md-content table td:not(:last-child) {
+  width: 1%;
+  white-space: nowrap;
+}
+.sc-md-content table th:last-child,
+.sc-md-content table td:last-child {
+  width: 99%;
+}
