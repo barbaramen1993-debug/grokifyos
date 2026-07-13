@@ -1870,13 +1870,14 @@ fun SpotifyControllerPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         Text(
-                            "Radio UP NEXT is kept in sync with Spotify’s Up Next so songs finish " +
-                                "before the next starts (no early cut). Banter may talk over the outro, " +
-                                "or pause in the last second when talkover is off. " +
+                            "Live DJ is the source of truth: UP NEXT is mirrored 1:1 into Spotify " +
+                                "(context replace — ghost Up Next items are dropped). Chat adds, skips, " +
+                                "removes, refill, and jumps all re-mirror. If Spotify drifts, we reclaim " +
+                                "the next DJ cut without wiping your set. " +
                                 "Tap a title or ▶ to jump (drops songs above · no talk). " +
-                                "Sync pulls whatever Spotify is on now. " +
-                                "Add to Spotify queue re-pushes UP NEXT. Refill adds · New queue replaces. " +
-                                    "Recently played + skipped tracks are excluded from new picks.",
+                                "Sync adopts whatever Spotify is on now (keeps UP NEXT). " +
+                                "Add to Spotify queue force-mirrors. Refill adds · New queue replaces. " +
+                                "Recently played + skipped tracks are excluded from new picks.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )
@@ -1896,7 +1897,7 @@ fun SpotifyControllerPane(
                                 enabled = (djStore.enabled || djState.enabled) &&
                                     djState.queue.isNotEmpty(),
                             ) {
-                                Text("Add to Spotify queue", color = GrokifyColors.GlowMint, fontSize = 12.sp)
+                                Text("Mirror to Spotify", color = GrokifyColors.GlowMint, fontSize = 12.sp)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjNewQueue(appCtx) },

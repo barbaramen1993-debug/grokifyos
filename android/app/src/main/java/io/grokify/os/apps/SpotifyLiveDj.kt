@@ -878,9 +878,9 @@ fun spotifyLiveDjSyncToSpotify(context: Context) {
 }
 
 /**
- * Push Live DJ UP NEXT tracks into Spotify’s native queue (Up Next),
- * so they show up in the Spotify app after the current song.
- * Does not clear Spotify’s existing queue — appends.
+ * Force-mirror Live DJ UP NEXT into Spotify (1:1).
+ * Spotify has no clear-queue API — we replace the playback context with
+ * currently-playing + the radio UP NEXT list so ghosts in Up Next cannot play first.
  */
 fun spotifyLiveDjAddToSpotifyQueue(context: Context) {
     val appCtx = context.applicationContext
@@ -998,12 +998,14 @@ class SpotifyLiveDjService : Service() {
     /** In-process cache of artist id → portrait URL (Spotify CDN). */
     private val artistImageCache = HashMap<String, String>(64)
     /**
-     * URIs we have already POSTed into Spotify’s native Up Next.
-     * Lets silent handoffs rely on Spotify auto-advancing instead of early playTrack cuts.
+     * URIs we believe are already mirrored into Spotify’s native Up Next
+     * (via context replace or POST /queue). Used to skip redundant mirrors.
      */
     private val syncedToSpotifyUris = LinkedHashSet<String>()
     /** Last time we bulk-synced the AI queue into Spotify (rate-limit guard). */
     private var lastSpotifyQueueSyncMs = 0L
+    /** Max tracks packed into a single play-context replace (Spotify practical limit). */
+    private val maxMirrorUris = 50
 
     private lateinit var store: SpotifyDjStore
 
@@ -1182,10 +1184,10 @@ class SpotifyLiveDjService : Service() {
                 role = DjChatRole.System,
                 text = if (restored > 0) {
                     "Live DJ on — restored $restored queued track${if (restored == 1) "" else "s"}. " +
-                        "UP NEXT is kept in sync with Spotify’s queue so cuts finish naturally."
+                        "Radio UP NEXT is mirrored 1:1 into Spotify (replaces ghost Up Next)."
                 } else {
                     "Live DJ on — building a radio set from liked · top · recent. " +
-                        "Queue syncs into Spotify Up Next · songs finish before the next starts."
+                        "UP NEXT is mirrored 1:1 into Spotify so the next cut is always ours."
                 },
             ),
         )
@@ -1198,8 +1200,8 @@ class SpotifyLiveDjService : Service() {
             if (queue.size < 4) {
                 fillQueue(useAi = store.useAiRank, force = true)
             } else {
-                // Push restored set into Spotify so natural advances work after leave/return
-                syncQueueToSpotify(quiet = true)
+                // Hard-mirror restored set so leave/return doesn't leave ghost Up Next.
+                syncQueueToSpotify(quiet = true, forceMirror = true)
             }
             // If Spotify is idle, kick the next track immediately (common after leave/return)
             kickIfIdle()
@@ -1701,6 +1703,10 @@ class SpotifyLiveDjService : Service() {
         adoptExternalCurrent(track, playing, progress, duration)
         persistRuntimeState()
         Log.i(TAG, "native advance adopted uri=$uri q=${queue.size}")
+        // Keep Spotify tail 1:1 after consuming the head.
+        scope.launch(Dispatchers.IO) {
+            syncQueueToSpotify(quiet = true, forceMirror = true)
+        }
     }
 
     /** Spotify Connect “next” — plays the head of native Up Next without replacing context. */
@@ -1783,9 +1789,11 @@ class SpotifyLiveDjService : Service() {
                 expectedPlayUntilMs = System.currentTimeMillis() + 20_000L
                 delay(700L)
                 if (awaitNativeAdvance(prevUri, next, maxWaitMs = 8_000L)) {
-                    // Re-push remaining set after skip consumed head
+                    // Re-mirror remaining set after skip consumed head (keep 1:1).
                     syncedToSpotifyUris.remove(next.uri)
-                    withContext(Dispatchers.IO) { syncQueueToSpotify(quiet = true) }
+                    withContext(Dispatchers.IO) {
+                        syncQueueToSpotify(quiet = true, forceMirror = true)
+                    }
                     return true
                 }
             }
@@ -1805,12 +1813,7 @@ class SpotifyLiveDjService : Service() {
         val taken = takeNextFromQueue(next)
         val play = taken ?: next
         val ok = playTrack(play)
-        if (ok) {
-            // play with uris replaces context → re-seed Spotify Up Next from our queue.
-            syncedToSpotifyUris.clear()
-            delay(350L)
-            withContext(Dispatchers.IO) { syncQueueToSpotify(quiet = true) }
-        }
+        // playTrack already packs remaining UP NEXT into the play context (1:1).
         return ok
     }
 
@@ -1834,72 +1837,199 @@ class SpotifyLiveDjService : Service() {
     }
 
     /**
-     * Push AI UP NEXT into Spotify’s native queue (only URIs not yet synced).
-     * Spotify cannot clear Up Next via API — we append and rely on adopt/skip for order.
+     * True when Spotify’s Up Next head (and the next few rows) already match our radio queue.
+     * Used to avoid needless context-replaces mid-song.
      */
-    private fun syncQueueToSpotify(quiet: Boolean = false) {
+    private fun spotifyUpNextMatchesDj(tracks: List<DjQueueTrack>, check: Int = 6): Boolean {
+        if (tracks.isEmpty()) return true
+        val res = spotifyGet("/v1/me/player/queue")
+        if (!res.ok) return false
+        val q = res.json?.optJSONArray("queue") ?: return false
+        if (q.length() == 0) return false
+        val n = minOf(check, tracks.size, q.length())
+        for (i in 0 until n) {
+            val sp = q.optJSONObject(i)?.optString("uri", "").orEmpty()
+            if (sp.isBlank() || sp != tracks[i].uri) return false
+        }
+        return true
+    }
+
+    /**
+     * Replace Spotify’s playback context with [headUri] + radio UP NEXT.
+     * This is the only reliable way to drop ghost Up Next items (API cannot clear the queue).
+     *
+     * @param headUri currently playing / about-to-play track (first in the context)
+     * @param positionMs resume offset for [headUri] so we don’t restart the cut (null = start)
+     * @param upcoming radio UP NEXT after [headUri]
+     */
+    private fun mirrorContextToSpotify(
+        headUri: String?,
+        upcoming: List<DjQueueTrack>,
+        positionMs: Long? = null,
+        quiet: Boolean = true,
+    ): Boolean {
+        val uris = ArrayList<String>(maxMirrorUris)
+        val head = headUri?.trim().orEmpty()
+        if (head.isNotBlank()) uris.add(head)
+        for (t in upcoming) {
+            val u = t.uri.trim()
+            if (u.isBlank() || u == head || uris.contains(u)) continue
+            uris.add(u)
+            if (uris.size >= maxMirrorUris) break
+        }
+        if (uris.isEmpty()) {
+            if (!quiet) publish(status = "UP NEXT empty — nothing to mirror", clearError = true)
+            return false
+        }
+
+        val uriArr = JSONArray()
+        for (u in uris) uriArr.put(u)
+        val body = JSONObject()
+            .put("uris", uriArr)
+            .put("offset", JSONObject().put("position", 0))
+        val pos = positionMs?.coerceAtLeast(0L)
+        if (pos != null && pos > 0L && head.isNotBlank()) {
+            body.put("position_ms", pos)
+        }
+
+        val device = pickDeviceId()
+        var path = if (device != null) {
+            "/v1/me/player/play?device_id=${java.net.URLEncoder.encode(device, "UTF-8")}"
+        } else {
+            "/v1/me/player/play"
+        }
+        var res = spotifyPut(path, body.toString())
+        if (!res.ok && res.status !in listOf(202, 204) && device != null) {
+            res = spotifyPut("/v1/me/player/play", body.toString())
+        }
+        val ok = res.ok || res.status in listOf(202, 204)
+        if (ok) {
+            syncedToSpotifyUris.clear()
+            syncedToSpotifyUris.addAll(uris)
+            lastSpotifyQueueSyncMs = System.currentTimeMillis()
+            // Own the context so lagging currently-playing doesn’t look “external”.
+            if (head.isNotBlank()) {
+                expectedPlayUri = head
+                expectedPlayFromUri = lastUri
+                expectedPlayUntilMs = System.currentTimeMillis() + 12_000L
+            }
+            Log.i(
+                TAG,
+                "mirror context head=${head.takeLast(12)} upcoming=${uris.size - if (head.isNotBlank()) 1 else 0} pos=$pos",
+            )
+            if (!quiet) {
+                val n = uris.size - if (head.isNotBlank()) 1 else 0
+                publish(
+                    status = "Mirrored $n up next into Spotify (1:1)",
+                    clearError = true,
+                )
+            }
+        } else {
+            Log.w(TAG, "mirror context failed: ${res.error} status=${res.status}")
+            if (!quiet) {
+                publish(
+                    status = "Couldn't mirror Spotify queue${res.error?.let { ": $it" } ?: ""}",
+                    error = res.error ?: "mirror_${res.status}",
+                )
+            }
+        }
+        return ok
+    }
+
+    /**
+     * Keep Spotify Up Next 1:1 with the Live DJ radio queue.
+     *
+     * Spotify cannot clear Up Next — when the heads diverge we **replace the entire
+     * playback context** (current cut + UP NEXT) via PUT play + uris, resuming the
+     * current track at its progress so mid-song enqueues don’t restart the song.
+     *
+     * When already aligned, only append any brand-new URIs (cheap path).
+     *
+     * @param forceMirror always replace context (skips / chat adds / manual button)
+     */
+    private fun syncQueueToSpotify(quiet: Boolean = false, forceMirror: Boolean = false) {
         val tracks = synchronized(queue) { queue.toList() }
         if (tracks.isEmpty()) {
             if (!quiet) publish(status = "UP NEXT empty — nothing to sync", clearError = true)
             return
         }
         val now = System.currentTimeMillis()
-        if (quiet && now - lastSpotifyQueueSyncMs < 2_500L) return
-        lastSpotifyQueueSyncMs = now
-        val device = pickDeviceId()
-        val deviceQ = if (!device.isNullOrBlank()) {
-            "&device_id=${java.net.URLEncoder.encode(device, "UTF-8")}"
-        } else {
-            ""
+        if (quiet && !forceMirror && now - lastSpotifyQueueSyncMs < 2_000L) return
+
+        // Decide head + resume position from live playback when possible.
+        var headUri = current?.uri?.takeIf { it.isNotBlank() } ?: lastUri
+        var posMs: Long? = null
+        val snapRes = spotifyGet("/v1/me/player/currently-playing")
+        val snap = snapRes.json
+        val snapItem = snap?.optJSONObject("item")
+        val snapUri = snapItem?.optString("uri", "").orEmpty()
+        if (snapUri.isNotBlank()) {
+            // Prefer what Spotify is actually on (unless we just commanded a different cut).
+            val expecting = expectedPlayUri
+            if (expecting == null || snapUri == expecting || headUri.isNullOrBlank()) {
+                headUri = snapUri
+                posMs = snap?.optLong("progress_ms", 0L)?.takeIf { it > 0L }
+            }
         }
-        val pending = tracks.filter { it.uri.isNotBlank() && !syncedToSpotifyUris.contains(it.uri) }
-            .take(25)
-        if (pending.isEmpty()) {
+        if (posMs == null && headUri != null && headUri == current?.uri && lastRemainMs in 1 until 900_000L) {
+            // Rough resume from last poll remain if currently-playing lagging
+            // (duration unknown here — leave null rather than guess wrong).
+        }
+
+        val aligned = !forceMirror && spotifyUpNextMatchesDj(tracks)
+        if (aligned) {
+            // Cheap path: only POST URIs we have never mirrored.
+            val pending = tracks.filter { it.uri.isNotBlank() && !syncedToSpotifyUris.contains(it.uri) }
+                .take(25)
+            if (pending.isEmpty()) {
+                if (!quiet) {
+                    publish(
+                        status = "Spotify queue already 1:1 · ${tracks.size} up next",
+                        clearError = true,
+                    )
+                }
+                lastSpotifyQueueSyncMs = now
+                return
+            }
+            val device = pickDeviceId()
+            val deviceQ = if (!device.isNullOrBlank()) {
+                "&device_id=${java.net.URLEncoder.encode(device, "UTF-8")}"
+            } else {
+                ""
+            }
+            var ok = 0
+            for (t in pending) {
+                val enc = java.net.URLEncoder.encode(t.uri, "UTF-8")
+                val res = spotifyPost("/v1/me/player/queue?uri=$enc$deviceQ", null)
+                if (res.ok || res.status == 204) {
+                    ok++
+                    syncedToSpotifyUris.add(t.uri)
+                } else {
+                    // Append failed or queue dirty — fall through to hard mirror.
+                    Log.w(TAG, "append queue failed for ${t.uri}: ${res.error} — hard mirror")
+                    mirrorContextToSpotify(headUri, tracks, positionMs = posMs, quiet = quiet)
+                    return
+                }
+                try {
+                    Thread.sleep(80L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+            lastSpotifyQueueSyncMs = System.currentTimeMillis()
             if (!quiet) {
-                publish(status = "Spotify queue already in sync · ${tracks.size} up next", clearError = true)
+                publish(status = "Synced $ok new into Spotify Up Next", clearError = true)
+            } else if (ok > 0) {
+                Log.i(TAG, "quiet append $ok into Spotify Up Next")
             }
             return
         }
+
+        // Heads diverged (or force) — wipe ghosts by replacing context.
         if (!quiet) {
-            publish(status = "Syncing ${pending.size} into Spotify Up Next…", clearError = true)
+            publish(status = "Mirroring ${tracks.size} into Spotify (replace Up Next)…", clearError = true)
         }
-        var ok = 0
-        var fail = 0
-        var lastErr: String? = null
-        for (t in pending) {
-            val enc = java.net.URLEncoder.encode(t.uri, "UTF-8")
-            val res = spotifyPost("/v1/me/player/queue?uri=$enc$deviceQ", null)
-            if (res.ok || res.status == 204) {
-                ok++
-                syncedToSpotifyUris.add(t.uri)
-            } else {
-                fail++
-                lastErr = res.error ?: "HTTP ${res.status}"
-                if (res.status == 401 || res.status == 403 || res.status == 404) break
-            }
-            try {
-                Thread.sleep(100L)
-            } catch (_: InterruptedException) {
-                break
-            }
-        }
-        if (!quiet || fail > 0) {
-            val status = when {
-                ok == 0 && fail > 0 ->
-                    "Couldn't sync Spotify queue${lastErr?.let { ": $it" } ?: ""}"
-                fail == 0 ->
-                    "Synced $ok into Spotify Up Next"
-                else ->
-                    "Synced $ok · $fail failed${lastErr?.let { " ($it)" } ?: ""}"
-            }
-            publish(
-                status = status,
-                error = if (ok == 0 && fail > 0) lastErr else null,
-                clearError = ok > 0,
-            )
-        } else if (ok > 0) {
-            Log.i(TAG, "quiet sync $ok into Spotify Up Next")
-        }
+        mirrorContextToSpotify(headUri, tracks, positionMs = posMs, quiet = quiet)
     }
 
     /**
@@ -1973,13 +2103,12 @@ class SpotifyLiveDjService : Service() {
      * Spotify is on a track we did not start via [playTrack] (or user tapped Sync).
      *
      * - URI already in the radio queue → adopt it (drop everything ahead + itself from
-     *   UP NEXT). Keeps the rest of the set — no extra skip, no forced play.
-     * - URI not in the queue → user/autoplay went somewhere else; adopt as now-playing
-     *   and rebuild a fresh radio queue seeded from that cut.
-     * - Same URI already adopted (manual Sync) → re-align queue pointer only; do not wipe.
-     *
-     * Never calls [runTransition] / [playTrack] here — overwriting Spotify is what caused
-     * “skipped the expected song” and “played something completely different”.
+     *   UP NEXT). Keeps the rest of the set — re-mirror remaining to Spotify.
+     * - URI not in the queue (auto / ghost Up Next) → **do not wipe** the radio set.
+     *   Reclaim: hard-play our next cut and re-mirror UP NEXT 1:1.
+     * - Manual Sync on a foreign cut → adopt as now-playing, keep UP NEXT, mirror
+     *   so Spotify follows DJ after this song (no wipe).
+     * - Same URI already adopted → re-align pointer only.
      */
     private fun handleExternalTrackChange(
         track: DjQueueTrack,
@@ -2064,6 +2193,10 @@ class SpotifyLiveDjService : Service() {
                 TAG,
                 "external sync uri=$uri droppedAhead=$droppedAhead remainWas=${prevRemainMs}ms q=${queue.size} user=$userInitiated",
             )
+            // Re-mirror tail so Spotify Up Next matches remaining radio set (1:1).
+            scope.launch(Dispatchers.IO) {
+                syncQueueToSpotify(quiet = true, forceMirror = droppedAhead > 0 || userInitiated)
+            }
             if (synchronized(queue) { queue.size } < 4 && !filling.get()) {
                 scope.launch(Dispatchers.IO) { fillQueue(useAi = store.useAiRank) }
             }
@@ -2098,54 +2231,121 @@ class SpotifyLiveDjService : Service() {
                 loggedIn = true,
             )
             updateNotif(buildExternalNowLine(track, playing, progressMs, durationMs))
+            if (userInitiated) {
+                scope.launch(Dispatchers.IO) {
+                    syncQueueToSpotify(quiet = false, forceMirror = true)
+                }
+            }
             if (qSize < 4 && !filling.get()) {
                 scope.launch(Dispatchers.IO) { fillQueue(useAi = store.useAiRank) }
             }
             return
         }
 
-        // Not in our queue — full recalibrate around what Spotify is doing
-        adoptExternalCurrent(track, playing, progressMs, durationMs)
-        if (countTowardBanter) {
-            songsSinceBanter = (songsSinceBanter + 1).coerceAtMost(banterEvery)
-            store.songsSinceBanter = songsSinceBanter
-        }
-        // Clear stale UP NEXT so we don't later hand off into the old vibe
-        synchronized(queue) { queue.clear() }
-        persistRuntimeState()
         val label = buildString {
             append(track.name.ifBlank { uri })
             if (track.artists.isNotBlank()) append(" — ").append(track.artists)
         }
+        val qSize = synchronized(queue) { queue.size }
+
+        // Manual Sync: user wants DJ to acknowledge what Spotify is on — adopt current
+        // but **keep** UP NEXT and force-mirror it behind this cut (never wipe).
+        if (userInitiated) {
+            adoptExternalCurrent(track, playing, progressMs, durationMs)
+            if (countTowardBanter) {
+                songsSinceBanter = (songsSinceBanter + 1).coerceAtMost(banterEvery)
+                store.songsSinceBanter = songsSinceBanter
+            }
+            persistRuntimeState()
+            appendChat(
+                DjChatMessage(
+                    id = "sys-sync-keep-${System.currentTimeMillis()}",
+                    role = DjChatRole.System,
+                    text = "Sync → on $label · kept $qSize up next · mirroring to Spotify",
+                ),
+            )
+            publish(
+                nowLine = buildExternalNowLine(track, playing, progressMs, durationMs),
+                status = "Synced · keeping $qSize up next…",
+                clearError = true,
+                loggedIn = true,
+            )
+            updateNotif(buildExternalNowLine(track, playing, progressMs, durationMs))
+            scope.launch(Dispatchers.IO) {
+                syncQueueToSpotify(quiet = false, forceMirror = true)
+                if (synchronized(queue) { queue.size } < 4 && !filling.get()) {
+                    fillQueue(useAi = store.useAiRank)
+                }
+            }
+            return
+        }
+
+        // Auto drift (ghost Up Next / autoplay) — reclaim our next cut, never wipe the set.
+        Log.i(
+            TAG,
+            "external drift uri=$uri remainWas=${prevRemainMs}ms q=$qSize — reclaim DJ next (no wipe)",
+        )
         appendChat(
             DjChatMessage(
-                id = "sys-recal-${System.currentTimeMillis()}",
+                id = "sys-reclaim-${System.currentTimeMillis()}",
                 role = DjChatRole.System,
-                text = if (userInitiated) {
-                    "Sync → recalibrating queue from $label"
-                } else {
-                    "Spotify changed outside Live DJ → recalibrating queue from $label"
-                },
+                text = "Spotify drifted to $label — reclaiming Live DJ queue ($qSize kept)",
             ),
         )
         publish(
-            nowLine = buildExternalNowLine(track, playing, progressMs, durationMs),
-            status = "Recalibrating queue from $label…",
+            status = "Reclaiming Live DJ next…",
             clearError = true,
             loggedIn = true,
         )
-        updateNotif(buildExternalNowLine(track, playing, progressMs, durationMs))
-        Log.i(
-            TAG,
-            "external recalibrate uri=$uri remainWas=${prevRemainMs}ms user=$userInitiated — new queue from seed",
-        )
-        scope.launch(Dispatchers.IO) {
-            fillQueue(useAi = store.useAiRank, force = true, replace = true)
-            val banterHint = " · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
-            publish(
-                status = "Recalibrated · ${synchronized(queue) { queue.size }} queued$banterHint",
-                clearError = true,
-            )
+        scope.launch {
+            if (!transitioning.compareAndSet(false, true)) return@launch
+            try {
+                withContext(Dispatchers.IO) {
+                    val next = synchronized(queue) { queue.firstOrNull() }
+                    if (next == null) {
+                        // Empty set — adopt foreign cut only so we have a seed, then fill.
+                        adoptExternalCurrent(track, playing, progressMs, durationMs)
+                        persistRuntimeState()
+                        fillQueue(useAi = store.useAiRank, force = true, replace = false)
+                        syncQueueToSpotify(quiet = true, forceMirror = true)
+                        return@withContext
+                    }
+                    if (countTowardBanter) {
+                        songsSinceBanter = (songsSinceBanter + 1).coerceAtMost(banterEvery)
+                        store.songsSinceBanter = songsSinceBanter
+                    }
+                    val taken = takeNextFromQueue(next) ?: next
+                    val ok = playTrack(taken) // also mirrors remaining UP NEXT
+                    if (!ok) {
+                        requeueFront(taken)
+                        // Fall back: adopt foreign track but still keep queue + mirror.
+                        adoptExternalCurrent(track, playing, progressMs, durationMs)
+                        syncQueueToSpotify(quiet = true, forceMirror = true)
+                        publish(
+                            status = "Reclaim play failed — kept queue · open Spotify",
+                            error = "reclaim_failed",
+                        )
+                    } else {
+                        val banterHint = " · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
+                        publish(
+                            status = "Reclaimed · ${taken.name.ifBlank { taken.uri }}$banterHint",
+                            clearError = true,
+                        )
+                    }
+                    persistRuntimeState()
+                    if (synchronized(queue) { queue.size } < 4 && !filling.get()) {
+                        fillQueue(useAi = store.useAiRank)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "reclaim failed", e)
+                publish(status = "Reclaim error: ${e.message}", error = e.message)
+            } finally {
+                transitioning.set(false)
+                publish(transitioning = false)
+            }
         }
     }
 
@@ -2225,8 +2425,8 @@ class SpotifyLiveDjService : Service() {
                 if (queue.size < 2) {
                     fillQueue(useAi = store.useAiRank, force = true)
                 }
-                // Keep Spotify Up Next aligned before any handoff (skip / natural).
-                syncQueueToSpotify(quiet = true)
+                // Keep Spotify Up Next 1:1 before any handoff (skip / natural).
+                syncQueueToSpotify(quiet = true, forceMirror = isSkipReason || isIdleKick)
 
                 // Peek only — do not remove until we actually advance (native path may
                 // adopt via URI change without a forced play).
@@ -2584,7 +2784,7 @@ class SpotifyLiveDjService : Service() {
                 songsSinceBanter = (songsSinceBanter + 1).coerceAtMost(banterEvery)
                 store.songsSinceBanter = songsSinceBanter
                 val discardedNote = if (discarded > 0) " · skipped $discarded ahead" else ""
-                val ok = playTrack(selected)
+                val ok = playTrack(selected) // includes remaining UP NEXT in context
                 if (ok) {
                     publish(
                         status = "Playing selected$discardedNote · ${banterCountdownLabel(songsSinceBanter, banterEvery)}",
@@ -2676,7 +2876,17 @@ class SpotifyLiveDjService : Service() {
         }
         lastPlayAttemptMs = System.currentTimeMillis()
         markPlayed(item.uri)
-        val body = JSONObject().put("uris", JSONArray().put(item.uri)).toString()
+        // Pack remaining UP NEXT into the same play context so Spotify’s queue is 1:1
+        // with ours (replaces any ghost Up Next left from earlier appends).
+        val upcoming = synchronized(queue) {
+            queue.toList().filter { it.uri.isNotBlank() && it.uri != item.uri }
+        }
+        val uriArr = JSONArray().put(item.uri)
+        for (t in upcoming.take(maxMirrorUris - 1)) uriArr.put(t.uri)
+        val body = JSONObject()
+            .put("uris", uriArr)
+            .put("offset", JSONObject().put("position", 0))
+            .toString()
         val device = pickDeviceId()
         var path = if (device != null) {
             "/v1/me/player/play?device_id=${java.net.URLEncoder.encode(device, "UTF-8")}"
@@ -2716,7 +2926,11 @@ class SpotifyLiveDjService : Service() {
         store.lastCurrentUri = item.uri
         nearEndArmed = false
         handoffLaunchedForUri = null
-        syncedToSpotifyUris.remove(item.uri)
+        // Context replace already set Up Next — bookkeeping matches.
+        syncedToSpotifyUris.clear()
+        syncedToSpotifyUris.add(item.uri)
+        upcoming.take(maxMirrorUris - 1).forEach { syncedToSpotifyUris.add(it.uri) }
+        lastSpotifyQueueSyncMs = System.currentTimeMillis()
         // Mark ownership so the next poll doesn't treat lag / our handoff as external.
         expectedPlayUri = item.uri
         expectedPlayUntilMs = System.currentTimeMillis() + 25_000L
@@ -2735,7 +2949,11 @@ class SpotifyLiveDjService : Service() {
         publish(
             nowLine = (if (ok) "▶ " else "⚠ ") +
                 "${item.name.ifBlank { item.uri }}${if (item.artists.isNotBlank()) " — ${item.artists}" else ""}",
-            status = if (ok) "Playing" else "Play rejected · ${res.error ?: res.status}",
+            status = if (ok) {
+                "Playing · ${upcoming.size} up next mirrored"
+            } else {
+                "Play rejected · ${res.error ?: res.status}"
+            },
             clearError = ok,
             error = if (ok) null else (res.error ?: "play_${res.status}"),
         )
@@ -2998,8 +3216,14 @@ class SpotifyLiveDjService : Service() {
                     "refill" -> fillQueue(useAi = store.useAiRank, force = true, replace = false)
                     "clear_queue" -> {
                         synchronized(queue) { queue.clear() }
+                        syncedToSpotifyUris.clear()
                         persistRuntimeState()
-                        publish(status = "Queue cleared", clearError = true)
+                        // Mirror empty context: keep current track only (drops Up Next ghosts).
+                        val head = current?.uri ?: lastUri
+                        if (!head.isNullOrBlank()) {
+                            mirrorContextToSpotify(head, emptyList(), positionMs = null, quiet = true)
+                        }
+                        publish(status = "Queue cleared · Spotify Up Next wiped", clearError = true)
                     }
                     "remove_track" -> {
                         val match = a.optString("match", a.optString("q", "")).ifBlank {
@@ -3132,7 +3356,8 @@ class SpotifyLiveDjService : Service() {
         }
         if (removed > 0) {
             persistRuntimeState()
-            publish(status = "Removed $removed · ${queue.size} left", clearError = true)
+            syncQueueToSpotify(quiet = true, forceMirror = true)
+            publish(status = "Removed $removed · ${queue.size} left · mirrored", clearError = true)
         }
         return removed
     }
@@ -3356,8 +3581,9 @@ class SpotifyLiveDjService : Service() {
         }
         if (added > 0) {
             persistRuntimeState()
-            syncQueueToSpotify(quiet = true)
-            publish(status = "Chat queued $added · total ${queue.size} · synced", clearError = true)
+            // Force 1:1 mirror so chat adds aren't buried under ghost Up Next.
+            syncQueueToSpotify(quiet = true, forceMirror = true)
+            publish(status = "Chat queued $added · total ${queue.size} · mirrored 1:1", clearError = true)
         }
         return added
     }
@@ -3589,13 +3815,13 @@ class SpotifyLiveDjService : Service() {
             }
             persistRuntimeState()
             if (batch.isNotEmpty()) {
-                // Push into Spotify Up Next so cuts can finish and auto-advance.
-                syncQueueToSpotify(quiet = true)
+                // Hard-mirror so a new/refill set isn't buried under stale Up Next.
+                syncQueueToSpotify(quiet = true, forceMirror = true)
                 publish(
                     status = if (replace) {
-                        "New queue · ${batch.size} tracks · synced to Spotify"
+                        "New queue · ${batch.size} tracks · mirrored 1:1"
                     } else {
-                        "Queued ${batch.size} · total ${queue.size} · synced to Spotify"
+                        "Queued ${batch.size} · total ${queue.size} · mirrored 1:1"
                     },
                     clearError = true,
                 )
@@ -4524,14 +4750,13 @@ class SpotifyLiveDjService : Service() {
     private fun spotifyPost(path: String, body: String?): ApiResult = spotifyCall("POST", path, body)
 
     /**
-     * Manual “Add to Spotify queue” — force-sync AI UP NEXT into Connect Up Next.
-     * Clears local sync bookkeeping first so every row is re-POSTed (Spotify may
-     * still keep older Up Next items; API cannot clear the queue).
+     * Manual “Add to Spotify queue” — force 1:1 mirror of AI UP NEXT into Connect.
+     * Replaces playback context (current + UP NEXT) so ghost Up Next items are dropped.
      */
     private fun pushQueueToSpotify() {
         syncedToSpotifyUris.clear()
         lastSpotifyQueueSyncMs = 0L
-        syncQueueToSpotify(quiet = false)
+        syncQueueToSpotify(quiet = false, forceMirror = true)
     }
 
     private fun spotifyCall(method: String, path: String, body: String?): ApiResult {
