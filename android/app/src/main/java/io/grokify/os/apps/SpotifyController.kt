@@ -1870,14 +1870,14 @@ fun SpotifyControllerPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         Text(
-                            "Live DJ is the source of truth: UP NEXT is mirrored 1:1 into Spotify " +
-                                "(context replace — ghost Up Next items are dropped). Chat adds, skips, " +
-                                "removes, refill, and jumps all re-mirror. If Spotify drifts, we reclaim " +
-                                "the next DJ cut without wiping your set. " +
+                            "Live DJ UP NEXT is the set Spotify should play. On every queue change " +
+                                "and ~every 12s while playing, we check Spotify’s Up Next and re-mirror " +
+                                "(context replace) so heads match — banter always names the real next cut. " +
+                                "Chat adds, removes, refill, jumps, and skips all force-mirror. " +
+                                "If Spotify drifts to a ghost track, we reclaim the DJ next without wiping. " +
                                 "Tap a title or ▶ to jump (drops songs above · no talk). " +
                                 "Sync adopts whatever Spotify is on now (keeps UP NEXT). " +
-                                "Add to Spotify queue force-mirrors. Refill adds · New queue replaces. " +
-                                "Recently played + skipped tracks are excluded from new picks.",
+                                "Mirror to Spotify force-aligns. Refill adds · New queue replaces.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )

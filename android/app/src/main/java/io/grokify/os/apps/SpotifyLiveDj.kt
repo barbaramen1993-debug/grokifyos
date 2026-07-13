@@ -943,7 +943,12 @@ class SpotifyLiveDjService : Service() {
      */
     private var handoffLaunchedForUri: String? = null
     private var wasPlaying = false
+    /**
+     * Optional one-shot banter from AI queue-shape (fill).
+     * **Must** be paired with [pendingBanterForUri] — never speak it for a different next cut.
+     */
     private var pendingBanter: String? = null
+    private var pendingBanterForUri: String? = null
     /** Consecutive polls with nothing on Spotify player (leave/return / idle). */
     private var idlePolls = 0
     /** Track ended but Spotify still reports the item paused at the end. */
@@ -1004,6 +1009,8 @@ class SpotifyLiveDjService : Service() {
     private val syncedToSpotifyUris = LinkedHashSet<String>()
     /** Last time we bulk-synced the AI queue into Spotify (rate-limit guard). */
     private var lastSpotifyQueueSyncMs = 0L
+    /** Last time poll verified Spotify Up Next still matches DJ queue (drift guard). */
+    private var lastQueueAlignCheckMs = 0L
     /** Max tracks packed into a single play-context replace (Spotify practical limit). */
     private val maxMirrorUris = 50
 
@@ -1530,6 +1537,19 @@ class SpotifyLiveDjService : Service() {
                 scope.launch(Dispatchers.IO) { prefetchBanter(prevSnap, peek) }
             }
         }
+        // Keep Spotify Up Next 1:1 with DJ queue while idle between handoffs.
+        // Drift (autoplay / ghost appends) is what makes banter name the wrong cut.
+        if (
+            playing &&
+            !transitioning.get() &&
+            queue.isNotEmpty() &&
+            System.currentTimeMillis() - lastQueueAlignCheckMs >= 12_000L
+        ) {
+            lastQueueAlignCheckMs = System.currentTimeMillis()
+            scope.launch(Dispatchers.IO) {
+                ensureDjQueueMirroredOnSpotify(force = false, quiet = true)
+            }
+        }
         // Flush banter counters every poll so leave/return always sees the true countdown.
         store.songsSinceBanter = songsSinceBanter
         store.banterEvery = banterEvery
@@ -1538,6 +1558,49 @@ class SpotifyLiveDjService : Service() {
             status = if (playing) "Watching playback$banterHint" else "Paused$banterHint · ${queue.size} queued",
         )
         updateNotif(line)
+    }
+
+    /** Drop prefetched / pending banter when it no longer matches the queue head. */
+    private fun invalidateStaleBanterCaches(expectedNextUri: String?) {
+        val next = expectedNextUri?.takeIf { it.isNotBlank() }
+        if (prefetchedForUri != null && prefetchedForUri != next) {
+            Log.i(TAG, "drop prefetched banter (was for ${prefetchedForUri}, head=$next)")
+            prefetchedBanter = null
+            prefetchedForUri = null
+        }
+        if (pendingBanterForUri != null && pendingBanterForUri != next) {
+            Log.i(TAG, "drop pending banter (was for $pendingBanterForUri, head=$next)")
+            pendingBanter = null
+            pendingBanterForUri = null
+        }
+        if (researchedForUri != null && researchedForUri != next) {
+            researchedForUri = null
+            researchedFacts = emptyList()
+        }
+    }
+
+    /**
+     * Ensure Spotify’s native Up Next prefix matches the Live DJ radio queue.
+     * When misaligned (or [force]), replace playback context (current + UP NEXT).
+     *
+     * @return true when Spotify head matches DJ head (or queue empty / check failed softly)
+     */
+    private fun ensureDjQueueMirroredOnSpotify(force: Boolean, quiet: Boolean = true): Boolean {
+        val tracks = synchronized(queue) { queue.toList() }
+        if (tracks.isEmpty()) return true
+        val aligned = !force && spotifyUpNextMatchesDj(tracks, check = 5)
+        if (aligned) {
+            lastSpotifyQueueSyncMs = System.currentTimeMillis()
+            return true
+        }
+        Log.i(
+            TAG,
+            "queue align force=$force head=${tracks.firstOrNull()?.uri?.takeLast(12)} " +
+                "n=${tracks.size} — mirror to Spotify",
+        )
+        syncQueueToSpotify(quiet = quiet, forceMirror = true)
+        // Re-check after mirror (API lag is OK — mirror already replaced context).
+        return force || spotifyUpNextMatchesDj(tracks, check = 3)
     }
 
     private fun prefetchBanter(prev: DjQueueTrack?, next: DjQueueTrack) {
@@ -2127,6 +2190,10 @@ class SpotifyLiveDjService : Service() {
         handoffLaunchedForUri = null
         prefetchedBanter = null
         prefetchedForUri = null
+        pendingBanter = null
+        pendingBanterForUri = null
+        researchedForUri = null
+        researchedFacts = emptyList()
         expectedPlayUri = null
         expectedPlayFromUri = null
         stuckEndPolls = 0
@@ -2157,6 +2224,7 @@ class SpotifyLiveDjService : Service() {
                     markPlayed(queue.removeFirst().uri)
                 }
             }
+            invalidateStaleBanterCaches(synchronized(queue) { queue.firstOrNull()?.uri })
             adoptExternalCurrent(track, playing, progressMs, durationMs)
             if (countTowardBanter) {
                 songsSinceBanter = (songsSinceBanter + 1).coerceAtMost(banterEvery)
@@ -2425,14 +2493,42 @@ class SpotifyLiveDjService : Service() {
                 if (queue.size < 2) {
                     fillQueue(useAi = store.useAiRank, force = true)
                 }
-                // Keep Spotify Up Next 1:1 before any handoff (skip / natural).
-                syncQueueToSpotify(quiet = true, forceMirror = isSkipReason || isIdleKick)
+                // Always make Spotify Up Next match DJ queue before naming the next cut.
+                // Soft-sync alone left ghost heads → banter introduced the wrong song.
+                ensureDjQueueMirroredOnSpotify(
+                    force = true,
+                    quiet = true,
+                )
 
                 // Peek only — do not remove until we actually advance (native path may
                 // adopt via URI change without a forced play).
-                val next = synchronized(queue) { queue.firstOrNull() }
-                val prev = current
-                val prevUri = prev?.uri ?: lastUri
+                var next = synchronized(queue) { queue.firstOrNull() }
+                var prev = current
+                // Prefer live currently-playing metadata for "just played" (not a stale current).
+                val liveSnap = readPlaybackSnap()
+                if (liveSnap != null && liveSnap.uri.isNotBlank()) {
+                    if (prev == null || prev.uri != liveSnap.uri) {
+                        val res = spotifyGet("/v1/me/player/currently-playing")
+                        val item = res.json?.optJSONObject("item")
+                        if (item != null) {
+                            val ids = artistIdsOf(item)
+                            prev = DjQueueTrack(
+                                uri = liveSnap.uri,
+                                name = item.optString("name", prev?.name.orEmpty()),
+                                artists = artistsOf(item).ifBlank { prev?.artists.orEmpty() },
+                                artistIds = ids,
+                                albumArtUrl = albumArtUrlOf(item),
+                                artistArtUrl = artistArtUrlOf(ids.firstOrNull().orEmpty()),
+                                albumUri = albumUriOf(item),
+                                artistUri = artistUriOf(item),
+                                reason = prev?.reason.orEmpty(),
+                            )
+                        }
+                    }
+                }
+                var prevUri = prev?.uri ?: lastUri
+                invalidateStaleBanterCaches(next?.uri)
+
                 // Plain skip: countdown −1 only. Banter only when due, already
                 // prefetched for next, or Skip + talk forced it.
                 val banterDue = songsSinceBanter + 1 >= banterEvery
@@ -2454,6 +2550,9 @@ class SpotifyLiveDjService : Service() {
                         delay(200L)
                     }
                 }
+                // Re-resolve after wait — queue or Spotify may have shifted.
+                next = synchronized(queue) { queue.firstOrNull() }
+                invalidateStaleBanterCaches(next?.uri)
                 val banterReady = next != null &&
                     prefetchedForUri == next.uri &&
                     !prefetchedBanter.isNullOrBlank()
@@ -2472,9 +2571,12 @@ class SpotifyLiveDjService : Service() {
                         transitioning = true,
                     )
 
+                    // Final targets for the spoken line — must match what we will play next.
+                    val banterNext = next
+                    val banterPrev = prev
                     val line = when {
-                        next != null &&
-                            prefetchedForUri == next.uri &&
+                        banterNext != null &&
+                            prefetchedForUri == banterNext.uri &&
                             !prefetchedBanter.isNullOrBlank() -> {
                             val p = prefetchedBanter!!
                             prefetchedBanter = null
@@ -2482,7 +2584,7 @@ class SpotifyLiveDjService : Service() {
                             p
                         }
                         // Handoff must stay fast: use cached facts / local templates only.
-                        else -> generateBanter(prev, next, allowResearch = false)
+                        else -> generateBanter(banterPrev, banterNext, allowResearch = false)
                     }
                     prefetchedBanter = null
                     prefetchedForUri = null
@@ -2528,11 +2630,29 @@ class SpotifyLiveDjService : Service() {
                         }
                     }
 
+                    // If Spotify already advanced to our next during the wait, adopt and
+                    // still speak (line is about that cut) — do not introduce a different song.
+                    val preSpeakSnap = readPlaybackSnap()
+                    if (
+                        preSpeakSnap != null &&
+                        banterNext != null &&
+                        preSpeakSnap.uri == banterNext.uri
+                    ) {
+                        adoptNativeAdvance(preSpeakSnap.uri, banterNext)
+                        next = synchronized(queue) { queue.firstOrNull() }
+                        prevUri = banterNext.uri
+                    }
+
                     // Clean handoff only: pause right before speech (after wait).
                     // Talkover / skip: leave the track running under the mic.
                     if (!talkover && !isSkipReason) {
-                        spotifyPut("/v1/me/player/pause", "{}")
-                        delay(200L)
+                        val stillOnPrev = preSpeakSnap == null ||
+                            prevUri == null ||
+                            preSpeakSnap.uri == prevUri
+                        if (stillOnPrev) {
+                            spotifyPut("/v1/me/player/pause", "{}")
+                            delay(200L)
+                        }
                     }
 
                     var duckedFrom: Int? = null
@@ -2582,10 +2702,18 @@ class SpotifyLiveDjService : Service() {
                     }
 
                     // After banter: prefer native Up Next — never hard-cut leftover outro.
+                    // Re-peek next in case we already adopted during wait.
+                    next = synchronized(queue) { queue.firstOrNull() }
+                        ?: next
+                    // If we already landed on banterNext during wait, skip advance.
+                    val alreadyOnBanterNext = lastUri != null &&
+                        banterNext != null &&
+                        lastUri == banterNext.uri
                     val advanced = when {
+                        alreadyOnBanterNext -> true
                         isSkipReason || isIdleKick -> {
                             advanceToNext(
-                                next = next,
+                                next = banterNext ?: next,
                                 prevUri = prevUri,
                                 preferSkip = isSkipReason,
                                 allowPlayFallback = true,
@@ -2597,12 +2725,16 @@ class SpotifyLiveDjService : Service() {
                                 status = "🎙 Waiting for track end$style…",
                                 transitioning = true,
                             )
-                            val natural = awaitNativeAdvance(prevUri, next, maxWaitMs = 28_000L)
+                            val natural = awaitNativeAdvance(
+                                prevUri,
+                                banterNext ?: next,
+                                maxWaitMs = 28_000L,
+                            )
                             if (natural) {
                                 true
                             } else {
                                 advanceToNext(
-                                    next = next,
+                                    next = banterNext ?: next,
                                     prevUri = prevUri,
                                     preferSkip = true,
                                     allowPlayFallback = true,
@@ -2613,7 +2745,7 @@ class SpotifyLiveDjService : Service() {
                             // Clean mic: we paused at ~last second → skip into synced Up Next.
                             delay(150L)
                             advanceToNext(
-                                next = next,
+                                next = banterNext ?: next,
                                 prevUri = prevUri,
                                 preferSkip = true,
                                 allowPlayFallback = true,
@@ -2749,6 +2881,9 @@ class SpotifyLiveDjService : Service() {
         prefetchedBanter = null
         prefetchedForUri = null
         pendingBanter = null
+        pendingBanterForUri = null
+        researchedForUri = null
+        researchedFacts = emptyList()
         publish(status = "Jumping in queue…", transitioning = true)
         try {
             withContext(Dispatchers.IO) {
@@ -3217,6 +3352,7 @@ class SpotifyLiveDjService : Service() {
                     "clear_queue" -> {
                         synchronized(queue) { queue.clear() }
                         syncedToSpotifyUris.clear()
+                        invalidateStaleBanterCaches(null)
                         persistRuntimeState()
                         // Mirror empty context: keep current track only (drops Up Next ghosts).
                         val head = current?.uri ?: lastUri
@@ -3339,6 +3475,7 @@ class SpotifyLiveDjService : Service() {
         val m = match.trim().lowercase()
         if (m.isBlank()) return 0
         var removed = 0
+        val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
         synchronized(queue) {
             val kept = queue.filterNot { t ->
                 val hit = t.uri.equals(match.trim(), ignoreCase = true) ||
@@ -3355,8 +3492,10 @@ class SpotifyLiveDjService : Service() {
             }
         }
         if (removed > 0) {
+            val newHead = synchronized(queue) { queue.firstOrNull()?.uri }
+            if (prevHead != newHead) invalidateStaleBanterCaches(newHead)
             persistRuntimeState()
-            syncQueueToSpotify(quiet = true, forceMirror = true)
+            ensureDjQueueMirroredOnSpotify(force = true, quiet = true)
             publish(status = "Removed $removed · ${queue.size} left · mirrored", clearError = true)
         }
         return removed
@@ -3556,6 +3695,7 @@ class SpotifyLiveDjService : Service() {
             ?.optJSONArray("items")
             ?: return 0
         var added = 0
+        val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
         synchronized(queue) {
             for (i in 0 until items.length()) {
                 val t = items.optJSONObject(i) ?: continue
@@ -3580,9 +3720,11 @@ class SpotifyLiveDjService : Service() {
             }
         }
         if (added > 0) {
+            val newHead = synchronized(queue) { queue.firstOrNull()?.uri }
+            if (prevHead != newHead) invalidateStaleBanterCaches(newHead)
             persistRuntimeState()
             // Force 1:1 mirror so chat adds aren't buried under ghost Up Next.
-            syncQueueToSpotify(quiet = true, forceMirror = true)
+            ensureDjQueueMirroredOnSpotify(force = true, quiet = true)
             publish(status = "Chat queued $added · total ${queue.size} · mirrored 1:1", clearError = true)
         }
         return added
@@ -3794,29 +3936,42 @@ class SpotifyLiveDjService : Service() {
             publish(status = "Radio pool ${pool.size} — picking…")
 
             var batch: List<DjQueueTrack> = emptyList()
+            var aiBanterLine: String? = null
             if (useAi && pool.size >= 8) {
                 publish(status = "Asking host Grok Build to shape the set…")
                 val ai = aiPickFromPool(pool, curForPool, if (replace) 8 else 6)
                 if (ai != null) {
                     batch = ai.first
-                    if (ai.second.isNotBlank()) pendingBanter = ai.second
+                    if (ai.second.isNotBlank()) aiBanterLine = ai.second
                 }
             }
             if (batch.isEmpty()) {
                 batch = pickFromPool(pool, curForPool, (if (replace) 8 else 6) + (0..3).random())
+                aiBanterLine = null
             }
             // Never re-add recently played / already heard
             batch = batch.filter { !isPlayed(it.uri) && it.uri != curForPool?.uri }
+            val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
             synchronized(queue) {
                 batch.forEach { t ->
                     if (queue.none { it.uri == t.uri } && !isPlayed(t.uri)) queue.addLast(t)
                 }
                 while (queue.size > MAX_DJ_QUEUE) queue.removeLast()
             }
+            val newHead = synchronized(queue) { queue.firstOrNull()?.uri }
+            // Drop caches keyed to the old head when the set changes.
+            if (prevHead != newHead || replace) {
+                invalidateStaleBanterCaches(newHead)
+            }
+            // Key fill-banter to the actual head of the queue after merge, not a stale pick.
+            if (!aiBanterLine.isNullOrBlank() && newHead != null && batch.any { it.uri == newHead }) {
+                pendingBanter = aiBanterLine
+                pendingBanterForUri = newHead
+            }
             persistRuntimeState()
             if (batch.isNotEmpty()) {
                 // Hard-mirror so a new/refill set isn't buried under stale Up Next.
-                syncQueueToSpotify(quiet = true, forceMirror = true)
+                ensureDjQueueMirroredOnSpotify(force = true, quiet = true)
                 publish(
                     status = if (replace) {
                         "New queue · ${batch.size} tracks · mirrored 1:1"
@@ -4198,11 +4353,25 @@ class SpotifyLiveDjService : Service() {
         next: DjQueueTrack?,
         allowResearch: Boolean = true,
     ): String {
-        pendingBanter?.let { cached ->
-            pendingBanter = null
-            val cleaned = sanitizeSpoken(cached)
-            if (cleaned.isNotBlank() && looksLikeSpokenLine(cleaned)) {
-                return cleaned.take(320)
+        // One-shot line from AI queue-shape — only if it was written for this exact next URI.
+        val pending = pendingBanter
+        val pendingUri = pendingBanterForUri
+        if (!pending.isNullOrBlank()) {
+            if (next != null && pendingUri == next.uri) {
+                pendingBanter = null
+                pendingBanterForUri = null
+                val cleaned = sanitizeSpoken(pending)
+                if (cleaned.isNotBlank() && looksLikeSpokenLine(cleaned)) {
+                    return cleaned.take(320)
+                }
+            } else {
+                // Stale or unkeyed — never speak a line that names the wrong cut.
+                Log.i(
+                    TAG,
+                    "skip pending banter (for=$pendingUri next=${next?.uri})",
+                )
+                pendingBanter = null
+                pendingBanterForUri = null
             }
         }
         val ai = aiBanterLine(prev, next, allowResearch = allowResearch)
@@ -4580,6 +4749,7 @@ class SpotifyLiveDjService : Service() {
      */
     private fun pruneQueueOfPlayed() {
         val before = synchronized(queue) { queue.size }
+        val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
         synchronized(queue) {
             val keep = queue.filterNot { isPlayed(it.uri) || it.uri == current?.uri }
             if (keep.size == queue.size) return
@@ -4588,8 +4758,14 @@ class SpotifyLiveDjService : Service() {
         }
         val after = synchronized(queue) { queue.size }
         if (before != after) {
+            val newHead = synchronized(queue) { queue.firstOrNull()?.uri }
+            if (prevHead != newHead) invalidateStaleBanterCaches(newHead)
             Log.i(TAG, "pruneQueueOfPlayed $before → $after")
             persistRuntimeState()
+            // fillQueue re-mirrors after rebuild; avoid double mid-song replace here.
+            if (!filling.get()) {
+                ensureDjQueueMirroredOnSpotify(force = true, quiet = true)
+            }
         }
     }
 
@@ -4756,7 +4932,8 @@ class SpotifyLiveDjService : Service() {
     private fun pushQueueToSpotify() {
         syncedToSpotifyUris.clear()
         lastSpotifyQueueSyncMs = 0L
-        syncQueueToSpotify(quiet = false, forceMirror = true)
+        lastQueueAlignCheckMs = 0L
+        ensureDjQueueMirroredOnSpotify(force = true, quiet = false)
     }
 
     private fun spotifyCall(method: String, path: String, body: String?): ApiResult {
