@@ -161,10 +161,7 @@ data class UiState(
     val loadingPanel: Boolean = false,
     val usage: UsageInfo? = null,
     val usageLoading: Boolean = false,
-    /**
-     * Custom Mapbox public access token (pk.…). Empty means use the built-in default
-     * shipped in resources.
-     */
+    /** Mapbox public access token (pk.…) from Settings / API key vault. Empty disables maps. */
     val mapboxAccessToken: String = "",
     /**
      * Host API key vault (user-facing keys for built-in apps). Values are full

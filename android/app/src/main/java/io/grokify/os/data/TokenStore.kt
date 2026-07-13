@@ -25,7 +25,7 @@ class TokenStore(private val context: Context) {
     private val keyShowThoughts = booleanPreferencesKey("show_thoughts")
     private val keyModel = stringPreferencesKey("preferred_model")
     private val keySessionId = stringPreferencesKey("active_session_id")
-    /** Optional Mapbox public access token (pk.…). Empty/null → use built-in default. */
+    /** Mapbox public access token (pk.…). Empty/null → maps stay disabled until set in Settings. */
     private val keyMapboxAccessToken = stringPreferencesKey("mapbox_access_token")
     /**
      * JSON vault of host API keys for built-in apps.
@@ -108,7 +108,7 @@ class TokenStore(private val context: Context) {
         }
     }
 
-    /** Persist a custom Mapbox public token, or clear to fall back to the built-in default. */
+    /** Persist Mapbox public token in DataStore (and mirror into the API key vault). */
     suspend fun setMapboxAccessToken(token: String?) {
         context.dataStore.edit {
             val cleaned = token?.trim().orEmpty()

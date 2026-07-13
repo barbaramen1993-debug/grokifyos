@@ -35,7 +35,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import io.grokify.os.GrokifyApp
-import io.grokify.os.R
 import io.grokify.os.ui.theme.GrokifyColors
 import org.json.JSONArray
 import org.json.JSONObject
@@ -71,17 +70,17 @@ fun WifiMapView(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val defaultToken = remember { context.getString(R.string.mapbox_access_token) }
     val store = remember { (context.applicationContext as GrokifyApp).tokenStore }
-    val customToken by store.mapboxAccessTokenFlow.collectAsState(initial = null)
-    val token = customToken?.trim()?.takeIf { it.isNotEmpty() } ?: defaultToken
+    val vaultToken by store.mapboxAccessTokenFlow.collectAsState(initial = null)
+    val token = vaultToken?.trim().orEmpty()
     var webView by remember { mutableStateOf<WebView?>(null) }
     var mapReady by remember { mutableStateOf(false) }
     var loadError by remember { mutableStateOf<String?>(null) }
     val onSelectLatest = rememberUpdatedState(onMarkerSelected)
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val hasToken = token.isNotEmpty()
 
-    // Rebuild the WebView when the access token changes (custom key ↔ default).
+    // Rebuild the WebView when the vault token changes.
     DisposableEffect(token) {
         mapReady = false
         loadError = null
@@ -129,92 +128,103 @@ fun WifiMapView(
             .then(chrome)
             .background(GrokifyColors.Panel),
     ) {
-        key(token) {
-            AndroidView(
-                factory = { ctx ->
-                    WebView(ctx).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                        )
-                        setBackgroundColor(AndroidColor.parseColor("#0B1220"))
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.cacheMode = WebSettings.LOAD_DEFAULT
-                        settings.allowFileAccess = false
-                        settings.allowContentAccess = false
-                        settings.mediaPlaybackRequiresUserGesture = true
-                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                        overScrollMode = WebView.OVER_SCROLL_NEVER
-                        webChromeClient = WebChromeClient()
-                        addJavascriptInterface(
-                            object {
-                                @JavascriptInterface
-                                fun onApSelected(id: String) {
-                                    mainHandler.post {
-                                        onSelectLatest.value(id)
+        if (!hasToken) {
+            Text(
+                "Add a Mapbox token in Settings to enable maps",
+                color = GrokifyColors.TextMuted,
+                fontSize = 13.sp,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(16.dp),
+            )
+        } else {
+            key(token) {
+                AndroidView(
+                    factory = { ctx ->
+                        WebView(ctx).apply {
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                            )
+                            setBackgroundColor(AndroidColor.parseColor("#0B1220"))
+                            settings.javaScriptEnabled = true
+                            settings.domStorageEnabled = true
+                            settings.cacheMode = WebSettings.LOAD_DEFAULT
+                            settings.allowFileAccess = false
+                            settings.allowContentAccess = false
+                            settings.mediaPlaybackRequiresUserGesture = true
+                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                            overScrollMode = WebView.OVER_SCROLL_NEVER
+                            webChromeClient = WebChromeClient()
+                            addJavascriptInterface(
+                                object {
+                                    @JavascriptInterface
+                                    fun onApSelected(id: String) {
+                                        mainHandler.post {
+                                            onSelectLatest.value(id)
+                                        }
+                                    }
+                                },
+                                "GrokifyWifiMap",
+                            )
+                            webViewClient = object : WebViewClient() {
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    super.onPageFinished(view, url)
+                                    if (url != null && url != "about:blank") {
+                                        mapReady = true
+                                        pushMarkers(view ?: return, markers, userGps, selectedId)
                                     }
                                 }
-                            },
-                            "GrokifyWifiMap",
-                        )
-                        webViewClient = object : WebViewClient() {
-                            override fun onPageFinished(view: WebView?, url: String?) {
-                                super.onPageFinished(view, url)
-                                if (url != null && url != "about:blank") {
-                                    mapReady = true
-                                    pushMarkers(view ?: return, markers, userGps, selectedId)
+
+                                @Deprecated("Deprecated in Java")
+                                override fun onReceivedError(
+                                    view: WebView?,
+                                    errorCode: Int,
+                                    description: String?,
+                                    failingUrl: String?,
+                                ) {
+                                    loadError = description ?: "Map failed to load"
                                 }
                             }
-
-                            @Deprecated("Deprecated in Java")
-                            override fun onReceivedError(
-                                view: WebView?,
-                                errorCode: Int,
-                                description: String?,
-                                failingUrl: String?,
-                            ) {
-                                loadError = description ?: "Map failed to load"
-                            }
+                            loadDataWithBaseURL(
+                                "https://api.mapbox.com",
+                                buildMapHtml(token),
+                                "text/html",
+                                "UTF-8",
+                                null,
+                            )
+                            webView = this
                         }
-                        loadDataWithBaseURL(
-                            "https://api.mapbox.com",
-                            buildMapHtml(token),
-                            "text/html",
-                            "UTF-8",
-                            null,
-                        )
-                        webView = this
-                    }
-                },
-                update = { /* markers / selection via LaunchedEffect */ },
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
+                    },
+                    update = { /* markers / selection via LaunchedEffect */ },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
 
-        if (markers.isEmpty()) {
-            Text(
-                "No GPS-tagged APs yet — scan with location on",
-                color = GrokifyColors.TextMuted,
-                fontSize = 12.sp,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(10.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(GrokifyColors.Panel.copy(alpha = 0.92f))
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-            )
-        }
+            if (markers.isEmpty()) {
+                Text(
+                    "No GPS-tagged APs yet — scan with location on",
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 12.sp,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(10.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(GrokifyColors.Panel.copy(alpha = 0.92f))
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            }
 
-        loadError?.let { err ->
-            Text(
-                err,
-                color = GrokifyColors.GlowRose,
-                fontSize = 11.sp,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(8.dp),
-            )
+            loadError?.let { err ->
+                Text(
+                    err,
+                    color = GrokifyColors.GlowRose,
+                    fontSize = 11.sp,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(8.dp),
+                )
+            }
         }
     }
 }

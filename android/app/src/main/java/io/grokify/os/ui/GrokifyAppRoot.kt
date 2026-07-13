@@ -79,7 +79,6 @@ import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
-import io.grokify.os.R
 import io.grokify.os.apps.BluetoothScannerPane
 import io.grokify.os.apps.LocationNotesPane
 import io.grokify.os.apps.SpotifyControllerPane
@@ -1951,10 +1950,6 @@ private fun SettingsPage(
     onSaveApiKey: (id: String, value: String, label: String?, description: String?) -> Unit = { _, _, _, _ -> },
     onClearApiKey: (String) -> Unit = {},
 ) {
-    val context = LocalContext.current
-    val defaultMapbox = remember {
-        runCatching { context.getString(R.string.mapbox_access_token) }.getOrDefault("")
-    }
     var mapboxDraft by remember(state.mapboxAccessToken) {
         mutableStateOf(state.mapboxAccessToken)
     }
@@ -2176,11 +2171,7 @@ private fun SettingsPage(
             value = mapboxDraft,
             visible = mapboxVisible,
             persistedValue = state.mapboxAccessToken,
-            defaultHint = if (defaultMapbox.isNotBlank()) {
-                "Built-in default active · ends …${defaultMapbox.takeLast(6)}"
-            } else {
-                "No built-in default — paste a pk. token to enable maps"
-            },
+            defaultHint = "Paste a public pk. token to enable maps",
             savedFlash = mapboxSavedFlash,
             onValueChange = { mapboxDraft = it },
             onToggleVisible = { mapboxVisible = !mapboxVisible },
@@ -2193,7 +2184,7 @@ private fun SettingsPage(
                 onClearMapboxAccessToken()
                 mapboxSavedFlash = true
             },
-            clearLabel = "Use default",
+            clearLabel = "Remove",
         )
 
         Text(
