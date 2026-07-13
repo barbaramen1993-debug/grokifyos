@@ -465,11 +465,70 @@ function gos_grok_auth_token_expired(array $entry, int $skewSeconds = 120): bool
     return $ts <= (time() + $skewSeconds);
 }
 
+/**
+ * Ask the root-owned bridge to copy CLI ~/.grok/auth.json → storage/grok-auth.json.
+ * PHP-FPM (www-data) cannot read the CLI auth file itself after `grok login`.
+ *
+ * @return array{ok: bool, synced?: bool, reason?: string, error?: string}
+ */
+function gos_grok_auth_request_bridge_sync(bool $force = true): array
+{
+    static $lastAttemptAt = 0;
+    static $lastResult = null;
+    // Avoid hammering the bridge when many usage polls race.
+    if (!$force && is_array($lastResult) && (time() - $lastAttemptAt) < 15) {
+        return $lastResult;
+    }
+    if ($force && (time() - $lastAttemptAt) < 5 && is_array($lastResult) && !empty($lastResult['ok'])) {
+        return $lastResult;
+    }
+
+    $base = rtrim((string) (gos_env('GROKIFY_BRIDGE_URL', 'http://127.0.0.1:8876') ?? 'http://127.0.0.1:8876'), '/');
+    $url = $base . '/sync-grok-auth' . ($force ? '?force=1' : '');
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return ['ok' => false, 'error' => 'curl_init_failed'];
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => $force ? 'POST' : 'GET',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 8,
+        CURLOPT_CONNECTTIMEOUT => 2,
+        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+    ]);
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    $lastAttemptAt = time();
+    if (!is_string($resp) || $resp === '') {
+        $lastResult = ['ok' => false, 'error' => $err !== '' ? $err : 'empty_response', 'http_code' => $code];
+
+        return $lastResult;
+    }
+    $json = json_decode($resp, true);
+    if (!is_array($json)) {
+        $lastResult = ['ok' => false, 'error' => 'parse_failed', 'http_code' => $code];
+
+        return $lastResult;
+    }
+    $json['http_code'] = $code;
+    $lastResult = $json;
+
+    return $lastResult;
+}
+
 /** @return array{ok: bool, token?: string, entry?: array<string, mixed>, error?: string, message?: string, http_code?: int, detail?: mixed} */
-function gos_grok_auth_ensure_token(): array
+function gos_grok_auth_ensure_token(bool $allowBridgeResync = true): array
 {
     $loaded = gos_grok_auth_load();
     if ($loaded === null) {
+        if ($allowBridgeResync) {
+            $sync = gos_grok_auth_request_bridge_sync(true);
+            if (!empty($sync['ok'])) {
+                return gos_grok_auth_ensure_token(false);
+            }
+        }
         $candidates = gos_grok_auth_json_candidates();
         $detail = [];
         foreach ($candidates as $p) {
@@ -497,6 +556,12 @@ function gos_grok_auth_ensure_token(): array
         // Never hand an already-expired token to callers — it only produces misleading 401s.
         if ($token !== '' && !gos_grok_auth_token_expired($entry)) {
             return ['ok' => true, 'token' => $token, 'entry' => $entry];
+        }
+        if ($allowBridgeResync) {
+            $sync = gos_grok_auth_request_bridge_sync(true);
+            if (!empty($sync['ok']) && !empty($sync['synced'])) {
+                return gos_grok_auth_ensure_token(false);
+            }
         }
 
         return [
@@ -536,6 +601,18 @@ function gos_grok_auth_ensure_token(): array
         // Only reuse the existing access token if it is still unexpired.
         if ($token !== '' && !gos_grok_auth_token_expired($entry)) {
             return ['ok' => true, 'token' => $token, 'entry' => $entry];
+        }
+        // CLI re-login rotates refresh tokens; bridge (root) can pull the new auth.json.
+        if ($allowBridgeResync) {
+            $sync = gos_grok_auth_request_bridge_sync(true);
+            if (!empty($sync['ok'])) {
+                $retry = gos_grok_auth_ensure_token(false);
+                if (!empty($retry['ok'])) {
+                    $retry['recovered_via'] = 'bridge_auth_sync';
+
+                    return $retry;
+                }
+            }
         }
 
         return [

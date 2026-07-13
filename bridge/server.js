@@ -178,6 +178,126 @@ function refreshGrokModels() {
 refreshGrokModels();
 setInterval(refreshGrokModels, 6 * 60 * 60 * 1000);
 
+/**
+ * Keep storage/grok-auth.json (www-data readable) in sync with the live CLI
+ * auth at ~/.grok/auth.json. PHP-FPM cannot read root's auth.json, so after
+ * `grok login` the usage API shows "re-login needed" until this copies over.
+ */
+function grokAuthSrcPath() {
+    return process.env.GROK_AUTH_SRC
+        || path.join(process.env.HOME || '/root', '.grok', 'auth.json');
+}
+
+function grokAuthDestPath() {
+    const destDefault = path.join(WORKSPACE, 'storage', 'grok-auth.json');
+    let dest = envFirst('GROKIFY_GROK_AUTH_JSON', 'GROKPOT_GROK_AUTH_JSON') || destDefault;
+    const src = grokAuthSrcPath();
+    try {
+        if (fs.realpathSync(src) === fs.realpathSync(dest)) dest = destDefault;
+    } catch (_) {
+        if (path.resolve(src) === path.resolve(dest)) dest = destDefault;
+    }
+    return dest;
+}
+
+function firstAuthEntryFromRaw(raw) {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return null;
+    for (const key of Object.keys(data)) {
+        const entry = data[key];
+        if (!entry || typeof entry !== 'object') continue;
+        if (entry.key || entry.access_token) return { key, entry };
+    }
+    return null;
+}
+
+function authNeedsSync(srcPath, destPath) {
+    if (!fs.existsSync(srcPath)) return { needed: false, reason: 'no_src' };
+    if (!fs.existsSync(destPath)) return { needed: true, reason: 'no_dest' };
+    try {
+        const src = firstAuthEntryFromRaw(fs.readFileSync(srcPath, 'utf8'));
+        const dest = firstAuthEntryFromRaw(fs.readFileSync(destPath, 'utf8'));
+        if (!src) return { needed: false, reason: 'src_empty' };
+        if (!dest) return { needed: true, reason: 'dest_empty' };
+        const srcRefresh = String(src.entry.refresh_token || '');
+        const destRefresh = String(dest.entry.refresh_token || '');
+        if (srcRefresh && destRefresh && srcRefresh !== destRefresh) {
+            return { needed: true, reason: 'refresh_token_mismatch' };
+        }
+        const srcToken = String(src.entry.key || src.entry.access_token || '');
+        const destToken = String(dest.entry.key || dest.entry.access_token || '');
+        if (srcToken && destToken && srcToken !== destToken) {
+            const srcExp = Date.parse(src.entry.expires_at || '');
+            const destExp = Date.parse(dest.entry.expires_at || '');
+            if (!Number.isNaN(srcExp) && (Number.isNaN(destExp) || srcExp > destExp + 5000)) {
+                return { needed: true, reason: 'src_fresher' };
+            }
+        }
+        const destExp = Date.parse(dest.entry.expires_at || '');
+        if (!Number.isNaN(destExp) && destExp <= Date.now() + 120000) {
+            // Dest expired but same refresh token → PHP OIDC refresh can heal itself.
+            if (srcRefresh && destRefresh && srcRefresh === destRefresh) {
+                return { needed: false, reason: 'same_refresh_php_can_refresh' };
+            }
+            // Dest expired and no usable matching refresh → pull from CLI.
+            return { needed: true, reason: 'dest_expired' };
+        }
+        return { needed: false, reason: 'in_sync' };
+    } catch (err) {
+        return { needed: true, reason: 'compare_error:' + (err.message || 'unknown') };
+    }
+}
+
+function syncGrokAuthIfNeeded(force = false) {
+    const src = grokAuthSrcPath();
+    const dest = grokAuthDestPath();
+    if (path.resolve(src) === path.resolve(dest)) {
+        return { ok: false, error: 'same_path', src, dest };
+    }
+    if (!fs.existsSync(src)) {
+        return { ok: false, error: 'src_missing', src, dest };
+    }
+    const check = force ? { needed: true, reason: 'forced' } : authNeedsSync(src, dest);
+    if (!check.needed) {
+        return { ok: true, synced: false, reason: check.reason, src, dest };
+    }
+    try {
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        // Atomic-ish: write temp then rename so PHP never reads a partial file.
+        const tmp = dest + '.tmp.' + process.pid;
+        fs.copyFileSync(src, tmp);
+        try {
+            const uid = Number(execSync('id -u www-data', { encoding: 'utf8' }).trim());
+            const gid = Number(execSync('id -g www-data', { encoding: 'utf8' }).trim());
+            fs.chownSync(tmp, uid, gid);
+        } catch (_) { /* non-Linux / no www-data — leave ownership as-is */ }
+        try { fs.chmodSync(tmp, 0o640); } catch (_) {}
+        fs.renameSync(tmp, dest);
+        try {
+            const uid = Number(execSync('id -u www-data', { encoding: 'utf8' }).trim());
+            const gid = Number(execSync('id -g www-data', { encoding: 'utf8' }).trim());
+            fs.chownSync(dest, uid, gid);
+            fs.chmodSync(dest, 0o640);
+        } catch (_) {}
+        log('info', 'auth', 'Synced Grok CLI auth → PHP-readable path', {
+            src,
+            dest,
+            reason: check.reason,
+            instance: INSTANCE_ID,
+        });
+        return { ok: true, synced: true, reason: check.reason, src, dest };
+    } catch (err) {
+        log('warning', 'auth', `Grok auth sync failed: ${err.message}`, { src, dest });
+        return { ok: false, error: err.message || 'sync_failed', src, dest };
+    }
+}
+
+// Startup + periodic self-heal (CLI login rotates tokens without telling PHP).
+syncGrokAuthIfNeeded(false);
+setInterval(() => {
+    try { syncGrokAuthIfNeeded(false); } catch (_) {}
+}, 60 * 1000);
+
 function isGrokModel(model) {
     return !!(model && (model.startsWith('gb:') || model.startsWith('grok:')));
 }
@@ -1436,6 +1556,11 @@ const httpServer = http.createServer((req, res) => {
         return;
     }
     if (url.pathname === '/health' && req.method === 'GET') {
+        // Opportunistic heal: keep usage API auth current whenever something pokes health.
+        let authSync = null;
+        try { authSync = syncGrokAuthIfNeeded(false); } catch (err) {
+            authSync = { ok: false, error: err.message || 'sync_failed' };
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'healthy',
@@ -1445,7 +1570,21 @@ const httpServer = http.createServer((req, res) => {
             detach: DETACH_AGENTS,
             role: 'worker',
             grok_auth: peekGrokAuthStatus(),
+            grok_auth_sync: authSync,
         }));
+        return;
+    }
+    // Force-copy CLI auth → storage/grok-auth.json (used by PHP after refresh_token revoke).
+    if (url.pathname === '/sync-grok-auth' && (req.method === 'POST' || req.method === 'GET')) {
+        const force = url.searchParams.get('force') === '1' || req.method === 'POST';
+        let result;
+        try {
+            result = syncGrokAuthIfNeeded(force);
+        } catch (err) {
+            result = { ok: false, error: err.message || 'sync_failed' };
+        }
+        res.writeHead(result && result.ok ? 200 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
         return;
     }
     // Gateway uses this to sticky-route reconnects to the worker that owns the agent

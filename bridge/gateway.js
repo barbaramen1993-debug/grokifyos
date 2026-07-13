@@ -188,6 +188,36 @@ const httpServer = http.createServer(async (req, res) => {
         proxy.end();
         return;
     }
+    // PHP usage self-heal: force CLI auth → storage/grok-auth.json via a root worker.
+    if (url.pathname === '/sync-grok-auth') {
+        const be = pickBackend();
+        const q = url.search || '';
+        const proxy = http.request(
+            {
+                host: be.host,
+                port: be.port,
+                path: '/sync-grok-auth' + q,
+                method: req.method === 'POST' ? 'POST' : 'GET',
+                headers: { Accept: 'application/json' },
+                timeout: 10000,
+            },
+            (up) => {
+                res.writeHead(up.statusCode || 502, { 'Content-Type': 'application/json' });
+                up.pipe(res);
+            }
+        );
+        proxy.on('error', () => {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'backend_unavailable' }));
+        });
+        proxy.on('timeout', () => {
+            proxy.destroy();
+            res.writeHead(504, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'backend_timeout' }));
+        });
+        proxy.end();
+        return;
+    }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'not_found', role: 'gateway' }));
 });
