@@ -1870,14 +1870,12 @@ fun SpotifyControllerPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         Text(
-                            "Live DJ UP NEXT is the set Spotify should play next. We mirror on " +
-                                "queue changes, handoffs, and near track end if the Up Next head drifted — " +
-                                "not on a mid-song timer (that thrashed Spotify’s queue). " +
-                                "Chat adds, removes, refill, jumps, and skips force-mirror. " +
-                                "If Spotify drifts to a ghost track, we reclaim the DJ next without wiping. " +
+                            "UP NEXT lives only in this app. When a cut ends (or you skip/jump), " +
+                                "Live DJ direct-plays the next URI — Spotify’s native queue is never written. " +
+                                "If Spotify autoplays something else, we reclaim our next track. " +
                                 "Tap a title or ▶ to jump (drops songs above · no talk). " +
-                                "Sync adopts whatever Spotify is on now (keeps UP NEXT). " +
-                                "Mirror to Spotify force-aligns. Refill adds · New queue replaces.",
+                                "Sync adopts whatever Spotify is on now (keeps the app list). " +
+                                "Refill adds · New queue replaces.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )
@@ -1891,13 +1889,6 @@ fun SpotifyControllerPane(
                                 enabled = djStore.enabled || djState.enabled,
                             ) {
                                 Text("Sync to Spotify", color = GrokifyColors.GlowMint, fontSize = 12.sp)
-                            }
-                            TextButton(
-                                onClick = { spotifyLiveDjAddToSpotifyQueue(appCtx) },
-                                enabled = (djStore.enabled || djState.enabled) &&
-                                    djState.queue.isNotEmpty(),
-                            ) {
-                                Text("Mirror to Spotify", color = GrokifyColors.GlowMint, fontSize = 12.sp)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjNewQueue(appCtx) },
@@ -2338,6 +2329,7 @@ fun SpotifyControllerPane(
                         Spacer(Modifier.height(12.dp))
                         Text(
                             "Radio seeds from liked, top, and recently played (recent cuts are excluded so they are not re-queued). " +
+                                "UP NEXT is an in-app list only — each track is direct-played when due (Spotify’s queue unused). " +
                                 "Queue, chat, and settings survive leave/return. " +
                                 "With resume on, an active session continues after OTA/restart.",
                             color = GrokifyColors.TextDim,
