@@ -2798,6 +2798,55 @@ private fun AddApiKeyDialog(
     )
 }
 
+private fun formatUsagePct(percent: Double): String =
+    if (percent == percent.toLong().toDouble()) {
+        "${percent.toLong()}%"
+    } else {
+        String.format("%.1f%%", percent)
+    }
+
+private fun usageProductLabel(raw: String): String = when (raw) {
+    "GrokBuild" -> "Build"
+    "GrokChat" -> "Chat"
+    "GrokImagine" -> "Imagine"
+    else -> raw.ifBlank { "Other" }
+}
+
+private fun usageAccent(percent: Double): Color = when {
+    percent >= 90 -> GrokifyColors.GlowRose
+    percent >= 70 -> GrokifyColors.GlowViolet
+    else -> GrokifyColors.GlowCyan
+}
+
+private fun formatResetWhen(resetAt: String): String {
+    if (resetAt.isBlank()) return "Reset time unknown"
+    return try {
+        val cleaned = resetAt
+            .replace("Z", "+00:00")
+            .let { if (it.contains('.')) it.replace(Regex("\\.\\d+"), "") else it }
+        val instant = java.time.OffsetDateTime.parse(cleaned).toInstant()
+        val now = java.time.Instant.now()
+        val secs = java.time.Duration.between(now, instant).seconds
+        val relative = when {
+            secs <= 0 -> "soon"
+            secs < 3600 -> "in ${secs / 60}m"
+            secs < 86400 -> "in ${secs / 3600}h"
+            else -> {
+                val days = secs / 86400
+                val hours = (secs % 86400) / 3600
+                if (hours > 0) "in ${days}d ${hours}h" else "in ${days}d"
+            }
+        }
+        val zoned = instant.atZone(java.time.ZoneId.systemDefault())
+        val clock = zoned.format(
+            java.time.format.DateTimeFormatter.ofPattern("EEE h:mm a", java.util.Locale.getDefault()),
+        )
+        "Resets $relative · $clock"
+    } catch (_: Exception) {
+        "Resets $resetAt"
+    }
+}
+
 @Composable
 private fun UsageCard(
     state: UiState,
@@ -2805,97 +2854,210 @@ private fun UsageCard(
 ) {
     val usage = state.usage
     val pct = usage?.usagePercent ?: 0.0
-    val progress = (pct / 100.0).toFloat().coerceIn(0f, 1f)
+    val remaining = usage?.remainingPercent?.takeIf { it > 0 } ?: (100.0 - pct).coerceAtLeast(0.0)
+    val accent = usageAccent(pct)
+    val hardError = usage?.error != null &&
+        (usage.label.isBlank() || (usage.usagePercent <= 0.0 && usage.products.isEmpty()))
+
     Column(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(14.dp))
             .background(GrokifyColors.Panel)
-            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                "WEEKLY USAGE",
-                style = MaterialTheme.typography.labelSmall,
-                color = GrokifyColors.GlowCyan,
-            )
-            TextButton(onClick = onRefresh, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+            Column(Modifier.weight(1f)) {
                 Text(
-                    if (state.usageLoading) "Refreshing…" else "Refresh",
+                    "WEEKLY USAGE",
+                    style = MaterialTheme.typography.labelSmall,
                     color = GrokifyColors.GlowCyan,
-                    fontSize = 11.sp,
+                    letterSpacing = 0.8.sp,
                 )
+                val tier = usage?.subscriptionTier?.trim().orEmpty()
+                if (tier.isNotEmpty() && !hardError) {
+                    Text(
+                        tier,
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            IconButton(
+                onClick = onRefresh,
+                modifier = Modifier.size(36.dp),
+                enabled = !state.usageLoading,
+            ) {
+                if (state.usageLoading) {
+                    CircularProgressIndicator(
+                        Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = GrokifyColors.GlowCyan,
+                    )
+                } else {
+                    Icon(
+                        Icons.Default.Refresh,
+                        contentDescription = "Refresh usage",
+                        tint = GrokifyColors.GlowCyan,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
             }
         }
-        if (usage?.error != null && (usage.label.isBlank() || usage.usagePercent <= 0.0 && usage.products.isEmpty())) {
-            Text(usage.error, color = GrokifyColors.GlowRose, fontSize = 12.sp)
-            if (usage.label.isNotBlank() && usage.label != usage.error) {
-                Text(usage.label, color = GrokifyColors.TextMuted, fontSize = 11.sp)
-            }
-        } else {
-            val pctLabel = if (pct == pct.toLong().toDouble()) {
-                "${pct.toLong()}%"
-            } else {
-                String.format("%.1f%%", pct)
-            }
-            Text(
-                "$pctLabel of weekly pool used",
-                color = GrokifyColors.TextPrimary,
-                fontWeight = FontWeight.Medium,
-                fontSize = 14.sp,
-            )
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp)
-                    .clip(RoundedCornerShape(999.dp)),
-                color = when {
-                    pct >= 90 -> GrokifyColors.GlowRose
-                    pct >= 70 -> GrokifyColors.GlowViolet
-                    else -> GrokifyColors.GlowCyan
-                },
-                trackColor = GrokifyColors.PanelBorder,
-            )
-            if (usage != null) {
+
+        when {
+            hardError -> {
                 Text(
-                    usage.label.ifBlank { "Resets: ${usage.resetAt}" },
+                    usage?.error ?: "Usage unavailable",
+                    color = GrokifyColors.GlowRose,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+                if (!usage?.label.isNullOrBlank() && usage?.label != usage?.error) {
+                    Text(usage!!.label, color = GrokifyColors.TextMuted, fontSize = 11.sp)
+                }
+            }
+            usage == null && state.usageLoading -> {
+                Text("Loading weekly pool…", color = GrokifyColors.TextMuted, fontSize = 13.sp)
+            }
+            usage == null -> {
+                Text(
+                    "Tap refresh to load your Grok weekly pool",
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 13.sp,
+                )
+            }
+            else -> {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Bottom,
+                ) {
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(
+                            formatUsagePct(pct).removeSuffix("%"),
+                            color = accent,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 32.sp,
+                            lineHeight = 34.sp,
+                        )
+                        Text(
+                            "%",
+                            color = accent.copy(alpha = 0.85f),
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 16.sp,
+                            modifier = Modifier.padding(bottom = 4.dp, start = 1.dp),
+                        )
+                        Text(
+                            " used",
+                            color = GrokifyColors.TextMuted,
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(bottom = 5.dp, start = 4.dp),
+                        )
+                    }
+                    Text(
+                        "${formatUsagePct(remaining)} left",
+                        color = GrokifyColors.TextPrimary,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(bottom = 4.dp),
+                    )
+                }
+
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(10.dp)
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(GrokifyColors.PanelSoft)
+                        .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(999.dp)),
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth((pct / 100.0).toFloat().coerceIn(0.02f, 1f).takeIf { pct > 0 } ?: 0f)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(accent.copy(alpha = 0.9f)),
+                    )
+                }
+
+                Text(
+                    formatResetWhen(usage.resetAt),
                     color = GrokifyColors.TextMuted,
                     fontSize = 12.sp,
                 )
-                if (usage.subscriptionTier.isNotBlank()) {
-                    Text(
-                        usage.subscriptionTier,
-                        color = GrokifyColors.TextDim,
-                        fontSize = 11.sp,
-                    )
+
+                val active = usage.products.filter {
+                    it.usagePercent != null && (it.usagePercent ?: 0.0) > 0
                 }
-                val active = usage.products.filter { it.usagePercent != null && (it.usagePercent ?: 0.0) > 0 }
                 if (active.isNotEmpty()) {
-                    Text(
-                        active.joinToString(" · ") { p ->
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(GrokifyColors.PanelSoft)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            "BY PRODUCT",
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            letterSpacing = 0.6.sp,
+                        )
+                        active.forEach { p ->
                             val pPct = p.usagePercent ?: 0.0
-                            val s = if (pPct == pPct.toLong().toDouble()) {
-                                "${pPct.toLong()}%"
-                            } else {
-                                String.format("%.1f%%", pPct)
+                            val pAccent = usageAccent(pPct)
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        usageProductLabel(p.product),
+                                        color = GrokifyColors.TextPrimary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                    Text(
+                                        formatUsagePct(pPct),
+                                        color = pAccent,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontFamily = FontFamily.Monospace,
+                                    )
+                                }
+                                Box(
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .height(4.dp)
+                                        .clip(RoundedCornerShape(999.dp))
+                                        .background(GrokifyColors.PanelBorder),
+                                ) {
+                                    Box(
+                                        Modifier
+                                            .fillMaxHeight()
+                                            .fillMaxWidth(
+                                                (pPct / 100.0).toFloat().coerceIn(0.02f, 1f),
+                                            )
+                                            .clip(RoundedCornerShape(999.dp))
+                                            .background(pAccent.copy(alpha = 0.85f)),
+                                    )
+                                }
                             }
-                            "${p.product}: $s"
-                        },
-                        color = GrokifyColors.TextDim,
-                        fontSize = 11.sp,
-                    )
+                        }
+                    }
                 }
-            } else if (state.usageLoading) {
-                Text("Loading usage…", color = GrokifyColors.TextMuted, fontSize = 12.sp)
-            } else {
-                Text("Tap Refresh to load Grok Build usage", color = GrokifyColors.TextMuted, fontSize = 12.sp)
             }
         }
     }

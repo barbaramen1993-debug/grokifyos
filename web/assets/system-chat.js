@@ -1861,32 +1861,144 @@
     }
   }
 
-  function formatUsageReset(resetAt) {
-    if (!resetAt) return 'reset unknown';
+  function formatUsageReset(resetAt, withClock) {
+    if (!resetAt) return withClock ? 'Reset time unknown' : 'reset unknown';
     try {
       const end = new Date(resetAt);
-      if (Number.isNaN(end.getTime())) return 'resets ' + resetAt;
+      if (Number.isNaN(end.getTime())) return (withClock ? 'Resets ' : 'resets ') + resetAt;
       const secs = Math.floor((end.getTime() - Date.now()) / 1000);
-      if (secs <= 0) return 'resets soon';
-      if (secs < 3600) return 'resets in ' + Math.floor(secs / 60) + 'm';
-      if (secs < 86400) return 'resets in ' + Math.floor(secs / 3600) + 'h';
-      const days = Math.floor(secs / 86400);
-      const hours = Math.floor((secs % 86400) / 3600);
-      return hours > 0 ? 'resets in ' + days + 'd ' + hours + 'h' : 'resets in ' + days + 'd';
+      let relative;
+      if (secs <= 0) relative = 'soon';
+      else if (secs < 3600) relative = 'in ' + Math.floor(secs / 60) + 'm';
+      else if (secs < 86400) relative = 'in ' + Math.floor(secs / 3600) + 'h';
+      else {
+        const days = Math.floor(secs / 86400);
+        const hours = Math.floor((secs % 86400) / 3600);
+        relative = hours > 0 ? 'in ' + days + 'd ' + hours + 'h' : 'in ' + days + 'd';
+      }
+      if (!withClock) return 'resets ' + relative;
+      const clock = end.toLocaleString(undefined, {
+        weekday: 'short',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+      return 'Resets ' + relative + ' · ' + clock;
     } catch (_) {
-      return 'resets ' + resetAt;
+      return (withClock ? 'Resets ' : 'resets ') + resetAt;
     }
   }
 
   function formatUsagePercent(n) {
     const v = Number(n) || 0;
-    return Number.isInteger(v) ? v + '%' : v.toFixed(1) + '%';
+    return Number.isInteger(v) ? String(v) : v.toFixed(1);
+  }
+
+  function formatUsagePercentLabel(n) {
+    return formatUsagePercent(n) + '%';
+  }
+
+  function usageLevelClass(pct) {
+    if (pct >= 90) return 'sc-usage-crit';
+    if (pct >= 70) return 'sc-usage-warn';
+    return '';
+  }
+
+  function usageProductName(raw) {
+    switch (raw) {
+      case 'GrokBuild': return 'Build';
+      case 'GrokChat': return 'Chat';
+      case 'GrokImagine': return 'Imagine';
+      default: return raw || 'Other';
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderUsageDetail(data) {
+    const detail = $('sc-usage-detail');
+    const body = $('sc-usage-detail-body') || (detail && detail.querySelector('.sc-usage-detail-body'));
+    const tierEl = $('sc-usage-tier');
+    if (!body) return;
+
+    if (!data || !data.ok) {
+      const msg = (data && (data.message || data.error)) || 'Usage unavailable';
+      if (detail) detail.classList.remove('sc-usage-warn', 'sc-usage-crit');
+      if (tierEl) {
+        tierEl.hidden = true;
+        tierEl.textContent = '';
+      }
+      body.innerHTML = '<div class="sc-usage-error">' + escapeHtml(msg) + '</div>';
+      return;
+    }
+
+    const pct = Number(data.usage_percent) || 0;
+    const remaining = data.remaining_percent != null
+      ? Number(data.remaining_percent)
+      : Math.max(0, 100 - pct);
+    const level = usageLevelClass(pct);
+    if (detail) {
+      detail.classList.toggle('sc-usage-warn', level === 'sc-usage-warn');
+      detail.classList.toggle('sc-usage-crit', level === 'sc-usage-crit');
+    }
+    if (tierEl) {
+      const tier = (data.subscription_tier || '').trim();
+      tierEl.hidden = !tier;
+      tierEl.textContent = tier;
+    }
+
+    const products = (data.products || [])
+      .filter((p) => p.usage_percent != null && Number(p.usage_percent) > 0);
+    let productsHtml = '';
+    if (products.length) {
+      productsHtml =
+        '<div class="sc-usage-products">' +
+        '<div class="sc-usage-products-label">By product</div>' +
+        products.map((p) => {
+          const pPct = Number(p.usage_percent) || 0;
+          const pLevel = usageLevelClass(pPct);
+          const w = Math.min(100, Math.max(pPct > 0 ? 2 : 0, pPct));
+          return (
+            '<div class="sc-usage-product ' + pLevel + '">' +
+              '<div class="sc-usage-product-row">' +
+                '<span class="sc-usage-product-name">' + escapeHtml(usageProductName(p.product)) + '</span>' +
+                '<span class="sc-usage-product-pct">' + escapeHtml(formatUsagePercentLabel(pPct)) + '</span>' +
+              '</div>' +
+              '<div class="sc-usage-product-bar"><span style="width:' + w + '%"></span></div>' +
+            '</div>'
+          );
+        }).join('') +
+        '</div>';
+    }
+
+    const barW = Math.min(100, Math.max(pct > 0 ? 2 : 0, pct));
+    body.innerHTML =
+      '<div class="sc-usage-hero">' +
+        '<div class="sc-usage-hero-left">' +
+          '<span class="sc-usage-pct">' + escapeHtml(formatUsagePercent(pct)) + '</span>' +
+          '<span class="sc-usage-pct-unit">%</span>' +
+          '<span class="sc-usage-pct-label">used</span>' +
+        '</div>' +
+        '<div class="sc-usage-left">' + escapeHtml(formatUsagePercentLabel(remaining)) + ' left</div>' +
+      '</div>' +
+      '<div class="sc-usage-bar ' + level + '"><span style="width:' + barW + '%"></span></div>' +
+      '<div class="sc-usage-reset">' + escapeHtml(formatUsageReset(data.reset_at, true)) + '</div>' +
+      productsHtml;
   }
 
   async function loadUsage(force) {
     const chip = $('sc-usage-chip');
-    const detail = $('sc-usage-detail');
-    if (chip) chip.textContent = 'Usage …';
+    const refreshBtn = $('sc-usage-refresh');
+    if (chip) chip.textContent = '…';
+    if (refreshBtn) {
+      refreshBtn.disabled = true;
+      refreshBtn.textContent = '…';
+    }
     try {
       const q = force ? '?refresh=1' : '';
       const data = await apiGet('/admin-system-chat-usage.php' + q);
@@ -1897,14 +2009,11 @@
           chip.classList.remove('sc-usage-warn', 'sc-usage-crit');
           chip.title = msg;
         }
-        if (detail) {
-          const body = detail.querySelector('.sc-usage-detail-body');
-          if (body) body.textContent = msg;
-        }
+        renderUsageDetail(data);
         return;
       }
       const pct = Number(data.usage_percent) || 0;
-      const label = 'Usage ' + formatUsagePercent(pct) + ' · ' + formatUsageReset(data.reset_at);
+      const label = formatUsagePercentLabel(pct) + ' used · ' + formatUsageReset(data.reset_at, false);
       if (chip) {
         chip.textContent = label;
         chip.classList.toggle('sc-usage-warn', pct >= 70 && pct < 90);
@@ -1913,26 +2022,17 @@
           (data.subscription_tier ? data.subscription_tier + '\n' : '') +
           'Reset: ' + (data.reset_at || 'unknown');
       }
-      if (detail) {
-        const body = detail.querySelector('.sc-usage-detail-body');
-        if (body) {
-          const products = (data.products || [])
-            .filter((p) => p.usage_percent != null && Number(p.usage_percent) > 0)
-            .map((p) => p.product + ': ' + formatUsagePercent(p.usage_percent))
-            .join(' · ');
-          const barClass = pct >= 90 ? 'sc-usage-crit' : pct >= 70 ? 'sc-usage-warn' : '';
-          body.innerHTML =
-            '<div><strong style="color:#fff">' + formatUsagePercent(pct) + '</strong> of weekly pool used</div>' +
-            '<div class="sc-usage-bar ' + barClass + '"><span style="width:' + Math.min(100, pct) + '%"></span></div>' +
-            '<div>' + formatUsageReset(data.reset_at) +
-            (data.subscription_tier ? ' · ' + data.subscription_tier : '') + '</div>' +
-            (products ? '<div style="margin-top:0.25rem">' + products + '</div>' : '');
-        }
-      }
+      renderUsageDetail(data);
     } catch (e) {
       if (chip) {
         chip.textContent = 'Usage —';
         chip.title = e.message || 'usage failed';
+      }
+      renderUsageDetail({ ok: false, message: e.message || 'usage failed' });
+    } finally {
+      if (refreshBtn) {
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = 'Refresh';
       }
     }
   }
@@ -2471,6 +2571,12 @@
     });
     $('sc-usage-chip') &&
       $('sc-usage-chip').addEventListener('click', () => {
+        loadUsage(true);
+      });
+    $('sc-usage-refresh') &&
+      $('sc-usage-refresh').addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         loadUsage(true);
       });
     $('sc-new-chat') && $('sc-new-chat').addEventListener('click', () => newChat());

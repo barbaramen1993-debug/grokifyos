@@ -20,7 +20,7 @@ $chatReady = gos_system_chat_tables_ready();
 $devPack = $canAccess ? gos_devices_for_user((int) $user['id']) : ['devices' => [], 'active' => []];
 $activeDevices = $devPack['active'];
 $latestApk = $canAccess ? gos_latest_apk() : null;
-$assetV = '20260713-chat-settings';
+$assetV = '20260713-usage-meter';
 ?><!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -496,8 +496,14 @@ $assetV = '20260713-chat-settings';
               <div class="sc-popover-header">Settings</div>
               <div class="sc-settings-body">
                 <div id="sc-usage-detail" class="sc-usage-detail">
-                  <div class="sc-usage-detail-title">Weekly usage</div>
-                  <div class="sc-usage-detail-body text-[#9ca3af]">Loading…</div>
+                  <div class="sc-usage-detail-head">
+                    <div>
+                      <div class="sc-usage-detail-title">Weekly usage</div>
+                      <span class="sc-usage-detail-tier" id="sc-usage-tier" hidden></span>
+                    </div>
+                    <button type="button" class="sc-usage-refresh" id="sc-usage-refresh" title="Refresh usage">Refresh</button>
+                  </div>
+                  <div class="sc-usage-detail-body" id="sc-usage-detail-body">Loading…</div>
                 </div>
                 <label class="sc-settings-label" for="sc-model-select">Model</label>
                 <select id="sc-model-select" class="sc-select w-full max-w-none"></select>

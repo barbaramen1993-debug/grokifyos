@@ -1156,7 +1156,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 val pct = data.optDouble("usage_percent", 0.0)
                 val resetAt = data.optString("reset_at")
                 val tier = data.optString("subscription_tier")
-                val label = formatUsageLabel(pct, resetAt, tier, products)
+                val label = formatUsageLabel(pct, resetAt)
                 _state.update {
                     it.copy(
                         usageLoading = false,
@@ -1206,30 +1206,9 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun formatUsageLabel(
-        percent: Double,
-        resetAt: String,
-        tier: String,
-        products: List<UsageProduct> = emptyList(),
-    ): String {
-        val pctStr = formatPct(percent)
-        val resetPart = formatResetRelative(resetAt)
-        val tierPart = tier.trim().takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
-        val productPart = products
-            .filter { it.usagePercent != null && (it.usagePercent ?: 0.0) > 0 }
-            .joinToString(" · ") { p ->
-                val name = when (p.product) {
-                    "GrokBuild" -> "Build"
-                    "GrokChat" -> "Chat"
-                    "GrokImagine" -> "Imagine"
-                    else -> p.product.ifBlank { "?" }
-                }
-                "$name ${formatPct(p.usagePercent ?: 0.0)}"
-            }
-            .takeIf { it.isNotEmpty() }
-            ?.let { " · $it" }
-            ?: ""
-        return "Usage $pctStr$tierPart$productPart · $resetPart"
+    private fun formatUsageLabel(percent: Double, resetAt: String): String {
+        // Compact chip label — product breakdown lives in Settings, not the status line.
+        return "${formatPct(percent)} used · ${formatResetRelative(resetAt)}"
     }
 
     private fun formatPct(percent: Double): String =
