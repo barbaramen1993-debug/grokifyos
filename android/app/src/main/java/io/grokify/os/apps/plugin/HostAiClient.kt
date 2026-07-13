@@ -34,8 +34,8 @@ import java.util.concurrent.atomic.AtomicReference
  * **Text / research** — same path as Chat: device token → host API → bridge →
  * Grok Build headless CLI. Does **not** call api.x.ai for completions.
  *
- * **Speak / DJ banter** — prefers xAI Voice TTS (`POST /v1/tts`) when an
- * xAI API key is stored; falls back to on-device TTS.
+ * **Speak / DJ banter** — prefers SpaceXAI Voice TTS (`POST /v1/tts`) when a
+ * SpaceXAI API key is stored; falls back to on-device TTS.
  *
  * Plugin / Live DJ turns reuse dedicated [system_chat_sessions] rows whose
  * titles start with [INTERNAL_SESSION_TITLE_PREFIX] so main Chat history can
@@ -414,7 +414,7 @@ object HostAiClient {
         val preferDevice = opts.optBoolean("prefer_device", false)
         val wait = opts.optBoolean("wait", false)
         val talkover = opts.optBoolean("talkover", false)
-        val xaiKey = HostApiKeyStore.getValue(ctx, ApiKeyIds.XAI)
+        val xaiKey = HostApiKeyStore.getValue(ctx, ApiKeyIds.SPACEXAI)
 
         if (!preferDevice && !xaiKey.isNullOrBlank()) {
             val voice = opts.optString("voice_id", "eve").ifBlank { "eve" }
@@ -445,8 +445,8 @@ object HostAiClient {
             return device
                 .put(
                     "hint",
-                    "Add an xAI API key in Settings for Grok Voice TTS (DJ banter). " +
-                        "Research already uses host Grok Build — no xAI key needed for that.",
+                    "Add a SpaceXAI API key in Settings for Grok Voice TTS (DJ banter). " +
+                        "Research already uses host Grok Build — no SpaceXAI key needed for that.",
                 )
                 .toString()
         }
@@ -638,7 +638,7 @@ object HostAiClient {
                 .put("focus", focus != null)
                 .put(
                     "note",
-                    "On-device TTS. Add xAI API key for Grok Voice between tracks.",
+                    "On-device TTS. Add SpaceXAI API key for Grok Voice between tracks.",
                 )
         } catch (e: Exception) {
             abandonSpeechFocus(ctx)

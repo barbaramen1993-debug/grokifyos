@@ -65,6 +65,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.automirrored.filled.Notes
 import androidx.compose.material.icons.filled.Key
@@ -83,6 +84,7 @@ import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
 import io.grokify.os.apps.BluetoothScannerPane
 import io.grokify.os.apps.LocationNotesPane
+import io.grokify.os.apps.SpaceXaiUsageAnalyzerPane
 import io.grokify.os.apps.SpotifyControllerPane
 import io.grokify.os.apps.WifiScannerPane
 import io.grokify.os.apps.plugin.BuiltinPluginCatalog
@@ -2156,95 +2158,43 @@ private fun SettingsPage(
             fontSize = 12.sp,
         )
 
-        // —— xAI (always visible with setup steps) ——
+        // —— SpaceXAI (inference + management are different product keys) ——
         Text(
-            "xAI · GROK VOICE",
+            "SPACEXAI · VOICE + USAGE",
             style = MaterialTheme.typography.labelSmall,
             color = GrokifyColors.GlowViolet,
         )
         Text(
-            "1) Open console.x.ai → API Keys → Create API key\n" +
-                "2) Paste below and Save\n" +
-                "3) In Spotify DJ → AI DJ, pick a voice (eve, ara, leo, rex, sal, carina, …)\n" +
-                "Used for Speak / banter TTS only. Playlist research uses host Grok Build " +
-                "(your device token on Home) — no xAI key needed for research.",
+            "Two different key types from console.x.ai — keep both if you use Voice and Usage Analyzer.\n" +
+                "• API key (inference) → Grok Voice TTS (Spotify Live DJ)\n" +
+                "• Management key (billing) → Apps → SpaceXAI Usage Analyzer\n" +
+                "Playlist research uses host Grok Build (device token) — not these keys.",
             color = GrokifyColors.TextMuted,
             fontSize = 12.sp,
             lineHeight = 16.sp,
         )
-        state.apiKeys.filter { it.id == "xai_api_key" }.forEach { entry ->
-            var draft by remember(entry.id, entry.value) { mutableStateOf(entry.value) }
-            var visible by remember(entry.id) { mutableStateOf(false) }
-            var flash by remember(entry.id) { mutableStateOf(false) }
-            LaunchedEffect(flash) {
-                if (flash) {
-                    delay(1400)
-                    flash = false
-                }
-            }
-            // Keep draft in sync if vault reloads from elsewhere
-            LaunchedEffect(entry.value) { draft = entry.value }
-            ApiKeyCard(
-                title = entry.label,
-                subtitle = if (entry.value.isBlank()) {
-                    "Not set · required for Grok Voice between tracks"
-                } else {
-                    "Saved · ends ${entry.maskedTail()} · ready for apps that need it"
-                },
-                value = draft,
-                visible = visible,
-                persistedValue = entry.value,
-                defaultHint = "id ${entry.id} · api.x.ai/v1/tts",
-                savedFlash = flash,
-                onValueChange = { draft = it },
-                onToggleVisible = { visible = !visible },
-                onSave = {
-                    onSaveApiKey(entry.id, draft, entry.label, entry.description)
-                    flash = true
-                    keySavedFlash = true
-                },
-                onClear = {
-                    draft = ""
-                    onClearApiKey(entry.id)
-                    flash = true
-                },
-                clearLabel = "Remove",
-            )
-        }
-        if (state.apiKeys.none { it.id == "xai_api_key" }) {
-            // Fallback if vault list not yet seeded
-            var draft by remember { mutableStateOf("") }
-            var visible by remember { mutableStateOf(false) }
-            var flash by remember { mutableStateOf(false) }
-            LaunchedEffect(flash) {
-                if (flash) {
-                    delay(1400)
-                    flash = false
-                }
-            }
-            ApiKeyCard(
-                title = "xAI API key",
-                subtitle = "Not set · paste key from console.x.ai",
-                value = draft,
-                visible = visible,
-                persistedValue = "",
-                defaultHint = "id xai_api_key",
-                savedFlash = flash,
-                onValueChange = { draft = it },
-                onToggleVisible = { visible = !visible },
-                onSave = {
-                    onSaveApiKey("xai_api_key", draft, "xAI API key", null)
-                    flash = true
-                    keySavedFlash = true
-                },
-                onClear = {
-                    draft = ""
-                    onClearApiKey("xai_api_key")
-                    flash = true
-                },
-                clearLabel = "Remove",
-            )
-        }
+        SettingsVaultKeyCard(
+            entry = state.apiKeys.firstOrNull { it.id == "spacexai_api_key" },
+            fallbackId = "spacexai_api_key",
+            fallbackLabel = "SpaceXAI API key",
+            emptySubtitle = "Not set · inference key for Voice TTS",
+            savedSubtitle = { "Saved · ends $it · api.x.ai Voice TTS" },
+            defaultHint = "id spacexai_api_key · console.x.ai → API Keys",
+            onSaveApiKey = onSaveApiKey,
+            onClearApiKey = onClearApiKey,
+            onSavedFlash = { keySavedFlash = true },
+        )
+        SettingsVaultKeyCard(
+            entry = state.apiKeys.firstOrNull { it.id == "spacexai_management_key" },
+            fallbackId = "spacexai_management_key",
+            fallbackLabel = "SpaceXAI Management key",
+            emptySubtitle = "Not set · billing key for Usage Analyzer",
+            savedSubtitle = { "Saved · ends $it · management-api.x.ai" },
+            defaultHint = "id spacexai_management_key · console.x.ai → Management Keys",
+            onSaveApiKey = onSaveApiKey,
+            onClearApiKey = onClearApiKey,
+            onSavedFlash = { keySavedFlash = true },
+        )
 
         Text(
             "SPOTIFY · MAPS · OTHER",
@@ -2280,7 +2230,11 @@ private fun SettingsPage(
             fontSize = 12.sp,
         )
         state.apiKeys
-            .filter { it.id != "mapbox_access_token" && it.id != "xai_api_key" }
+            .filter {
+                it.id != "mapbox_access_token" &&
+                    it.id != "spacexai_api_key" &&
+                    it.id != "spacexai_management_key"
+            }
             .forEach { entry ->
                 var draft by remember(entry.id, entry.value) { mutableStateOf(entry.value) }
                 var visible by remember(entry.id) { mutableStateOf(false) }
@@ -2545,6 +2499,61 @@ private fun SecretStatusChip(
             .background(color.copy(alpha = 0.12f))
             .border(1.dp, color.copy(alpha = 0.4f), RoundedCornerShape(999.dp))
             .padding(horizontal = 10.dp, vertical = 4.dp),
+    )
+}
+
+/** Dedicated Settings row for a vault key (with empty fallback when not yet seeded). */
+@Composable
+private fun SettingsVaultKeyCard(
+    entry: io.grokify.os.data.ApiKeyEntry?,
+    fallbackId: String,
+    fallbackLabel: String,
+    emptySubtitle: String,
+    savedSubtitle: (maskedTail: String) -> String,
+    defaultHint: String,
+    onSaveApiKey: (id: String, value: String, label: String, description: String?) -> Unit,
+    onClearApiKey: (id: String) -> Unit,
+    onSavedFlash: () -> Unit,
+) {
+    val id = entry?.id ?: fallbackId
+    val label = entry?.label?.ifBlank { fallbackLabel } ?: fallbackLabel
+    val description = entry?.description
+    val persisted = entry?.value.orEmpty()
+    var draft by remember(id, persisted) { mutableStateOf(persisted) }
+    var visible by remember(id) { mutableStateOf(false) }
+    var flash by remember(id) { mutableStateOf(false) }
+    LaunchedEffect(flash) {
+        if (flash) {
+            delay(1400)
+            flash = false
+        }
+    }
+    LaunchedEffect(persisted) { draft = persisted }
+    ApiKeyCard(
+        title = label,
+        subtitle = if (persisted.isBlank()) {
+            emptySubtitle
+        } else {
+            savedSubtitle(entry?.maskedTail().orEmpty())
+        },
+        value = draft,
+        visible = visible,
+        persistedValue = persisted,
+        defaultHint = defaultHint,
+        savedFlash = flash,
+        onValueChange = { draft = it },
+        onToggleVisible = { visible = !visible },
+        onSave = {
+            onSaveApiKey(id, draft, label, description)
+            flash = true
+            onSavedFlash()
+        },
+        onClear = {
+            draft = ""
+            onClearApiKey(id)
+            flash = true
+        },
+        clearLabel = "Remove",
     )
 }
 
@@ -3773,6 +3782,9 @@ private fun AppsPane(
             onBack = onBackToHub,
             onRequestPermissions = onRequestNotifPerms,
         )
+        BuiltinPluginCatalog.SPACEXAI_USAGE, "spacexai_usage_analyzer" -> SpaceXaiUsageAnalyzerPane(
+            onBack = onBackToHub,
+        )
         else -> AppsHub(
             appOrder = appOrder,
             onOpenApp = onOpenApp,
@@ -3991,6 +4003,7 @@ private fun pluginIcon(key: PluginIconKey): ImageVector = when (key) {
     PluginIconKey.Music -> Icons.Default.MusicNote
     PluginIconKey.Apps -> Icons.Default.Apps
     PluginIconKey.Extension -> Icons.Default.Extension
+    PluginIconKey.Chart -> Icons.Default.BarChart
 }
 
 @Composable

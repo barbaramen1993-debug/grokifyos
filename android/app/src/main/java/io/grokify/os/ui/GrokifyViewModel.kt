@@ -613,7 +613,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             .filter { it.id != ApiKeyIds.MAPBOX }
             .sortedWith(
                 compareBy(
-                    { it.id != ApiKeyIds.XAI }, // xAI first
+                    { it.id != ApiKeyIds.SPACEXAI }, // inference key first
+                    { it.id != ApiKeyIds.SPACEXAI_MANAGEMENT },
                     { it.id != ApiKeyIds.SPOTIFY_CLIENT_ID },
                     { !it.preset },
                     { it.label.lowercase() },

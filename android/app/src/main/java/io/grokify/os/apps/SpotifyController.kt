@@ -868,7 +868,7 @@ fun SpotifyControllerPane(
     var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
     var voicePreviewBusy by remember { mutableStateOf(false) }
     var hasXaiKey by remember {
-        mutableStateOf(!HostApiKeyStore.getValue(appCtx, ApiKeyIds.XAI).isNullOrBlank())
+        mutableStateOf(!HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank())
     }
     var djChatDraft by remember { mutableStateOf("") }
     /** 0 = Chat, 1 = Queue, 2 = Settings (inner Live DJ tabs) */
@@ -927,7 +927,7 @@ fun SpotifyControllerPane(
         while (true) {
             loggedIn = SpotifyOAuth.isLoggedIn(appCtx)
             authMsg = SpotifyOAuth.lastAuthMessage.orEmpty()
-            hasXaiKey = !HostApiKeyStore.getValue(appCtx, ApiKeyIds.XAI).isNullOrBlank()
+            hasXaiKey = !HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank()
             delay(1_200L)
         }
     }
@@ -1769,7 +1769,7 @@ fun SpotifyControllerPane(
                                     djOn = djStore.enabled || djState.enabled,
                                     onPrev = { spotifyLiveDjPrevious(appCtx) },
                                     onPauseToggle = { spotifyLiveDjPauseToggle(appCtx) },
-                                    onSkip = { spotifyLiveDjSkip(appCtx) },
+                                    onSkip = { spotifyLiveDjSkip(appCtx, forceTalk = false) },
                                 )
                             }
                         }
@@ -1876,7 +1876,7 @@ fun SpotifyControllerPane(
                                 Text("Refill", color = GrokifyColors.GlowCyan, fontSize = 12.sp)
                             }
                             TextButton(
-                                onClick = { spotifyLiveDjSkip(appCtx) },
+                                onClick = { spotifyLiveDjSkip(appCtx, forceTalk = true) },
                                 enabled = djStore.enabled || djState.enabled,
                             ) {
                                 Text("Skip + talk", color = GrokifyColors.GlowCyan, fontSize = 12.sp)
@@ -3083,7 +3083,7 @@ private fun DjChatBubble(
                             IconButton(onClick = onSkip) {
                                 Icon(
                                     Icons.Default.SkipNext,
-                                    contentDescription = "Skip",
+                                    contentDescription = "Skip (countdown −1, no forced talk)",
                                     tint = GrokifyColors.TextPrimary,
                                 )
                             }

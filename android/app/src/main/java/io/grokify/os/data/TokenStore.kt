@@ -131,11 +131,14 @@ class TokenStore(private val context: Context) {
     }
 
     suspend fun upsertApiKey(entry: ApiKeyEntry) {
-        val cleanedId = entry.id.trim()
+        var cleanedId = entry.id.trim()
         if (cleanedId.isEmpty()) return
+        // Normalize legacy xAI id → SpaceXAI vault id.
+        if (ApiKeyIds.isSpaceXaiKeyId(cleanedId)) cleanedId = ApiKeyIds.SPACEXAI
         val cleanedValue = entry.value.trim()
         context.dataStore.edit { prefs ->
             val current = ApiKeyVaultCodec.decode(prefs[keyApiVault]).toMutableMap()
+            current.remove(ApiKeyIds.LEGACY_XAI)
             if (cleanedValue.isEmpty()) {
                 current.remove(cleanedId)
             } else {
@@ -165,11 +168,13 @@ class TokenStore(private val context: Context) {
     }
 
     suspend fun removeApiKey(id: String) {
-        val cleanedId = id.trim()
+        var cleanedId = id.trim()
         if (cleanedId.isEmpty()) return
+        if (ApiKeyIds.isSpaceXaiKeyId(cleanedId)) cleanedId = ApiKeyIds.SPACEXAI
         context.dataStore.edit { prefs ->
             val current = ApiKeyVaultCodec.decode(prefs[keyApiVault]).toMutableMap()
             current.remove(cleanedId)
+            current.remove(ApiKeyIds.LEGACY_XAI)
             if (current.isEmpty()) prefs.remove(keyApiVault)
             else prefs[keyApiVault] = ApiKeyVaultCodec.encode(current)
         }
@@ -179,8 +184,9 @@ class TokenStore(private val context: Context) {
     }
 
     suspend fun setApiKeyValue(id: String, value: String, label: String? = null, description: String? = null) {
-        val cleanedId = id.trim()
+        var cleanedId = id.trim()
         if (cleanedId.isEmpty()) return
+        if (ApiKeyIds.isSpaceXaiKeyId(cleanedId)) cleanedId = ApiKeyIds.SPACEXAI
         val preset = ApiKeyPresets.byId(cleanedId)
         upsertApiKey(
             ApiKeyEntry(

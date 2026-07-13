@@ -28,8 +28,18 @@ object HostApiKeyStore {
         val cleaned = id.trim()
         if (cleaned.isEmpty()) return null
         val vault = snapshot(ctx)
-        val v = vault[cleaned]?.value?.trim().orEmpty()
+        val primaryId = when {
+            ApiKeyIds.isSpaceXaiKeyId(cleaned) -> ApiKeyIds.SPACEXAI
+            ApiKeyIds.isSpaceXaiManagementKeyId(cleaned) -> ApiKeyIds.SPACEXAI_MANAGEMENT
+            else -> cleaned
+        }
+        val v = vault[primaryId]?.value?.trim().orEmpty()
         if (v.isNotEmpty()) return v
+        // Legacy vault id before SpaceXAI rename (inference key only)
+        if (ApiKeyIds.isSpaceXaiKeyId(cleaned)) {
+            val legacy = vault[ApiKeyIds.LEGACY_XAI]?.value?.trim().orEmpty()
+            if (legacy.isNotEmpty()) return legacy
+        }
         // Legacy Mapbox field
         if (cleaned == ApiKeyIds.MAPBOX) {
             return runBlocking {
@@ -37,6 +47,16 @@ object HostApiKeyStore {
             }
         }
         return null
+    }
+
+    /**
+     * Management Key for billing / Usage Analyzer.
+     * Prefers [ApiKeyIds.SPACEXAI_MANAGEMENT]; falls back to inference vault only when
+     * management is empty (users who previously shared one slot).
+     */
+    fun getSpaceXaiManagementKey(ctx: Context): String? {
+        getValue(ctx, ApiKeyIds.SPACEXAI_MANAGEMENT)?.takeIf { it.isNotBlank() }?.let { return it }
+        return getValue(ctx, ApiKeyIds.SPACEXAI)?.takeIf { it.isNotBlank() }
     }
 
     fun has(ctx: Context, id: String): Boolean = !getValue(ctx, id).isNullOrBlank()
@@ -71,14 +91,31 @@ object HostApiKeyStore {
     }
 
     fun save(ctx: Context, id: String, value: String, label: String? = null, description: String? = null) {
+        val cleaned = when {
+            ApiKeyIds.isSpaceXaiKeyId(id) -> ApiKeyIds.SPACEXAI
+            ApiKeyIds.isSpaceXaiManagementKeyId(id) -> ApiKeyIds.SPACEXAI_MANAGEMENT
+            else -> id.trim()
+        }
         runBlocking {
-            store(ctx).setApiKeyValue(id, value, label, description)
+            store(ctx).setApiKeyValue(cleaned, value, label, description)
+            // Drop pre-rename id so vault stays single-source.
+            if (ApiKeyIds.isSpaceXaiKeyId(id)) {
+                store(ctx).removeApiKey(ApiKeyIds.LEGACY_XAI)
+            }
         }
     }
 
     fun remove(ctx: Context, id: String) {
+        val cleaned = when {
+            ApiKeyIds.isSpaceXaiKeyId(id) -> ApiKeyIds.SPACEXAI
+            ApiKeyIds.isSpaceXaiManagementKeyId(id) -> ApiKeyIds.SPACEXAI_MANAGEMENT
+            else -> id.trim()
+        }
         runBlocking {
-            store(ctx).removeApiKey(id)
+            store(ctx).removeApiKey(cleaned)
+            if (ApiKeyIds.isSpaceXaiKeyId(id)) {
+                store(ctx).removeApiKey(ApiKeyIds.LEGACY_XAI)
+            }
         }
     }
 }

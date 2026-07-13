@@ -653,10 +653,20 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
 }
 
 
-fun spotifyLiveDjSkip(context: Context) {
+/**
+ * Advance to the next Live DJ queue track.
+ *
+ * @param forceTalk when true (Skip + talk), always speak a banter line first.
+ *   When false (plain skip / media next), only talk if the countdown is due
+ *   or a line was already prefetched for the next track — otherwise just
+ *   skip and decrement the banter countdown by one.
+ */
+fun spotifyLiveDjSkip(context: Context, forceTalk: Boolean = false) {
     val appCtx = context.applicationContext
     if (!SpotifyDjStore(appCtx).enabled) return
-    val i = Intent(appCtx, SpotifyLiveDjService::class.java).setAction(SpotifyLiveDjService.ACTION_DJ_SKIP)
+    val i = Intent(appCtx, SpotifyLiveDjService::class.java)
+        .setAction(SpotifyLiveDjService.ACTION_DJ_SKIP)
+        .putExtra(SpotifyLiveDjService.EXTRA_FORCE_TALK, forceTalk)
     try {
         ContextCompat.startForegroundService(appCtx, i)
     } catch (e: Exception) {
@@ -861,7 +871,7 @@ class SpotifyLiveDjService : Service() {
     private var songsSinceBanter = 0
     /** Speak after this many songs (from settings: fixed or rolled random). */
     private var banterEvery = 4
-    /** Manual skip always forces a line. */
+    /** Skip + talk (or explicit chat force) forces a banter line. Plain skip does not. */
     private var forceBanter = false
     /** Soft rotation of radio seed modes (liked / top / recent / artist). */
     private var radioModeIdx = 0
@@ -943,7 +953,8 @@ class SpotifyLiveDjService : Service() {
             }
             ACTION_DJ_SKIP -> {
                 if (store.enabled) {
-                    forceBanter = true
+                    // Only Skip + talk forces banter; plain skip follows the countdown.
+                    forceBanter = intent.getBooleanExtra(EXTRA_FORCE_TALK, false)
                     scope.launch { runTransition("skip") }
                 }
             }
@@ -1671,18 +1682,19 @@ class SpotifyLiveDjService : Service() {
     private suspend fun runTransition(reason: String) {
         if (!store.enabled) return
         if (!transitioning.compareAndSet(false, true)) return
-        val isSkip = reason == "skip" || reason == "chat_skip"
-        val wantBanter = forceBanter || isSkip || songsSinceBanter + 1 >= banterEvery
+        // Capture before clear — Skip + talk sets this; plain skip / natural end do not.
+        val forcedTalk = forceBanter
         forceBanter = false
         // Talk-over: when the user allows it, always ride the track (duck volume) —
         // never hard-pause mid-outro. Random "clean mic" pauses made it feel broken.
         // When allowTalkOver is off, pause only for a clean handoff line.
         val allowTalk = store.allowTalkOver
-        val talkover = wantBanter && allowTalk
+        // Provisional status; refined after we know next + prefetch below.
+        val banterDueProvisional = forcedTalk || songsSinceBanter + 1 >= banterEvery
         publish(
             status = when {
-                wantBanter && talkover -> "🎙 Prep talkover ($reason)…"
-                wantBanter -> "🎙 Prep banter ($reason)…"
+                banterDueProvisional && allowTalk -> "🎙 Prep talkover ($reason)…"
+                banterDueProvisional -> "🎙 Prep banter ($reason)…"
                 else -> "Next track ($reason)…"
             },
             transitioning = true,
@@ -1694,6 +1706,14 @@ class SpotifyLiveDjService : Service() {
                 }
                 val next = synchronized(queue) { queue.removeFirstOrNull() }
                 val prev = current
+                // Plain skip: countdown −1 only. Banter only when due, already
+                // prefetched for next, or Skip + talk forced it.
+                val banterDue = songsSinceBanter + 1 >= banterEvery
+                val banterReady = next != null &&
+                    prefetchedForUri == next.uri &&
+                    !prefetchedBanter.isNullOrBlank()
+                val wantBanter = forcedTalk || banterDue || banterReady
+                val talkover = wantBanter && allowTalk
 
                 if (wantBanter) {
                     // Keep Spotify playing while we write + fetch TTS so the cut isn't
@@ -2159,8 +2179,13 @@ class SpotifyLiveDjService : Service() {
                     lower.contains("skip") || lower.contains("next song") ||
                         lower.contains("pass") || lower.contains("hate this") ||
                         lower.contains("don't like this") || lower.contains("dont like this") -> {
-                        replaceStreaming(thinkingId, "Skipping ahead — one sec.")
-                        forceBanter = true
+                        // Chat skip follows countdown like the Skip button — not Skip + talk.
+                        val forceTalk = lower.contains("talk") || lower.contains("banter")
+                        replaceStreaming(
+                            thinkingId,
+                            if (forceTalk) "Skip + talk — one sec." else "Skipping ahead — one sec.",
+                        )
+                        forceBanter = forceTalk
                         runTransition("chat_skip")
                         return@withContext
                     }
@@ -2359,7 +2384,8 @@ class SpotifyLiveDjService : Service() {
                         infoBits.add(lookupArtistInfo(q))
                     }
                     "skip" -> {
-                        forceBanter = true
+                        // Tool skip is plain next (countdown −1); use talk/banter ops for force.
+                        forceBanter = false
                         scope.launch { runTransition("chat_skip") }
                     }
                     "pause" -> {
@@ -4041,6 +4067,8 @@ class SpotifyLiveDjService : Service() {
     companion object {
         const val ACTION_DJ_STOP = "io.grokify.os.SPOTIFY_DJ_STOP"
         const val ACTION_DJ_SKIP = "io.grokify.os.SPOTIFY_DJ_SKIP"
+        /** Intent extra for [ACTION_DJ_SKIP]: true = Skip + talk (force banter). */
+        const val EXTRA_FORCE_TALK = "force_talk"
         const val ACTION_DJ_REFILL = "io.grokify.os.SPOTIFY_DJ_REFILL"
         const val ACTION_DJ_NEW_QUEUE = "io.grokify.os.SPOTIFY_DJ_NEW_QUEUE"
         const val ACTION_DJ_REMOVE_TRACK = "io.grokify.os.SPOTIFY_DJ_REMOVE_TRACK"

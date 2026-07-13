@@ -9,6 +9,7 @@ object BuiltinPluginCatalog {
     const val BT_SCANNER = "bt_scanner"
     const val PLACE_NOTES = "place_notes"
     const val SPOTIFY_CONTROLLER = "spotify_controller"
+    const val SPACEXAI_USAGE = "spacexai_usage_analyzer"
 
     val all: List<PluginManifest> = listOf(
         PluginManifest(
@@ -70,10 +71,31 @@ object BuiltinPluginCatalog {
                     required = false,
                 ),
                 PluginRequiredKey(
-                    id = "xai_api_key",
-                    label = "xAI API key",
+                    id = "spacexai_api_key",
+                    label = "SpaceXAI API key",
                     description = "Optional — Grok Voice TTS for Live DJ banter. Device TTS works without it.",
                     required = false,
+                ),
+            ),
+        ),
+        PluginManifest(
+            id = SPACEXAI_USAGE,
+            title = "SpaceXAI Usage Analyzer",
+            subtitle = "Monitor prepaid credits, period spend, limits, and usage breakdown via the SpaceXAI Management API.",
+            version = "1.0.0",
+            source = PluginSource.Builtin,
+            kind = PluginKind.HostModule,
+            hostModuleId = SPACEXAI_USAGE,
+            capabilities = listOf("Billing", "Credits", "Network"),
+            accent = PluginAccent.Amber,
+            icon = PluginIconKey.Chart,
+            featured = true,
+            requiredKeys = listOf(
+                PluginRequiredKey(
+                    id = "spacexai_management_key",
+                    label = "SpaceXAI Management key",
+                    description = "console.x.ai → Management Keys (billing read). Separate from the inference API key used for Voice TTS.",
+                    required = true,
                 ),
             ),
         ),

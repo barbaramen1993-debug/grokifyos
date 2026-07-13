@@ -510,7 +510,7 @@ private class GrokifyHostBridge(
 
     /**
      * Speak [text]. Pass optionsJson as JSON string or null.
-     * Uses xAI Voice TTS when xai_api_key is set; else device TTS.
+     * Uses SpaceXAI Voice TTS when spacexai_api_key is set; else device TTS.
      * optionsJson may include voice_id, language, prefer_device, wait (block until done).
      */
     @JavascriptInterface

@@ -156,7 +156,8 @@ Open the Android app → **Apps** tab. Every app is a **native host module** com
 | **Wi‑Fi Scanner** | Scan nearby networks; GPS pins, distance, times seen; alerts (SSID/MAC watch, unseen, strong nearby); Mapbox map of hits | Nearby Wi‑Fi, Location | **Mapbox** `pk.…` for maps |
 | **Bluetooth Tracker** | BLE + classic discovery; GPS pins, distance, times seen; watch/unseen/strong alerts; map | Bluetooth, Location, Notifications | **Mapbox** for maps |
 | **Place Notes** | Pin notes to GPS spots; on enter: notify, open an app, or show an image; list + map + area monitoring | Location, Notifications | **Mapbox** for maps |
-| **Spotify** | Lockscreen / media controls; **Live AI DJ** booth (banter, queue chat); research/build/edit playlists via host Grok Build; optional Grok Voice TTS | Notifications, Media session, mic (voice), network | **Spotify Client ID** (+ optional secret); **xAI API key** for Grok Voice (device TTS works without it) |
+| **Spotify** | Lockscreen / media controls; **Live AI DJ** booth (banter, queue chat); research/build/edit playlists via host Grok Build; optional Grok Voice TTS | Notifications, Media session, mic (voice), network | **Spotify Client ID** (+ optional secret); **SpaceXAI API key** for Grok Voice (device TTS works without it) |
+| **SpaceXAI Usage Analyzer** | Prepaid credit balance, period spend, soft/hard limits, 7‑day usage by model, balance history | Network | **SpaceXAI Management key** vault id `spacexai_management_key` (billing read on [management-api.x.ai](https://management-api.x.ai)) |
 
 Capabilities are gated by Android permissions (Settings → Permissions, or in-chat `[[permission_request:…]]` cards). Keys live in **Settings → API key vault** on the device — never in git.
 
@@ -181,7 +182,7 @@ All third-party keys are **optional until you use the feature**. Store them **on
 | **Where** | Host machine: [Grok / Grok Build CLI](https://grok.com) → `grok login` |
 | **Wire-up** | `GROKIFY_GROK_AUTH_JSON=…` then `./scripts/sync-grok-auth.sh` → `storage/grok-auth.json` |
 | **Used for** | Streaming agents, chat, playlist research, live usage chip |
-| **Not** | Not the same as the on-device xAI API key |
+| **Not** | Not the same as the on-device SpaceXAI API key |
 
 ```bash
 grok login          # or: grok login --device-code
@@ -210,14 +211,17 @@ Missing auth → APIs return a **clear error** (no invented usage).
 | **Redirect URI** | Must match what your app/build expects (default documented in-app; sample hosts use `https://…/spotify-callback.php`) |
 | **OAuth tokens** | Access/refresh are stored **internally** after login — not typed by hand |
 
-### 5. xAI API key (Grok Voice TTS)
+### 5. SpaceXAI keys (Voice TTS + Usage Analyzer)
 
-| | |
-|--|--|
-| **Where** | [console.x.ai](https://console.x.ai/) → API Keys → Create |
-| **Paste** | Settings vault id `xai_api_key` |
-| **Used for** | Optional **Grok Voice** for Live DJ banter (eve, ara, leo, rex, sal, …) |
-| **Not used for** | Playlist research / main chat — those use **host Grok Build** + device token |
+| | Inference API key | Management key |
+|--|--|--|
+| **Where** | [console.x.ai](https://console.x.ai/) → **API Keys** | [console.x.ai](https://console.x.ai/) → **Management Keys** (billing read) |
+| **Vault id** | `spacexai_api_key` (legacy `xai_api_key` auto-migrated) | `spacexai_management_key` |
+| **Settings** | SpaceXAI API key card | SpaceXAI Management key card |
+| **Used for** | Grok Voice TTS (`api.x.ai`) for Live DJ banter | Usage Analyzer prepaid balance / spend / limits (`management-api.x.ai`) |
+| **Not used for** | Playlist research / main chat — those use **host Grok Build** + device token | same |
+
+> These are **different product types**. Keep both filled if you use Voice and Usage Analyzer. Usage Analyzer prefers the Management key field; it may fall back to the inference vault only if Management is empty (pre-split installs).
 
 ---
 

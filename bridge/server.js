@@ -829,7 +829,7 @@ async function gracefulShutdown(signal) {
 /** True when CLI / stderr text indicates Grok Build auth is missing or expired. */
 function isAuthFailureMessage(msg) {
     const s = String(msg || '').toLowerCase();
-    return /not signed in|not authenticated|authentication required|auth(?:entication)? failed|please (?:log|sign) in|run:\s*grok login|unauthorized|invalid.?token|session expired|login required|xai_api_key/.test(s);
+    return /not signed in|not authenticated|authentication required|auth(?:entication)? failed|please (?:log|sign) in|run:\s*grok login|unauthorized|invalid.?token|session expired|login required|xai_api_key|spacexai_api_key/.test(s);
 }
 
 function formatCliAuthError(raw) {
