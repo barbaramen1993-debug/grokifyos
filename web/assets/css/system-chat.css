@@ -233,6 +233,11 @@
 .sc-wrap.open .sc-popover {
     display: flex;
 }
+.sc-popover.sc-settings-popover {
+    min-width: 300px;
+    max-width: 360px;
+    max-height: min(72vh, 520px);
+}
 .sc-popover-header {
     display: flex;
     justify-content: space-between;
@@ -242,11 +247,82 @@
     font-weight: 600;
     color: #fff;
     border-bottom: 1px solid #272b31;
+    flex-shrink: 0;
 }
 .sc-popover-body {
     overflow-y: auto;
     padding: 0.35rem;
     flex: 1;
+}
+
+/* Chat Settings — Android-parity toggles */
+.sc-settings-body {
+    overflow-y: auto;
+    padding: 0.65rem 0.75rem 0.85rem;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+}
+.sc-settings-label {
+    display: block;
+    font-size: 0.7rem;
+    color: #9ca3af;
+    margin-top: 0.15rem;
+}
+.sc-settings-section {
+    margin-top: 0.35rem;
+    padding-top: 0.45rem;
+    border-top: 1px solid #272b31;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: #22d3ee;
+}
+.sc-setting-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.65rem;
+    cursor: pointer;
+    padding: 0.35rem 0;
+    user-select: none;
+}
+.sc-setting-row:hover .sc-setting-title {
+    color: #fff;
+}
+.sc-setting-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+}
+.sc-setting-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #e5e7eb;
+    line-height: 1.25;
+}
+.sc-setting-sub {
+    font-size: 0.68rem;
+    color: #9ca3af;
+    line-height: 1.3;
+}
+.sc-setting-check {
+    flex-shrink: 0;
+    width: 1rem;
+    height: 1rem;
+    margin-top: 0.15rem;
+    accent-color: #22d3ee;
+    cursor: pointer;
+}
+
+/* Visibility toggles (data still streams/stores; UI only) */
+.sc-root.sc-hide-tools .sc-tool-card {
+    display: none !important;
+}
+.sc-root.sc-hide-thoughts .sc-thinking-block {
+    display: none !important;
 }
 
 .sc-input-area {

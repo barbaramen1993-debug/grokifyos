@@ -308,7 +308,7 @@ Helper scripts (Linux/macOS): `android/scripts/build.sh`, `publish.sh`, `install
 | `/api/admin-system-chat-models.php` | Models + WS token |
 | `/api/admin-system-chat-audit.php` | Audit list / SSE |
 | `/api/admin-system-chat-usage.php` | Live Grok Build usage |
-| `/api/apk-upload.php` / `apk-download.php` / `update.php` | APK releases / OTA |
+| `/api/apk-download.php` / `update.php` | APK download / OTA check (publish via `android/scripts/publish.sh`) |
 
 ---
 

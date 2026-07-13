@@ -20,7 +20,7 @@ $chatReady = gos_system_chat_tables_ready();
 $devPack = $canAccess ? gos_devices_for_user((int) $user['id']) : ['devices' => [], 'active' => []];
 $activeDevices = $devPack['active'];
 $latestApk = $canAccess ? gos_latest_apk() : null;
-$assetV = '20260713-p2';
+$assetV = '20260713-chat-settings';
 ?><!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -45,6 +45,8 @@ $assetV = '20260713-p2';
       --gf-accent-dim: rgba(74, 222, 128, 0.12);
       --safe-b: env(safe-area-inset-bottom, 0px);
       --safe-t: env(safe-area-inset-top, 0px);
+      --gf-sidebar: 14.5rem;
+      --gf-header-h: 3.75rem;
     }
     * { box-sizing: border-box; }
     html, body {
@@ -53,14 +55,22 @@ $assetV = '20260713-p2';
       font-family: Inter, system-ui, -apple-system, sans-serif;
       -webkit-tap-highlight-color: transparent;
     }
-    body { padding-top: var(--safe-t); padding-bottom: calc(3.5rem + var(--safe-b)); }
-    .gf-shell { max-width: 960px; margin: 0 auto; padding: 0 0.75rem 1.5rem; }
+    body {
+      padding-top: var(--safe-t);
+      padding-bottom: calc(3.5rem + var(--safe-b));
+    }
+    .gf-app { min-height: 100dvh; }
+    .gf-shell {
+      max-width: 960px; margin: 0 auto;
+      padding: 0 0.75rem 1.5rem;
+    }
     .gf-header {
       position: sticky; top: 0; z-index: 40;
       background: rgba(10, 11, 14, 0.92);
       backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--gf-border);
       margin: 0 -0.75rem; padding: 0.75rem 0.75rem;
+      min-height: var(--gf-header-h);
     }
     .gf-header-inner {
       display: flex; align-items: center; gap: 0.75rem;
@@ -72,7 +82,7 @@ $assetV = '20260713-p2';
       border: 1px solid var(--gf-border);
       display: flex; align-items: center; justify-content: center;
       color: var(--gf-accent); font-weight: 700; font-size: 0.85rem;
-      overflow: hidden;
+      overflow: hidden; flex-shrink: 0;
     }
     .gf-logo img { width: 100%; height: 100%; object-fit: cover; }
     .gf-title { flex: 1; min-width: 0; }
@@ -97,8 +107,11 @@ $assetV = '20260713-p2';
       display: flex; flex-direction: column; align-items: center; gap: 0.15rem;
       background: none; border: none; color: var(--gf-faint);
       font-size: 0.65rem; padding: 0.35rem; cursor: pointer;
+      border-radius: 0.5rem;
     }
+    .gf-nav button:hover { color: #e5e7eb; }
     .gf-nav button.active { color: var(--gf-accent); }
+    .gf-main { min-width: 0; }
     .gf-panel { display: none; padding-top: 1rem; }
     .gf-panel.active { display: block; }
     .gf-card {
@@ -111,21 +124,33 @@ $assetV = '20260713-p2';
     }
     .gf-muted { color: var(--gf-muted); font-size: 0.85rem; line-height: 1.45; }
     .gf-faint { color: var(--gf-faint); font-size: 0.75rem; }
+    .gf-code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8rem; background: #0f1115; border: 1px solid var(--gf-border);
+      border-radius: 0.5rem; padding: 0.75rem 0.85rem; color: var(--gf-accent);
+      overflow-x: auto; white-space: pre; margin: 0.5rem 0 0;
+    }
     .gf-btn {
       display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
       padding: 0.6rem 1rem; border-radius: 0.65rem; font-size: 0.875rem; font-weight: 600;
       border: 1px solid var(--gf-border); background: #0f1115; color: #fff; cursor: pointer;
       text-decoration: none; min-height: 2.75rem;
     }
+    .gf-btn:hover { border-color: #3a4149; }
     .gf-btn:active { transform: scale(0.98); }
     .gf-btn-primary { background: #fff; color: #0f1115; border-color: #fff; }
+    .gf-btn-primary:hover { background: #e5e7eb; }
     .gf-btn-accent { background: var(--gf-accent-dim); color: var(--gf-accent); border-color: rgba(74,222,128,.35); }
     .gf-btn-danger { color: #f87171; border-color: rgba(248,113,113,.35); }
     .gf-btn-block { width: 100%; }
+    .gf-btn-inline { min-height: auto; padding: 0.35rem 0.75rem; font-size: 0.8rem; }
     .gf-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
     .gf-input, .gf-textarea, .gf-select {
       width: 100%; background: #0f1115; border: 1px solid var(--gf-border);
       border-radius: 0.55rem; color: #fff; padding: 0.65rem 0.75rem; font-size: 16px;
+    }
+    .gf-input:focus, .gf-textarea:focus, .gf-select:focus {
+      outline: none; border-color: #4b5563;
     }
     .gf-label { display: block; font-size: 0.72rem; color: var(--gf-faint); margin: 0.5rem 0 0.25rem; }
     .gf-token-box {
@@ -135,29 +160,23 @@ $assetV = '20260713-p2';
     }
     .gf-device {
       display: flex; align-items: flex-start; gap: 0.65rem;
-      padding: 0.65rem 0; border-bottom: 1px solid #1f2329;
+      padding: 0.75rem 0; border-bottom: 1px solid #1f2329;
     }
     .gf-device:last-child { border-bottom: none; padding-bottom: 0; }
     .gf-device-body { flex: 1; min-width: 0; }
     .gf-device-body strong { display: block; color: #fff; font-size: 0.9rem; }
     .gf-stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.55rem; }
-    @media (min-width: 640px) {
-      .gf-stat-grid { grid-template-columns: repeat(4, 1fr); }
-      body { padding-bottom: calc(4rem + var(--safe-b)); }
-    }
     .gf-stat {
       background: #0f1115; border: 1px solid var(--gf-border);
-      border-radius: 0.75rem; padding: 0.75rem;
+      border-radius: 0.75rem; padding: 0.85rem 1rem;
     }
-    .gf-stat .n { font-size: 1.25rem; font-weight: 700; color: #fff; }
-    .gf-stat .l { font-size: 0.68rem; color: var(--gf-faint); margin-top: 0.15rem; }
+    .gf-stat .n { font-size: 1.25rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; }
+    .gf-stat .l { font-size: 0.68rem; color: var(--gf-faint); margin-top: 0.2rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .gf-home-grid { display: grid; gap: 0; }
+    .gf-split { display: grid; gap: 0; }
     #panel-chat.active .sc-root {
       height: calc(100dvh - 9.5rem - var(--safe-b));
       min-height: 360px; max-height: none; border-radius: 1rem;
-    }
-    @media (min-width: 900px) {
-      .gf-shell { max-width: 1100px; }
-      #panel-chat.active .sc-root { height: calc(100dvh - 8.5rem - var(--safe-b)); }
     }
     .gf-gate {
       min-height: calc(100dvh - 2rem);
@@ -165,11 +184,135 @@ $assetV = '20260713-p2';
       text-align: center; padding: 2rem 1rem;
     }
     .gf-gate h1 { font-size: 1.75rem; margin: 0.5rem 0; color: #fff; letter-spacing: -0.03em; }
-    .gf-gate p { color: var(--gf-muted); max-width: 22rem; line-height: 1.45; }
+    .gf-gate p { color: var(--gf-muted); max-width: 24rem; line-height: 1.45; }
     .gf-gate-form { width: 100%; max-width: 22rem; text-align: left; margin-top: 1rem; }
     .gf-msg { margin-top: 0.75rem; font-size: 0.85rem; min-height: 1.2em; }
     .gf-msg.err { color: #f87171; }
     .gf-msg.ok { color: var(--gf-accent); }
+
+    @media (min-width: 640px) {
+      .gf-stat-grid { grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
+      body { padding-bottom: calc(4rem + var(--safe-b)); }
+      .gf-shell { padding: 0 1.25rem 2rem; }
+    }
+
+    /* Desktop layout: sidebar + wide main */
+    @media (min-width: 960px) {
+      body {
+        padding-bottom: 0;
+        padding-top: 0;
+      }
+      .gf-app {
+        display: grid;
+        grid-template-columns: var(--gf-sidebar) minmax(0, 1fr);
+        grid-template-rows: auto 1fr;
+        min-height: 100dvh;
+        max-width: 1440px;
+        margin: 0 auto;
+      }
+      .gf-header {
+        grid-column: 1 / -1;
+        margin: 0;
+        padding: 0.85rem 1.5rem;
+        border-bottom: 1px solid var(--gf-border);
+      }
+      .gf-header-inner {
+        max-width: none; margin: 0;
+      }
+      .gf-title h1 { font-size: 1.15rem; }
+      .gf-title p { font-size: 0.78rem; }
+      .gf-nav {
+        position: sticky;
+        top: var(--gf-header-h);
+        align-self: start;
+        left: auto; right: auto; bottom: auto;
+        flex-direction: column;
+        justify-content: flex-start;
+        gap: 0.25rem;
+        padding: 1rem 0.75rem;
+        height: calc(100dvh - var(--gf-header-h));
+        border-top: none;
+        border-right: 1px solid var(--gf-border);
+        background: var(--gf-surface);
+        backdrop-filter: none;
+        overflow-y: auto;
+      }
+      .gf-nav button {
+        flex: 0 0 auto;
+        max-width: none;
+        width: 100%;
+        flex-direction: row;
+        justify-content: flex-start;
+        gap: 0.65rem;
+        font-size: 0.875rem;
+        font-weight: 500;
+        padding: 0.7rem 0.85rem;
+        text-align: left;
+        color: var(--gf-muted);
+      }
+      .gf-nav button:hover {
+        background: rgba(255,255,255,0.04);
+        color: #fff;
+      }
+      .gf-nav button.active {
+        background: var(--gf-accent-dim);
+        color: var(--gf-accent);
+      }
+      .gf-shell {
+        max-width: none;
+        width: 100%;
+        margin: 0;
+        padding: 0 1.75rem 2rem;
+        grid-column: 2;
+        grid-row: 2;
+      }
+      .gf-panel { padding-top: 1.25rem; }
+      .gf-card {
+        padding: 1.25rem 1.35rem;
+        margin-bottom: 1rem;
+      }
+      .gf-card h2 { margin-bottom: 0.85rem; font-size: 0.75rem; }
+      .gf-stat .n { font-size: 1.45rem; }
+      .gf-home-grid {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr;
+        gap: 1rem;
+        align-items: start;
+        margin-top: 1rem;
+      }
+      .gf-home-grid > .gf-card { margin-bottom: 0; }
+      .gf-home-grid .gf-about { grid-column: 1 / -1; }
+      .gf-split {
+        display: grid;
+        grid-template-columns: 1fr 1.15fr;
+        gap: 1rem;
+        align-items: start;
+      }
+      .gf-split > .gf-card { margin-bottom: 0; }
+      .gf-btn { min-height: 2.5rem; padding: 0.55rem 1.1rem; cursor: pointer; }
+      .gf-btn-block { width: auto; min-width: 12rem; }
+      .gf-input, .gf-textarea, .gf-select { font-size: 0.9rem; max-width: 28rem; }
+      #panel-chat.active {
+        padding-top: 1rem;
+      }
+      #panel-chat.active .sc-root {
+        height: calc(100dvh - var(--gf-header-h) - 2.5rem);
+        min-height: 480px;
+      }
+      .gf-device {
+        align-items: center;
+        padding: 0.85rem 0;
+      }
+    }
+
+    @media (min-width: 1280px) {
+      :root { --gf-sidebar: 15.5rem; }
+      .gf-app { max-width: 1600px; }
+      .gf-shell { padding: 0 2rem 2.5rem; }
+      .gf-home-grid { grid-template-columns: 1.35fr 1fr; }
+      .sc-msg.user { max-width: min(70%, 42rem); }
+      .sc-msg.assistant { max-width: min(85%, 52rem); }
+    }
   </style>
 </head>
 <body>
@@ -180,7 +323,7 @@ $assetV = '20260713-p2';
         <img src="<?= $h('/assets/grokify-icon.png') ?>" alt="" width="56" height="56" onerror="this.remove()">
       </div>
       <h1><?= htmlspecialchars($appName, ENT_QUOTES) ?></h1>
-      <p>Self-hosted AI assistant. Password-only admin auth. Chat, devices, and APK releases — no demo data.</p>
+      <p>Self-hosted AI assistant. Password-only admin auth. Chat, devices, and OTA APKs — no demo data.</p>
       <form class="gf-gate-form" id="auth-form" autocomplete="on">
         <label class="gf-label" for="username">Username</label>
         <input class="gf-input" id="username" name="username" required minlength="3" maxlength="32" pattern="[a-zA-Z0-9_]+" autocomplete="username">
@@ -229,7 +372,7 @@ $assetV = '20260713-p2';
     });
   </script>
 <?php else: ?>
-  <div class="gf-shell">
+  <div class="gf-app">
     <header class="gf-header">
       <div class="gf-header-inner">
         <div class="gf-logo">
@@ -240,10 +383,18 @@ $assetV = '20260713-p2';
           <p><?= htmlspecialchars($displayName, ENT_QUOTES) ?><?= $role ? ' · ' . htmlspecialchars($role, ENT_QUOTES) : '' ?></p>
         </div>
         <span class="gf-badge" id="gf-bridge-badge">Bridge…</span>
-        <button type="button" class="gf-btn" id="btn-logout" style="min-height:2rem;padding:0.35rem 0.65rem;font-size:0.75rem">Sign out</button>
+        <button type="button" class="gf-btn gf-btn-inline" id="btn-logout">Sign out</button>
       </div>
     </header>
 
+    <nav class="gf-nav" aria-label="GrokifyOS">
+      <button type="button" class="active" data-goto="home">Home</button>
+      <button type="button" data-goto="chat">Chat</button>
+      <button type="button" data-goto="devices">Devices</button>
+      <button type="button" data-goto="build">Build</button>
+    </nav>
+
+    <div class="gf-shell gf-main">
     <section class="gf-panel active" id="panel-home" data-panel="home">
       <div class="gf-stat-grid">
         <div class="gf-stat">
@@ -264,35 +415,37 @@ $assetV = '20260713-p2';
         </div>
       </div>
 
-      <div class="gf-card" style="margin-top:0.85rem">
-        <h2>Install on your phone</h2>
-        <?php if ($latestApk): ?>
-          <p class="gf-muted">
-            Latest: <strong style="color:#fff"><?= htmlspecialchars((string) $latestApk['version_name'], ENT_QUOTES) ?></strong>
-            (<?= number_format((int) $latestApk['file_size'] / 1048576, 2) ?> MB)
-          </p>
-          <a class="gf-btn gf-btn-accent gf-btn-block" style="margin-top:0.75rem;text-align:center"
-             href="<?= $h('/api/apk-download.php') ?>" download="grokifyos.apk">Download APK</a>
-        <?php else: ?>
-          <p class="gf-muted">No APK published yet. Open <button type="button" class="gf-btn" data-goto="build" style="display:inline;padding:0.2rem 0.5rem">Build</button> to upload a release.</p>
-        <?php endif; ?>
-      </div>
-
-      <div class="gf-card">
-        <h2>Quick actions</h2>
-        <div class="gf-row">
-          <button type="button" class="gf-btn gf-btn-accent" data-goto="chat">Open chat</button>
-          <button type="button" class="gf-btn" data-goto="devices">Devices</button>
-          <button type="button" class="gf-btn" data-goto="build">Builds</button>
+      <div class="gf-home-grid" style="margin-top:0.85rem">
+        <div class="gf-card">
+          <h2>Install on your phone</h2>
+          <?php if ($latestApk): ?>
+            <p class="gf-muted">
+              Latest: <strong style="color:#fff"><?= htmlspecialchars((string) $latestApk['version_name'], ENT_QUOTES) ?></strong>
+              (<?= number_format((int) $latestApk['file_size'] / 1048576, 2) ?> MB)
+            </p>
+            <a class="gf-btn gf-btn-accent" style="margin-top:0.75rem;text-align:center"
+               href="<?= $h('/api/apk-download.php') ?>" download="grokifyos.apk">Download APK</a>
+          <?php else: ?>
+            <p class="gf-muted">No APK published yet. Publish from the host with <code>android/scripts/publish.sh</code>, then refresh.</p>
+          <?php endif; ?>
         </div>
-      </div>
 
-      <div class="gf-card">
-        <h2>About</h2>
-        <p class="gf-muted">Production self-host stack: password auth, real MySQL sessions/messages, Grok Build bridge, Android device tokens. Nothing is seeded as demo content.</p>
-        <?php if (!$chatReady): ?>
-          <p class="gf-badge warn" style="margin-top:0.75rem;display:inline-block">Run schema migrations</p>
-        <?php endif; ?>
+        <div class="gf-card">
+          <h2>Quick actions</h2>
+          <div class="gf-row">
+            <button type="button" class="gf-btn gf-btn-accent" data-goto="chat">Open chat</button>
+            <button type="button" class="gf-btn" data-goto="devices">Devices</button>
+            <button type="button" class="gf-btn" data-goto="build">Build</button>
+          </div>
+        </div>
+
+        <div class="gf-card gf-about">
+          <h2>About</h2>
+          <p class="gf-muted">Production self-host stack: password auth, real MySQL sessions/messages, Grok Build bridge, Android device tokens. Nothing is seeded as demo content.</p>
+          <?php if (!$chatReady): ?>
+            <p class="gf-badge warn" style="margin-top:0.75rem;display:inline-block">Run schema migrations</p>
+          <?php endif; ?>
+        </div>
       </div>
     </section>
 
@@ -339,17 +492,51 @@ $assetV = '20260713-p2';
           <div class="sc-toolbar-spacer"></div>
           <div class="sc-wrap relative" id="sc-settings-wrap">
             <button type="button" class="sc-toolbar-btn" id="sc-settings-btn">Settings</button>
-            <div class="sc-popover" id="sc-settings-popover" style="right:0;left:auto">
+            <div class="sc-popover sc-settings-popover" id="sc-settings-popover" style="right:0;left:auto">
               <div class="sc-popover-header">Settings</div>
-              <div class="p-2 space-y-2 text-xs">
+              <div class="sc-settings-body">
                 <div id="sc-usage-detail" class="sc-usage-detail">
                   <div class="sc-usage-detail-title">Weekly usage</div>
                   <div class="sc-usage-detail-body text-[#9ca3af]">Loading…</div>
                 </div>
-                <label class="text-[#9ca3af] block">Model</label>
+                <label class="sc-settings-label" for="sc-model-select">Model</label>
                 <select id="sc-model-select" class="sc-select w-full max-w-none"></select>
-                <label class="flex items-center gap-2 text-[#9ca3af] mt-2">
-                  <input type="checkbox" id="sc-ctrl-enter" checked> Ctrl+Enter to send
+
+                <div class="sc-settings-section">CHAT</div>
+                <label class="sc-setting-row" for="sc-set-history">
+                  <span class="sc-setting-text">
+                    <span class="sc-setting-title">Send history / context</span>
+                    <span class="sc-setting-sub">Include prior session messages with each prompt</span>
+                  </span>
+                  <input type="checkbox" id="sc-set-history" class="sc-setting-check" checked>
+                </label>
+                <label class="sc-setting-row" for="sc-set-keep-awake">
+                  <span class="sc-setting-text">
+                    <span class="sc-setting-title">Keep screen on</span>
+                    <span class="sc-setting-sub">Prevent sleep while chat is open (Wake Lock)</span>
+                  </span>
+                  <input type="checkbox" id="sc-set-keep-awake" class="sc-setting-check" checked>
+                </label>
+                <label class="sc-setting-row" for="sc-set-enter-newline">
+                  <span class="sc-setting-text">
+                    <span class="sc-setting-title">Enter for newline</span>
+                    <span class="sc-setting-sub" id="sc-set-enter-hint">Enter inserts a new line; send with the button or Ctrl+Enter</span>
+                  </span>
+                  <input type="checkbox" id="sc-set-enter-newline" class="sc-setting-check" checked>
+                </label>
+                <label class="sc-setting-row" for="sc-set-show-tools">
+                  <span class="sc-setting-text">
+                    <span class="sc-setting-title">Show tools</span>
+                    <span class="sc-setting-sub" id="sc-set-tools-hint">Tool call cards appear in the chat transcript</span>
+                  </span>
+                  <input type="checkbox" id="sc-set-show-tools" class="sc-setting-check" checked>
+                </label>
+                <label class="sc-setting-row" for="sc-set-show-thoughts">
+                  <span class="sc-setting-text">
+                    <span class="sc-setting-title">Show thoughts</span>
+                    <span class="sc-setting-sub" id="sc-set-thoughts-hint">Thinking / thought cards appear in the chat transcript</span>
+                  </span>
+                  <input type="checkbox" id="sc-set-show-thoughts" class="sc-setting-check" checked>
                 </label>
               </div>
             </div>
@@ -405,88 +592,78 @@ $assetV = '20260713-p2';
     </section>
 
     <section class="gf-panel" id="panel-devices" data-panel="devices">
-      <div class="gf-card">
-        <h2>Register device</h2>
-        <p class="gf-muted" style="margin-bottom:0.75rem">Creates a long-lived API token for the Android app (shown once). Prefix: <code>gos_</code></p>
-        <label class="gf-label">Device name</label>
-        <input type="text" id="device-name" class="gf-input" placeholder="Pixel / my phone" maxlength="128">
-        <button type="button" class="gf-btn gf-btn-primary gf-btn-block" id="btn-create-device" style="margin-top:0.75rem">Create device token</button>
-        <div id="new-token-wrap" class="hidden" style="margin-top:0.85rem">
-          <p class="gf-faint" style="margin-bottom:0.35rem">Copy now — not shown again:</p>
-          <div class="gf-token-box" id="new-token"></div>
-          <button type="button" class="gf-btn gf-btn-block" id="btn-copy-token" style="margin-top:0.5rem">Copy token</button>
+      <div class="gf-split">
+        <div class="gf-card">
+          <h2>Register device</h2>
+          <p class="gf-muted" style="margin-bottom:0.75rem">Creates a long-lived API token for the Android app (shown once). Prefix: <code>gos_</code></p>
+          <label class="gf-label">Device name</label>
+          <input type="text" id="device-name" class="gf-input" placeholder="Pixel / my phone" maxlength="128">
+          <button type="button" class="gf-btn gf-btn-primary" id="btn-create-device" style="margin-top:0.75rem">Create device token</button>
+          <div id="new-token-wrap" class="hidden" style="margin-top:0.85rem">
+            <p class="gf-faint" style="margin-bottom:0.35rem">Copy now — not shown again:</p>
+            <div class="gf-token-box" id="new-token"></div>
+            <button type="button" class="gf-btn" id="btn-copy-token" style="margin-top:0.5rem">Copy token</button>
+          </div>
         </div>
-      </div>
-      <div class="gf-card">
-        <h2>Your devices</h2>
-        <div id="device-list">
-          <?php if (!$activeDevices): ?>
-            <p class="gf-muted">No active devices yet.</p>
-          <?php else: ?>
-            <?php foreach ($activeDevices as $d): ?>
-            <div class="gf-device" data-id="<?= (int) $d['id'] ?>">
-              <div class="gf-device-body">
-                <strong><?= htmlspecialchars((string) $d['device_name'], ENT_QUOTES) ?></strong>
-                <div class="gf-faint">
-                  <?= htmlspecialchars((string) $d['token_prefix'], ENT_QUOTES) ?>…
-                  <?php if (!empty($d['app_version_name'])): ?>
-                    · v<?= htmlspecialchars((string) $d['app_version_name'], ENT_QUOTES) ?>
-                  <?php endif; ?>
-                  <?php if (!empty($d['last_seen_at'])): ?>
-                    · seen <?= htmlspecialchars((string) $d['last_seen_at'], ENT_QUOTES) ?>
-                  <?php endif; ?>
+        <div class="gf-card">
+          <h2>Your devices</h2>
+          <div id="device-list">
+            <?php if (!$activeDevices): ?>
+              <p class="gf-muted">No active devices yet.</p>
+            <?php else: ?>
+              <?php foreach ($activeDevices as $d): ?>
+              <div class="gf-device" data-id="<?= (int) $d['id'] ?>">
+                <div class="gf-device-body">
+                  <strong><?= htmlspecialchars((string) $d['device_name'], ENT_QUOTES) ?></strong>
+                  <div class="gf-faint">
+                    <?= htmlspecialchars((string) $d['token_prefix'], ENT_QUOTES) ?>…
+                    <?php if (!empty($d['app_version_name'])): ?>
+                      · v<?= htmlspecialchars((string) $d['app_version_name'], ENT_QUOTES) ?>
+                    <?php endif; ?>
+                    <?php if (!empty($d['last_seen_at'])): ?>
+                      · seen <?= htmlspecialchars((string) $d['last_seen_at'], ENT_QUOTES) ?>
+                    <?php endif; ?>
+                  </div>
                 </div>
+                <button type="button" class="gf-btn gf-btn-danger btn-revoke" data-id="<?= (int) $d['id'] ?>">Revoke</button>
               </div>
-              <button type="button" class="gf-btn gf-btn-danger btn-revoke" data-id="<?= (int) $d['id'] ?>">Revoke</button>
-            </div>
-            <?php endforeach; ?>
-          <?php endif; ?>
+              <?php endforeach; ?>
+            <?php endif; ?>
+          </div>
         </div>
       </div>
     </section>
 
     <section class="gf-panel" id="panel-build" data-panel="build">
-      <div class="gf-card">
-        <h2>Latest release</h2>
-        <?php if ($latestApk): ?>
-          <p class="gf-muted">
-            <strong style="color:#fff"><?= htmlspecialchars((string) $latestApk['version_name'], ENT_QUOTES) ?></strong>
-            (code <?= (int) $latestApk['version_code'] ?>)
-            · <?= number_format((int) $latestApk['file_size'] / 1048576, 2) ?> MB
-          </p>
-          <?php if (!empty($latestApk['changelog'])): ?>
-            <p class="gf-faint" style="margin-top:0.5rem;white-space:pre-wrap"><?= htmlspecialchars((string) $latestApk['changelog'], ENT_QUOTES) ?></p>
+      <div class="gf-split">
+        <div class="gf-card">
+          <h2>Latest release</h2>
+          <?php if ($latestApk): ?>
+            <p class="gf-muted">
+              <strong style="color:#fff"><?= htmlspecialchars((string) $latestApk['version_name'], ENT_QUOTES) ?></strong>
+              (code <?= (int) $latestApk['version_code'] ?>)
+              · <?= number_format((int) $latestApk['file_size'] / 1048576, 2) ?> MB
+            </p>
+            <?php if (!empty($latestApk['changelog'])): ?>
+              <p class="gf-faint" style="margin-top:0.5rem;white-space:pre-wrap"><?= htmlspecialchars((string) $latestApk['changelog'], ENT_QUOTES) ?></p>
+            <?php endif; ?>
+            <a class="gf-btn gf-btn-accent" style="margin-top:0.85rem;text-align:center"
+               href="<?= $h('/api/apk-download.php') ?>" download="grokifyos.apk">Download APK</a>
+          <?php else: ?>
+            <p class="gf-muted">No APK published yet. Ship one from the host with the publish script.</p>
           <?php endif; ?>
-          <a class="gf-btn gf-btn-accent gf-btn-block" style="margin-top:0.85rem;text-align:center"
-             href="<?= $h('/api/apk-download.php') ?>" download="grokifyos.apk">Download APK</a>
-        <?php else: ?>
-          <p class="gf-muted">No APK published yet. Upload a real build below.</p>
-        <?php endif; ?>
-      </div>
-      <div class="gf-card">
-        <h2>Upload release</h2>
-        <form id="apk-form">
-          <label class="gf-label">APK file</label>
-          <input type="file" name="apk" id="apk-file" accept=".apk,application/vnd.android.package-archive" class="gf-input" required>
-          <label class="gf-label">Version code (integer, must increase)</label>
-          <input type="number" name="version_code" id="apk-code" class="gf-input" min="1" required placeholder="1" value="<?= $latestApk ? ((int) $latestApk['version_code'] + 1) : 1 ?>">
-          <label class="gf-label">Version name</label>
-          <input type="text" name="version_name" id="apk-name" class="gf-input" required placeholder="0.1.0" maxlength="32">
-          <label class="gf-label">Changelog</label>
-          <textarea name="changelog" id="apk-changelog" class="gf-textarea" rows="3" placeholder="What's new…"></textarea>
-          <button type="submit" class="gf-btn gf-btn-primary gf-btn-block" style="margin-top:0.85rem">Upload release</button>
-        </form>
-        <p class="gf-faint" id="apk-upload-status" style="margin-top:0.5rem"></p>
+        </div>
+        <div class="gf-card">
+          <h2>Publish from host</h2>
+          <p class="gf-muted">APK releases are registered on the server with the CLI — not uploaded from this dashboard.</p>
+          <pre class="gf-code">cd android
+./scripts/publish.sh debug --changelog "What changed"</pre>
+          <p class="gf-faint" style="margin-top:0.75rem">Requires increasing <code>versionCode</code>. Details: <code>android/README.md</code>.</p>
+        </div>
       </div>
     </section>
-  </div>
-
-  <nav class="gf-nav" aria-label="GrokifyOS">
-    <button type="button" class="active" data-goto="home">Home</button>
-    <button type="button" data-goto="chat">Chat</button>
-    <button type="button" data-goto="devices">Devices</button>
-    <button type="button" data-goto="build">Build</button>
-  </nav>
+    </div><!-- .gf-shell -->
+  </div><!-- .gf-app -->
 
   <script>
     window.API_BASE = <?= json_encode($base . '/api') ?>;
@@ -569,27 +746,6 @@ $assetV = '20260713-p2';
       });
     }
     document.querySelectorAll('.btn-revoke').forEach(bindRevoke);
-
-    $('apk-form')?.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const st = $('apk-upload-status');
-      st.textContent = 'Uploading…';
-      const fd = new FormData();
-      const file = $('apk-file').files[0];
-      if (!file) { st.textContent = 'Choose an APK.'; return; }
-      fd.append('apk', file);
-      fd.append('version_code', $('apk-code').value);
-      fd.append('version_name', $('apk-name').value);
-      fd.append('changelog', $('apk-changelog').value);
-      const res = await fetch(base + '/api/apk-upload.php', { method: 'POST', credentials: 'same-origin', body: fd });
-      const data = await res.json().catch(() => ({}));
-      if (!data.ok) {
-        st.textContent = data.error || ('HTTP ' + res.status);
-        return;
-      }
-      st.textContent = 'Uploaded ' + data.release.version_name + '. Reloading…';
-      setTimeout(() => location.reload(), 800);
-    });
 
     async function refreshHomeStats() {
       try {

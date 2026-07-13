@@ -12,7 +12,15 @@
   let sessionHasMessages = false;
   let isStreaming = false;
   let useHistory = localStorage.getItem('gos_sc_use_history') !== 'false';
-  let ctrlEnterSend = localStorage.getItem('gos_sc_ctrl_enter') !== 'false';
+  /** Enter inserts newline (send via button / Ctrl+Enter). Mirrors Android enter_for_newline. */
+  let enterForNewline = (function () {
+    const v = localStorage.getItem('gos_sc_enter_for_newline');
+    if (v !== null) return v !== 'false';
+    // Migrate legacy “Ctrl+Enter to send” (same default: true)
+    return localStorage.getItem('gos_sc_ctrl_enter') !== 'false';
+  })();
+  let showTools = localStorage.getItem('gos_sc_show_tools') !== 'false';
+  let showThoughts = localStorage.getItem('gos_sc_show_thoughts') !== 'false';
   let dbNotes = [];
 
   let streamContainer = null;
@@ -2467,35 +2475,10 @@
       });
     $('sc-new-chat') && $('sc-new-chat').addEventListener('click', () => newChat());
 
-    $('sc-context-toggle') &&
-      $('sc-context-toggle').addEventListener('click', () => {
-        useHistory = !useHistory;
-        localStorage.setItem('gos_sc_use_history', useHistory);
-        $('sc-context-toggle').classList.toggle('active', useHistory);
-      });
-    if ($('sc-context-toggle')) $('sc-context-toggle').classList.toggle('active', useHistory);
-
     bindWakeLockListeners();
-    $('sc-keep-awake') &&
-      $('sc-keep-awake').addEventListener('click', async () => {
-        keepScreenOn = !keepScreenOn;
-        localStorage.setItem('gos_sc_keep_awake', keepScreenOn);
-        updateKeepAwakeButton();
-        if (keepScreenOn) {
-          await requestWakeLock();
-        } else {
-          await releaseWakeLock();
-        }
-      });
-    updateKeepAwakeButton();
-
-    $('sc-ctrl-enter') &&
-      ($('sc-ctrl-enter').checked = ctrlEnterSend) &&
-      $('sc-ctrl-enter').addEventListener('change', () => {
-        ctrlEnterSend = $('sc-ctrl-enter').checked;
-        localStorage.setItem('gos_sc_ctrl_enter', ctrlEnterSend);
-        updatePlaceholder();
-      });
+    bindChatSettingsUi();
+    applyChatVisibility();
+    syncChatSettingsUi();
 
     const prompt = $('sc-prompt');
     if (prompt) {
@@ -2512,7 +2495,8 @@
       });
       prompt.addEventListener('keydown', (e) => {
         if (e.key !== 'Enter') return;
-        if (ctrlEnterSend) {
+        if (enterForNewline) {
+          // Enter = newline; Ctrl/Cmd+Enter sends (send button also works)
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
             sendMessage();
@@ -2556,9 +2540,125 @@
   function updatePlaceholder() {
     const p = $('sc-prompt');
     if (!p) return;
-    p.placeholder = ctrlEnterSend
-      ? 'Message… (Ctrl+Enter to send)'
-      : 'Message… (Enter to send, Shift+Enter for newline)';
+    p.placeholder = enterForNewline
+      ? 'Message… (Enter = new line · Ctrl+Enter or send)'
+      : 'Message… (Enter to send · Shift+Enter for newline)';
+  }
+
+  function applyChatVisibility() {
+    const root = $('sc-root');
+    if (!root) return;
+    root.classList.toggle('sc-hide-tools', !showTools);
+    root.classList.toggle('sc-hide-thoughts', !showThoughts);
+  }
+
+  function setUseHistory(on) {
+    useHistory = !!on;
+    localStorage.setItem('gos_sc_use_history', useHistory);
+    syncChatSettingsUi();
+  }
+
+  async function setKeepScreenOn(on) {
+    keepScreenOn = !!on;
+    localStorage.setItem('gos_sc_keep_awake', keepScreenOn);
+    syncChatSettingsUi();
+    if (keepScreenOn) {
+      await requestWakeLock();
+    } else {
+      await releaseWakeLock();
+    }
+  }
+
+  function setEnterForNewline(on) {
+    enterForNewline = !!on;
+    localStorage.setItem('gos_sc_enter_for_newline', enterForNewline);
+    // Keep legacy key in sync for older tabs / caches
+    localStorage.setItem('gos_sc_ctrl_enter', enterForNewline);
+    updatePlaceholder();
+    syncChatSettingsUi();
+  }
+
+  function setShowTools(on) {
+    showTools = !!on;
+    localStorage.setItem('gos_sc_show_tools', showTools);
+    applyChatVisibility();
+    syncChatSettingsUi();
+  }
+
+  function setShowThoughts(on) {
+    showThoughts = !!on;
+    localStorage.setItem('gos_sc_show_thoughts', showThoughts);
+    applyChatVisibility();
+    syncChatSettingsUi();
+  }
+
+  function syncChatSettingsUi() {
+    const ctx = $('sc-context-toggle');
+    if (ctx) ctx.classList.toggle('active', useHistory);
+    updateKeepAwakeButton();
+
+    const setHistory = $('sc-set-history');
+    if (setHistory) setHistory.checked = useHistory;
+    const setAwake = $('sc-set-keep-awake');
+    if (setAwake) setAwake.checked = keepScreenOn;
+    const setEnter = $('sc-set-enter-newline');
+    if (setEnter) setEnter.checked = enterForNewline;
+    const setTools = $('sc-set-show-tools');
+    if (setTools) setTools.checked = showTools;
+    const setThoughts = $('sc-set-show-thoughts');
+    if (setThoughts) setThoughts.checked = showThoughts;
+
+    const enterHint = $('sc-set-enter-hint');
+    if (enterHint) {
+      enterHint.textContent = enterForNewline
+        ? 'Enter inserts a new line; send with the button or Ctrl+Enter'
+        : 'Enter sends the message; Shift+Enter for a new line';
+    }
+    const toolsHint = $('sc-set-tools-hint');
+    if (toolsHint) {
+      toolsHint.textContent = showTools
+        ? 'Tool call cards appear in the chat transcript'
+        : 'Tool call cards are hidden (still run normally)';
+    }
+    const thoughtsHint = $('sc-set-thoughts-hint');
+    if (thoughtsHint) {
+      thoughtsHint.textContent = showThoughts
+        ? 'Thinking / thought cards appear in the chat transcript'
+        : 'Thinking cards are hidden (model still thinks)';
+    }
+  }
+
+  function bindChatSettingsUi() {
+    $('sc-context-toggle') &&
+      $('sc-context-toggle').addEventListener('click', () => {
+        setUseHistory(!useHistory);
+      });
+
+    $('sc-keep-awake') &&
+      $('sc-keep-awake').addEventListener('click', () => {
+        setKeepScreenOn(!keepScreenOn);
+      });
+
+    $('sc-set-history') &&
+      $('sc-set-history').addEventListener('change', (e) => {
+        setUseHistory(e.target.checked);
+      });
+    $('sc-set-keep-awake') &&
+      $('sc-set-keep-awake').addEventListener('change', (e) => {
+        setKeepScreenOn(e.target.checked);
+      });
+    $('sc-set-enter-newline') &&
+      $('sc-set-enter-newline').addEventListener('change', (e) => {
+        setEnterForNewline(e.target.checked);
+      });
+    $('sc-set-show-tools') &&
+      $('sc-set-show-tools').addEventListener('change', (e) => {
+        setShowTools(e.target.checked);
+      });
+    $('sc-set-show-thoughts') &&
+      $('sc-set-show-thoughts').addEventListener('change', (e) => {
+        setShowThoughts(e.target.checked);
+      });
   }
 
   /** True when chat UI is the active view (admin tab or Grokify panel). */
