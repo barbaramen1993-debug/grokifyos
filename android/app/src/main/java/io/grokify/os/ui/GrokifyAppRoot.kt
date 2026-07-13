@@ -37,7 +37,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -127,6 +129,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -159,6 +162,41 @@ import io.grokify.os.BuildConfig
 import io.grokify.os.ui.chat.MarkdownText
 import io.grokify.os.ui.theme.GrokifyColors
 import kotlinx.coroutines.delay
+
+/**
+ * Chat stick-to-bottom: [scrollToItem] only aligns the *top* of a row, so tall
+ * streaming bubbles stay clipped. Prefer [scrollBy] when the row is already
+ * visible (avoids jump-to-top flicker on every stream token); only jump when
+ * the row is off-screen. Optional [extraBottomPx] clears room for action bars.
+ */
+private suspend fun LazyListState.ensureItemBottomVisible(
+    index: Int,
+    extraBottomPx: Int = 0,
+) {
+    val total = layoutInfo.totalItemsCount
+    if (total <= 0) return
+    val safeIndex = index.coerceIn(0, total - 1)
+
+    suspend fun settleOverflow() {
+        withFrameNanos { }
+        val info = layoutInfo
+        val item = info.visibleItemsInfo.firstOrNull { it.index == safeIndex } ?: return
+        val viewportEnd = info.viewportEndOffset - info.afterContentPadding
+        val itemBottom = item.offset + item.size + extraBottomPx
+        val overflow = itemBottom - viewportEnd
+        if (overflow > 1f) {
+            scroll { scrollBy(overflow.toFloat()) }
+        }
+    }
+
+    // Only hard-jump when the target row isn't already laid out.
+    if (layoutInfo.visibleItemsInfo.none { it.index == safeIndex }) {
+        scrollToItem(safeIndex)
+    }
+    settleOverflow()
+    // Markdown / AnimatedVisibility often remeasure one frame later
+    settleOverflow()
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1038,6 +1076,7 @@ private fun ChatPane(
 ) {
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
+    val density = LocalDensity.current
     var menuMsgId by remember { mutableStateOf<String?>(null) }
     var editMsg by remember { mutableStateOf<ChatLine?>(null) }
     var editDraft by remember { mutableStateOf("") }
@@ -1053,6 +1092,13 @@ private fun ChatPane(
         }
     }
 
+    // Fingerprint tail growth (streaming text, tools, thoughts, expand) for stick-to-bottom.
+    val tailFingerprint = remember(visibleMessages) {
+        visibleMessages.takeLast(4).joinToString("|") { m ->
+            "${m.id}:${m.role}:${m.text.length}:${m.toolResult.length}:${m.expanded}:${m.streaming}"
+        }
+    }
+
     // Auto-scroll only when the user is already near the bottom (or list grew while pinned)
     var pinToBottom by remember { mutableStateOf(true) }
     var prevMessageCount by remember { mutableIntStateOf(0) }
@@ -1064,14 +1110,23 @@ private fun ChatPane(
         return n
     }
 
+    val menuBottomPadPx = with(density) { 52.dp.roundToPx() }
+    val stickBottomPadPx = with(density) { 10.dp.roundToPx() }
+
     LaunchedEffect(listState, state.hasMoreMessages, state.loadingOlder) {
         snapshotFlow {
             val info = listState.layoutInfo
             val last = info.visibleItemsInfo.lastOrNull()
             val first = info.visibleItemsInfo.firstOrNull()
             val total = info.totalItemsCount
+            // Near end if last rows are on screen AND the bottom of the last visible
+            // row is not far above the viewport (user hasn't scrolled content up).
+            val viewportEnd = info.viewportEndOffset - info.afterContentPadding
+            val slackPx = 160
+            val nearEnd = last != null && total > 0 && last.index >= total - 2 &&
+                (last.offset + last.size) >= (viewportEnd - slackPx)
             Triple(
-                last != null && total > 0 && last.index >= total - 2,
+                nearEnd,
                 first?.index ?: -1,
                 total,
             )
@@ -1089,10 +1144,13 @@ private fun ChatPane(
         if (state.scrollToBottomNonce > 0 && visibleMessages.isNotEmpty()) {
             pinToBottom = true
             val index = listPrefixCount() + visibleMessages.lastIndex
-            listState.scrollToItem(index)
+            listState.ensureItemBottomVisible(index, stickBottomPadPx)
             delay(48)
             if (visibleMessages.isNotEmpty()) {
-                listState.scrollToItem(listPrefixCount() + visibleMessages.lastIndex)
+                listState.ensureItemBottomVisible(
+                    listPrefixCount() + visibleMessages.lastIndex,
+                    stickBottomPadPx,
+                )
             }
         }
     }
@@ -1100,12 +1158,11 @@ private fun ChatPane(
     // Streaming / new messages while pinned; preserve anchor when prepending older pages
     LaunchedEffect(
         visibleMessages.size,
-        visibleMessages.lastOrNull()?.id,
-        visibleMessages.lastOrNull()?.text?.length,
-        visibleMessages.lastOrNull()?.toolResult?.length,
+        tailFingerprint,
         state.loadingOlder,
         state.showTools,
         state.showThoughts,
+        pinToBottom,
     ) {
         val size = visibleMessages.size
         // Detect prepend: size grew while not at bottom (user reading history)
@@ -1120,8 +1177,12 @@ private fun ChatPane(
             }
         }
         prevMessageCount = size
+        // Keep stick-to-bottom during stream; menu open uses its own scroll effect.
         if (visibleMessages.isNotEmpty() && menuMsgId == null && pinToBottom) {
-            listState.scrollToItem(listPrefixCount() + visibleMessages.lastIndex)
+            listState.ensureItemBottomVisible(
+                listPrefixCount() + visibleMessages.lastIndex,
+                stickBottomPadPx,
+            )
         }
     }
 
@@ -1131,6 +1192,25 @@ private fun ChatPane(
         if (id != null && visibleMessages.none { it.id == id }) {
             menuMsgId = null
         }
+    }
+
+    // Bubble action bar sits under the row — scroll it out from under the composer
+    LaunchedEffect(menuMsgId) {
+        val id = menuMsgId ?: return@LaunchedEffect
+        val msgIndex = visibleMessages.indexOfFirst { it.id == id }
+        if (msgIndex < 0) return@LaunchedEffect
+        // Wait for AnimatedVisibility + layout of the action bar
+        delay(60)
+        withFrameNanos { }
+        listState.ensureItemBottomVisible(
+            listPrefixCount() + msgIndex,
+            menuBottomPadPx,
+        )
+        delay(40)
+        listState.ensureItemBottomVisible(
+            listPrefixCount() + msgIndex,
+            menuBottomPadPx,
+        )
     }
 
     fun toggleMenu(msg: ChatLine) {
@@ -1168,7 +1248,13 @@ private fun ChatPane(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() },
                         ) { menuMsgId = null },
-                    contentPadding = PaddingValues(vertical = 8.dp, horizontal = 4.dp),
+                    // Extra bottom pad when a bubble menu is open so action chips clear the composer
+                    contentPadding = PaddingValues(
+                        start = 4.dp,
+                        end = 4.dp,
+                        top = 8.dp,
+                        bottom = if (menuMsgId != null) 56.dp else 12.dp,
+                    ),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     if (state.hasMoreMessages || state.loadingOlder) {
