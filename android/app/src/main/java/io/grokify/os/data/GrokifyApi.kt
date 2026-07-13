@@ -47,6 +47,15 @@ class GrokifyApi(
         return executeJson(req)
     }
 
+    /** Marketplace catalog (built-ins + remote script packages). */
+    fun pluginCatalog(versionCode: Int, versionName: String): JSONObject {
+        val path = "/plugins.php?version_code=$versionCode&version_name=${
+            java.net.URLEncoder.encode(versionName, "UTF-8")
+        }"
+        val req = authRequest(path).get().build()
+        return executeJson(req)
+    }
+
     /** Absolute download URL for the latest published APK (auth required on request). */
     fun apkDownloadUrl(): String = BuildConfig.API_BASE.trimEnd('/') + "/apk-download.php"
 

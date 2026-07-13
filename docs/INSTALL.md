@@ -229,6 +229,15 @@ GROKIFY_GROK_AUTH_JSON=/path/to/auth.json
 
 Usage endpoints call xAI billing with that token. Missing auth → clear API error, not fake numbers.
 
+**PHP-FPM must be able to read the file.** `~/.grok/auth.json` is usually `0600 root`, so the web pool (`www-data`) cannot open it — the chat usage chip then shows unavailable even though CLI/bridge auth works. After login, sync a web-readable copy:
+
+```bash
+# Copies auth → storage/grok-auth.json (www-data:640) and updates .env
+./scripts/sync-grok-auth.sh
+```
+
+Default production path: `storage/grok-auth.json` (gitignored). Re-run the sync after every `grok login`.
+
 ### Check / recover auth (CLI)
 
 When chat returns no reply after an agent dies, auth often expired. On the **server**:
@@ -246,8 +255,9 @@ php scripts/check-grok-auth.php --refresh
 # Live probe via Grok CLI (slower)
 php scripts/check-grok-auth.php --probe
 
-# Re-login (headless)
+# Re-login (headless), then sync for the PHP usage API
 grok login --device-code
+./scripts/sync-grok-auth.sh
 ```
 
 Bridge workers also expose a peek on `GET /health` → `grok_auth`. The Android app surfaces auth failures as a **system chat message** (not a silent empty turn).
@@ -318,6 +328,6 @@ Helper scripts (Linux/macOS): `android/scripts/build.sh`, `publish.sh`, `install
 |---------|--------|
 | `db` health fails | `.env` credentials; MySQL listening; user host (`localhost` vs `127.0.0.1`) |
 | Login loop | Cookies / HTTPS mismatch (`GROKIFY_SITE_URL`); session dir writable |
-| Usage unavailable | `GROKIFY_GROK_AUTH_JSON` path + valid `grok login` token |
+| Usage unavailable | `GROKIFY_GROK_AUTH_JSON` readable by **www-data** — run `./scripts/sync-grok-auth.sh` after `grok login` |
 | Agents don’t stream | Bridge process up; `GROKIFY_BRIDGE_*`; WS proxy path |
 | Phone can’t reach LAN server | Same Wi‑Fi; firewall allows 8787; use LAN IP not `127.0.0.1` on the phone |

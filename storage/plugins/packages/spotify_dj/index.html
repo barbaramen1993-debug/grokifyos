@@ -1,0 +1,2290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Spotify DJ</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a0f14;
+      --panel: #121a22;
+      --panel2: #18222d;
+      --border: rgba(148, 163, 184, 0.16);
+      --text: #e8eef6;
+      --muted: #8b9bb0;
+      --dim: #64748b;
+      --cyan: #3ee0ff;
+      --mint: #4dffb5;
+      --violet: #a78bfa;
+      --rose: #fb7185;
+      --amber: #ffc857;
+      --spotify: #1db954;
+      --shadow: 0 12px 40px rgba(0,0,0,.35);
+      --radius: 16px;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+      background:
+        radial-gradient(900px 480px at 0% -10%, rgba(29,185,84,.16), transparent 55%),
+        radial-gradient(800px 420px at 100% 0%, rgba(62,224,255,.10), transparent 50%),
+        radial-gradient(700px 400px at 50% 100%, rgba(167,139,250,.08), transparent 55%),
+        var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 14px 14px 28px;
+    }
+    .hero {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .brand { display: flex; gap: 12px; align-items: center; }
+    .logo {
+      width: 44px; height: 44px;
+      border-radius: 14px;
+      background: linear-gradient(145deg, #1db954, #169c46 60%, #0e7a35);
+      display: grid; place-items: center;
+      box-shadow: 0 0 24px rgba(29,185,84,.35);
+      font-size: 1.25rem;
+      animation: logoPulse 3.2s ease-in-out infinite;
+    }
+    @keyframes logoPulse {
+      0%, 100% { box-shadow: 0 0 18px rgba(29,185,84,.28); transform: scale(1); }
+      50% { box-shadow: 0 0 32px rgba(29,185,84,.55); transform: scale(1.04); }
+    }
+    h1 { margin: 0; font-size: 1.2rem; letter-spacing: .02em; font-weight: 750; }
+    .sub { color: var(--muted); font-size: .82rem; margin-top: 2px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 10px; border-radius: 999px;
+      font-size: .72rem; font-weight: 700;
+      border: 1px solid var(--border);
+      background: rgba(18,26,34,.8);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .pill.ok { color: var(--mint); border-color: rgba(77,255,181,.35); background: rgba(77,255,181,.08); }
+    .pill.warn { color: var(--amber); border-color: rgba(255,200,87,.35); background: rgba(255,200,87,.08); }
+    .pill.err { color: var(--rose); border-color: rgba(251,113,133,.35); background: rgba(251,113,133,.08); }
+
+    .tabs {
+      display: flex; gap: 6px; overflow-x: auto;
+      padding-bottom: 10px; margin-bottom: 8px;
+      scrollbar-width: none;
+    }
+    .tabs::-webkit-scrollbar { display: none; }
+    .tab {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 8px 14px;
+      font-weight: 700;
+      font-size: .8rem;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .tab.active {
+      color: #041016;
+      background: linear-gradient(135deg, var(--cyan), #2bc4e8);
+      border-color: transparent;
+    }
+
+    .card {
+      background: linear-gradient(180deg, var(--panel2), var(--panel));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+      margin-bottom: 12px;
+      box-shadow: var(--shadow);
+    }
+    .card h2 {
+      margin: 0 0 10px;
+      font-size: .72rem;
+      letter-spacing: .1em;
+      color: var(--cyan);
+      font-weight: 800;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .grow { flex: 1 1 auto; min-width: 0; }
+
+    input, textarea, select {
+      width: 100%;
+      background: rgba(8,12,18,.7);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 11px 12px;
+      font: inherit;
+      font-size: .92rem;
+      outline: none;
+    }
+    input:focus, textarea:focus, select:focus { border-color: rgba(62,224,255,.45); }
+    textarea { min-height: 84px; resize: vertical; }
+
+    button {
+      border: 0;
+      border-radius: 12px;
+      padding: 11px 14px;
+      font-weight: 750;
+      font-size: .88rem;
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--cyan), #35c7e6);
+      color: #041016;
+      transition: transform .12s ease, opacity .15s ease, filter .15s ease;
+    }
+    button:active:not(:disabled) { transform: scale(.97); }
+    button.secondary {
+      background: rgba(148,163,184,.1);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button.spotify {
+      background: linear-gradient(135deg, #1ed760, #1db954);
+      color: #041016;
+    }
+    button.violet {
+      background: linear-gradient(135deg, #c4b5fd, #a78bfa);
+      color: #1a0b2e;
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.sm { padding: 7px 10px; font-size: .75rem; border-radius: 9px; }
+    button.icon-ctl {
+      min-width: 48px;
+      font-size: 1rem;
+      padding: 10px 12px;
+    }
+
+    .transport {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .now-card {
+      display: flex; gap: 12px; align-items: center;
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(8,12,18,.55);
+      border: 1px solid rgba(29,185,84,.2);
+      min-height: 72px;
+    }
+    .now-card .art {
+      width: 56px; height: 56px; border-radius: 12px;
+      box-shadow: 0 0 20px rgba(29,185,84,.2);
+    }
+    .now-card.playing .art {
+      animation: spinArt 12s linear infinite;
+    }
+    @keyframes spinArt {
+      from { filter: brightness(1); }
+      50% { filter: brightness(1.12); }
+      to { filter: brightness(1); }
+    }
+    .eq {
+      display: flex; gap: 3px; align-items: flex-end; height: 18px; margin-top: 6px;
+    }
+    .eq span {
+      width: 3px; border-radius: 2px;
+      background: linear-gradient(180deg, var(--mint), var(--spotify));
+      animation: eqBar 0.9s ease-in-out infinite;
+    }
+    .eq span:nth-child(1) { height: 40%; animation-delay: 0s; }
+    .eq span:nth-child(2) { height: 80%; animation-delay: .15s; }
+    .eq span:nth-child(3) { height: 55%; animation-delay: .3s; }
+    .eq span:nth-child(4) { height: 95%; animation-delay: .05s; }
+    .eq span:nth-child(5) { height: 45%; animation-delay: .25s; }
+    .eq.paused span { animation: none; opacity: .35; height: 30% !important; }
+    @keyframes eqBar {
+      0%, 100% { transform: scaleY(.45); }
+      50% { transform: scaleY(1); }
+    }
+
+    .list { display: flex; flex-direction: column; gap: 8px; }
+    .item {
+      display: flex; gap: 10px; align-items: center;
+      padding: 10px;
+      border-radius: 12px;
+      background: rgba(8,12,18,.45);
+      border: 1px solid rgba(148,163,184,.1);
+    }
+    .item:active { border-color: rgba(62,224,255,.3); }
+    .art {
+      width: 46px; height: 46px; border-radius: 10px;
+      background: #0f1720; object-fit: cover; flex: 0 0 auto;
+      display: grid; place-items: center; color: var(--dim); font-size: .7rem;
+    }
+    .meta { min-width: 0; flex: 1; }
+    .title {
+      font-weight: 700; font-size: .92rem;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .artist {
+      color: var(--muted); font-size: .78rem;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .actions { display: flex; gap: 6px; flex: 0 0 auto; }
+
+    .status {
+      font-size: .8rem; color: var(--muted);
+      min-height: 1.2em; margin-top: 8px;
+    }
+    .status.err { color: var(--rose); }
+    .status.ok { color: var(--mint); }
+    .hint { color: var(--dim); font-size: .78rem; line-height: 1.45; }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .chip {
+      font-size: .72rem; font-weight: 700;
+      padding: 4px 9px; border-radius: 999px;
+      background: rgba(62,224,255,.1); color: var(--cyan);
+      border: 1px solid rgba(62,224,255,.2);
+      cursor: pointer;
+    }
+    .chip.voice {
+      background: rgba(167,139,250,.1);
+      color: var(--violet);
+      border-color: rgba(167,139,250,.28);
+    }
+    .chip.voice.active {
+      background: linear-gradient(135deg, #c4b5fd, #a78bfa);
+      color: #1a0b2e;
+      border-color: transparent;
+    }
+    .ai-box {
+      border: 1px solid rgba(167,139,250,.25);
+      background: linear-gradient(160deg, rgba(167,139,250,.12), rgba(18,26,34,.6));
+      border-radius: 14px;
+      padding: 12px;
+      margin-top: 10px;
+      white-space: pre-wrap;
+      font-size: .86rem;
+      line-height: 1.45;
+      color: var(--text);
+      max-height: 240px;
+      overflow: auto;
+    }
+    .live-card {
+      border: 1px solid rgba(29,185,84,.28);
+      background:
+        radial-gradient(500px 200px at 0% 0%, rgba(29,185,84,.14), transparent 60%),
+        linear-gradient(180deg, rgba(24,40,32,.9), var(--panel));
+    }
+    .live-head {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      gap: 12px; margin-bottom: 8px;
+    }
+    .live-toggle {
+      min-width: 108px;
+      font-weight: 800;
+      letter-spacing: .02em;
+    }
+    .live-toggle.on {
+      background: linear-gradient(135deg, #34d399, #1db954) !important;
+      color: #04210f !important;
+      border-color: transparent !important;
+      box-shadow: 0 0 0 3px rgba(29,185,84,.2), 0 8px 24px rgba(29,185,84,.25);
+    }
+    .live-toggle.off {
+      background: rgba(251,113,133,.12) !important;
+      color: var(--rose) !important;
+      border: 1px solid rgba(251,113,133,.35) !important;
+    }
+    .live-pulse {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: .72rem; font-weight: 700; color: var(--mint);
+    }
+    .live-pulse i {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--mint);
+      box-shadow: 0 0 0 0 rgba(77,255,181,.6);
+      animation: pulseDot 1.4s ease infinite;
+    }
+    .live-pulse.idle { color: var(--dim); }
+    .live-pulse.idle i { background: var(--dim); animation: none; box-shadow: none; }
+    @keyframes pulseDot {
+      0% { box-shadow: 0 0 0 0 rgba(77,255,181,.55); }
+      70% { box-shadow: 0 0 0 10px rgba(77,255,181,0); }
+      100% { box-shadow: 0 0 0 0 rgba(77,255,181,0); }
+    }
+    .queue-list {
+      margin-top: 10px;
+      display: flex; flex-direction: column; gap: 6px;
+      max-height: 180px; overflow: auto;
+    }
+    .queue-item {
+      display: flex; gap: 8px; align-items: center;
+      padding: 8px 10px; border-radius: 10px;
+      background: rgba(8,12,18,.4);
+      border: 1px solid rgba(148,163,184,.1);
+      font-size: .8rem;
+    }
+    .queue-item .n {
+      color: var(--cyan); font-weight: 800; width: 18px; flex: 0 0 auto;
+    }
+    .queue-item .t {
+      min-width: 0; flex: 1;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .queue-item .a { color: var(--muted); font-size: .72rem; }
+    .hidden { display: none !important; }
+    .empty {
+      text-align: center; color: var(--muted);
+      padding: 22px 10px; font-size: .9rem;
+    }
+    .device-item {
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 8px; padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(8,12,18,.45);
+      border: 1px solid rgba(148,163,184,.1);
+      margin-bottom: 6px;
+    }
+    .device-item.active {
+      border-color: rgba(29,185,84,.45);
+      background: rgba(29,185,84,.08);
+    }
+    .device-name { font-weight: 700; font-size: .88rem; }
+    .device-meta { color: var(--muted); font-size: .72rem; }
+
+    /* —— Work overlay (research / build) —— */
+    .work-overlay {
+      position: fixed; inset: 0; z-index: 50;
+      background: rgba(4, 8, 12, .78);
+      backdrop-filter: blur(8px);
+      display: flex; align-items: center; justify-content: center;
+      padding: 20px;
+      animation: fadeIn .2s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .work-card {
+      width: min(400px, 100%);
+      border-radius: 20px;
+      padding: 22px 20px 18px;
+      background: linear-gradient(165deg, #1a2430, #101820 55%, #0c1218);
+      border: 1px solid rgba(167,139,250,.28);
+      box-shadow: 0 24px 80px rgba(0,0,0,.55), 0 0 60px rgba(167,139,250,.12);
+    }
+    .work-orb {
+      width: 72px; height: 72px; margin: 0 auto 14px;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 30% 30%, rgba(255,255,255,.35), transparent 40%),
+        conic-gradient(from 0deg, var(--spotify), var(--cyan), var(--violet), var(--spotify));
+      animation: orbSpin 2.4s linear infinite;
+      position: relative;
+    }
+    .work-orb::after {
+      content: "♪";
+      position: absolute; inset: 6px;
+      border-radius: 50%;
+      background: #0c1218;
+      display: grid; place-items: center;
+      font-size: 1.4rem;
+      animation: orbPulse 1.4s ease-in-out infinite;
+    }
+    @keyframes orbSpin { to { transform: rotate(360deg); } }
+    @keyframes orbPulse {
+      0%, 100% { transform: scale(.92); opacity: .9; }
+      50% { transform: scale(1); opacity: 1; }
+    }
+    .work-title {
+      text-align: center;
+      font-weight: 800;
+      font-size: 1.05rem;
+      margin-bottom: 4px;
+    }
+    .work-sub {
+      text-align: center;
+      color: var(--muted);
+      font-size: .8rem;
+      margin-bottom: 16px;
+      min-height: 1.2em;
+    }
+    .work-steps { display: flex; flex-direction: column; gap: 8px; }
+    .work-step {
+      display: flex; gap: 10px; align-items: flex-start;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(8,12,18,.45);
+      border: 1px solid transparent;
+      color: var(--dim);
+      font-size: .82rem;
+      transition: all .25s ease;
+    }
+    .work-step.active {
+      color: var(--text);
+      border-color: rgba(62,224,255,.3);
+      background: rgba(62,224,255,.08);
+    }
+    .work-step.done {
+      color: var(--mint);
+      border-color: rgba(77,255,181,.2);
+    }
+    .work-step .dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      margin-top: 4px; flex: 0 0 auto;
+      background: var(--dim);
+    }
+    .work-step.active .dot {
+      background: var(--cyan);
+      box-shadow: 0 0 10px var(--cyan);
+      animation: blink 1s ease-in-out infinite;
+    }
+    .work-step.done .dot { background: var(--mint); }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .35; }
+    }
+    .work-bar {
+      margin-top: 14px;
+      height: 6px;
+      border-radius: 999px;
+      background: rgba(148,163,184,.12);
+      overflow: hidden;
+    }
+    .work-bar > i {
+      display: block; height: 100%; width: 30%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--spotify), var(--cyan), var(--violet));
+      background-size: 200% 100%;
+      animation: barSlide 1.2s ease-in-out infinite, barHue 2s linear infinite;
+    }
+    .work-bar.determinate > i { animation: barHue 2s linear infinite; }
+    @keyframes barSlide {
+      0% { transform: translateX(-100%); width: 35%; }
+      50% { width: 55%; }
+      100% { transform: translateX(280%); width: 35%; }
+    }
+    @keyframes barHue {
+      0% { filter: hue-rotate(0deg); }
+      100% { filter: hue-rotate(40deg); }
+    }
+    .work-track {
+      margin-top: 10px;
+      font-size: .75rem;
+      color: var(--muted);
+      text-align: center;
+      min-height: 1.1em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .btn-busy {
+      position: relative;
+      pointer-events: none;
+    }
+    .btn-busy::after {
+      content: "";
+      position: absolute; inset: 0;
+      border-radius: inherit;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,.18), transparent);
+      animation: shimmer 1.1s linear infinite;
+    }
+    @keyframes shimmer {
+      from { transform: translateX(-100%); }
+      to { transform: translateX(100%); }
+    }
+    code { color: var(--cyan); font-size: .78rem; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <div class="brand">
+      <div class="logo">♪</div>
+      <div>
+        <h1>Spotify DJ</h1>
+        <div class="sub">AI research · playlists · transport · voice</div>
+      </div>
+    </div>
+    <div id="authPill" class="pill warn">Checking…</div>
+  </div>
+
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="home">Home</button>
+    <button class="tab" data-tab="recent">Recent</button>
+    <button class="tab" data-tab="playlists">Playlists</button>
+    <button class="tab" data-tab="search">Search</button>
+    <button class="tab" data-tab="dj">AI DJ</button>
+  </div>
+
+  <!-- HOME -->
+  <section id="tab-home">
+    <div class="card">
+      <h2>CONNECTION</h2>
+      <div class="row">
+        <button class="spotify grow" id="btnLogin">Connect Spotify</button>
+        <button class="secondary" id="btnLogout">Logout</button>
+        <button class="secondary" id="btnRefreshAuth">Refresh</button>
+      </div>
+      <p class="hint" style="margin-top:10px">
+        In <strong>developer.spotify.com</strong> → your app → Redirect URIs, add
+        <strong>exactly</strong>:<br>
+        <code id="redirUri">https://grokifyos.grokpot.io/spotify-callback.php</code>
+        <button type="button" class="secondary sm" id="btnCopyRedir" style="margin-top:8px">Copy URI</button>
+      </p>
+      <div class="status" id="homeStatus"></div>
+    </div>
+
+    <div class="card">
+      <h2>NOW PLAYING</h2>
+      <div id="nowBox" class="now-card">
+        <div class="art">♪</div>
+        <div class="meta">
+          <div class="title" id="nowTitle">Nothing loaded</div>
+          <div class="artist" id="nowArtist">Connect Spotify · start a song on any device</div>
+          <div class="eq paused" id="nowEq"><span></span><span></span><span></span><span></span><span></span></div>
+        </div>
+      </div>
+      <div class="transport">
+        <button class="secondary icon-ctl" id="btnPrev" title="Previous">⏮</button>
+        <button class="spotify icon-ctl" id="btnPlay" title="Play / Resume">▶</button>
+        <button class="secondary icon-ctl" id="btnPause" title="Pause">❚❚</button>
+        <button class="secondary icon-ctl" id="btnNext" title="Next">⏭</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="secondary sm grow" id="btnNow">Refresh now</button>
+        <button class="secondary sm grow" id="btnOpenApp">Open Spotify app</button>
+      </div>
+      <div class="status" id="playerStatus"></div>
+      <p class="hint" style="margin-top:8px">
+        Remote control needs <strong>Spotify Premium</strong> and an <strong>active Connect device</strong>
+        (phone / desktop / speaker). If nothing is active, open the Spotify app, play once, then retry —
+        or transfer to a device below.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>DEVICES</h2>
+      <div class="row">
+        <button class="secondary sm" id="btnLoadDevices">Scan devices</button>
+      </div>
+      <div id="deviceList" style="margin-top:10px" class="empty">No devices yet — play something in Spotify, then scan.</div>
+      <div class="status" id="deviceStatus"></div>
+    </div>
+
+    <div class="card">
+      <h2>PROFILE</h2>
+      <div id="profileBox" class="empty">Connect Spotify to load your profile.</div>
+    </div>
+  </section>
+
+  <!-- RECENT -->
+  <section id="tab-recent" class="hidden">
+    <div class="card">
+      <h2>RECENTLY PLAYED</h2>
+      <div class="row">
+        <button class="secondary" id="btnLoadRecent">Reload</button>
+      </div>
+      <div class="list" id="recentList" style="margin-top:10px"></div>
+      <div class="status" id="recentStatus"></div>
+    </div>
+  </section>
+
+  <!-- PLAYLISTS -->
+  <section id="tab-playlists" class="hidden">
+    <div class="card">
+      <h2>YOUR PLAYLISTS</h2>
+      <div class="row">
+        <button class="secondary" id="btnLoadPlaylists">Reload</button>
+      </div>
+      <div class="list" id="playlistList" style="margin-top:10px"></div>
+      <div class="status" id="playlistStatus"></div>
+    </div>
+    <div class="card">
+      <h2>CREATE PLAYLIST</h2>
+      <input id="newPlName" placeholder="Playlist name" />
+      <textarea id="newPlDesc" placeholder="Description (optional)" style="margin-top:8px"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="btnCreatePl">Create</button>
+      </div>
+      <div class="status" id="createStatus"></div>
+    </div>
+    <div class="card hidden" id="plDetailCard">
+      <h2 id="plDetailTitle">PLAYLIST</h2>
+      <div class="row" style="margin-bottom:8px">
+        <button class="spotify sm" id="btnPlayPlaylist">Play playlist</button>
+      </div>
+      <div class="list" id="plTracks"></div>
+      <div class="status" id="plDetailStatus"></div>
+    </div>
+  </section>
+
+  <!-- SEARCH -->
+  <section id="tab-search" class="hidden">
+    <div class="card">
+      <h2>SEARCH TRACKS</h2>
+      <div class="row">
+        <input class="grow" id="searchQ" placeholder="Artist, song, vibe…" />
+        <button id="btnSearch">Search</button>
+      </div>
+      <div class="list" id="searchList" style="margin-top:10px"></div>
+      <div class="status" id="searchStatus"></div>
+    </div>
+    <div class="card">
+      <h2>ADD TO PLAYLIST</h2>
+      <select id="targetPlaylist"><option value="">Select playlist…</option></select>
+      <p class="hint" style="margin-top:8px">Search results include an Add button once a playlist is selected.</p>
+    </div>
+  </section>
+
+  <!-- AI DJ -->
+  <section id="tab-dj" class="hidden">
+    <div class="card live-card">
+      <div class="live-head">
+        <div>
+          <h2 style="margin:0">LIVE AI DJ</h2>
+          <div id="livePulse" class="live-pulse idle" style="margin-top:6px">
+            <i></i><span id="livePulseLabel">Off</span>
+          </div>
+        </div>
+        <button type="button" class="secondary live-toggle off" id="btnLiveDj">Turn ON</button>
+      </div>
+      <p class="hint">
+        Watches Spotify playback, picks ~5 related tracks from your <strong>playlists</strong> and
+        <strong>recently played</strong>, pauses at song end for DJ commentary (Grok Voice / device TTS),
+        then plays the next pick. Research still uses host Grok Build.
+      </p>
+      <div class="row" style="margin-top:10px">
+        <button class="secondary sm" id="btnLiveRefill" disabled>Refill queue</button>
+        <button class="secondary sm" id="btnLiveSkip" disabled>Skip → next + banter</button>
+      </div>
+      <div class="status" id="liveStatus"></div>
+      <div id="liveNowLine" class="hint" style="margin-top:6px"></div>
+      <div class="queue-list" id="liveQueue"></div>
+    </div>
+
+    <div class="card">
+      <h2>AI DJ · RESEARCH & BUILD</h2>
+      <p class="hint">
+        Research runs on <strong>host Grok Build</strong> (same bridge as Chat — device token on Home).
+        Optional <strong>xAI Voice</strong> key is only for DJ banter TTS.
+      </p>
+      <textarea id="djPrompt" placeholder="e.g. Late-night cyberpunk drive: dense synths, no vocals, 110–125 BPM…"></textarea>
+      <div class="chip-row">
+        <span class="chip" data-fill="Sunset rooftop chill: soft R&B, lo-fi edges, warm bass, 80–95 BPM">Rooftop chill</span>
+        <span class="chip" data-fill="Gym aggression: modern trap + metalcore drops, high energy, clean structure">Gym</span>
+        <span class="chip" data-fill="Focus deep work: instrumental only, minimal lyrics, ambient electronic">Focus</span>
+        <span class="chip" data-fill="Party starter 2020s hits + timeless sing-alongs, upbeat">Party</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="violet grow" id="btnDjResearch">Research set</button>
+        <button class="spotify grow" id="btnDjBuild" disabled>Build playlist</button>
+        <button class="secondary" id="btnSpeak">Speak banter</button>
+      </div>
+      <div class="ai-box hidden" id="djOut"></div>
+      <div class="status" id="djStatus"></div>
+    </div>
+
+    <div class="card">
+      <h2>GROK VOICE</h2>
+      <div id="xaiKeyStatus" class="pill warn" style="margin-bottom:10px">Checking xAI key…</div>
+      <p class="hint" id="xaiKeyHint">
+        Settings → API Keys → <strong>xAI · Grok Voice</strong>. Create a key at
+        <strong>console.x.ai</strong> → API Keys. Used for <code>POST api.x.ai/v1/tts</code> only.
+      </p>
+      <p class="hint" style="margin-top:8px">Pick a voice (from xAI Voice docs). Default is <strong>eve</strong>.</p>
+      <div class="chip-row" id="voiceChips" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="secondary sm" id="btnPreviewVoice">Preview voice</button>
+      </div>
+      <div class="status" id="voiceStatus"></div>
+    </div>
+  </section>
+
+  <!-- Work overlay -->
+  <div id="workOverlay" class="work-overlay hidden" aria-live="polite">
+    <div class="work-card">
+      <div class="work-orb"></div>
+      <div class="work-title" id="workTitle">Working…</div>
+      <div class="work-sub" id="workSub">Please wait</div>
+      <div class="work-steps" id="workSteps"></div>
+      <div class="work-bar" id="workBar"><i id="workBarFill"></i></div>
+      <div class="work-track" id="workTrack"></div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  var VOICES = [
+    { id: 'eve', label: 'Eve', tone: 'Energetic & upbeat' },
+    { id: 'ara', label: 'Ara', tone: 'Warm & friendly' },
+    { id: 'leo', label: 'Leo', tone: 'Authoritative & strong' },
+    { id: 'rex', label: 'Rex', tone: 'Confident & clear' },
+    { id: 'sal', label: 'Sal', tone: 'Smooth & balanced' },
+    { id: 'carina', label: 'Carina', tone: 'Soft, empathetic' },
+    { id: 'helix', label: 'Helix', tone: 'Bold, dynamic' },
+    { id: 'zagan', label: 'Zagan', tone: 'Dramatic narration' },
+    { id: 'orion', label: 'Orion', tone: 'Cinematic, rich' },
+    { id: 'luna', label: 'Luna', tone: 'Gentle, nurturing' },
+    { id: 'iris', label: 'Iris', tone: 'Friendly, upbeat' },
+    { id: 'helios', label: 'Helios', tone: 'Energetic assistant' },
+    { id: 'sirius', label: 'Sirius', tone: 'Playful, clever' },
+    { id: 'atlas', label: 'Atlas', tone: 'Commanding, confident' },
+    { id: 'celeste', label: 'Celeste', tone: 'Compassionate support' },
+    { id: 'lumen', label: 'Lumen', tone: 'Warm, articulate' },
+  ];
+
+  var state = {
+    me: null,
+    playlists: [],
+    lastResearch: null,
+    selectedPlaylistId: null,
+    selectedPlaylistUri: null,
+    voiceId: localStorage.getItem('spotify_dj_voice') || 'eve',
+    lastDeviceId: localStorage.getItem('spotify_dj_device') || null,
+    busy: false,
+    live: {
+      on: false,
+      timer: null,
+      queue: [],
+      playedUris: {},
+      lastUri: null,
+      lastProgress: 0,
+      lastDuration: 0,
+      wasPlaying: false,
+      transitioning: false,
+      filling: false,
+      nearEndArmed: false,
+      current: null,
+    },
+  };
+
+  function host() {
+    return (typeof GrokifyHost !== 'undefined') ? GrokifyHost : null;
+  }
+
+  function parse(s) {
+    try { return JSON.parse(s); } catch (e) { return null; }
+  }
+
+  function setStatus(id, msg, kind) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function toast(msg) {
+    var h = host();
+    if (h && h.toast) h.toast(String(msg).slice(0, 120));
+  }
+
+  function yieldUi(fn, ms) {
+    setTimeout(fn, ms == null ? 60 : ms);
+  }
+
+  /* —— Work overlay —— */
+  function showWork(title, steps) {
+    var ov = document.getElementById('workOverlay');
+    document.getElementById('workTitle').textContent = title || 'Working…';
+    document.getElementById('workSub').textContent = 'Starting…';
+    document.getElementById('workTrack').textContent = '';
+    var box = document.getElementById('workSteps');
+    box.innerHTML = '';
+    (steps || []).forEach(function (label, i) {
+      var d = document.createElement('div');
+      d.className = 'work-step' + (i === 0 ? ' active' : '');
+      d.id = 'wstep-' + i;
+      d.innerHTML = '<span class="dot"></span><span class="lbl"></span>';
+      d.querySelector('.lbl').textContent = label;
+      box.appendChild(d);
+    });
+    var bar = document.getElementById('workBar');
+    bar.classList.remove('determinate');
+    document.getElementById('workBarFill').style.width = '';
+    ov.classList.remove('hidden');
+  }
+
+  function setWorkStep(index, sub) {
+    var steps = document.querySelectorAll('.work-step');
+    steps.forEach(function (el, i) {
+      el.classList.remove('active', 'done');
+      if (i < index) el.classList.add('done');
+      if (i === index) el.classList.add('active');
+    });
+    if (sub) document.getElementById('workSub').textContent = sub;
+    var pct = steps.length ? Math.round(((index + 0.35) / steps.length) * 100) : 0;
+    if (pct > 8) {
+      var bar = document.getElementById('workBar');
+      bar.classList.add('determinate');
+      document.getElementById('workBarFill').style.width = Math.min(95, pct) + '%';
+    }
+  }
+
+  function setWorkTrack(msg) {
+    document.getElementById('workTrack').textContent = msg || '';
+  }
+
+  function hideWork() {
+    document.getElementById('workOverlay').classList.add('hidden');
+  }
+
+  function setBusyButtons(ids, on) {
+    ids.forEach(function (id) {
+      var b = document.getElementById(id);
+      if (!b) return;
+      b.disabled = !!on;
+      b.classList.toggle('btn-busy', !!on);
+    });
+  }
+
+  function spotify(method, path, body) {
+    var h = host();
+    if (!h || !h.spotifyApi) {
+      return { ok: false, error: 'bridge_missing', body: '' };
+    }
+    var raw = h.spotifyApi(method, path, body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body)));
+    var res = parse(raw) || { ok: false, error: 'bad_json', body: raw };
+    if (res.body && typeof res.body === 'string') {
+      try { res.json = JSON.parse(res.body); } catch (e) { res.json = null; }
+    }
+    return res;
+  }
+
+  function spotifyErr(res) {
+    if (!res) return 'failed';
+    if (res.json && res.json.error) {
+      var e = res.json.error;
+      if (typeof e === 'string') {
+        return res.json.error_description ? (e + ': ' + res.json.error_description) : e;
+      }
+      if (e.message) return e.message + (e.reason ? ' (' + e.reason + ')' : '');
+    }
+    return res.error || ('http_' + (res.status || '?'));
+  }
+
+  function normalizeUri(uri) {
+    if (!uri) return '';
+    var s = String(uri).trim();
+    var m = s.match(/open\.spotify\.com\/(track|album|playlist|episode|show)\/([a-zA-Z0-9]+)/i);
+    if (m) return 'spotify:' + m[1].toLowerCase() + ':' + m[2];
+    m = s.match(/^spotify:(track|album|playlist|episode|show):([a-zA-Z0-9]+)$/i);
+    if (m) return 'spotify:' + m[1].toLowerCase() + ':' + m[2];
+    return '';
+  }
+
+  function openInSpotifyApp(uri) {
+    var h = host();
+    if (!h || !h.spotifyOpenUri) return { ok: false, error: 'bridge_missing' };
+    return parse(h.spotifyOpenUri(uri)) || { ok: false, error: 'bad_json' };
+  }
+
+  function aiComplete(prompt, system) {
+    var h = host();
+    if (!h || !h.aiComplete) return { ok: false, error: 'bridge_missing' };
+    var opts = JSON.stringify({
+      system: system || '',
+      session_title: '· Plugin · Spotify DJ'
+    });
+    return parse(h.aiComplete(prompt, opts)) || { ok: false, error: 'bad_json' };
+  }
+
+  function speakBanter(text, voiceId, wait) {
+    var h = host();
+    if (!h || !h.speak) return { ok: false, error: 'bridge_missing' };
+    var opts = JSON.stringify({
+      voice_id: voiceId || state.voiceId || 'eve',
+      language: 'en',
+      wait: !!wait
+    });
+    return parse(h.speak(String(text || '').slice(0, 500), opts)) || { ok: false, error: 'bad_json' };
+  }
+
+  function hasXaiKey() {
+    var h = host();
+    if (!h) return false;
+    if (h.hasApiKey) {
+      var r = parse(h.hasApiKey('xai_api_key'));
+      if (r && r.present) return true;
+    }
+    if (h.getApiKeyStatus) {
+      var st = parse(h.getApiKeyStatus());
+      var arr = Array.isArray(st) ? st : (st && st.keys) || null;
+      if (arr) {
+        for (var i = 0; i < arr.length; i++) {
+          if (arr[i] && arr[i].id === 'xai_api_key' && arr[i].present) return true;
+        }
+      }
+    }
+    if (h.getRequiredKeys) {
+      var req = parse(h.getRequiredKeys());
+      if (Array.isArray(req)) {
+        for (var j = 0; j < req.length; j++) {
+          if (req[j] && req[j].id === 'xai_api_key' && req[j].present) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function artUrl(images) {
+    if (!images || !images.length) return '';
+    return images[0].url || images[images.length - 1].url || '';
+  }
+
+  function trackItem(t, extraBtns) {
+    if (!t) return '';
+    var img = artUrl((t.album && t.album.images) || t.images || []);
+    var artHtml = img
+      ? '<img class="art" src="' + img + '" alt="" />'
+      : '<div class="art">♪</div>';
+    return (
+      '<div class="item" data-uri="' + (t.uri || '') + '">' +
+        artHtml +
+        '<div class="meta"><div class="title"></div><div class="artist"></div></div>' +
+        '<div class="actions">' + (extraBtns || '') + '</div>' +
+      '</div>'
+    );
+  }
+
+  function fillTrackEl(el, t) {
+    el.querySelector('.title').textContent = t.name || 'Unknown';
+    el.querySelector('.artist').textContent = (t.artists || []).map(function (a) { return a.name; }).join(', ');
+  }
+
+  /* —— Auth / profile —— */
+  function refreshAuth() {
+    var h = host();
+    var pill = document.getElementById('authPill');
+    if (!h) {
+      pill.className = 'pill err';
+      pill.textContent = 'No host bridge';
+      return;
+    }
+    var st = parse(h.spotifyAuthStatus()) || {};
+    var redir = st.redirectUri || '';
+    if (redir) {
+      var elR = document.getElementById('redirUri');
+      if (elR) elR.textContent = redir;
+    }
+    if (!st.hasClientId) {
+      pill.className = 'pill warn';
+      pill.textContent = 'Need Client ID';
+      setStatus('homeStatus', 'Add Spotify Client ID in Settings → API keys, then reconnect.', 'err');
+      return;
+    }
+    if (st.loggedIn) {
+      pill.className = 'pill ok';
+      pill.textContent = 'Spotify linked';
+      var msg = st.lastMessage || '';
+      if (!msg || /invalid|expired|mismatch|timed out|session expired/i.test(msg)) {
+        msg = 'Connected. Use transport below or open Recent / Playlists / AI DJ.';
+      }
+      setStatus('homeStatus', msg, 'ok');
+      loadProfile();
+      loadPlaylists(true);
+      refreshNow();
+      loadDevices(true);
+    } else {
+      pill.className = 'pill warn';
+      pill.textContent = 'Not linked';
+      setStatus(
+        'homeStatus',
+        st.lastMessage ||
+          ('Tap Connect Spotify. Dashboard redirect URI must be exactly: ' +
+            (redir || 'https://grokifyos.grokpot.io/spotify-callback.php')),
+        st.lastMessage ? 'err' : ''
+      );
+    }
+    refreshXaiStatus();
+  }
+
+  function refreshXaiStatus() {
+    var pill = document.getElementById('xaiKeyStatus');
+    var present = hasXaiKey();
+    if (present) {
+      pill.className = 'pill ok';
+      pill.textContent = 'xAI key saved · Grok Voice ready';
+      document.getElementById('xaiKeyHint').textContent =
+        'Banter will use Grok Voice (' + state.voiceId + '). Research still uses host Grok Build.';
+    } else {
+      pill.className = 'pill warn';
+      pill.textContent = 'xAI key not set · device TTS fallback';
+      document.getElementById('xaiKeyHint').innerHTML =
+        'Open <strong>Settings → API Keys → xAI · Grok Voice</strong>. Create a key at ' +
+        '<strong>console.x.ai</strong> → API Keys, paste & Save. Then return here and pick a voice.';
+    }
+  }
+
+  function loadProfile() {
+    var res = spotify('GET', '/v1/me');
+    var box = document.getElementById('profileBox');
+    if (!res.ok || !res.json) {
+      box.className = 'empty';
+      box.textContent = spotifyErr(res) + (res.status ? ' (' + res.status + ')' : '');
+      return;
+    }
+    state.me = res.json;
+    var img = artUrl(res.json.images);
+    box.className = '';
+    box.innerHTML =
+      '<div class="item">' +
+        (img ? '<img class="art" src="' + img + '" />' : '<div class="art">☺</div>') +
+        '<div class="meta"><div class="title"></div><div class="artist"></div></div>' +
+      '</div>';
+    box.querySelector('.title').textContent = res.json.display_name || res.json.id;
+    var product = res.json.product || 'account';
+    box.querySelector('.artist').textContent = product + ' · ' + (res.json.country || '') +
+      (product !== 'premium' ? ' · Premium required for remote transport' : '');
+  }
+
+  /* —— Devices / transport —— */
+  function pickDevice(list) {
+    if (!list || !list.length) return null;
+    var preferred = state.lastDeviceId;
+    var active = null, pref = null, any = null;
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i];
+      if (!d || d.is_restricted) continue;
+      if (!any) any = d;
+      if (d.is_active) active = d;
+      if (preferred && d.id === preferred) pref = d;
+    }
+    return active || pref || any;
+  }
+
+  function loadDevices(silent) {
+    if (!silent) setStatus('deviceStatus', 'Scanning…');
+    var res = spotify('GET', '/v1/me/player/devices');
+    var box = document.getElementById('deviceList');
+    if (!res.ok || !res.json) {
+      box.className = 'empty';
+      box.textContent = spotifyErr(res);
+      setStatus('deviceStatus', spotifyErr(res), 'err');
+      return null;
+    }
+    var list = res.json.devices || [];
+    if (!list.length) {
+      box.className = 'empty';
+      box.textContent = 'No Connect devices. Open Spotify app, play a track once, then scan again.';
+      setStatus('deviceStatus', 'No devices', 'err');
+      return null;
+    }
+    box.className = '';
+    box.innerHTML = '';
+    list.forEach(function (d) {
+      var row = document.createElement('div');
+      row.className = 'device-item' + (d.is_active ? ' active' : '');
+      row.innerHTML =
+        '<div><div class="device-name"></div><div class="device-meta"></div></div>' +
+        '<button class="secondary sm btn-use">Use</button>';
+      row.querySelector('.device-name').textContent = d.name || d.id;
+      row.querySelector('.device-meta').textContent =
+        (d.type || 'device') + (d.is_active ? ' · active' : '') + (d.volume_percent != null ? ' · vol ' + d.volume_percent + '%' : '');
+      row.querySelector('.btn-use').onclick = function () { transferTo(d.id, true); };
+      box.appendChild(row);
+    });
+    setStatus('deviceStatus', list.length + ' device(s)', 'ok');
+    return pickDevice(list);
+  }
+
+  function transferTo(deviceId, startPlay) {
+    if (!deviceId) return { ok: false, error: 'no_device' };
+    setStatus('deviceStatus', 'Transferring…');
+    var res = spotify('PUT', '/v1/me/player', {
+      device_ids: [deviceId],
+      play: !!startPlay
+    });
+    if (res.ok || res.status === 204) {
+      state.lastDeviceId = deviceId;
+      localStorage.setItem('spotify_dj_device', deviceId);
+      setStatus('deviceStatus', 'Active device set', 'ok');
+      toast('Device ready');
+      yieldUi(function () { loadDevices(true); refreshNow(); }, 400);
+      return { ok: true };
+    }
+    setStatus('deviceStatus', spotifyErr(res), 'err');
+    return res;
+  }
+
+  function ensurePlaybackDevice() {
+    var res = spotify('GET', '/v1/me/player/devices');
+    var list = (res.json && res.json.devices) || [];
+    var pick = pickDevice(list);
+    if (!pick) return null;
+    if (!pick.is_active) {
+      transferTo(pick.id, false);
+      // small wait not possible sync — caller may retry
+    }
+    state.lastDeviceId = pick.id;
+    localStorage.setItem('spotify_dj_device', pick.id);
+    return pick;
+  }
+
+  function playBodyForUri(uri) {
+    if (uri.indexOf('spotify:track:') === 0 || uri.indexOf('spotify:episode:') === 0) {
+      return { uris: [uri] };
+    }
+    return { context_uri: uri };
+  }
+
+  function playUri(uri) {
+    var n = normalizeUri(uri);
+    if (!n) {
+      setStatus('playerStatus', 'Invalid Spotify URI', 'err');
+      toast('Invalid Spotify URI');
+      return;
+    }
+    var body = playBodyForUri(n);
+    var device = ensurePlaybackDevice();
+    var path = '/v1/me/player/play';
+    if (device && device.id) path += '?device_id=' + encodeURIComponent(device.id);
+
+    var res = spotify('PUT', path, body);
+    if (res.ok || res.status === 204) {
+      toast('Playing');
+      setStatus('playerStatus', 'Playing' + (device ? ' on ' + (device.name || 'device') : ''), 'ok');
+      yieldUi(refreshNow, 500);
+      return;
+    }
+
+    var msg = spotifyErr(res);
+    var needDevice = res.status === 404 || /NO_ACTIVE_DEVICE|active device|not found|Device not found/i.test(msg || '');
+    if (needDevice) {
+      var againDev = loadDevices(true);
+      if (againDev && againDev.id) {
+        var again = spotify(
+          'PUT',
+          '/v1/me/player/play?device_id=' + encodeURIComponent(againDev.id),
+          body
+        );
+        if (again.ok || again.status === 204) {
+          toast('Playing on ' + (againDev.name || 'device'));
+          setStatus('playerStatus', 'Playing on ' + (againDev.name || againDev.id), 'ok');
+          yieldUi(refreshNow, 500);
+          return;
+        }
+        msg = spotifyErr(again);
+      }
+      var opened = openInSpotifyApp(n);
+      if (opened.ok) {
+        toast('Opened in Spotify app');
+        setStatus(
+          'playerStatus',
+          'No active Connect device — opened Spotify. Play once there, then Scan devices / retry.',
+          'ok'
+        );
+        return;
+      }
+    }
+    if (/premium|restriction/i.test(msg || '')) {
+      setStatus('playerStatus', msg + ' — Spotify Premium is required for remote control.', 'err');
+      openInSpotifyApp(n);
+      return;
+    }
+    if (/invalid|uri/i.test(msg || '')) {
+      var o = openInSpotifyApp(n);
+      if (o.ok) {
+        setStatus('playerStatus', 'Opened in Spotify app', 'ok');
+        return;
+      }
+    }
+    setStatus(
+      'playerStatus',
+      msg + ' — open Spotify, start any song once (Premium for remote control), then retry',
+      'err'
+    );
+  }
+
+  function player(cmd) {
+    var device = ensurePlaybackDevice();
+    var q = device && device.id ? '?device_id=' + encodeURIComponent(device.id) : '';
+    var map = {
+      pause: ['PUT', '/v1/me/player/pause' + q, null],
+      play: ['PUT', '/v1/me/player/play' + q, null],
+      next: ['POST', '/v1/me/player/next' + q, null],
+      prev: ['POST', '/v1/me/player/previous' + q, null],
+      now: ['GET', '/v1/me/player/currently-playing', null]
+    };
+    var path = map[cmd];
+    if (!path) return;
+    setStatus('playerStatus', cmd === 'now' ? 'Checking…' : 'Sending ' + cmd + '…');
+    var res = spotify(path[0], path[1], path[2]);
+
+    if (cmd === 'now') {
+      updateNowFromResponse(res);
+      return;
+    }
+
+    if (res.ok || res.status === 204) {
+      setStatus('playerStatus', cmd.charAt(0).toUpperCase() + cmd.slice(1) + ' OK', 'ok');
+      yieldUi(refreshNow, 450);
+      return;
+    }
+
+    // Retry without device_id, then with transfer
+    var msg = spotifyErr(res);
+    if (res.status === 404 || /NO_ACTIVE_DEVICE|active device/i.test(msg || '')) {
+      var d = loadDevices(true);
+      if (d && d.id) {
+        transferTo(d.id, cmd === 'play' || cmd === 'next');
+        var path2 = map[cmd][1].split('?')[0] + '?device_id=' + encodeURIComponent(d.id);
+        var r2 = spotify(map[cmd][0], path2, null);
+        if (r2.ok || r2.status === 204) {
+          setStatus('playerStatus', cmd + ' on ' + (d.name || 'device'), 'ok');
+          yieldUi(refreshNow, 450);
+          return;
+        }
+        msg = spotifyErr(r2);
+      }
+      setStatus(
+        'playerStatus',
+        (msg || 'No active device') + ' — open Spotify app, play once, then Scan devices',
+        'err'
+      );
+      return;
+    }
+    if (/premium/i.test(msg || '')) {
+      setStatus('playerStatus', msg + ' (Premium required for transport)', 'err');
+      return;
+    }
+    setStatus('playerStatus', msg, 'err');
+  }
+
+  function updateNowFromResponse(res) {
+    var box = document.getElementById('nowBox');
+    var title = document.getElementById('nowTitle');
+    var artist = document.getElementById('nowArtist');
+    var eq = document.getElementById('nowEq');
+    if (res.ok && res.json && res.json.item) {
+      var t = res.json.item;
+      var playing = !!res.json.is_playing;
+      title.textContent = t.name || 'Unknown';
+      artist.textContent = (t.artists || []).map(function (a) { return a.name; }).join(', ');
+      var img = artUrl((t.album && t.album.images) || []);
+      var art = box.querySelector('.art');
+      if (img) {
+        if (art.tagName === 'IMG') art.src = img;
+        else {
+          var im = document.createElement('img');
+          im.className = 'art';
+          im.src = img;
+          art.replaceWith(im);
+        }
+      }
+      box.classList.toggle('playing', playing);
+      eq.classList.toggle('paused', !playing);
+      setStatus(
+        'playerStatus',
+        (playing ? '▶ ' : '❚❚ ') + t.name,
+        'ok'
+      );
+    } else if (res.status === 204 || (res.ok && !res.json)) {
+      title.textContent = 'Nothing playing';
+      artist.textContent = 'Start a track in Spotify, then refresh';
+      eq.classList.add('paused');
+      box.classList.remove('playing');
+      setStatus('playerStatus', 'Nothing playing or no active device', 'err');
+    } else {
+      setStatus('playerStatus', spotifyErr(res) || 'Could not read player', 'err');
+    }
+  }
+
+  function refreshNow() {
+    player('now');
+  }
+
+  /* —— Library —— */
+  function loadRecent() {
+    setStatus('recentStatus', 'Loading…');
+    var res = spotify('GET', '/v1/me/player/recently-played?limit=30');
+    var list = document.getElementById('recentList');
+    list.innerHTML = '';
+    if (!res.ok || !res.json) {
+      setStatus('recentStatus', spotifyErr(res), 'err');
+      return;
+    }
+    var items = res.json.items || [];
+    if (!items.length) {
+      list.innerHTML = '<div class="empty">No recent plays.</div>';
+      setStatus('recentStatus', '', '');
+      return;
+    }
+    items.forEach(function (it) {
+      var t = it.track;
+      if (!t) return;
+      var wrap = document.createElement('div');
+      wrap.innerHTML = trackItem(t, '<button class="secondary sm btn-play">Play</button>');
+      var el = wrap.firstChild;
+      fillTrackEl(el, t);
+      el.querySelector('.btn-play').onclick = function () { playUri(t.uri); };
+      list.appendChild(el);
+    });
+    setStatus('recentStatus', items.length + ' tracks', 'ok');
+  }
+
+  function loadPlaylists(silent) {
+    if (!silent) setStatus('playlistStatus', 'Loading…');
+    var res = spotify('GET', '/v1/me/playlists?limit=50');
+    var list = document.getElementById('playlistList');
+    var sel = document.getElementById('targetPlaylist');
+    list.innerHTML = '';
+    sel.innerHTML = '<option value="">Select playlist…</option>';
+    if (!res.ok || !res.json) {
+      setStatus('playlistStatus', spotifyErr(res), 'err');
+      return;
+    }
+    state.playlists = res.json.items || [];
+    state.playlists.forEach(function (pl) {
+      var img = artUrl(pl.images);
+      var wrap = document.createElement('div');
+      wrap.innerHTML =
+        '<div class="item">' +
+          (img ? '<img class="art" src="' + img + '" />' : '<div class="art">≡</div>') +
+          '<div class="meta"><div class="title"></div><div class="artist"></div></div>' +
+          '<div class="actions"><button class="secondary sm btn-open">Open</button></div>' +
+        '</div>';
+      var el = wrap.firstChild;
+      el.querySelector('.title').textContent = pl.name;
+      el.querySelector('.artist').textContent = (pl.tracks && pl.tracks.total != null ? pl.tracks.total + ' tracks' : '') +
+        (pl.public === false ? ' · private' : '');
+      el.querySelector('.btn-open').onclick = function () { openPlaylist(pl); };
+      list.appendChild(el);
+
+      var opt = document.createElement('option');
+      opt.value = pl.id;
+      opt.textContent = pl.name;
+      sel.appendChild(opt);
+    });
+    setStatus('playlistStatus', state.playlists.length + ' playlists', 'ok');
+  }
+
+  function openPlaylist(pl) {
+    state.selectedPlaylistId = pl.id;
+    state.selectedPlaylistUri = pl.uri || ('spotify:playlist:' + pl.id);
+    document.getElementById('plDetailCard').classList.remove('hidden');
+    document.getElementById('plDetailTitle').textContent = (pl.name || 'PLAYLIST').toUpperCase();
+    document.getElementById('targetPlaylist').value = pl.id;
+    setStatus('plDetailStatus', 'Loading tracks…');
+    var res = spotify('GET', '/v1/playlists/' + encodeURIComponent(pl.id) + '/tracks?limit=50');
+    var list = document.getElementById('plTracks');
+    list.innerHTML = '';
+    if (!res.ok || !res.json) {
+      setStatus('plDetailStatus', spotifyErr(res), 'err');
+      return;
+    }
+    (res.json.items || []).forEach(function (it) {
+      var t = it.track;
+      if (!t || t.is_local) return;
+      var wrap = document.createElement('div');
+      wrap.innerHTML = trackItem(t,
+        '<button class="secondary sm btn-play">Play</button>' +
+        '<button class="secondary sm btn-rm">Remove</button>');
+      var el = wrap.firstChild;
+      fillTrackEl(el, t);
+      el.querySelector('.btn-play').onclick = function () { playUri(t.uri); };
+      el.querySelector('.btn-rm').onclick = function () {
+        var r = spotify('DELETE', '/v1/playlists/' + encodeURIComponent(pl.id) + '/tracks', {
+          tracks: [{ uri: t.uri }]
+        });
+        if (r.ok) { toast('Removed'); openPlaylist(pl); }
+        else toast(spotifyErr(r) || 'Remove failed');
+      };
+      list.appendChild(el);
+    });
+    setStatus('plDetailStatus', (res.json.items || []).length + ' tracks shown', 'ok');
+  }
+
+  function createPlaylist() {
+    if (!state.me || !state.me.id) loadProfile();
+    var name = document.getElementById('newPlName').value.trim();
+    var desc = document.getElementById('newPlDesc').value.trim();
+    if (!name) {
+      setStatus('createStatus', 'Name required', 'err');
+      return;
+    }
+    if (!state.me || !state.me.id) {
+      setStatus('createStatus', 'Profile not loaded — connect Spotify first', 'err');
+      return;
+    }
+    setStatus('createStatus', 'Creating…');
+    var res = spotify('POST', '/v1/users/' + encodeURIComponent(state.me.id) + '/playlists', {
+      name: name,
+      description: desc || 'Created by GrokifyOS Spotify DJ',
+      public: false
+    });
+    if (!res.ok || !res.json) {
+      setStatus('createStatus', spotifyErr(res), 'err');
+      return;
+    }
+    setStatus('createStatus', 'Created “' + name + '”', 'ok');
+    toast('Playlist created');
+    document.getElementById('newPlName').value = '';
+    document.getElementById('newPlDesc').value = '';
+    loadPlaylists();
+    openPlaylist(res.json);
+  }
+
+  function doSearch() {
+    var q = document.getElementById('searchQ').value.trim();
+    if (!q) return;
+    setStatus('searchStatus', 'Searching…');
+    var res = spotify('GET', '/v1/search?type=track&limit=20&q=' + encodeURIComponent(q));
+    var list = document.getElementById('searchList');
+    list.innerHTML = '';
+    if (!res.ok || !res.json) {
+      setStatus('searchStatus', spotifyErr(res), 'err');
+      return;
+    }
+    var tracks = (res.json.tracks && res.json.tracks.items) || [];
+    tracks.forEach(function (t) {
+      var wrap = document.createElement('div');
+      wrap.innerHTML = trackItem(t,
+        '<button class="secondary sm btn-play">Play</button>' +
+        '<button class="sm btn-add">Add</button>');
+      var el = wrap.firstChild;
+      fillTrackEl(el, t);
+      el.querySelector('.btn-play').onclick = function () { playUri(t.uri); };
+      el.querySelector('.btn-add').onclick = function () { addToSelected(t.uri); };
+      list.appendChild(el);
+    });
+    setStatus('searchStatus', tracks.length + ' results', 'ok');
+  }
+
+  function addToSelected(uri) {
+    var pid = document.getElementById('targetPlaylist').value || state.selectedPlaylistId;
+    if (!pid) {
+      toast('Select a playlist first');
+      return;
+    }
+    var res = spotify('POST', '/v1/playlists/' + encodeURIComponent(pid) + '/tracks', {
+      uris: [uri]
+    });
+    if (res.ok) toast('Added to playlist');
+    else toast(spotifyErr(res));
+  }
+
+  function extractJson(text) {
+    var cleaned = (text || '').trim();
+    if (!cleaned) return null;
+    if (cleaned.indexOf('```') >= 0) {
+      var m = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (m) cleaned = m[1].trim();
+    }
+    try { return JSON.parse(cleaned); } catch (e) {}
+    var start = cleaned.indexOf('{');
+    var end = cleaned.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try { return JSON.parse(cleaned.slice(start, end + 1)); } catch (e2) {}
+    }
+    return null;
+  }
+
+  /* —— AI DJ —— */
+  function djResearch() {
+    var prompt = document.getElementById('djPrompt').value.trim();
+    if (!prompt) {
+      setStatus('djStatus', 'Describe the set you want', 'err');
+      return;
+    }
+    if (state.busy) return;
+    state.busy = true;
+    setBusyButtons(['btnDjResearch', 'btnDjBuild', 'btnSpeak'], true);
+    showWork('Researching your set', [
+      'Reading your brief',
+      'Running host Grok Build',
+      'Parsing tracklist JSON',
+      'Polishing banter line'
+    ]);
+    setWorkStep(0, 'Understanding the vibe…');
+
+    yieldUi(function () {
+      setWorkStep(1, 'Grok Build agent working — this can take a minute…');
+      var system =
+        'You are an expert music supervisor and DJ running inside GrokifyOS Spotify DJ. ' +
+        'Reply with ONLY valid JSON (no markdown fences, no tool chatter in the final answer) of shape: ' +
+        '{"title":"playlist title","description":"short desc","rationale":"2-4 sentences of research/taste notes",' +
+        '"banter":"1-2 short spoken lines a radio DJ would say introducing this set",' +
+        '"tracks":[{"query":"spotify search query artist + track","reason":"why"}]} ' +
+        'Provide 12-18 tracks. Prefer real, searchable track queries. Match the user vibe precisely.';
+
+      var res = aiComplete(prompt, system);
+      var box = document.getElementById('djOut');
+
+      setWorkStep(2, 'Parsing research…');
+      if (!res.ok) {
+        hideWork();
+        state.busy = false;
+        setBusyButtons(['btnDjResearch', 'btnSpeak'], false);
+        document.getElementById('btnDjBuild').disabled = true;
+        box.classList.remove('hidden');
+        box.textContent = (res.error || 'failed') + (res.hint ? '\n' + res.hint : '') +
+          (res.partial ? '\n\nPartial:\n' + res.partial : '') +
+          (res.body ? '\n' + res.body : '');
+        setStatus('djStatus', 'Grok Build failed — check bridge / device token (same as Chat)', 'err');
+        return;
+      }
+
+      var text = res.text || '';
+      var json = extractJson(text);
+      if (!json) {
+        hideWork();
+        state.busy = false;
+        setBusyButtons(['btnDjResearch', 'btnSpeak'], false);
+        document.getElementById('btnDjBuild').disabled = true;
+        box.classList.remove('hidden');
+        box.textContent = text;
+        setStatus('djStatus', 'Got text but not JSON — you can still copy ideas', 'err');
+        state.lastResearch = null;
+        return;
+      }
+
+      setWorkStep(3, 'Ready');
+      setWorkTrack((json.tracks || []).length + ' tracks proposed');
+      state.lastResearch = json;
+      box.classList.remove('hidden');
+      var lines = [];
+      lines.push('▶ ' + (json.title || 'Untitled set'));
+      if (json.description) lines.push(json.description);
+      lines.push('');
+      if (json.rationale) lines.push(json.rationale);
+      if (json.banter) {
+        lines.push('');
+        lines.push('🎙 Banter: ' + json.banter);
+      }
+      lines.push('');
+      (json.tracks || []).forEach(function (t, i) {
+        lines.push((i + 1) + '. ' + (t.query || '') + (t.reason ? ' — ' + t.reason : ''));
+      });
+      box.textContent = lines.join('\n');
+      document.getElementById('btnDjBuild').disabled = !(json.tracks && json.tracks.length);
+      setStatus('djStatus', 'Research ready — Build playlist writes it to Spotify', 'ok');
+
+      yieldUi(function () {
+        hideWork();
+        state.busy = false;
+        setBusyButtons(['btnDjResearch', 'btnSpeak'], false);
+        document.getElementById('btnDjBuild').disabled = !(json.tracks && json.tracks.length);
+        if (json.banter) {
+          yieldUi(function () { speakBanter(json.banter); }, 200);
+        }
+      }, 350);
+    }, 80);
+  }
+
+  function djBuild() {
+    var data = state.lastResearch;
+    if (!data || !data.tracks || !data.tracks.length) {
+      setStatus('djStatus', 'Run research first', 'err');
+      return;
+    }
+    if (!state.me || !state.me.id) loadProfile();
+    if (!state.me || !state.me.id) {
+      setStatus('djStatus', 'Connect Spotify first', 'err');
+      return;
+    }
+    if (state.busy) return;
+    state.busy = true;
+    setBusyButtons(['btnDjResearch', 'btnDjBuild', 'btnSpeak'], true);
+
+    var tracks = data.tracks || [];
+    showWork('Building playlist', [
+      'Creating Spotify playlist',
+      'Resolving tracks on Spotify',
+      'Adding tracks to playlist',
+      'Opening your new set'
+    ]);
+    setWorkStep(0, 'Creating “' + (data.title || 'Grokify DJ Set') + '”…');
+
+    yieldUi(function () {
+      var title = data.title || 'Grokify DJ Set';
+      var desc = (data.description || '') + ' · via GrokifyOS AI DJ';
+      var created = spotify('POST', '/v1/users/' + encodeURIComponent(state.me.id) + '/playlists', {
+        name: title,
+        description: desc.slice(0, 300),
+        public: false
+      });
+      if (!created.ok || !created.json) {
+        hideWork();
+        state.busy = false;
+        setBusyButtons(['btnDjResearch', 'btnDjBuild', 'btnSpeak'], false);
+        setStatus('djStatus', spotifyErr(created) || 'Create failed', 'err');
+        return;
+      }
+      var pid = created.json.id;
+      setWorkStep(1, 'Searching Spotify catalog…');
+
+      var uris = [];
+      var i = 0;
+
+      function nextTrack() {
+        if (i >= tracks.length) {
+          setWorkStep(2, 'Adding ' + uris.length + ' tracks…');
+          if (!uris.length) {
+            hideWork();
+            state.busy = false;
+            setBusyButtons(['btnDjResearch', 'btnDjBuild', 'btnSpeak'], false);
+            setStatus('djStatus', 'Playlist created but no tracks resolved', 'err');
+            loadPlaylists();
+            return;
+          }
+          var add = spotify('POST', '/v1/playlists/' + encodeURIComponent(pid) + '/tracks', { uris: uris });
+          setWorkStep(3, 'Finishing…');
+          if (!add.ok) {
+            setStatus('djStatus', 'Playlist created; add tracks failed: ' + spotifyErr(add), 'err');
+          } else {
+            setStatus('djStatus', 'Built “' + title + '” with ' + uris.length + ' tracks', 'ok');
+            toast('DJ set ready');
+          }
+          loadPlaylists();
+          openPlaylist(created.json);
+          document.querySelector('.tab[data-tab="playlists"]').click();
+          yieldUi(function () {
+            hideWork();
+            state.busy = false;
+            setBusyButtons(['btnDjResearch', 'btnDjBuild', 'btnSpeak'], false);
+          }, 400);
+          return;
+        }
+
+        var t = tracks[i];
+        var q = (t.query || '').trim();
+        setWorkTrack((i + 1) + '/' + tracks.length + ' · ' + q);
+        var pct = Math.round(((i + 1) / tracks.length) * 100);
+        document.getElementById('workBar').classList.add('determinate');
+        document.getElementById('workBarFill').style.width = Math.min(92, 20 + pct * 0.7) + '%';
+        document.getElementById('workSub').textContent = 'Resolving track ' + (i + 1) + ' of ' + tracks.length;
+
+        if (q) {
+          var s = spotify('GET', '/v1/search?type=track&limit=1&q=' + encodeURIComponent(q));
+          var item = s.json && s.json.tracks && s.json.tracks.items && s.json.tracks.items[0];
+          if (item && item.uri) uris.push(item.uri);
+        }
+        i++;
+        // Yield so the overlay animates between tracks
+        yieldUi(nextTrack, 30);
+      }
+
+      nextTrack();
+    }, 80);
+  }
+
+  /* —— Live AI DJ —— */
+  function liveUi() {
+    var on = state.live.on;
+    var btn = document.getElementById('btnLiveDj');
+    var pulse = document.getElementById('livePulse');
+    var label = document.getElementById('livePulseLabel');
+    btn.textContent = on ? 'Turn OFF' : 'Turn ON';
+    btn.classList.toggle('on', on);
+    btn.classList.toggle('off', !on);
+    pulse.classList.toggle('idle', !on);
+    label.textContent = on
+      ? (state.live.transitioning ? 'Banter / transition…' : (state.live.filling ? 'Filling queue…' : 'Watching playback'))
+      : 'Off';
+    document.getElementById('btnLiveRefill').disabled = !on;
+    document.getElementById('btnLiveSkip').disabled = !on;
+    renderLiveQueue();
+  }
+
+  function renderLiveQueue() {
+    var box = document.getElementById('liveQueue');
+    if (!box) return;
+    box.innerHTML = '';
+    var q = state.live.queue || [];
+    if (!q.length) {
+      if (state.live.on) {
+        box.innerHTML = '<div class="hint">Queue empty — filling from your library…</div>';
+      }
+      return;
+    }
+    q.slice(0, 8).forEach(function (t, i) {
+      var d = document.createElement('div');
+      d.className = 'queue-item';
+      d.innerHTML =
+        '<span class="n">' + (i + 1) + '</span>' +
+        '<div class="t"><div></div><div class="a"></div></div>';
+      d.querySelector('.t div').textContent = t.name || t.uri || 'Track';
+      d.querySelector('.a').textContent = t.artists || (t.reason || '');
+      box.appendChild(d);
+    });
+  }
+
+  function trackLabel(t) {
+    if (!t) return 'unknown';
+    var artists = (t.artists || []).map(function (a) { return a.name; }).join(', ');
+    return (t.name || 'track') + (artists ? ' by ' + artists : '');
+  }
+
+  function artistsStr(t) {
+    if (!t) return '';
+    if (typeof t.artists === 'string') return t.artists;
+    return (t.artists || []).map(function (a) { return a.name; }).join(', ');
+  }
+
+  function shuffle(arr) {
+    var a = arr.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+    return a;
+  }
+
+  function markPlayed(uri) {
+    if (uri) state.live.playedUris[uri] = Date.now();
+  }
+
+  function isPlayed(uri) {
+    return !!(uri && state.live.playedUris[uri]);
+  }
+
+  function gatherLibraryPool(current) {
+    var pool = [];
+    var seen = {};
+
+    function addTrack(t, reason) {
+      if (!t || !t.uri || t.is_local) return;
+      if (seen[t.uri] || isPlayed(t.uri)) return;
+      if (current && current.uri && t.uri === current.uri) return;
+      seen[t.uri] = true;
+      pool.push({
+        uri: t.uri,
+        name: t.name || '',
+        artists: artistsStr(t),
+        reason: reason || ''
+      });
+    }
+
+    // Recently played
+    var recent = spotify('GET', '/v1/me/player/recently-played?limit=30');
+    if (recent.ok && recent.json) {
+      (recent.json.items || []).forEach(function (it) {
+        addTrack(it.track, 'recently played');
+      });
+    }
+
+    // Random playlists (up to 4)
+    var plsRes = spotify('GET', '/v1/me/playlists?limit=50');
+    var playlists = (plsRes.ok && plsRes.json && plsRes.json.items) || state.playlists || [];
+    if (playlists.length) state.playlists = playlists;
+    var picks = shuffle(playlists).slice(0, Math.min(4, playlists.length));
+    picks.forEach(function (pl) {
+      if (!pl || !pl.id) return;
+      var tr = spotify('GET', '/v1/playlists/' + encodeURIComponent(pl.id) + '/tracks?limit=40');
+      if (!tr.ok || !tr.json) return;
+      var items = shuffle(tr.json.items || []).slice(0, 12);
+      items.forEach(function (it) {
+        addTrack(it.track, 'playlist: ' + (pl.name || 'set'));
+      });
+    });
+
+    // Related search from current artists (library-adjacent)
+    if (current && current.artists && current.artists.length) {
+      var a0 = current.artists[0].name;
+      if (a0) {
+        var s = spotify('GET', '/v1/search?type=track&limit=10&q=' + encodeURIComponent('artist:"' + a0 + '"'));
+        var items = (s.json && s.json.tracks && s.json.tracks.items) || [];
+        items.forEach(function (t) { addTrack(t, 'same artist'); });
+      }
+    }
+
+    return pool;
+  }
+
+  function pickFromPool(pool, current, n) {
+    n = n || 5;
+    if (!pool.length) return [];
+    var curArtists = {};
+    if (current && current.artists) {
+      current.artists.forEach(function (a) {
+        if (a && a.name) curArtists[a.name.toLowerCase()] = true;
+      });
+    }
+    var scored = pool.map(function (t) {
+      var score = Math.random() * 2;
+      var arts = (t.artists || '').toLowerCase();
+      Object.keys(curArtists).forEach(function (a) {
+        if (arts.indexOf(a) >= 0) score += 4;
+      });
+      if ((t.reason || '').indexOf('recently') >= 0) score += 1.2;
+      if ((t.reason || '').indexOf('playlist') >= 0) score += 0.8;
+      if ((t.reason || '').indexOf('same artist') >= 0) score += 2;
+      return { t: t, score: score };
+    });
+    scored.sort(function (a, b) { return b.score - a.score; });
+    // Take top candidates then shuffle a bit for variety
+    var top = scored.slice(0, Math.min(scored.length, n * 3)).map(function (x) { return x.t; });
+    return shuffle(top).slice(0, n);
+  }
+
+  function aiPickFromPool(pool, current, n) {
+    n = n || 5;
+    if (!pool.length) return [];
+    // Keep AI prompt small — sample pool
+    var sample = shuffle(pool).slice(0, 40);
+    var curLine = current ? trackLabel(current) : 'nothing specific';
+    var list = sample.map(function (t, i) {
+      return (i + 1) + '. ' + t.name + ' — ' + t.artists + ' [' + t.uri + ']';
+    }).join('\n');
+    var system =
+      'You are a radio DJ music director. Reply ONLY with valid JSON: ' +
+      '{"picks":[{"uri":"spotify:track:...","banter_note":"short why"}],"banter":"optional general line"}. ' +
+      'Pick exactly ' + n + ' tracks from the CANDIDATES list only (use their uris). ' +
+      'Prefer related mood/artist/energy to the CURRENT track. No markdown.';
+    var prompt =
+      'CURRENT: ' + curLine + '\n\nCANDIDATES:\n' + list +
+      '\n\nPick ' + n + ' best next tracks for a continuous DJ set.';
+    var res = aiComplete(prompt, system);
+    if (!res.ok) return null;
+    var json = extractJson(res.text || '');
+    if (!json || !json.picks || !json.picks.length) return null;
+    var byUri = {};
+    sample.forEach(function (t) { byUri[t.uri] = t; });
+    var out = [];
+    json.picks.forEach(function (p) {
+      var uri = (p && p.uri) || '';
+      var hit = byUri[uri];
+      if (hit && !isPlayed(hit.uri)) {
+        out.push({
+          uri: hit.uri,
+          name: hit.name,
+          artists: hit.artists,
+          reason: p.banter_note || hit.reason || 'AI pick'
+        });
+      }
+    });
+    return out.length ? { tracks: out.slice(0, n), banter: json.banter || '' } : null;
+  }
+
+  function fillLiveQueue(opts) {
+    opts = opts || {};
+    if (!state.live.on && !opts.force) return;
+    if (state.live.filling) return;
+    state.live.filling = true;
+    liveUi();
+    setStatus('liveStatus', 'Gathering playlists + recently played…', '');
+
+    yieldUi(function () {
+      try {
+        var current = state.live.current;
+        if (!current) {
+          var now = spotify('GET', '/v1/me/player/currently-playing');
+          if (now.ok && now.json && now.json.item) current = now.json.item;
+        }
+        var pool = gatherLibraryPool(current);
+        setStatus('liveStatus', 'Pool ' + pool.length + ' tracks — picking next batch…', '');
+
+        var batch = null;
+        // Prefer quick heuristic; optional AI polish when queue is empty (slower)
+        if (opts.useAi && pool.length >= 8) {
+          setStatus('liveStatus', 'Asking host Grok Build to rank next tracks…', '');
+          var ai = aiPickFromPool(pool, current, 5);
+          if (ai && ai.tracks && ai.tracks.length) {
+            batch = ai.tracks;
+            if (ai.banter) state.live.pendingBanter = ai.banter;
+          }
+        }
+        if (!batch || !batch.length) {
+          batch = pickFromPool(pool, current, 5 + Math.floor(Math.random() * 3)); // 5–7
+        }
+
+        batch.forEach(function (t) {
+          var exists = state.live.queue.some(function (q) { return q.uri === t.uri; });
+          if (!exists) state.live.queue.push(t);
+        });
+        renderLiveQueue();
+        setStatus(
+          'liveStatus',
+          batch.length
+            ? ('Queued ' + batch.length + ' · total ' + state.live.queue.length)
+            : 'Could not find more tracks — play something or check Spotify auth',
+          batch.length ? 'ok' : 'err'
+        );
+      } catch (e) {
+        setStatus('liveStatus', 'Queue fill error: ' + (e.message || e), 'err');
+      }
+      state.live.filling = false;
+      liveUi();
+    }, 40);
+  }
+
+  function banterLine(prev, next) {
+    if (state.live.pendingBanter) {
+      var b = state.live.pendingBanter;
+      state.live.pendingBanter = null;
+      return b;
+    }
+    var lines = [];
+    if (prev) {
+      lines.push(
+        'That was ' + (prev.name || 'the last track') +
+        (prev.artists && prev.artists.length
+          ? ' by ' + artistsStr(prev)
+          : '') + '.'
+      );
+    } else {
+      lines.push('Alright, keeping the set rolling.');
+    }
+    if (next) {
+      lines.push(
+        'Up next: ' + (next.name || 'a fresh cut') +
+        (next.artists ? ' by ' + next.artists : '') + '.'
+      );
+      if (next.reason && next.reason.indexOf('playlist') === 0) {
+        lines.push('Pulled from your ' + next.reason.replace(/^playlist:\s*/i, '') + ' playlist.');
+      }
+    } else {
+      lines.push('Give me a second while I dig through your library.');
+    }
+    // Keep spoken length short
+    return lines.join(' ').slice(0, 280);
+  }
+
+  function playQueuedTrack(item) {
+    if (!item || !item.uri) return false;
+    markPlayed(item.uri);
+    var ok = playUri(item.uri);
+    state.live.lastUri = item.uri;
+    state.live.nearEndArmed = false;
+    state.live.current = {
+      uri: item.uri,
+      name: item.name,
+      artists: (item.artists || '').split(', ').filter(Boolean).map(function (n) { return { name: n }; })
+    };
+    document.getElementById('liveNowLine').textContent =
+      'Now: ' + (item.name || item.uri) + (item.artists ? ' — ' + item.artists : '');
+    return ok !== false;
+  }
+
+  function runLiveTransition(reason) {
+    if (!state.live.on || state.live.transitioning) return;
+    state.live.transitioning = true;
+    liveUi();
+    setStatus('liveStatus', 'Transition (' + (reason || 'song end') + ')…', '');
+
+    yieldUi(function () {
+      var prev = state.live.current;
+      // Pause Spotify so banter is audible
+      var dev = ensurePlaybackDevice();
+      var q = dev ? ('?device_id=' + encodeURIComponent(dev.id)) : '';
+      spotify('PUT', '/v1/me/player/pause' + q, {});
+
+      if (state.live.queue.length < 2) {
+        // Synchronous-ish fill via heuristic (no AI wait during transition)
+        try {
+          var pool = gatherLibraryPool(prev);
+          pickFromPool(pool, prev, 5).forEach(function (t) {
+            if (!state.live.queue.some(function (x) { return x.uri === t.uri; })) {
+              state.live.queue.push(t);
+            }
+          });
+          renderLiveQueue();
+        } catch (e) {}
+      }
+
+      var next = state.live.queue.shift() || null;
+      renderLiveQueue();
+      var line = banterLine(prev, next);
+      setStatus('liveStatus', '🎙 ' + line, '');
+
+      // Block until speech finishes when host supports wait
+      var spoken = speakBanter(line, state.voiceId, true);
+      if (!spoken.ok) {
+        // Brief pause so device TTS can start
+        var waitMs = Math.min(12000, 1800 + String(line).split(/\s+/).length * 280);
+        // busy-wait not available — use nested yield for fallback delay estimate
+        yieldUi(function () {
+          finishTransition(next, spoken);
+        }, waitMs);
+        return;
+      }
+      finishTransition(next, spoken);
+    }, 30);
+  }
+
+  function finishTransition(next, spoken) {
+    if (next) {
+      playQueuedTrack(next);
+      setStatus(
+        'liveStatus',
+        'Playing next' + (spoken && spoken.mode ? ' · banter ' + spoken.mode : ''),
+        'ok'
+      );
+    } else {
+      setStatus('liveStatus', 'No next track — refill queue', 'err');
+      fillLiveQueue({ useAi: true });
+    }
+    // Prefetch if running low
+    if (state.live.queue.length < 3) {
+      yieldUi(function () { fillLiveQueue({ useAi: state.live.queue.length === 0 }); }, 500);
+    }
+    state.live.transitioning = false;
+    state.live.nearEndArmed = false;
+    liveUi();
+  }
+
+  function pollLiveDj() {
+    if (!state.live.on) return;
+    if (state.live.transitioning) return;
+
+    var res = spotify('GET', '/v1/me/player/currently-playing');
+    // 204 = nothing
+    if (!res.ok && res.status !== 204) {
+      setStatus('liveStatus', spotifyErr(res) || 'Player poll failed', 'err');
+      return;
+    }
+    var data = res.json || null;
+    if (!data || !data.item) {
+      document.getElementById('liveNowLine').textContent = 'Nothing playing — start a song or wait for queue…';
+      // If we have queue and were playing, track ended without next — transition
+      if (state.live.wasPlaying && state.live.queue.length) {
+        state.live.wasPlaying = false;
+        runLiveTransition('ended');
+        return;
+      }
+      // Auto-start first queued track if idle with queue
+      if (state.live.queue.length && !state.live.wasPlaying) {
+        var first = state.live.queue.shift();
+        renderLiveQueue();
+        playQueuedTrack(first);
+        setStatus('liveStatus', 'Started from queue', 'ok');
+      }
+      return;
+    }
+
+    var item = data.item;
+    var uri = item.uri;
+    var progress = data.progress_ms || 0;
+    var duration = item.duration_ms || 0;
+    var playing = !!data.is_playing;
+
+    state.live.current = item;
+    document.getElementById('liveNowLine').textContent =
+      (playing ? '▶ ' : '⏸ ') + trackLabel(item) +
+      (duration ? (' · ' + Math.floor(progress / 1000) + 's / ' + Math.floor(duration / 1000) + 's') : '');
+
+    // Track change (user skipped or natural advance)
+    if (state.live.lastUri && uri && uri !== state.live.lastUri) {
+      markPlayed(state.live.lastUri);
+      // If Spotify auto-advanced outside our queue, still inject banter occasionally
+      // Prefer controlling next ourselves when near end was armed
+      if (state.live.nearEndArmed) {
+        // We expected to take over — if Spotify already moved on, just update state
+        state.live.nearEndArmed = false;
+      }
+    }
+    state.live.lastUri = uri;
+    if (uri) markPlayed(uri);
+
+    // Near end of song → pause + banter + our next pick
+    var remain = duration > 0 ? (duration - progress) : 999999;
+    if (playing && duration > 20000 && remain <= 7000 && !state.live.nearEndArmed) {
+      state.live.nearEndArmed = true;
+      runLiveTransition('near_end');
+      return;
+    }
+
+    // Was playing, now stopped near end
+    if (state.live.wasPlaying && !playing && duration > 0 && remain <= 3000) {
+      runLiveTransition('stopped_at_end');
+      return;
+    }
+
+    state.live.wasPlaying = playing;
+    state.live.lastProgress = progress;
+    state.live.lastDuration = duration;
+
+    if (state.live.queue.length < 2 && !state.live.filling) {
+      fillLiveQueue({ useAi: false });
+    }
+  }
+
+  function startLiveDj() {
+    if (state.live.on) return;
+    if (!state.me) loadProfile();
+    state.live.on = true;
+    state.live.playedUris = {};
+    state.live.nearEndArmed = false;
+    state.live.transitioning = false;
+    liveUi();
+    setStatus('liveStatus', 'Live AI DJ on — loading your library…', 'ok');
+    toast('Live AI DJ on');
+
+    // Seed queue fast from library (AI rank is optional via Refill)
+    fillLiveQueue({ useAi: false, force: true });
+    if (state.live.timer) clearInterval(state.live.timer);
+    state.live.timer = setInterval(function () {
+      try { pollLiveDj(); } catch (e) {
+        setStatus('liveStatus', 'Poll error: ' + (e.message || e), 'err');
+      }
+    }, 2500);
+    // First poll soon
+    yieldUi(function () { pollLiveDj(); }, 600);
+
+    // Soft intro banter
+    yieldUi(function () {
+      if (!state.live.on) return;
+      speakBanter(
+        'AI DJ is live. I am watching your Spotify and will talk between tracks from your playlists and recent plays.',
+        state.voiceId,
+        false
+      );
+    }, 900);
+  }
+
+  function stopLiveDj() {
+    state.live.on = false;
+    if (state.live.timer) {
+      clearInterval(state.live.timer);
+      state.live.timer = null;
+    }
+    state.live.transitioning = false;
+    state.live.filling = false;
+    state.live.nearEndArmed = false;
+    liveUi();
+    setStatus('liveStatus', 'Live AI DJ off', '');
+    document.getElementById('liveNowLine').textContent = '';
+    toast('Live AI DJ off');
+  }
+
+  function toggleLiveDj() {
+    if (state.live.on) stopLiveDj();
+    else startLiveDj();
+  }
+
+  /* —— Voice chips —— */
+  function renderVoices() {
+    var box = document.getElementById('voiceChips');
+    box.innerHTML = '';
+    VOICES.forEach(function (v) {
+      var c = document.createElement('span');
+      c.className = 'chip voice' + (v.id === state.voiceId ? ' active' : '');
+      c.textContent = v.label;
+      c.title = v.tone;
+      c.onclick = function () {
+        state.voiceId = v.id;
+        localStorage.setItem('spotify_dj_voice', v.id);
+        renderVoices();
+        setStatus('voiceStatus', v.label + ' — ' + v.tone, 'ok');
+      };
+      box.appendChild(c);
+    });
+  }
+
+  /* —— Tabs & events —— */
+  document.querySelectorAll('.tab').forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      document.querySelectorAll('.tab').forEach(function (t) { t.classList.remove('active'); });
+      tab.classList.add('active');
+      ['home','recent','playlists','search','dj'].forEach(function (id) {
+        document.getElementById('tab-' + id).classList.toggle('hidden', id !== tab.dataset.tab);
+      });
+      if (tab.dataset.tab === 'recent') loadRecent();
+      if (tab.dataset.tab === 'playlists') loadPlaylists();
+      if (tab.dataset.tab === 'home') { refreshNow(); loadDevices(true); }
+      if (tab.dataset.tab === 'dj') {
+        refreshXaiStatus();
+        liveUi();
+      }
+    });
+  });
+
+  document.getElementById('btnLogin').onclick = function () {
+    var h = host();
+    if (!h) return;
+    var r = parse(h.spotifyLogin()) || {};
+    setStatus('homeStatus', r.ok ? 'Browser opened — approve Spotify, then return here and Refresh' : (r.error || 'Login failed'), r.ok ? 'ok' : 'err');
+    if (r.hint) setStatus('homeStatus', r.hint, 'err');
+  };
+  document.getElementById('btnCopyRedir').onclick = function () {
+    var t = (document.getElementById('redirUri') || {}).textContent || '';
+    var h = host();
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t);
+    } catch (e) {}
+    if (h && h.toast) h.toast('Redirect URI copied — paste into Spotify Dashboard');
+    setStatus('homeStatus', 'Register this redirect URI exactly: ' + t, 'ok');
+  };
+  document.getElementById('btnLogout').onclick = function () {
+    var h = host();
+    if (h) h.spotifyLogout();
+    state.me = null;
+    refreshAuth();
+  };
+  document.getElementById('btnRefreshAuth').onclick = refreshAuth;
+  document.getElementById('btnLoadRecent').onclick = loadRecent;
+  document.getElementById('btnLoadPlaylists').onclick = function () { loadPlaylists(); };
+  document.getElementById('btnCreatePl').onclick = createPlaylist;
+  document.getElementById('btnSearch').onclick = doSearch;
+  document.getElementById('searchQ').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') doSearch();
+  });
+  document.getElementById('btnLiveDj').onclick = toggleLiveDj;
+  document.getElementById('btnLiveRefill').onclick = function () {
+    if (!state.live.on) return;
+    fillLiveQueue({ useAi: true, force: true });
+  };
+  document.getElementById('btnLiveSkip').onclick = function () {
+    if (!state.live.on || state.live.transitioning) return;
+    runLiveTransition('manual_skip');
+  };
+  document.getElementById('btnDjResearch').onclick = djResearch;
+  document.getElementById('btnDjBuild').onclick = djBuild;
+  document.getElementById('btnSpeak').onclick = function () {
+    var data = state.lastResearch;
+    var text = (data && data.banter) ||
+      document.getElementById('djOut').textContent ||
+      document.getElementById('djPrompt').value;
+    var r = speakBanter(text);
+    var mode = r.mode || '';
+    if (r.ok) {
+      setStatus(
+        'djStatus',
+        mode === 'xai_tts'
+          ? 'Speaking with Grok Voice · ' + (r.voice_id || state.voiceId)
+          : 'Speaking (device TTS)' + (r.fallback_from ? ' · xAI fallback' : ''),
+        'ok'
+      );
+    } else {
+      setStatus(
+        'djStatus',
+        (r.error || 'TTS failed') + (r.hint ? ' — ' + r.hint : ''),
+        'err'
+      );
+    }
+  };
+  document.getElementById('btnPreviewVoice').onclick = function () {
+    var v = VOICES.filter(function (x) { return x.id === state.voiceId; })[0];
+    var line = 'This is ' + (v ? v.label : state.voiceId) +
+      ' on Grok Voice. Your AI DJ is ready to drop the next set.';
+    var r = speakBanter(line);
+    setStatus(
+      'voiceStatus',
+      r.ok
+        ? ('Preview · ' + (r.mode || 'tts') + ' · ' + state.voiceId)
+        : ((r.error || 'failed') + (r.hint ? ' — ' + r.hint : '')),
+      r.ok ? 'ok' : 'err'
+    );
+  };
+  document.getElementById('btnNow').onclick = refreshNow;
+  document.getElementById('btnPlay').onclick = function () { player('play'); };
+  document.getElementById('btnPause').onclick = function () { player('pause'); };
+  document.getElementById('btnNext').onclick = function () { player('next'); };
+  document.getElementById('btnPrev').onclick = function () { player('prev'); };
+  document.getElementById('btnLoadDevices').onclick = function () { loadDevices(false); };
+  document.getElementById('btnOpenApp').onclick = function () {
+    openInSpotifyApp('spotify:open');
+  };
+  document.getElementById('btnPlayPlaylist').onclick = function () {
+    if (state.selectedPlaylistUri) playUri(state.selectedPlaylistUri);
+    else toast('Open a playlist first');
+  };
+  document.querySelectorAll('.chip[data-fill]').forEach(function (c) {
+    c.onclick = function () {
+      document.getElementById('djPrompt').value = c.getAttribute('data-fill') || '';
+    };
+  });
+
+  renderVoices();
+  setTimeout(refreshAuth, 50);
+})();
+</script>
+</body>
+</html>

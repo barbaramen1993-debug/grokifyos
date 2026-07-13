@@ -28,6 +28,8 @@ class GrokifyForegroundService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        // Android requires an ongoing FGS notification — we demote it as far as
+        // the OS allows (MIN channel, no sound/badge/lockscreen, quiet shade only).
         return NotificationCompat.Builder(this, GrokifyApp.CHANNEL_ASSISTANT)
             .setContentTitle(getString(R.string.fg_title))
             .setContentText(getString(R.string.fg_text))
@@ -35,6 +37,11 @@ class GrokifyForegroundService : Service() {
             .setContentIntent(pi)
             .setOngoing(true)
             .setSilent(true)
+            .setShowWhen(false)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFERRED)
             .build()
     }
 

@@ -51,6 +51,8 @@ class MainActivity : ComponentActivity() {
         // Do not request all dangerous permissions on first run — user toggles
         // each capability in Settings or via AI-driven in-chat Allow cards.
         startAssistantService()
+        // Spotify OAuth deep link (cold start after browser redirect).
+        io.grokify.os.apps.plugin.SpotifyOAuth.handleRedirect(this, intent)
 
         setContent {
             GrokifyTheme {
@@ -91,10 +93,20 @@ class MainActivity : ComponentActivity() {
                         onDownloadInstallUpdate = vm::downloadAndInstallUpdate,
                         onToggleExpand = vm::toggleExpand,
                         onSetPanel = vm::setPanel,
+                        onOpenSettings = vm::openSettings,
+                        onCloseSettings = vm::closeSettings,
+                        onSaveMapboxAccessToken = vm::saveMapboxAccessToken,
+                        onClearMapboxAccessToken = vm::clearMapboxAccessToken,
+                        onSaveApiKey = { id, value, label, desc ->
+                            vm.saveApiKey(id, value, label, desc)
+                        },
+                        onClearApiKey = vm::clearApiKey,
                         onToggleHistory = vm::toggleUseHistory,
                         onToggleKeepScreenOn = vm::toggleKeepScreenOn,
                         onToggleEnterForNewline = vm::toggleEnterForNewline,
                         onToggleShareNotifications = vm::toggleShareNotifications,
+                        onToggleShowTools = vm::toggleShowTools,
+                        onToggleShowThoughts = vm::toggleShowThoughts,
                         onOpenNotificationAccess = { openNotificationListenerSettings() },
                         onRefreshNotificationAccess = vm::refreshNotificationAccessState,
                         onTogglePermission = vm::togglePermission,
@@ -119,6 +131,7 @@ class MainActivity : ComponentActivity() {
                         onRenameSession = vm::renameSession,
                         onLoadOlder = vm::loadOlderMessages,
                         onRefreshUsage = { vm.refreshUsage(force = true) },
+                        onSetAppOrder = vm::setAppOrder,
                     )
                 }
             }
@@ -128,6 +141,18 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         onReturnFromSettings?.invoke()
+        // Only re-check if intent still carries a Spotify callback URI
+        // (custom scheme or https App Link). handleRedirect consumes data
+        // and remembers the code so we never double-exchange.
+        if (io.grokify.os.apps.plugin.SpotifyOAuth.isSpotifyCallbackUri(intent?.data)) {
+            io.grokify.os.apps.plugin.SpotifyOAuth.handleRedirect(this, intent)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        io.grokify.os.apps.plugin.SpotifyOAuth.handleRedirect(this, intent)
     }
 
     /**

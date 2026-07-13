@@ -1,9 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">GrokifyOS</string>
-    <string name="notification_channel_assistant">GrokifyOS assistant</string>
+    <string name="notification_channel_assistant">GrokifyOS (quiet)</string>
+    <string name="notification_channel_assistant_desc">Required by Android while the background assistant bridge is active. Minimal priority — no sound or lockscreen.</string>
     <string name="notification_channel_updates">App updates</string>
-    <string name="fg_title">GrokifyOS is running</string>
-    <string name="fg_text">Assistant bridge active in background</string>
+    <string name="notification_channel_nearby_wifi">Nearby Wi‑Fi alerts</string>
+    <string name="notification_channel_nearby_wifi_desc">Alerts for strong nearby, first-seen, or watched SSID/MAC networks</string>
+    <string name="notification_channel_nearby_bt">Nearby Bluetooth alerts</string>
+    <string name="notification_channel_nearby_bt_desc">Alerts for strong nearby, first-seen, or watched Bluetooth name/MAC devices</string>
+    <string name="notification_channel_place_notes">Place notes</string>
+    <string name="notification_channel_place_notes_desc">Alerts when you enter a GPS place note area</string>
+    <string name="notification_channel_spotify_ctrl">Spotify controller</string>
+    <string name="notification_channel_spotify_ctrl_desc">Lockscreen media controls: previous, play/pause, next</string>
+    <string name="notification_channel_spotify_dj">Live AI DJ</string>
+    <string name="notification_channel_spotify_dj_desc">Native Live AI DJ: library queue and banter between tracks</string>
+    <string name="fg_title">GrokifyOS</string>
+    <string name="fg_text">Background bridge (can be ignored)</string>
     <string name="notification_listener_label">GrokifyOS notification access</string>
 </resources>

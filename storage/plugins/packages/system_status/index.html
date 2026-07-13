@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>System Status</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1016;
+      --panel: #121a24;
+      --border: rgba(148, 163, 184, 0.18);
+      --text: #e8eef6;
+      --muted: #8b9bb0;
+      --cyan: #3ee0ff;
+      --mint: #4dffb5;
+      --amber: #ffc857;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, rgba(62, 224, 255, 0.12), transparent),
+                  radial-gradient(900px 500px at 100% 0%, rgba(255, 200, 87, 0.10), transparent),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 1.15rem;
+      margin: 0 0 4px;
+      letter-spacing: 0.02em;
+    }
+    .sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .label {
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      color: var(--cyan);
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+      font-size: 0.9rem;
+    }
+    .row:last-child { border-bottom: none; }
+    .k { color: var(--muted); }
+    .v { color: var(--text); font-weight: 600; text-align: right; word-break: break-all; }
+    .pill {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      background: rgba(77, 255, 181, 0.12);
+      color: var(--mint);
+    }
+    .pill.off {
+      background: rgba(255, 200, 87, 0.12);
+      color: var(--amber);
+    }
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-weight: 700;
+      font-size: 0.95rem;
+      background: linear-gradient(90deg, var(--cyan), #6aa8ff);
+      color: #041016;
+      cursor: pointer;
+    }
+    button:active { transform: scale(0.99); }
+    .hint { color: var(--muted); font-size: 0.8rem; line-height: 1.45; margin-top: 10px; }
+    code { color: var(--amber); font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>System Status</h1>
+  <p class="sub">Remote marketplace script · unload anytime from Apps</p>
+
+  <div class="card">
+    <div class="label">HOST</div>
+    <div class="row"><span class="k">App</span><span class="v" id="appName">…</span></div>
+    <div class="row"><span class="k">Version</span><span class="v" id="version">…</span></div>
+    <div class="row"><span class="k">Bridge</span><span class="v" id="connected">…</span></div>
+    <div class="row"><span class="k">Token</span><span class="v" id="token">…</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">SCRIPT</div>
+    <div class="row"><span class="k">Plugin id</span><span class="v">system_status</span></div>
+    <div class="row"><span class="k">Source</span><span class="v">server package</span></div>
+    <div class="row"><span class="k">Runtime</span><span class="v">WebView sandbox</span></div>
+    <p class="hint">
+      This page was downloaded from your GrokifyOS server and cached on-device.
+      It is not compiled into the APK. Unload removes the local package files.
+    </p>
+  </div>
+
+  <button type="button" id="refreshBtn">Refresh host info</button>
+  <p class="hint">Bridge API: <code>GrokifyHost.getInfo()</code> · <code>GrokifyHost.toast(msg)</code></p>
+
+  <script>
+    function safeParse(json) {
+      try { return JSON.parse(json); } catch (e) { return {}; }
+    }
+
+    function render() {
+      if (typeof GrokifyHost === 'undefined' || !GrokifyHost.getInfo) {
+        document.getElementById('appName').textContent = 'GrokifyOS';
+        document.getElementById('version').textContent = 'bridge unavailable';
+        document.getElementById('connected').innerHTML = '<span class="pill off">unknown</span>';
+        document.getElementById('token').textContent = '—';
+        return;
+      }
+      var info = safeParse(GrokifyHost.getInfo());
+      document.getElementById('appName').textContent = info.appName || 'GrokifyOS';
+      document.getElementById('version').textContent =
+        (info.versionName || '?') + ' (' + (info.versionCode || '?') + ')';
+      var on = !!info.connected;
+      document.getElementById('connected').innerHTML =
+        '<span class="pill' + (on ? '' : ' off') + '">' + (on ? 'connected' : 'offline') + '</span>';
+      document.getElementById('token').textContent = info.tokenSaved ? 'saved' : 'empty';
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', function () {
+      render();
+      if (typeof GrokifyHost !== 'undefined' && GrokifyHost.toast) {
+        GrokifyHost.toast('Host info refreshed');
+      }
+    });
+
+    render();
+  </script>
+</body>
+</html>

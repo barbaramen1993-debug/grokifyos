@@ -5,7 +5,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.grokify.os.BuildConfig
 import io.grokify.os.GrokifyApp
+import io.grokify.os.apps.plugin.BuiltinPluginCatalog
 import io.grokify.os.chat.BridgeClient
+import io.grokify.os.data.ApiKeyEntry
+import io.grokify.os.data.ApiKeyIds
+import io.grokify.os.data.ApiKeyPresets
 import io.grokify.os.data.GrokifyApi
 import io.grokify.os.permission.AppPermissionId
 import io.grokify.os.permission.PermissionHelper
@@ -92,7 +96,7 @@ data class UsageInfo(
     val error: String? = null,
 )
 
-enum class ChatPanel { None, History, Notes, Settings }
+enum class ChatPanel { None, History, Notes }
 
 data class UiState(
     val token: String = "",
@@ -139,6 +143,10 @@ data class UiState(
     val enterForNewline: Boolean = true,
     /** Share active phone notifications with Grok as prompt notes. */
     val shareNotifications: Boolean = true,
+    /** Show tool call cards in the chat transcript. */
+    val showTools: Boolean = true,
+    /** Show thinking / thoughts cards in the chat transcript. */
+    val showThoughts: Boolean = true,
     /** System Notification access (NotificationListenerService) granted. */
     val notificationAccessGranted: Boolean = false,
     /** Listener service currently bound (receiving posts). */
@@ -148,9 +156,26 @@ data class UiState(
     /** Runtime permission groups for Settings toggles (camera, mic, …). */
     val permissions: List<PermissionStatus> = emptyList(),
     val panel: ChatPanel = ChatPanel.None,
+    /** Full-screen Settings page (not a bottom-nav tab, not a chat overlay). */
+    val showSettings: Boolean = false,
     val loadingPanel: Boolean = false,
     val usage: UsageInfo? = null,
     val usageLoading: Boolean = false,
+    /**
+     * Custom Mapbox public access token (pk.…). Empty means use the built-in default
+     * shipped in resources.
+     */
+    val mapboxAccessToken: String = "",
+    /**
+     * Host API key vault (user-facing keys for built-in apps). Values are full
+     * secrets held only in process memory while Settings is open.
+     */
+    val apiKeys: List<ApiKeyEntry> = emptyList(),
+    /**
+     * User order of built-in app ids in the Apps hub.
+     * Empty → default [BuiltinPluginCatalog] order.
+     */
+    val appOrder: List<String> = emptyList(),
 )
 
 class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
@@ -192,8 +217,13 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             val keepOn = store.keepScreenOnFlow.first()
             val enterNl = store.enterForNewlineFlow.first()
             val shareNotifs = store.shareNotificationsFlow.first()
+            val showTools = store.showToolsFlow.first()
+            val showThoughts = store.showThoughtsFlow.first()
             val savedModel = store.modelFlow.first()
             val savedSession = store.sessionIdFlow.first()
+            val mapboxTok = store.mapboxAccessTokenFlow.first().orEmpty()
+            val vault = store.apiKeyVaultFlow.first()
+            val appOrder = normalizeAppOrder(store.appOrderFlow.first())
             if (!savedSession.isNullOrBlank()) sessionId = savedSession
             NotificationMirror.setShareEnabled(shareNotifs)
             _state.update {
@@ -202,18 +232,60 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     keepScreenOn = keepOn,
                     enterForNewline = enterNl,
                     shareNotifications = shareNotifs,
+                    showTools = showTools,
+                    showThoughts = showThoughts,
                     model = savedModel?.takeIf { it.startsWith("gb:") || it.startsWith("grok:") } ?: "",
                     sessionId = sessionId,
+                    mapboxAccessToken = mapboxTok,
+                    apiKeys = vaultForUi(vault, mapboxTok),
+                    appOrder = appOrder,
                 )
             }
             refreshNotificationAccessState()
             refreshPermissions()
+
+            // Keep vault UI in sync
+            viewModelScope.launch {
+                store.apiKeyVaultFlow.collect { v ->
+                    val mapbox = store.mapboxAccessTokenFlow.first().orEmpty()
+                    _state.update {
+                        it.copy(
+                            apiKeys = vaultForUi(v, mapbox),
+                            mapboxAccessToken = mapbox,
+                        )
+                    }
+                }
+            }
+
             if (!t.isNullOrBlank()) {
                 _token = t
                 _state.update { it.copy(token = t, tokenSaved = true) }
                 refresh()
             }
         }
+    }
+
+    /** Persist Apps hub tile order after long-press rearrange. */
+    fun setAppOrder(ids: List<String>) {
+        val cleaned = normalizeAppOrder(ids)
+        viewModelScope.launch {
+            store.setAppOrder(cleaned)
+            _state.update { it.copy(appOrder = cleaned) }
+        }
+    }
+
+    private fun normalizeAppOrder(ids: List<String>): List<String> {
+        val known = BuiltinPluginCatalog.all.map { it.id }
+        val knownSet = known.toSet()
+        val ordered = ids
+            .map { if (it == "spotify_dj") BuiltinPluginCatalog.SPOTIFY_CONTROLLER else it.trim() }
+            .filter { it in knownSet }
+            .distinct()
+            .toMutableList()
+        for (id in known) {
+            if (id !in ordered) ordered.add(id)
+        }
+        return ordered
     }
 
     fun bindPermissionRequester(
@@ -418,20 +490,138 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val cleaned = token.trim()
             store.setToken(cleaned)
-            _token = cleaned
-            _state.update { it.copy(token = cleaned, tokenSaved = true, error = null) }
-            refresh()
+            _token = cleaned.ifBlank { null }
+            _state.update {
+                it.copy(
+                    token = cleaned,
+                    tokenSaved = cleaned.isNotBlank(),
+                    error = null,
+                )
+            }
+            if (cleaned.isNotBlank()) refresh()
         }
     }
 
     fun setPanel(panel: ChatPanel) {
-        _state.update { it.copy(panel = panel) }
+        _state.update { it.copy(panel = panel, showSettings = false) }
         when (panel) {
             ChatPanel.History -> loadSessions()
             ChatPanel.Notes -> loadNotes()
-            ChatPanel.Settings -> loadModels()
             ChatPanel.None -> {}
         }
+    }
+
+    /** Open the dedicated Settings page (full content, not a chat sheet). */
+    fun openSettings() {
+        _state.update { it.copy(showSettings = true, panel = ChatPanel.None) }
+        loadModels()
+        refreshUsage(force = false)
+        refreshPermissions()
+        refreshNotificationAccessState()
+    }
+
+    fun closeSettings() {
+        _state.update { it.copy(showSettings = false) }
+    }
+
+    /** Save or clear the Mapbox public access token used by map views. */
+    fun saveMapboxAccessToken(token: String) {
+        viewModelScope.launch {
+            val cleaned = token.trim()
+            store.setMapboxAccessToken(cleaned.ifEmpty { null })
+            val vault = store.apiKeyVaultFlow.first()
+            _state.update {
+                it.copy(
+                    mapboxAccessToken = cleaned,
+                    apiKeys = vaultForUi(vault, cleaned),
+                )
+            }
+        }
+    }
+
+    fun clearMapboxAccessToken() {
+        viewModelScope.launch {
+            store.setMapboxAccessToken(null)
+            val vault = store.apiKeyVaultFlow.first()
+            _state.update {
+                it.copy(
+                    mapboxAccessToken = "",
+                    apiKeys = vaultForUi(vault, ""),
+                )
+            }
+        }
+    }
+
+    /** Upsert a host API key (Settings "Add API key" + plugin gate). */
+    fun saveApiKey(id: String, value: String, label: String? = null, description: String? = null) {
+        viewModelScope.launch {
+            store.setApiKeyValue(id, value, label, description)
+            val vault = store.apiKeyVaultFlow.first()
+            val mapbox = store.mapboxAccessTokenFlow.first().orEmpty()
+            _state.update {
+                it.copy(
+                    apiKeys = vaultForUi(vault, mapbox),
+                    mapboxAccessToken = mapbox,
+                )
+            }
+        }
+    }
+
+    fun clearApiKey(id: String) {
+        viewModelScope.launch {
+            store.removeApiKey(id)
+            val vault = store.apiKeyVaultFlow.first()
+            val mapbox = store.mapboxAccessTokenFlow.first().orEmpty()
+            _state.update {
+                it.copy(
+                    apiKeys = vaultForUi(vault, mapbox),
+                    mapboxAccessToken = mapbox,
+                )
+            }
+        }
+    }
+
+    private fun vaultForUi(
+        vault: Map<String, ApiKeyEntry>,
+        mapboxTok: String,
+    ): List<ApiKeyEntry> {
+        val merged = vault.toMutableMap()
+        // Always surface known presets (even empty) so Settings shows where to paste keys.
+        for (preset in ApiKeyPresets.all) {
+            if (preset.id !in merged) {
+                merged[preset.id] = preset
+            } else {
+                val cur = merged[preset.id]!!
+                // Keep stored value; refresh label/description from preset when blank.
+                merged[preset.id] = cur.copy(
+                    label = cur.label.ifBlank { preset.label },
+                    description = cur.description.ifBlank { preset.description },
+                    preset = true,
+                )
+            }
+        }
+        if (mapboxTok.isNotBlank() && merged[ApiKeyIds.MAPBOX]?.value.isNullOrBlank()) {
+            merged[ApiKeyIds.MAPBOX] = ApiKeyEntry(
+                id = ApiKeyIds.MAPBOX,
+                label = ApiKeyPresets.labelFor(ApiKeyIds.MAPBOX),
+                value = mapboxTok,
+                description = ApiKeyPresets.descriptionFor(ApiKeyIds.MAPBOX),
+                preset = true,
+            )
+        }
+        return merged.values
+            .filter { it.id !in ApiKeyIds.INTERNAL }
+            // Mapbox has its own dedicated card above the vault list.
+            .filter { it.id != ApiKeyIds.MAPBOX }
+            .sortedWith(
+                compareBy(
+                    { it.id != ApiKeyIds.XAI }, // xAI first
+                    { it.id != ApiKeyIds.SPOTIFY_CLIENT_ID },
+                    { !it.preset },
+                    { it.label.lowercase() },
+                    { it.id },
+                ),
+            )
     }
 
     fun toggleUseHistory() {
@@ -476,6 +666,22 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             }
+        }
+    }
+
+    fun toggleShowTools() {
+        viewModelScope.launch {
+            val next = !_state.value.showTools
+            store.setShowTools(next)
+            _state.update { it.copy(showTools = next) }
+        }
+    }
+
+    fun toggleShowThoughts() {
+        viewModelScope.launch {
+            val next = !_state.value.showThoughts
+            store.setShowThoughts(next)
+            _state.update { it.copy(showThoughts = next) }
         }
     }
 
@@ -918,11 +1124,17 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val data = withContext(Dispatchers.IO) { api.usage(refresh = force) }
                 if (!data.optBoolean("ok", false)) {
+                    val err = data.optString("error", "usage_failed").ifBlank { "usage_failed" }
+                    val msg = data.optString("message").ifBlank { err }
                     _state.update {
+                        val prev = it.usage
                         it.copy(
                             usageLoading = false,
-                            usage = (it.usage ?: UsageInfo()).copy(
-                                error = data.optString("message", data.optString("error", "usage_failed")),
+                            usage = (prev ?: UsageInfo()).copy(
+                                // Keep last good label if we had one; surface short error for the chip.
+                                error = msg,
+                                label = prev?.label?.takeIf { l -> l.isNotBlank() }
+                                    ?: shortUsageError(err, msg),
                             ),
                         )
                     }
@@ -947,7 +1159,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 val pct = data.optDouble("usage_percent", 0.0)
                 val resetAt = data.optString("reset_at")
                 val tier = data.optString("subscription_tier")
-                val label = formatUsageLabel(pct, resetAt, tier)
+                val label = formatUsageLabel(pct, resetAt, tier, products)
                 _state.update {
                     it.copy(
                         usageLoading = false,
@@ -967,25 +1179,68 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } catch (e: Exception) {
                 _state.update {
+                    val prev = it.usage
                     it.copy(
                         usageLoading = false,
-                        usage = (it.usage ?: UsageInfo()).copy(error = e.message),
+                        usage = (prev ?: UsageInfo()).copy(
+                            error = e.message,
+                            label = prev?.label?.takeIf { l -> l.isNotBlank() }
+                                ?: shortUsageError("network", e.message ?: "network error"),
+                        ),
                     )
                 }
             }
         }
     }
 
-    private fun formatUsageLabel(percent: Double, resetAt: String, tier: String): String {
-        val pctStr = if (percent == percent.toLong().toDouble()) {
+    private fun shortUsageError(code: String, message: String): String {
+        val c = code.lowercase()
+        val m = message.lowercase()
+        return when {
+            c.contains("auth_refresh_revoked") || m.contains("revoked") -> "Usage: re-login needed"
+            c.contains("auth") || m.contains("credential") || m.contains("sync-grok-auth") ->
+                "Usage: auth error"
+            c.contains("billing_auth") -> "Usage: auth error"
+            c.contains("billing") -> "Usage: billing error"
+            c.contains("network") || c.contains("timeout") || m.contains("timeout") ->
+                "Usage: network error"
+            message.contains("auth", ignoreCase = true) -> "Usage: auth error"
+            else -> "Usage unavailable"
+        }
+    }
+
+    private fun formatUsageLabel(
+        percent: Double,
+        resetAt: String,
+        tier: String,
+        products: List<UsageProduct> = emptyList(),
+    ): String {
+        val pctStr = formatPct(percent)
+        val resetPart = formatResetRelative(resetAt)
+        val tierPart = tier.trim().takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
+        val productPart = products
+            .filter { it.usagePercent != null && (it.usagePercent ?: 0.0) > 0 }
+            .joinToString(" · ") { p ->
+                val name = when (p.product) {
+                    "GrokBuild" -> "Build"
+                    "GrokChat" -> "Chat"
+                    "GrokImagine" -> "Imagine"
+                    else -> p.product.ifBlank { "?" }
+                }
+                "$name ${formatPct(p.usagePercent ?: 0.0)}"
+            }
+            .takeIf { it.isNotEmpty() }
+            ?.let { " · $it" }
+            ?: ""
+        return "Usage $pctStr$tierPart$productPart · $resetPart"
+    }
+
+    private fun formatPct(percent: Double): String =
+        if (percent == percent.toLong().toDouble()) {
             "${percent.toLong()}%"
         } else {
             String.format("%.1f%%", percent)
         }
-        val resetPart = formatResetRelative(resetAt)
-        val tierPart = tier.trim().takeIf { it.isNotEmpty() }?.let { " · $it" } ?: ""
-        return "Usage $pctStr$tierPart · $resetPart"
-    }
 
     private fun formatResetRelative(resetAt: String): String {
         if (resetAt.isBlank()) return "reset unknown"

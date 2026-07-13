@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "updated_at": "2026-07-13T22:00:00Z",
+  "plugins": [
+    {
+      "id": "wifi_scanner",
+      "title": "Wi‑Fi Scanner",
+      "subtitle": "Scan nearby networks with GPS, distance, times seen, and alerts (SSID/MAC watch, unseen, strong nearby).",
+      "version": "1.0.0",
+      "author": "GrokifyOS",
+      "kind": "host_module",
+      "host_module_id": "wifi_scanner",
+      "capabilities": ["Nearby Wi‑Fi", "Location"],
+      "accent": "cyan",
+      "icon": "wifi",
+      "featured": true,
+      "enabled": true
+    },
+    {
+      "id": "bt_scanner",
+      "title": "Bluetooth Tracker",
+      "subtitle": "BLE + classic discovery with GPS pins, distance, times seen, and alerts (name/MAC watch, unseen, strong nearby).",
+      "version": "1.0.0",
+      "author": "GrokifyOS",
+      "kind": "host_module",
+      "host_module_id": "bt_scanner",
+      "capabilities": ["Bluetooth", "Location", "Notifications"],
+      "accent": "mint",
+      "icon": "bluetooth",
+      "featured": true,
+      "enabled": true
+    },
+    {
+      "id": "place_notes",
+      "title": "Place Notes",
+      "subtitle": "Pin notes to GPS spots. On enter: notify, open an app, or show an image. List + map + area monitoring.",
+      "version": "1.0.0",
+      "author": "GrokifyOS",
+      "kind": "host_module",
+      "host_module_id": "place_notes",
+      "capabilities": ["Location", "Notifications"],
+      "accent": "violet",
+      "icon": "place",
+      "featured": true,
+      "enabled": true
+    },
+    {
+      "id": "spotify_controller",
+      "title": "Spotify",
+      "subtitle": "Lockscreen controls, Live AI DJ booth chat (plays + banter as messages, queue chat), research/build/edit playlists. OAuth + media.",
+      "version": "2.1.0",
+      "author": "GrokifyOS",
+      "kind": "host_module",
+      "host_module_id": "spotify_controller",
+      "capabilities": ["Notifications", "Media control", "AI", "Voice"],
+      "accent": "mint",
+      "icon": "music",
+      "featured": true,
+      "enabled": true,
+      "required_keys": [
+        {
+          "id": "spotify_client_id",
+          "label": "Spotify Client ID",
+          "description": "From developer.spotify.com — Redirect URI: https://grokifyos.grokpot.io/spotify-callback.php",
+          "required": false
+        },
+        {
+          "id": "xai_api_key",
+          "label": "xAI API key",
+          "description": "Optional — Grok Voice TTS for Live DJ banter. Device TTS works without it.",
+          "required": false
+        }
+      ]
+    },
+    {
+      "id": "system_status",
+      "title": "System Status",
+      "subtitle": "Lightweight remote script: host info, connection status, and quick tips. Loaded from the server — unload anytime.",
+      "version": "1.0.0",
+      "author": "GrokifyOS",
+      "kind": "webview",
+      "capabilities": ["Scripts"],
+      "accent": "amber",
+      "icon": "extension",
+      "package": "system_status",
+      "featured": true,
+      "enabled": true
+    }
+  ]
+}

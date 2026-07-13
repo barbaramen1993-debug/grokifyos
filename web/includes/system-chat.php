@@ -470,10 +470,17 @@ function gos_grok_auth_ensure_token(): array
 {
     $loaded = gos_grok_auth_load();
     if ($loaded === null) {
+        $candidates = gos_grok_auth_json_candidates();
+        $detail = [];
+        foreach ($candidates as $p) {
+            $detail[] = $p . (is_readable($p) ? ' (readable)' : ' (unreadable)');
+        }
+
         return [
             'ok' => false,
             'error' => 'auth_missing',
-            'message' => 'Grok Build auth unavailable — set GROKIFY_GROK_AUTH_JSON or place auth.json (from `grok login`).',
+            'message' => 'Grok Build auth unavailable — run `scripts/sync-grok-auth.sh` after `grok login` so PHP (www-data) can read auth.json.',
+            'candidates' => $detail,
         ];
     }
     $entryKey = $loaded['entry_key'];
@@ -487,9 +494,16 @@ function gos_grok_auth_ensure_token(): array
     $refresh = (string) ($entry['refresh_token'] ?? '');
     $clientId = (string) ($entry['oidc_client_id'] ?? '');
     if ($refresh === '' || $clientId === '') {
-        return $token !== ''
-            ? ['ok' => true, 'token' => $token, 'entry' => $entry]
-            : ['ok' => false, 'error' => 'auth_refresh_unavailable'];
+        // Never hand an already-expired token to callers — it only produces misleading 401s.
+        if ($token !== '' && !gos_grok_auth_token_expired($entry)) {
+            return ['ok' => true, 'token' => $token, 'entry' => $entry];
+        }
+
+        return [
+            'ok' => false,
+            'error' => 'auth_refresh_unavailable',
+            'message' => 'Grok access token expired and no refresh_token is available. Run `grok login` then `./scripts/sync-grok-auth.sh`.',
+        ];
     }
 
     $body = http_build_query([
@@ -513,11 +527,26 @@ function gos_grok_auth_ensure_token(): array
     $err = curl_error($ch);
     curl_close($ch);
     if (!is_string($resp) || $resp === '' || $code < 200 || $code >= 300) {
-        if ($token !== '' && !gos_grok_auth_token_expired($entry, -3600)) {
+        $detail = is_string($resp) && $resp !== '' ? $resp : $err;
+        $revoked = is_string($detail) && (
+            str_contains($detail, 'invalid_grant')
+            || str_contains($detail, 'revoked')
+            || str_contains($detail, 'expired')
+        );
+        // Only reuse the existing access token if it is still unexpired.
+        if ($token !== '' && !gos_grok_auth_token_expired($entry)) {
             return ['ok' => true, 'token' => $token, 'entry' => $entry];
         }
 
-        return ['ok' => false, 'error' => 'auth_refresh_failed', 'http_code' => $code, 'detail' => $err ?: $resp];
+        return [
+            'ok' => false,
+            'error' => $revoked ? 'auth_refresh_revoked' : 'auth_refresh_failed',
+            'http_code' => $code,
+            'message' => $revoked
+                ? 'Grok refresh token revoked/expired — run `grok login` then `./scripts/sync-grok-auth.sh` so PHP can read the new auth.json.'
+                : 'Grok auth refresh failed (HTTP ' . $code . ').',
+            'detail' => $detail,
+        ];
     }
     $json = json_decode($resp, true);
     if (!is_array($json) || empty($json['access_token'])) {
@@ -581,6 +610,7 @@ function gos_grok_build_fetch_usage(bool $forceRefresh = false): array
             $loaded = gos_grok_auth_load();
             if ($loaded !== null) {
                 $entry = $loaded['entry'];
+                // Force ensure_token to refresh on the next attempt.
                 $entry['expires_at'] = gmdate('Y-m-d\TH:i:s\Z', time() - 10);
                 gos_grok_auth_save_entry($loaded['entry_key'], $entry, $loaded['path'] ?? null);
             }
@@ -588,11 +618,20 @@ function gos_grok_build_fetch_usage(bool $forceRefresh = false): array
             return gos_grok_build_fetch_usage(true);
         }
 
+        $upstreamBody = is_string($resp) ? trim($resp) : '';
+        $authish = $code === 401 || $code === 403
+            || str_contains($upstreamBody, 'expired credentials')
+            || str_contains($upstreamBody, 'Invalid or expired')
+            || str_contains($upstreamBody, 'PermissionDenied');
+
         return [
             'ok' => false,
-            'error' => 'billing_fetch_failed',
+            'error' => $authish ? 'billing_auth_failed' : 'billing_fetch_failed',
             'http_code' => $code,
-            'message' => $err ?: 'Billing upstream error',
+            'message' => $authish
+                ? 'Grok billing rejected credentials (HTTP ' . $code . ') — run `./scripts/sync-grok-auth.sh` after `grok login`.'
+                : ($err ?: ('Billing upstream error (HTTP ' . $code . ')')),
+            'detail' => $upstreamBody !== '' ? mb_substr($upstreamBody, 0, 400) : null,
         ];
     }
 

@@ -1,0 +1,22 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "io.grokify.os.debug",
+      "sha256_cert_fingerprints": [
+        "B6:0A:BD:BE:3A:B8:D3:7A:A6:70:A9:C8:D1:E4:0C:F3:0C:75:C9:4A:1E:9D:51:A0:4F:63:35:F4:C8:71:85:AF"
+      ]
+    }
+  },
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "io.grokify.os",
+      "sha256_cert_fingerprints": [
+        "B6:0A:BD:BE:3A:B8:D3:7A:A6:70:A9:C8:D1:E4:0C:F3:0C:75:C9:4A:1E:9D:51:A0:4F:63:35:F4:C8:71:85:AF"
+      ]
+    }
+  }
+]

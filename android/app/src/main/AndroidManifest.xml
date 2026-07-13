@@ -40,6 +40,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
@@ -54,6 +55,20 @@
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <uses-feature android:name="android.software.companion_device_setup" android:required="false" />
+
+    <!-- Package visibility for Place Notes picker + Spotify controller -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="image/*" />
+        </intent>
+        <package android:name="com.spotify.music" />
+        <package android:name="com.spotify.lite" />
+    </queries>
 
     <application
         android:name=".GrokifyApp"
@@ -75,6 +90,25 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Spotify OAuth PKCE — custom scheme (bounce page / intent://) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="grokifyos"
+                    android:host="spotify-callback" />
+            </intent-filter>
+            <!-- Spotify OAuth — verified App Link (opens app directly from HTTPS redirect) -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="grokifyos.grokpot.io"
+                    android:path="/spotify-callback.php" />
             </intent-filter>
             <!-- Assistant / voice entry -->
             <intent-filter>
@@ -106,6 +140,24 @@
         </service>
 
         <service
+            android:name=".apps.SpotifyControllerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="lockscreen_media_remote_control" />
+        </service>
+
+        <service
+            android:name=".apps.SpotifyLiveDjService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="spotify_live_ai_dj_playback_watch" />
+        </service>
+
+        <service
             android:name=".service.GrokifyNotificationListener"
             android:exported="true"
             android:label="@string/notification_listener_label"
@@ -124,5 +176,40 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <receiver
+            android:name=".apps.LocationNoteReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.grokify.os.PLACE_NOTE_LOCATION" />
+                <action android:name="io.grokify.os.PLACE_NOTE_OPEN" />
+                <action android:name="io.grokify.os.PLACE_NOTE_OPEN_APP" />
+                <action android:name="io.grokify.os.PLACE_NOTE_OPEN_IMAGE" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".apps.SpotifyControllerReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.grokify.os.SPOTIFY_PREV" />
+                <action android:name="io.grokify.os.SPOTIFY_PLAY_PAUSE" />
+                <action android:name="io.grokify.os.SPOTIFY_NEXT" />
+                <action android:name="io.grokify.os.SPOTIFY_STOP" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".apps.SpotifyLiveDjReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.grokify.os.SPOTIFY_DJ_STOP" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

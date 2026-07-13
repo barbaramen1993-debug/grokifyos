@@ -47,9 +47,11 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -63,6 +65,8 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.automirrored.filled.Notes
+import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.ScreenLockPortrait
@@ -70,10 +74,26 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
+import io.grokify.os.R
+import io.grokify.os.apps.BluetoothScannerPane
+import io.grokify.os.apps.LocationNotesPane
+import io.grokify.os.apps.SpotifyControllerPane
 import io.grokify.os.apps.WifiScannerPane
+import io.grokify.os.apps.plugin.BuiltinPluginCatalog
+import io.grokify.os.apps.plugin.PluginAccent
+import io.grokify.os.apps.plugin.PluginIconKey
+import io.grokify.os.apps.plugin.PluginManifest
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.material.icons.filled.DragHandle
 import io.grokify.os.permission.AppPermissionId
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -101,6 +121,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -116,12 +138,14 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -148,10 +172,18 @@ fun GrokifyAppRoot(
     onDownloadInstallUpdate: () -> Unit = {},
     onToggleExpand: (String) -> Unit = {},
     onSetPanel: (ChatPanel) -> Unit = {},
+    onOpenSettings: () -> Unit = {},
+    onCloseSettings: () -> Unit = {},
+    onSaveMapboxAccessToken: (String) -> Unit = {},
+    onClearMapboxAccessToken: () -> Unit = {},
+    onSaveApiKey: (id: String, value: String, label: String?, description: String?) -> Unit = { _, _, _, _ -> },
+    onClearApiKey: (String) -> Unit = {},
     onToggleHistory: () -> Unit = {},
     onToggleKeepScreenOn: () -> Unit = {},
     onToggleEnterForNewline: () -> Unit = {},
     onToggleShareNotifications: () -> Unit = {},
+    onToggleShowTools: () -> Unit = {},
+    onToggleShowThoughts: () -> Unit = {},
     onOpenNotificationAccess: () -> Unit = {},
     onRefreshNotificationAccess: () -> Unit = {},
     onTogglePermission: (String) -> Unit = {},
@@ -174,9 +206,10 @@ fun GrokifyAppRoot(
     onRenameSession: (String) -> Unit = {},
     onLoadOlder: () -> Unit = {},
     onRefreshUsage: () -> Unit = {},
+    onSetAppOrder: (List<String>) -> Unit = {},
 ) {
     var tab by remember { mutableIntStateOf(1) } // default Chat
-    /** null = Apps hub; "wifi_scanner" = mini-app. */
+    /** null = Apps hub; else built-in mini-app id. */
     var appsScreen by remember { mutableStateOf<String?>(null) }
     var tokenDraft by remember { mutableStateOf(state.token) }
     var chatDraft by remember { mutableStateOf("") }
@@ -187,6 +220,14 @@ fun GrokifyAppRoot(
     val density = LocalDensity.current
     val imeBottom = WindowInsets.ime.getBottom(density)
     val keyboardOpen = imeBottom > 0
+
+    // When the persisted token loads (or is saved), keep the draft field aligned
+    // unless the user already typed something different.
+    LaunchedEffect(state.token) {
+        if (tokenDraft.isBlank() || tokenDraft == state.token) {
+            tokenDraft = state.token
+        }
+    }
 
     // Android cannot grant Notification access via a runtime permission dialog —
     // we must send the user to system settings. Prompt once when sharing is on.
@@ -255,10 +296,11 @@ fun GrokifyAppRoot(
             containerColor = Color.Transparent,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
-                if (!(tab == 1 && keyboardOpen)) {
+                if (!(tab == 1 && keyboardOpen && !state.showSettings)) {
                     TopChrome(
                         state = state,
                         tab = tab,
+                        settingsOpen = state.showSettings,
                         onRenameSession = { openRename() },
                     )
                 }
@@ -284,23 +326,31 @@ fun GrokifyAppRoot(
                             indicatorColor = GrokifyColors.GlowCyan.copy(alpha = 0.12f),
                         )
                         NavigationBarItem(
-                            selected = tab == 0,
-                            onClick = { tab = 0; onSetPanel(ChatPanel.None) },
+                            selected = !state.showSettings && tab == 0,
+                            onClick = {
+                                tab = 0
+                                onCloseSettings()
+                                onSetPanel(ChatPanel.None)
+                            },
                             icon = { Icon(Icons.Default.Home, null) },
                             label = { Text("Home", fontSize = 11.sp) },
                             colors = colors,
                         )
                         NavigationBarItem(
-                            selected = tab == 1,
-                            onClick = { tab = 1 },
+                            selected = !state.showSettings && tab == 1,
+                            onClick = {
+                                tab = 1
+                                onCloseSettings()
+                            },
                             icon = { Icon(Icons.AutoMirrored.Filled.Chat, null) },
                             label = { Text("Chat", fontSize = 11.sp) },
                             colors = colors,
                         )
                         NavigationBarItem(
-                            selected = tab == 2,
+                            selected = !state.showSettings && tab == 2,
                             onClick = {
                                 tab = 2
+                                onCloseSettings()
                                 onSetPanel(ChatPanel.None)
                             },
                             icon = { Icon(Icons.Default.Apps, null) },
@@ -308,10 +358,11 @@ fun GrokifyAppRoot(
                             colors = colors,
                         )
                         NavigationBarItem(
-                            selected = tab == 3,
+                            selected = !state.showSettings && tab == 3,
                             onClick = {
                                 tab = 3
                                 appsScreen = null
+                                onCloseSettings()
                                 onSetPanel(ChatPanel.None)
                             },
                             icon = { Icon(Icons.Default.SystemUpdate, null) },
@@ -328,17 +379,36 @@ fun GrokifyAppRoot(
                     .padding(pad)
                     .imePadding()
             ) {
-                when (tab) {
+                if (state.showSettings) {
+                    SettingsPage(
+                        state = state,
+                        onBack = onCloseSettings,
+                        onRefreshUsage = onRefreshUsage,
+                        onSelectModel = onSelectModel,
+                        onToggleHistory = onToggleHistory,
+                        onToggleKeepScreenOn = onToggleKeepScreenOn,
+                        onToggleEnterForNewline = onToggleEnterForNewline,
+                        onToggleShareNotifications = onToggleShareNotifications,
+                        onToggleShowTools = onToggleShowTools,
+                        onToggleShowThoughts = onToggleShowThoughts,
+                        onOpenNotificationAccess = onOpenNotificationAccess,
+                        onRefreshNotificationAccess = onRefreshNotificationAccess,
+                        onTogglePermission = onTogglePermission,
+                        onRefreshPermissions = onRefreshPermissions,
+                        onOpenAppPermissionSettings = onOpenAppPermissionSettings,
+                        onSaveMapboxAccessToken = onSaveMapboxAccessToken,
+                        onClearMapboxAccessToken = onClearMapboxAccessToken,
+                        onSaveApiKey = onSaveApiKey,
+                        onClearApiKey = onClearApiKey,
+                    )
+                } else when (tab) {
                     0 -> HomePane(
                         state = state,
                         tokenDraft = tokenDraft,
                         onTokenChange = { tokenDraft = it },
                         onSaveToken = { onSaveToken(tokenDraft) },
                         onRefresh = onRefresh,
-                        onOpenSettings = {
-                            tab = 1
-                            onSetPanel(ChatPanel.Settings)
-                        },
+                        onOpenSettings = onOpenSettings,
                         onOpenNotificationAccess = onOpenNotificationAccess,
                         onRefreshNotificationAccess = onRefreshNotificationAccess,
                     )
@@ -354,24 +424,17 @@ fun GrokifyAppRoot(
                         onToggleExpand = onToggleExpand,
                         onRefresh = onRefresh,
                         onSetPanel = onSetPanel,
+                        onOpenSettings = onOpenSettings,
                         onToggleHistory = onToggleHistory,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
-                        onToggleEnterForNewline = onToggleEnterForNewline,
-                        onToggleShareNotifications = onToggleShareNotifications,
-                        onOpenNotificationAccess = onOpenNotificationAccess,
-                        onRefreshNotificationAccess = onRefreshNotificationAccess,
-                        onTogglePermission = onTogglePermission,
-                        onRefreshPermissions = onRefreshPermissions,
                         onAllowPermissionRequest = onAllowPermissionRequest,
                         onDenyPermissionRequest = onDenyPermissionRequest,
-                        onOpenAppPermissionSettings = onOpenAppPermissionSettings,
                         onNewChat = onNewChat,
                         onSelectSession = onSelectSession,
                         onDeleteSession = onDeleteSession,
                         onAddNote = onAddNote,
                         onToggleNote = onToggleNote,
                         onDeleteNote = onDeleteNote,
-                        onSelectModel = onSelectModel,
                         onToggleMessageExclude = onToggleMessageExclude,
                         onDeleteMessage = onDeleteMessage,
                         onEditMessage = onEditMessage,
@@ -381,8 +444,18 @@ fun GrokifyAppRoot(
                     )
                     2 -> AppsPane(
                         screen = appsScreen,
-                        onOpenApp = { appsScreen = it },
+                        appOrder = state.appOrder,
+                        onOpenApp = { id ->
+                            val resolved =
+                                if (id == "spotify_dj") "spotify_controller" else id
+                            if (BuiltinPluginCatalog.isKnown(resolved) ||
+                                resolved == "spotify_controller"
+                            ) {
+                                appsScreen = resolved
+                            }
+                        },
                         onBackToHub = { appsScreen = null },
+                        onSetAppOrder = onSetAppOrder,
                         onRequestWifiPerms = {
                             // Single system dialog: nearby Wi‑Fi + location (OEM-friendly).
                             onEnsurePermissions(
@@ -391,6 +464,27 @@ fun GrokifyAppRoot(
                                     AppPermissionId.LOCATION.id,
                                 ),
                             )
+                        },
+                        onRequestBtPerms = {
+                            onEnsurePermissions(
+                                listOf(
+                                    AppPermissionId.BLUETOOTH.id,
+                                    AppPermissionId.LOCATION.id,
+                                    AppPermissionId.NOTIFICATIONS.id,
+                                ),
+                            )
+                        },
+                        onRequestPlacePerms = {
+                            onEnsurePermissions(
+                                listOf(
+                                    AppPermissionId.LOCATION.id,
+                                    AppPermissionId.NOTIFICATIONS.id,
+                                    AppPermissionId.MEDIA.id,
+                                ),
+                            )
+                        },
+                        onRequestNotifPerms = {
+                            onEnsurePermissions(listOf(AppPermissionId.NOTIFICATIONS.id))
                         },
                     )
                     3 -> UpdatePane(
@@ -487,6 +581,7 @@ fun GrokifyAppRoot(
 private fun TopChrome(
     state: UiState,
     tab: Int,
+    settingsOpen: Boolean = false,
     onRenameSession: () -> Unit = {},
 ) {
     Column(
@@ -513,7 +608,7 @@ private fun TopChrome(
                 )
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = if (tab == 1) {
+                    modifier = if (!settingsOpen && tab == 1) {
                         Modifier
                             .clip(RoundedCornerShape(8.dp))
                             .clickable(onClick = onRenameSession, role = Role.Button)
@@ -523,10 +618,11 @@ private fun TopChrome(
                     },
                 ) {
                     Text(
-                        when (tab) {
-                            0 -> "Command center"
-                            1 -> shortenTitle(state.sessionTitle.ifBlank { "Chat" })
-                            2 -> "Inner Apps"
+                        when {
+                            settingsOpen -> "Settings"
+                            tab == 0 -> "Command center"
+                            tab == 1 -> shortenTitle(state.sessionTitle.ifBlank { "Chat" })
+                            tab == 2 -> "Inner Apps"
                             else -> "Deploy"
                         },
                         style = MaterialTheme.typography.titleSmall,
@@ -609,6 +705,17 @@ private fun HomePane(
     onOpenNotificationAccess: () -> Unit = {},
     onRefreshNotificationAccess: () -> Unit = {},
 ) {
+    var tokenVisible by remember { mutableStateOf(false) }
+    var tokenCopiedFlash by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+
+    LaunchedEffect(tokenCopiedFlash) {
+        if (tokenCopiedFlash) {
+            delay(1400)
+            tokenCopiedFlash = false
+        }
+    }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -649,11 +756,40 @@ private fun HomePane(
             Spacer(Modifier.height(12.dp))
         }
         GlassCard {
-            Text("DEVICE TOKEN", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+            val tokenPersisted = state.token.isNotBlank()
+            val tokenDirty = tokenDraft.trim() != state.token.trim()
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    "DEVICE TOKEN",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = GrokifyColors.GlowCyan,
+                )
+                SecretStatusChip(
+                    saved = tokenPersisted,
+                    dirty = tokenDirty,
+                )
+            }
             Spacer(Modifier.height(6.dp))
             Text(
-                "Paste a token from grokifyos.grokpot.io → Devices.",
-                color = GrokifyColors.TextMuted,
+                when {
+                    tokenPersisted && !tokenDirty ->
+                        "Saved on device · ends …${state.token.takeLast(6)}"
+                    tokenPersisted && tokenDirty ->
+                        "Saved on device · field has unsaved edits"
+                    !tokenPersisted && tokenDraft.isBlank() ->
+                        "Empty — paste a token from grokifyos.grokpot.io → Devices"
+                    else ->
+                        "Empty on device — save to connect"
+                },
+                color = when {
+                    tokenPersisted && !tokenDirty -> GrokifyColors.GlowMint
+                    tokenDirty -> GrokifyColors.GlowAmber
+                    else -> GrokifyColors.TextMuted
+                },
                 fontSize = 13.sp,
             )
             Spacer(Modifier.height(12.dp))
@@ -663,11 +799,36 @@ private fun HomePane(
                 modifier = Modifier.fillMaxWidth(),
                 placeholder = { Text("gf_…", color = GrokifyColors.TextDim) },
                 singleLine = true,
+                visualTransformation = if (tokenVisible) {
+                    VisualTransformation.None
+                } else {
+                    PasswordVisualTransformation()
+                },
+                trailingIcon = {
+                    IconButton(onClick = { tokenVisible = !tokenVisible }) {
+                        Icon(
+                            if (tokenVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            contentDescription = if (tokenVisible) "Hide token" else "Show token",
+                            tint = GrokifyColors.TextMuted,
+                        )
+                    }
+                },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Ascii,
+                    imeAction = ImeAction.Done,
+                ),
                 colors = fieldColors(),
                 shape = RoundedCornerShape(12.dp),
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 13.sp,
+                ),
             )
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Button(
                     onClick = onSaveToken,
                     colors = ButtonDefaults.buttonColors(
@@ -675,7 +836,33 @@ private fun HomePane(
                         contentColor = Color(0xFF041016),
                     ),
                     shape = RoundedCornerShape(10.dp),
-                ) { Text("Save", fontWeight = FontWeight.SemiBold) }
+                ) {
+                    Text(
+                        if (tokenDirty) "Save" else if (tokenPersisted) "Saved" else "Save",
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                if (tokenVisible && tokenDraft.isNotBlank()) {
+                    TextButton(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(tokenDraft))
+                            tokenCopiedFlash = true
+                        },
+                    ) {
+                        Icon(
+                            Icons.Default.ContentCopy,
+                            contentDescription = null,
+                            tint = if (tokenCopiedFlash) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            if (tokenCopiedFlash) "Copied" else "Copy",
+                            color = if (tokenCopiedFlash) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
                 IconButton(
                     onClick = onRefresh,
                     modifier = Modifier
@@ -698,7 +885,7 @@ private fun HomePane(
         ) {
             Icon(Icons.Default.Settings, null, tint = GrokifyColors.GlowCyan)
             Spacer(Modifier.width(8.dp))
-            Text("Chat settings & models", color = GrokifyColors.TextPrimary)
+            Text("Settings · models · API keys", color = GrokifyColors.TextPrimary)
         }
         state.error?.let {
             Spacer(Modifier.height(10.dp))
@@ -832,24 +1019,17 @@ private fun ChatPane(
     onToggleExpand: (String) -> Unit,
     onRefresh: () -> Unit,
     onSetPanel: (ChatPanel) -> Unit,
+    onOpenSettings: () -> Unit = {},
     onToggleHistory: () -> Unit,
     onToggleKeepScreenOn: () -> Unit,
-    onToggleEnterForNewline: () -> Unit,
-    onToggleShareNotifications: () -> Unit = {},
-    onOpenNotificationAccess: () -> Unit = {},
-    onRefreshNotificationAccess: () -> Unit = {},
-    onTogglePermission: (String) -> Unit = {},
-    onRefreshPermissions: () -> Unit = {},
     onAllowPermissionRequest: (String) -> Unit = {},
     onDenyPermissionRequest: (String) -> Unit = {},
-    onOpenAppPermissionSettings: () -> Unit = {},
     onNewChat: () -> Unit,
     onSelectSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
     onAddNote: (String) -> Unit,
     onToggleNote: (Int, Boolean) -> Unit,
     onDeleteNote: (Int) -> Unit,
-    onSelectModel: (String) -> Unit,
     onToggleMessageExclude: (String) -> Unit,
     onDeleteMessage: (String) -> Unit,
     onEditMessage: (String, String) -> Unit,
@@ -863,6 +1043,17 @@ private fun ChatPane(
     var editMsg by remember { mutableStateOf<ChatLine?>(null) }
     var editDraft by remember { mutableStateOf("") }
 
+    // Respect Settings → Chat visibility toggles (data still streamed/stored).
+    val visibleMessages = remember(state.messages, state.showTools, state.showThoughts) {
+        state.messages.filter { msg ->
+            when (msg.role) {
+                ChatRole.Tool -> state.showTools
+                ChatRole.Thinking -> state.showThoughts
+                else -> true
+            }
+        }
+    }
+
     // Auto-scroll only when the user is already near the bottom (or list grew while pinned)
     var pinToBottom by remember { mutableStateOf(true) }
     var prevMessageCount by remember { mutableIntStateOf(0) }
@@ -870,7 +1061,7 @@ private fun ChatPane(
     fun listPrefixCount(): Int {
         var n = 0
         if (state.hasMoreMessages || state.loadingOlder) n++
-        if (state.messages.isEmpty() && !state.busy) n++
+        if (visibleMessages.isEmpty() && !state.busy) n++
         return n
     }
 
@@ -895,27 +1086,29 @@ private fun ChatPane(
     }
 
     // Session open / initial page load → jump to bottom immediately
-    LaunchedEffect(state.scrollToBottomNonce, state.messages.size) {
-        if (state.scrollToBottomNonce > 0 && state.messages.isNotEmpty()) {
+    LaunchedEffect(state.scrollToBottomNonce, visibleMessages.size) {
+        if (state.scrollToBottomNonce > 0 && visibleMessages.isNotEmpty()) {
             pinToBottom = true
-            val index = listPrefixCount() + state.messages.lastIndex
+            val index = listPrefixCount() + visibleMessages.lastIndex
             listState.scrollToItem(index)
             delay(48)
-            if (state.messages.isNotEmpty()) {
-                listState.scrollToItem(listPrefixCount() + state.messages.lastIndex)
+            if (visibleMessages.isNotEmpty()) {
+                listState.scrollToItem(listPrefixCount() + visibleMessages.lastIndex)
             }
         }
     }
 
     // Streaming / new messages while pinned; preserve anchor when prepending older pages
     LaunchedEffect(
-        state.messages.size,
-        state.messages.lastOrNull()?.id,
-        state.messages.lastOrNull()?.text?.length,
-        state.messages.lastOrNull()?.toolResult?.length,
+        visibleMessages.size,
+        visibleMessages.lastOrNull()?.id,
+        visibleMessages.lastOrNull()?.text?.length,
+        visibleMessages.lastOrNull()?.toolResult?.length,
         state.loadingOlder,
+        state.showTools,
+        state.showThoughts,
     ) {
-        val size = state.messages.size
+        val size = visibleMessages.size
         // Detect prepend: size grew while not at bottom (user reading history)
         if (size > prevMessageCount && !pinToBottom && prevMessageCount > 0) {
             val added = size - prevMessageCount
@@ -928,15 +1121,15 @@ private fun ChatPane(
             }
         }
         prevMessageCount = size
-        if (state.messages.isNotEmpty() && menuMsgId == null && pinToBottom) {
-            listState.scrollToItem(listPrefixCount() + state.messages.lastIndex)
+        if (visibleMessages.isNotEmpty() && menuMsgId == null && pinToBottom) {
+            listState.scrollToItem(listPrefixCount() + visibleMessages.lastIndex)
         }
     }
 
-    // Drop selection if message was deleted
-    LaunchedEffect(state.messages) {
+    // Drop selection if message was deleted or filtered out
+    LaunchedEffect(visibleMessages) {
         val id = menuMsgId
-        if (id != null && state.messages.none { it.id == id }) {
+        if (id != null && visibleMessages.none { it.id == id }) {
             menuMsgId = null
         }
     }
@@ -953,6 +1146,7 @@ private fun ChatPane(
                 state = state,
                 keyboardOpen = keyboardOpen,
                 onSetPanel = onSetPanel,
+                onOpenSettings = onOpenSettings,
                 onToggleHistory = onToggleHistory,
                 onToggleKeepScreenOn = onToggleKeepScreenOn,
                 onNewChat = onNewChat,
@@ -1010,17 +1204,21 @@ private fun ChatPane(
                             }
                         }
                     }
-                    if (state.messages.isEmpty() && !state.busy) {
+                    if (visibleMessages.isEmpty() && !state.busy) {
                         item {
                             Text(
-                                "No messages yet — say hello.",
+                                if (state.messages.isEmpty()) {
+                                    "No messages yet — say hello."
+                                } else {
+                                    "Messages hidden by visibility settings."
+                                },
                                 color = GrokifyColors.TextMuted,
                                 fontSize = 14.sp,
                                 modifier = Modifier.padding(vertical = 24.dp, horizontal = 8.dp),
                             )
                         }
                     }
-                    items(state.messages, key = { it.id }) { msg ->
+                    items(visibleMessages, key = { it.id }) { msg ->
                         val selected = menuMsgId == msg.id
                         when (msg.role) {
                             ChatRole.User -> UserBubble(
@@ -1113,7 +1311,7 @@ private fun ChatPane(
                         }
                     }
                 }
-                if (state.busy && state.messages.isEmpty()) {
+                if (state.busy && visibleMessages.isEmpty()) {
                     CircularProgressIndicator(
                         color = GrokifyColors.GlowCyan,
                         modifier = Modifier
@@ -1144,7 +1342,7 @@ private fun ChatPane(
             )
         }
 
-        // Side panels as overlays
+        // Side panels as overlays (history / notes only — Settings is a full page)
         AnimatedVisibility(
             visible = state.panel != ChatPanel.None,
             enter = fadeIn() + slideInVertically { it / 3 },
@@ -1164,21 +1362,6 @@ private fun ChatPane(
                     onAdd = onAddNote,
                     onToggle = onToggleNote,
                     onDelete = onDeleteNote,
-                )
-                ChatPanel.Settings -> SettingsPanel(
-                    state = state,
-                    onRefreshUsage = onRefreshUsage,
-                    onClose = { onSetPanel(ChatPanel.None) },
-                    onSelectModel = onSelectModel,
-                    onToggleHistory = onToggleHistory,
-                    onToggleKeepScreenOn = onToggleKeepScreenOn,
-                    onToggleEnterForNewline = onToggleEnterForNewline,
-                    onToggleShareNotifications = onToggleShareNotifications,
-                    onOpenNotificationAccess = onOpenNotificationAccess,
-                    onRefreshNotificationAccess = onRefreshNotificationAccess,
-                    onTogglePermission = onTogglePermission,
-                    onRefreshPermissions = onRefreshPermissions,
-                    onOpenAppPermissionSettings = onOpenAppPermissionSettings,
                 )
                 ChatPanel.None -> {}
             }
@@ -1304,6 +1487,7 @@ private fun ChatToolbar(
     state: UiState,
     keyboardOpen: Boolean,
     onSetPanel: (ChatPanel) -> Unit,
+    onOpenSettings: () -> Unit = {},
     onToggleHistory: () -> Unit,
     onToggleKeepScreenOn: () -> Unit,
     onNewChat: () -> Unit,
@@ -1353,10 +1537,8 @@ private fun ChatToolbar(
             ToolbarChip(
                 label = "Settings",
                 icon = Icons.Default.Settings,
-                active = state.panel == ChatPanel.Settings,
-                onClick = {
-                    onSetPanel(if (state.panel == ChatPanel.Settings) ChatPanel.None else ChatPanel.Settings)
-                },
+                active = false,
+                onClick = onOpenSettings,
             )
             ToolbarChip(
                 label = "New",
@@ -1377,8 +1559,8 @@ private fun ChatToolbar(
             val usage = state.usage
             val usageText = when {
                 state.usageLoading && usage == null -> "Usage …"
-                usage?.error != null && usage.label.isBlank() -> "Usage unavailable"
                 usage != null && usage.label.isNotBlank() -> usage.label
+                usage?.error != null -> "Usage unavailable"
                 else -> null
             }
             Row(
@@ -1748,170 +1930,881 @@ private fun NotesPanel(
 }
 
 @Composable
-private fun SettingsPanel(
+private fun SettingsPage(
     state: UiState,
-    onClose: () -> Unit,
+    onBack: () -> Unit,
     onSelectModel: (String) -> Unit,
     onToggleHistory: () -> Unit,
     onToggleKeepScreenOn: () -> Unit,
     onToggleEnterForNewline: () -> Unit,
     onToggleShareNotifications: () -> Unit = {},
+    onToggleShowTools: () -> Unit = {},
+    onToggleShowThoughts: () -> Unit = {},
     onOpenNotificationAccess: () -> Unit = {},
     onRefreshNotificationAccess: () -> Unit = {},
     onTogglePermission: (String) -> Unit = {},
     onRefreshPermissions: () -> Unit = {},
     onOpenAppPermissionSettings: () -> Unit = {},
     onRefreshUsage: () -> Unit = {},
+    onSaveMapboxAccessToken: (String) -> Unit = {},
+    onClearMapboxAccessToken: () -> Unit = {},
+    onSaveApiKey: (id: String, value: String, label: String?, description: String?) -> Unit = { _, _, _, _ -> },
+    onClearApiKey: (String) -> Unit = {},
 ) {
+    val context = LocalContext.current
+    val defaultMapbox = remember {
+        runCatching { context.getString(R.string.mapbox_access_token) }.getOrDefault("")
+    }
+    var mapboxDraft by remember(state.mapboxAccessToken) {
+        mutableStateOf(state.mapboxAccessToken)
+    }
+    var mapboxVisible by remember { mutableStateOf(false) }
+    var mapboxSavedFlash by remember { mutableStateOf(false) }
+    var addKeyOpen by remember { mutableStateOf(false) }
+    var addKeyPresetId by remember { mutableStateOf("") }
+    var addKeyCustomId by remember { mutableStateOf("") }
+    var addKeyLabel by remember { mutableStateOf("") }
+    var addKeyDesc by remember { mutableStateOf("") }
+    var addKeyValue by remember { mutableStateOf("") }
+    var addKeyVisible by remember { mutableStateOf(false) }
+    var keySavedFlash by remember { mutableStateOf(false) }
+
     LaunchedEffect(Unit) {
         onRefreshNotificationAccess()
         onRefreshPermissions()
     }
-    PanelScaffold(title = "Settings", onClose = onClose) {
-        Column(
-            Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            UsageCard(state = state, onRefresh = onRefreshUsage)
-            SettingRow(
-                title = "Send history / context",
-                subtitle = "Include prior session messages with each prompt",
-                checked = state.useHistory,
-                onToggle = onToggleHistory,
-            )
-            SettingRow(
-                title = "Keep screen on",
-                subtitle = "Prevent sleep while Grokify is open",
-                checked = state.keepScreenOn,
-                onToggle = onToggleKeepScreenOn,
-            )
-            SettingRow(
-                title = "Enter for newline",
-                subtitle = if (state.enterForNewline) {
-                    "Enter inserts a new line; send with the send button"
-                } else {
-                    "Enter sends the message"
-                },
-                checked = state.enterForNewline,
-                onToggle = onToggleEnterForNewline,
-            )
-            Text(
-                "PERMISSIONS",
-                style = MaterialTheme.typography.labelSmall,
-                color = GrokifyColors.GlowCyan,
-            )
-            Text(
-                "Grant only what you need. Turning a switch on asks Android for access; " +
-                    "turning off opens system settings to revoke.",
-                color = GrokifyColors.TextMuted,
-                fontSize = 12.sp,
-            )
-            val requestable = state.permissions.filter { it.requestable }
-            if (requestable.isEmpty()) {
+    LaunchedEffect(mapboxSavedFlash) {
+        if (mapboxSavedFlash) {
+            delay(1600)
+            mapboxSavedFlash = false
+        }
+    }
+    LaunchedEffect(keySavedFlash) {
+        if (keySavedFlash) {
+            delay(1600)
+            keySavedFlash = false
+        }
+    }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(GrokifyColors.Void)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    tint = GrokifyColors.GlowCyan,
+                )
+            }
+            Column(Modifier.weight(1f)) {
                 Text(
-                    "No runtime permissions on this Android version.",
+                    "Settings",
+                    color = GrokifyColors.TextPrimary,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 18.sp,
+                )
+                Text(
+                    "Chat, permissions, models, and API keys",
                     color = GrokifyColors.TextDim,
                     fontSize = 12.sp,
                 )
+            }
+        }
+
+        UsageCard(state = state, onRefresh = onRefreshUsage)
+
+        Text("CHAT", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+        SettingRow(
+            title = "Send history / context",
+            subtitle = "Include prior session messages with each prompt",
+            checked = state.useHistory,
+            onToggle = onToggleHistory,
+        )
+        SettingRow(
+            title = "Keep screen on",
+            subtitle = "Prevent sleep while Grokify is open",
+            checked = state.keepScreenOn,
+            onToggle = onToggleKeepScreenOn,
+        )
+        SettingRow(
+            title = "Enter for newline",
+            subtitle = if (state.enterForNewline) {
+                "Enter inserts a new line; send with the send button"
             } else {
-                requestable.forEach { perm ->
-                    SettingRow(
-                        title = perm.id.title,
-                        subtitle = if (perm.granted) {
-                            "Allowed · ${perm.id.description}"
-                        } else {
-                            "Not granted · ${perm.id.description}"
-                        },
-                        checked = perm.granted,
-                        onToggle = { onTogglePermission(perm.id.id) },
-                    )
+                "Enter sends the message"
+            },
+            checked = state.enterForNewline,
+            onToggle = onToggleEnterForNewline,
+        )
+        SettingRow(
+            title = "Show tools",
+            subtitle = if (state.showTools) {
+                "Tool call cards appear in the chat transcript"
+            } else {
+                "Tool call cards are hidden (still run normally)"
+            },
+            checked = state.showTools,
+            onToggle = onToggleShowTools,
+        )
+        SettingRow(
+            title = "Show thoughts",
+            subtitle = if (state.showThoughts) {
+                "Thinking / thought cards appear in the chat transcript"
+            } else {
+                "Thinking cards are hidden (model still thinks)"
+            },
+            checked = state.showThoughts,
+            onToggle = onToggleShowThoughts,
+        )
+
+        Text(
+            "API KEYS",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        Text(
+            "Keys stay on this device. Built-in apps read only the keys they need. " +
+                "Empty fields mean “not set” — save a value to enable that integration.",
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+        )
+
+        // —— xAI (always visible with setup steps) ——
+        Text(
+            "xAI · GROK VOICE",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowViolet,
+        )
+        Text(
+            "1) Open console.x.ai → API Keys → Create API key\n" +
+                "2) Paste below and Save\n" +
+                "3) In Spotify DJ → AI DJ, pick a voice (eve, ara, leo, rex, sal, carina, …)\n" +
+                "Used for Speak / banter TTS only. Playlist research uses host Grok Build " +
+                "(your device token on Home) — no xAI key needed for research.",
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+            lineHeight = 16.sp,
+        )
+        state.apiKeys.filter { it.id == "xai_api_key" }.forEach { entry ->
+            var draft by remember(entry.id, entry.value) { mutableStateOf(entry.value) }
+            var visible by remember(entry.id) { mutableStateOf(false) }
+            var flash by remember(entry.id) { mutableStateOf(false) }
+            LaunchedEffect(flash) {
+                if (flash) {
+                    delay(1400)
+                    flash = false
                 }
             }
-            TextButton(
-                onClick = onOpenAppPermissionSettings,
-                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+            // Keep draft in sync if vault reloads from elsewhere
+            LaunchedEffect(entry.value) { draft = entry.value }
+            ApiKeyCard(
+                title = entry.label,
+                subtitle = if (entry.value.isBlank()) {
+                    "Not set · required for Grok Voice between tracks"
+                } else {
+                    "Saved · ends ${entry.maskedTail()} · ready for apps that need it"
+                },
+                value = draft,
+                visible = visible,
+                persistedValue = entry.value,
+                defaultHint = "id ${entry.id} · api.x.ai/v1/tts",
+                savedFlash = flash,
+                onValueChange = { draft = it },
+                onToggleVisible = { visible = !visible },
+                onSave = {
+                    onSaveApiKey(entry.id, draft, entry.label, entry.description)
+                    flash = true
+                    keySavedFlash = true
+                },
+                onClear = {
+                    draft = ""
+                    onClearApiKey(entry.id)
+                    flash = true
+                },
+                clearLabel = "Remove",
+            )
+        }
+        if (state.apiKeys.none { it.id == "xai_api_key" }) {
+            // Fallback if vault list not yet seeded
+            var draft by remember { mutableStateOf("") }
+            var visible by remember { mutableStateOf(false) }
+            var flash by remember { mutableStateOf(false) }
+            LaunchedEffect(flash) {
+                if (flash) {
+                    delay(1400)
+                    flash = false
+                }
+            }
+            ApiKeyCard(
+                title = "xAI API key",
+                subtitle = "Not set · paste key from console.x.ai",
+                value = draft,
+                visible = visible,
+                persistedValue = "",
+                defaultHint = "id xai_api_key",
+                savedFlash = flash,
+                onValueChange = { draft = it },
+                onToggleVisible = { visible = !visible },
+                onSave = {
+                    onSaveApiKey("xai_api_key", draft, "xAI API key", null)
+                    flash = true
+                    keySavedFlash = true
+                },
+                onClear = {
+                    draft = ""
+                    onClearApiKey("xai_api_key")
+                    flash = true
+                },
+                clearLabel = "Remove",
+            )
+        }
+
+        Text(
+            "SPOTIFY · MAPS · OTHER",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        ApiKeyCard(
+            title = "Mapbox",
+            subtitle = "Public access token (pk.…) for Wi‑Fi, Bluetooth, and Place Notes maps",
+            value = mapboxDraft,
+            visible = mapboxVisible,
+            persistedValue = state.mapboxAccessToken,
+            defaultHint = if (defaultMapbox.isNotBlank()) {
+                "Built-in default active · ends …${defaultMapbox.takeLast(6)}"
+            } else {
+                "No built-in default — paste a pk. token to enable maps"
+            },
+            savedFlash = mapboxSavedFlash,
+            onValueChange = { mapboxDraft = it },
+            onToggleVisible = { mapboxVisible = !mapboxVisible },
+            onSave = {
+                onSaveMapboxAccessToken(mapboxDraft)
+                mapboxSavedFlash = true
+            },
+            onClear = {
+                mapboxDraft = ""
+                onClearMapboxAccessToken()
+                mapboxSavedFlash = true
+            },
+            clearLabel = "Use default",
+        )
+
+        Text(
+            "Keys are stored on this device for built-in apps (Spotify, maps, voice). " +
+                "Only the apps that need a key will use it.",
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+        )
+        state.apiKeys
+            .filter { it.id != "mapbox_access_token" && it.id != "xai_api_key" }
+            .forEach { entry ->
+                var draft by remember(entry.id, entry.value) { mutableStateOf(entry.value) }
+                var visible by remember(entry.id) { mutableStateOf(false) }
+                var flash by remember(entry.id) { mutableStateOf(false) }
+                LaunchedEffect(flash) {
+                    if (flash) {
+                        delay(1400)
+                        flash = false
+                    }
+                }
+                LaunchedEffect(entry.value) { draft = entry.value }
+                ApiKeyCard(
+                    title = entry.label,
+                    subtitle = buildString {
+                        append(entry.description.ifBlank { entry.id })
+                        if (entry.value.isBlank()) append(" · not set")
+                        else append(" · saved …${entry.maskedTail()}")
+                    },
+                    value = draft,
+                    visible = visible,
+                    persistedValue = entry.value,
+                    defaultHint = "Stored for plugins · id ${entry.id}",
+                    savedFlash = flash,
+                    onValueChange = { draft = it },
+                    onToggleVisible = { visible = !visible },
+                    onSave = {
+                        onSaveApiKey(entry.id, draft, entry.label, entry.description)
+                        flash = true
+                        keySavedFlash = true
+                    },
+                    onClear = {
+                        draft = ""
+                        onClearApiKey(entry.id)
+                        flash = true
+                    },
+                    clearLabel = "Remove",
+                )
+            }
+
+        Button(
+            onClick = {
+                addKeyPresetId = ""
+                addKeyCustomId = ""
+                addKeyLabel = ""
+                addKeyDesc = ""
+                addKeyValue = ""
+                addKeyVisible = false
+                addKeyOpen = true
+            },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = GrokifyColors.GlowViolet.copy(alpha = 0.2f),
+                contentColor = GrokifyColors.GlowViolet,
+            ),
+            border = BorderStroke(1.dp, GrokifyColors.GlowViolet.copy(alpha = 0.45f)),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Add API key", fontWeight = FontWeight.SemiBold)
+        }
+        if (keySavedFlash) {
+            Text("Key saved on device", color = GrokifyColors.GlowMint, fontSize = 12.sp)
+        }
+
+        if (addKeyOpen) {
+            AddApiKeyDialog(
+                presetId = addKeyPresetId,
+                customId = addKeyCustomId,
+                label = addKeyLabel,
+                description = addKeyDesc,
+                value = addKeyValue,
+                visible = addKeyVisible,
+                existingIds = state.apiKeys.map { it.id }.toSet(),
+                onPresetChange = { id ->
+                    addKeyPresetId = id
+                    if (id.isNotBlank() && id != "custom") {
+                        val p = io.grokify.os.data.ApiKeyPresets.byId(id)
+                        addKeyCustomId = id
+                        addKeyLabel = p?.label.orEmpty()
+                        addKeyDesc = p?.description.orEmpty()
+                    } else if (id == "custom") {
+                        addKeyCustomId = ""
+                        addKeyLabel = ""
+                        addKeyDesc = ""
+                    }
+                },
+                onCustomIdChange = { addKeyCustomId = it },
+                onLabelChange = { addKeyLabel = it },
+                onDescChange = { addKeyDesc = it },
+                onValueChange = { addKeyValue = it },
+                onToggleVisible = { addKeyVisible = !addKeyVisible },
+                onDismiss = { addKeyOpen = false },
+                onSave = {
+                    val id = when {
+                        addKeyPresetId.isNotBlank() && addKeyPresetId != "custom" -> addKeyPresetId
+                        else -> addKeyCustomId.trim()
+                    }
+                    if (id.isNotBlank() && addKeyValue.isNotBlank()) {
+                        onSaveApiKey(
+                            id,
+                            addKeyValue,
+                            addKeyLabel.ifBlank { null },
+                            addKeyDesc.ifBlank { null },
+                        )
+                        keySavedFlash = true
+                        addKeyOpen = false
+                    }
+                },
+            )
+        }
+
+        Text(
+            "PERMISSIONS",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        Text(
+            "Grant only what you need. Turning a switch on asks Android for access; " +
+                "turning off opens system settings to revoke.",
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+        )
+        val requestable = state.permissions.filter { it.requestable }
+        if (requestable.isEmpty()) {
+            Text(
+                "No runtime permissions on this Android version.",
+                color = GrokifyColors.TextDim,
+                fontSize = 12.sp,
+            )
+        } else {
+            requestable.forEach { perm ->
+                SettingRow(
+                    title = perm.id.title,
+                    subtitle = if (perm.granted) {
+                        "Allowed · ${perm.id.description}"
+                    } else {
+                        "Not granted · ${perm.id.description}"
+                    },
+                    checked = perm.granted,
+                    onToggle = { onTogglePermission(perm.id.id) },
+                )
+            }
+        }
+        TextButton(
+            onClick = onOpenAppPermissionSettings,
+            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+        ) {
+            Text(
+                "Open system app permissions",
+                color = GrokifyColors.TextMuted,
+                fontSize = 12.sp,
+            )
+        }
+
+        Text(
+            "NOTIFICATIONS",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        SettingRow(
+            title = "Share with Grok",
+            subtitle = if (state.shareNotifications) {
+                "Grok receives active notification summaries with each message"
+            } else {
+                "Phone notifications stay local and are not sent to Grok"
+            },
+            checked = state.shareNotifications,
+            onToggle = {
+                val enabling = !state.shareNotifications
+                onToggleShareNotifications()
+                // System permission — open grant screen immediately when turning on.
+                if (enabling && !state.notificationAccessGranted) {
+                    onOpenNotificationAccess()
+                }
+            },
+        )
+        NotificationAccessCard(
+            granted = state.notificationAccessGranted,
+            count = state.notificationCount,
+            onOpenSettings = onOpenNotificationAccess,
+            onRefresh = onRefreshNotificationAccess,
+            listenerBound = state.notificationListenerBound,
+        )
+
+        Text("MODEL", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+        if (state.loadingPanel && state.models.isEmpty()) {
+            CircularProgressIndicator(color = GrokifyColors.GlowCyan, modifier = Modifier.size(24.dp))
+        } else if (state.models.isEmpty()) {
+            Text("No models loaded — reconnect.", color = GrokifyColors.TextMuted, fontSize = 13.sp)
+        } else {
+            state.models.forEach { m ->
+                val selected = m.id == state.model
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(
+                            if (selected) GrokifyColors.GlowCyan.copy(alpha = 0.1f)
+                            else GrokifyColors.Panel
+                        )
+                        .border(
+                            1.dp,
+                            if (selected) GrokifyColors.GlowCyan.copy(alpha = 0.45f)
+                            else GrokifyColors.PanelBorder,
+                            RoundedCornerShape(10.dp),
+                        )
+                        .clickable { onSelectModel(m.id) }
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(m.name, color = GrokifyColors.TextPrimary, fontWeight = FontWeight.Medium)
+                        Text(
+                            m.id.removePrefix("gb:"),
+                            color = GrokifyColors.TextDim,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                    if (selected) {
+                        Icon(
+                            Icons.Default.CheckCircle,
+                            null,
+                            tint = GrokifyColors.GlowMint,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun SecretStatusChip(
+    saved: Boolean,
+    dirty: Boolean = false,
+    emptyLabel: String = "Empty",
+    savedLabel: String = "Saved",
+) {
+    val label = when {
+        dirty && saved -> "Unsaved"
+        dirty && !saved -> "Unsaved"
+        saved -> savedLabel
+        else -> emptyLabel
+    }
+    val color = when {
+        dirty -> GrokifyColors.GlowAmber
+        saved -> GrokifyColors.GlowMint
+        else -> GrokifyColors.TextDim
+    }
+    Text(
+        label,
+        color = color,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(color.copy(alpha = 0.12f))
+            .border(1.dp, color.copy(alpha = 0.4f), RoundedCornerShape(999.dp))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+    )
+}
+
+@Composable
+private fun ApiKeyCard(
+    title: String,
+    subtitle: String,
+    value: String,
+    visible: Boolean,
+    /** What is actually stored on device (not the draft field). */
+    persistedValue: String,
+    defaultHint: String,
+    savedFlash: Boolean,
+    onValueChange: (String) -> Unit,
+    onToggleVisible: () -> Unit,
+    onSave: () -> Unit,
+    onClear: () -> Unit,
+    clearLabel: String = "Use default",
+) {
+    val clipboard = LocalClipboardManager.current
+    var copiedFlash by remember { mutableStateOf(false) }
+    LaunchedEffect(copiedFlash) {
+        if (copiedFlash) {
+            delay(1400)
+            copiedFlash = false
+        }
+    }
+
+    val persistedSaved = persistedValue.isNotBlank()
+    val dirty = value.trim() != persistedValue.trim()
+    val statusLine = when {
+        persistedSaved && !dirty ->
+            "Saved on device · ends …${persistedValue.takeLast(6)}"
+        persistedSaved && dirty ->
+            "Saved on device · field has unsaved edits"
+        !persistedSaved && value.isBlank() ->
+            "Empty · $defaultHint"
+        else ->
+            "Empty on device · draft not saved yet"
+    }
+    val statusColor = when {
+        persistedSaved && !dirty -> GrokifyColors.GlowMint
+        dirty -> GrokifyColors.GlowAmber
+        else -> GrokifyColors.TextDim
+    }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Key,
+                contentDescription = null,
+                tint = GrokifyColors.GlowViolet,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, color = GrokifyColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(subtitle, color = GrokifyColors.TextMuted, fontSize = 12.sp)
+            }
+            SecretStatusChip(saved = persistedSaved, dirty = dirty)
+        }
+        Text(
+            statusLine,
+            color = statusColor,
+            fontSize = 11.sp,
+        )
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = {
+                Text("pk.eyJ…", color = GrokifyColors.TextDim, fontFamily = FontFamily.Monospace)
+            },
+            singleLine = true,
+            visualTransformation = if (visible) {
+                VisualTransformation.None
+            } else {
+                PasswordVisualTransformation()
+            },
+            trailingIcon = {
+                Row {
+                    if (visible && value.isNotBlank()) {
+                        IconButton(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(value))
+                                copiedFlash = true
+                            },
+                        ) {
+                            Icon(
+                                Icons.Default.ContentCopy,
+                                contentDescription = "Copy key",
+                                tint = if (copiedFlash) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+                            )
+                        }
+                    }
+                    IconButton(onClick = onToggleVisible) {
+                        Icon(
+                            if (visible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            contentDescription = if (visible) "Hide key" else "Show key",
+                            tint = GrokifyColors.TextMuted,
+                        )
+                    }
+                }
+            },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Ascii,
+                imeAction = ImeAction.Done,
+            ),
+            colors = fieldColors(),
+            shape = RoundedCornerShape(10.dp),
+            textStyle = androidx.compose.ui.text.TextStyle(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 13.sp,
+            ),
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Button(
+                onClick = onSave,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GrokifyColors.GlowCyan,
+                    contentColor = Color(0xFF041016),
+                ),
+                shape = RoundedCornerShape(10.dp),
             ) {
                 Text(
-                    "Open system app permissions",
-                    color = GrokifyColors.TextMuted,
+                    when {
+                        savedFlash -> "Saved"
+                        dirty -> "Save"
+                        persistedSaved -> "Saved"
+                        else -> "Save"
+                    },
+                    fontWeight = FontWeight.SemiBold,
                     fontSize = 12.sp,
                 )
             }
-            Text(
-                "NOTIFICATIONS",
-                style = MaterialTheme.typography.labelSmall,
-                color = GrokifyColors.GlowCyan,
-            )
-            SettingRow(
-                title = "Share with Grok",
-                subtitle = if (state.shareNotifications) {
-                    "Grok receives active notification summaries with each message"
-                } else {
-                    "Phone notifications stay local and are not sent to Grok"
-                },
-                checked = state.shareNotifications,
-                onToggle = {
-                    val enabling = !state.shareNotifications
-                    onToggleShareNotifications()
-                    // System permission — open grant screen immediately when turning on.
-                    if (enabling && !state.notificationAccessGranted) {
-                        onOpenNotificationAccess()
-                    }
-                },
-            )
-            NotificationAccessCard(
-                granted = state.notificationAccessGranted,
-                count = state.notificationCount,
-                onOpenSettings = onOpenNotificationAccess,
-                onRefresh = onRefreshNotificationAccess,
-                listenerBound = state.notificationListenerBound,
-            )
-            Text("MODEL", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
-            if (state.loadingPanel && state.models.isEmpty()) {
-                CircularProgressIndicator(color = GrokifyColors.GlowCyan, modifier = Modifier.size(24.dp))
-            } else if (state.models.isEmpty()) {
-                Text("No models loaded — reconnect.", color = GrokifyColors.TextMuted, fontSize = 13.sp)
-            } else {
-                state.models.forEach { m ->
-                    val selected = m.id == state.model
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(
-                                if (selected) GrokifyColors.GlowCyan.copy(alpha = 0.1f)
-                                else GrokifyColors.Panel
-                            )
-                            .border(
-                                1.dp,
-                                if (selected) GrokifyColors.GlowCyan.copy(alpha = 0.45f)
-                                else GrokifyColors.PanelBorder,
-                                RoundedCornerShape(10.dp),
-                            )
-                            .clickable { onSelectModel(m.id) }
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(m.name, color = GrokifyColors.TextPrimary, fontWeight = FontWeight.Medium)
-                            Text(
-                                m.id.removePrefix("gb:"),
-                                color = GrokifyColors.TextDim,
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace,
-                            )
-                        }
-                        if (selected) {
-                            Icon(Icons.Default.CheckCircle, null, tint = GrokifyColors.GlowMint, modifier = Modifier.size(18.dp))
-                        }
-                    }
-                    Spacer(Modifier.height(6.dp))
+            if (visible && value.isNotBlank()) {
+                TextButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(value))
+                        copiedFlash = true
+                    },
+                ) {
+                    Icon(
+                        Icons.Default.ContentCopy,
+                        contentDescription = null,
+                        tint = if (copiedFlash) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        if (copiedFlash) "Copied" else "Copy",
+                        color = if (copiedFlash) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+            if (persistedSaved || value.isNotBlank()) {
+                TextButton(onClick = onClear) {
+                    Text(clearLabel, color = GrokifyColors.TextMuted, fontSize = 12.sp)
                 }
             }
         }
     }
+}
+
+@Composable
+private fun AddApiKeyDialog(
+    presetId: String,
+    customId: String,
+    label: String,
+    description: String,
+    value: String,
+    visible: Boolean,
+    existingIds: Set<String>,
+    onPresetChange: (String) -> Unit,
+    onCustomIdChange: (String) -> Unit,
+    onLabelChange: (String) -> Unit,
+    onDescChange: (String) -> Unit,
+    onValueChange: (String) -> Unit,
+    onToggleVisible: () -> Unit,
+    onDismiss: () -> Unit,
+    onSave: () -> Unit,
+) {
+    val presets = remember { io.grokify.os.data.ApiKeyPresets.all }
+    val resolvedId = when {
+        presetId.isNotBlank() && presetId != "custom" -> presetId
+        else -> customId.trim()
+    }
+    val canSave = resolvedId.isNotBlank() && value.isNotBlank()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = GrokifyColors.Panel,
+        titleContentColor = GrokifyColors.TextPrimary,
+        textContentColor = GrokifyColors.TextMuted,
+        title = { Text("Add API key", fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Stored on this device. Built-in apps request keys by id.",
+                    fontSize = 12.sp,
+                    color = GrokifyColors.TextMuted,
+                )
+                Text("PRESET", fontSize = 11.sp, color = GrokifyColors.GlowCyan, fontWeight = FontWeight.SemiBold)
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    presets.forEach { p ->
+                        val selected = presetId == p.id
+                        Text(
+                            p.label,
+                            color = if (selected) Color(0xFF041016) else GrokifyColors.TextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(
+                                    if (selected) GrokifyColors.GlowCyan
+                                    else GrokifyColors.Void,
+                                )
+                                .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(999.dp))
+                                .clickable { onPresetChange(p.id) }
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                        )
+                    }
+                    val customSel = presetId == "custom" || presetId.isBlank()
+                    Text(
+                        "Custom",
+                        color = if (customSel && presetId == "custom") Color(0xFF041016) else GrokifyColors.TextPrimary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(
+                                if (presetId == "custom") GrokifyColors.GlowCyan
+                                else GrokifyColors.Void,
+                            )
+                            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(999.dp))
+                            .clickable { onPresetChange("custom") }
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
+                }
+                if (presetId == "custom" || presetId.isBlank()) {
+                    OutlinedTextField(
+                        value = customId,
+                        onValueChange = onCustomIdChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Key id") },
+                        placeholder = { Text("my_service_key") },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp,
+                        ),
+                    )
+                    OutlinedTextField(
+                        value = label,
+                        onValueChange = onLabelChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Label") },
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = description,
+                        onValueChange = onDescChange,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Description (optional)") },
+                        singleLine = true,
+                    )
+                } else {
+                    Text(
+                        "id: $resolvedId",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        color = GrokifyColors.TextDim,
+                    )
+                }
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Secret value") },
+                    singleLine = true,
+                    visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = onToggleVisible) {
+                            Icon(
+                                if (visible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = null,
+                                tint = GrokifyColors.TextMuted,
+                            )
+                        }
+                    },
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 13.sp,
+                    ),
+                )
+                if (resolvedId in existingIds) {
+                    Text(
+                        "This key already exists — saving will replace it.",
+                        color = GrokifyColors.GlowAmber,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onSave,
+                enabled = canSave,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GrokifyColors.GlowCyan,
+                    contentColor = Color(0xFF041016),
+                ),
+            ) {
+                Text("Save", fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = GrokifyColors.TextMuted)
+            }
+        },
+    )
 }
 
 @Composable
@@ -1949,8 +2842,11 @@ private fun UsageCard(
                 )
             }
         }
-        if (usage?.error != null && usage.label.isBlank()) {
+        if (usage?.error != null && (usage.label.isBlank() || usage.usagePercent <= 0.0 && usage.products.isEmpty())) {
             Text(usage.error, color = GrokifyColors.GlowRose, fontSize = 12.sp)
+            if (usage.label.isNotBlank() && usage.label != usage.error) {
+                Text(usage.label, color = GrokifyColors.TextMuted, fontSize = 11.sp)
+            }
         } else {
             val pctLabel = if (pct == pct.toLong().toDouble()) {
                 "${pct.toLong()}%"
@@ -2608,21 +3504,82 @@ private fun SystemLine(
 @Composable
 private fun AppsPane(
     screen: String?,
+    appOrder: List<String>,
     onOpenApp: (String) -> Unit,
     onBackToHub: () -> Unit,
+    onSetAppOrder: (List<String>) -> Unit,
     onRequestWifiPerms: () -> Unit,
+    onRequestBtPerms: () -> Unit,
+    onRequestPlacePerms: () -> Unit,
+    onRequestNotifPerms: () -> Unit = {},
 ) {
-    when (screen) {
-        "wifi_scanner" -> WifiScannerPane(
+    val resolved = when (screen) {
+        "spotify_dj" -> BuiltinPluginCatalog.SPOTIFY_CONTROLLER
+        else -> screen
+    }
+    when (resolved) {
+        BuiltinPluginCatalog.WIFI_SCANNER, "wifi_scanner" -> WifiScannerPane(
             onBack = onBackToHub,
             onRequestPermissions = onRequestWifiPerms,
         )
-        else -> AppsHub(onOpenApp = onOpenApp)
+        BuiltinPluginCatalog.BT_SCANNER, "bt_scanner" -> BluetoothScannerPane(
+            onBack = onBackToHub,
+            onRequestPermissions = onRequestBtPerms,
+        )
+        BuiltinPluginCatalog.PLACE_NOTES, "place_notes" -> LocationNotesPane(
+            onBack = onBackToHub,
+            onRequestPermissions = onRequestPlacePerms,
+        )
+        BuiltinPluginCatalog.SPOTIFY_CONTROLLER, "spotify_controller" -> SpotifyControllerPane(
+            onBack = onBackToHub,
+            onRequestPermissions = onRequestNotifPerms,
+        )
+        else -> AppsHub(
+            appOrder = appOrder,
+            onOpenApp = onOpenApp,
+            onSetAppOrder = onSetAppOrder,
+        )
     }
 }
 
+private fun orderedBuiltinApps(order: List<String>): List<PluginManifest> {
+    val byId = BuiltinPluginCatalog.all.associateBy { it.id }
+    val known = BuiltinPluginCatalog.all.map { it.id }
+    val knownSet = known.toSet()
+    val cleaned = order
+        .map { if (it == "spotify_dj") BuiltinPluginCatalog.SPOTIFY_CONTROLLER else it }
+        .filter { it in knownSet }
+        .distinct()
+        .toMutableList()
+    for (id in known) {
+        if (id !in cleaned) cleaned.add(id)
+    }
+    return cleaned.mapNotNull { byId[it] }
+}
+
 @Composable
-private fun AppsHub(onOpenApp: (String) -> Unit) {
+private fun AppsHub(
+    appOrder: List<String>,
+    onOpenApp: (String) -> Unit,
+    onSetAppOrder: (List<String>) -> Unit,
+) {
+    val density = LocalDensity.current
+    val haptics = LocalHapticFeedback.current
+    val itemHeightPx = with(density) { 88.dp.toPx() }
+    var orderedIds by remember { mutableStateOf(orderedBuiltinApps(appOrder).map { it.id }) }
+    LaunchedEffect(appOrder) {
+        orderedIds = orderedBuiltinApps(appOrder).map { it.id }
+    }
+    var draggingId by remember { mutableStateOf<String?>(null) }
+    var dragFromIndex by remember { mutableIntStateOf(-1) }
+    var dragAccum by remember { mutableFloatStateOf(0f) }
+    var suppressClick by remember { mutableStateOf(false) }
+
+    val apps = remember(orderedIds) {
+        val byId = BuiltinPluginCatalog.all.associateBy { it.id }
+        orderedIds.mapNotNull { byId[it] }
+    }
+
     Column(
         Modifier
             .fillMaxSize()
@@ -2630,25 +3587,74 @@ private fun AppsHub(onOpenApp: (String) -> Unit) {
             .padding(16.dp),
     ) {
         GlassCard {
-            Text("INNER APPS", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+            Text("APPS", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
             Spacer(Modifier.height(6.dp))
             Text(
-                "Mini-apps that run on your phone. Permissions are requested only when you open a tool that needs them.",
+                "Built-in tools that ship with GrokifyOS. Press and hold a tile, then drag to rearrange.",
                 color = GrokifyColors.TextMuted,
                 fontSize = 13.sp,
             )
         }
-        Spacer(Modifier.height(12.dp))
-        AppTile(
-            title = "Wi‑Fi Scanner",
-            subtitle = "Discover nearby networks, signal strength, and channel. History kept for this session.",
-            icon = Icons.Default.Wifi,
-            accent = GrokifyColors.GlowCyan,
-            onClick = { onOpenApp("wifi_scanner") },
-        )
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(14.dp))
+
         Text(
-            "More apps soon — Bluetooth tracker, room maps, and sensor tools.",
+            if (draggingId != null) "REARRANGING…" else "YOUR APPS",
+            style = MaterialTheme.typography.labelSmall,
+            color = if (draggingId != null) GrokifyColors.GlowAmber else GrokifyColors.TextDim,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
+        Spacer(Modifier.height(8.dp))
+
+        apps.forEachIndexed { index, app ->
+            key(app.id) {
+                if (index > 0) Spacer(Modifier.height(10.dp))
+                val isDragging = draggingId == app.id
+                BuiltinAppTile(
+                    app = app,
+                    isDragging = isDragging,
+                    onOpen = {
+                        if (!suppressClick) onOpenApp(app.id)
+                        suppressClick = false
+                    },
+                    onLongPressDragStart = {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        draggingId = app.id
+                        dragFromIndex = orderedIds.indexOf(app.id)
+                        dragAccum = 0f
+                        suppressClick = true
+                    },
+                    onLongPressDrag = { dy ->
+                        val id = draggingId ?: return@BuiltinAppTile
+                        if (id != app.id) return@BuiltinAppTile
+                        var from = orderedIds.indexOf(id)
+                        if (from < 0) from = dragFromIndex
+                        if (from < 0) return@BuiltinAppTile
+                        dragAccum += dy
+                        val shift = (dragAccum / itemHeightPx).toInt()
+                        if (shift == 0) return@BuiltinAppTile
+                        val target = (from + shift).coerceIn(0, orderedIds.lastIndex)
+                        if (target != from) {
+                            val list = orderedIds.toMutableList()
+                            list.add(target, list.removeAt(from))
+                            orderedIds = list
+                            dragFromIndex = target
+                            dragAccum -= shift * itemHeightPx
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        }
+                    },
+                    onLongPressDragEnd = {
+                        draggingId = null
+                        dragFromIndex = -1
+                        dragAccum = 0f
+                        onSetAppOrder(orderedIds)
+                    },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "Host permissions stay on GrokifyOS — each app requests them when needed.",
             color = GrokifyColors.TextDim,
             fontSize = 12.sp,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -2657,20 +3663,37 @@ private fun AppsHub(onOpenApp: (String) -> Unit) {
 }
 
 @Composable
-private fun AppTile(
-    title: String,
-    subtitle: String,
-    icon: ImageVector,
-    accent: Color,
-    onClick: () -> Unit,
+private fun BuiltinAppTile(
+    app: PluginManifest,
+    isDragging: Boolean,
+    onOpen: () -> Unit,
+    onLongPressDragStart: () -> Unit,
+    onLongPressDrag: (Float) -> Unit,
+    onLongPressDragEnd: () -> Unit,
 ) {
+    val accent = pluginAccentColor(app.accent)
+    val borderColor = if (isDragging) accent.copy(alpha = 0.65f) else GrokifyColors.PanelBorder
+    val elevationAlpha = if (isDragging) 0.18f else 0f
     Row(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
-            .background(GrokifyColors.Panel)
-            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick, role = Role.Button)
+            .background(
+                if (isDragging) accent.copy(alpha = 0.10f) else GrokifyColors.Panel,
+            )
+            .border(1.dp, borderColor, RoundedCornerShape(14.dp))
+            .pointerInput(app.id) {
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { onLongPressDragStart() },
+                    onDragEnd = { onLongPressDragEnd() },
+                    onDragCancel = { onLongPressDragEnd() },
+                    onDrag = { change, dragAmount ->
+                        change.consume()
+                        onLongPressDrag(dragAmount.y)
+                    },
+                )
+            }
+            .clickable(onClick = onOpen, role = Role.Button)
             .padding(14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -2678,18 +3701,57 @@ private fun AppTile(
             Modifier
                 .size(44.dp)
                 .clip(RoundedCornerShape(12.dp))
-                .background(accent.copy(alpha = 0.12f)),
+                .background(accent.copy(alpha = 0.12f + elevationAlpha)),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(24.dp))
+            Icon(
+                pluginIcon(app.icon),
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(24.dp),
+            )
         }
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(title, color = GrokifyColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            Text(
+                app.title,
+                color = GrokifyColors.TextPrimary,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 15.sp,
+            )
             Spacer(Modifier.height(2.dp))
-            Text(subtitle, color = GrokifyColors.TextMuted, fontSize = 12.sp)
+            Text(
+                app.subtitle,
+                color = GrokifyColors.TextMuted,
+                fontSize = 12.sp,
+                maxLines = 2,
+            )
         }
+        Icon(
+            Icons.Default.DragHandle,
+            contentDescription = "Hold and drag to rearrange",
+            tint = if (isDragging) accent else GrokifyColors.TextDim,
+            modifier = Modifier.size(22.dp),
+        )
     }
+}
+
+private fun pluginAccentColor(accent: PluginAccent): Color = when (accent) {
+    PluginAccent.Cyan -> GrokifyColors.GlowCyan
+    PluginAccent.Mint -> GrokifyColors.GlowMint
+    PluginAccent.Violet -> GrokifyColors.GlowViolet
+    PluginAccent.Amber -> GrokifyColors.GlowAmber
+    PluginAccent.Rose -> GrokifyColors.GlowRose
+    PluginAccent.Blue -> GrokifyColors.GlowBlue
+}
+
+private fun pluginIcon(key: PluginIconKey): ImageVector = when (key) {
+    PluginIconKey.Wifi -> Icons.Default.Wifi
+    PluginIconKey.Bluetooth -> Icons.Default.Bluetooth
+    PluginIconKey.Place -> Icons.Default.Place
+    PluginIconKey.Music -> Icons.Default.MusicNote
+    PluginIconKey.Apps -> Icons.Default.Apps
+    PluginIconKey.Extension -> Icons.Default.Extension
 }
 
 @Composable
