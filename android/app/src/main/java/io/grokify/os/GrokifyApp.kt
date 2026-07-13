@@ -102,6 +102,15 @@ class GrokifyApp : Application() {
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
         )
+        nm.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_SPACEXAI_USAGE,
+                getString(R.string.notification_channel_spacexai_usage),
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = getString(R.string.notification_channel_spacexai_usage_desc)
+            }
+        )
         // Re-arm lockscreen Spotify controller after process start
         runCatching {
             if (io.grokify.os.apps.SpotifyControllerStore(this).enabled) {
@@ -111,6 +120,11 @@ class GrokifyApp : Application() {
         runCatching {
             if (io.grokify.os.apps.SpotifyDjStore(this).enabled) {
                 io.grokify.os.apps.setSpotifyLiveDjEnabled(this, true)
+            }
+        }
+        runCatching {
+            if (io.grokify.os.apps.SpaceXaiUsageAlertStore(this).enabled) {
+                io.grokify.os.apps.scheduleUsageAlertChecks(this)
             }
         }
     }
@@ -125,6 +139,7 @@ class GrokifyApp : Application() {
         // v2 id: forces a fresh channel on upgrade (importance is immutable once created)
         const val CHANNEL_SPOTIFY_CTRL = "grokify_spotify_ctrl_v2"
         const val CHANNEL_SPOTIFY_DJ = "grokify_spotify_dj"
+        const val CHANNEL_SPACEXAI_USAGE = "grokify_spacexai_usage"
 
         lateinit var instance: GrokifyApp
             private set

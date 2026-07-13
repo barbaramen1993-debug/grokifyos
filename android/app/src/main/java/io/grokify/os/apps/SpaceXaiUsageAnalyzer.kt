@@ -1,8 +1,12 @@
 package io.grokify.os.apps
 
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -18,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -31,6 +36,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -47,10 +56,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import io.grokify.os.GrokifyApp
+import io.grokify.os.MainActivity
 import io.grokify.os.apps.plugin.HostApiKeyStore
-import io.grokify.os.data.ApiKeyIds
 import io.grokify.os.ui.theme.GrokifyColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -105,7 +118,48 @@ data class BalanceChangeRow(
     val status: String?,
     val createTime: String?,
     val invoiceNumber: String?,
+    val spendYear: Int? = null,
+    val spendMonth: Int? = null,
 )
+
+/** Local prefs for prepaid / spend threshold notifications. */
+class SpaceXaiUsageAlertStore(context: Context) {
+    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    var enabled: Boolean
+        get() = prefs.getBoolean(KEY_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_ENABLED, value).apply()
+
+    /** Notify when remaining prepaid balance (USD) is at or below this. */
+    var lowBalanceUsd: Float
+        get() = prefs.getFloat(KEY_LOW_BALANCE, 5f)
+        set(value) = prefs.edit().putFloat(KEY_LOW_BALANCE, value.coerceAtLeast(0f)).apply()
+
+    /**
+     * Notify when period spend (USD) is at or above this.
+     * `0` means the high-spend alert is disabled.
+     */
+    var highSpendUsd: Float
+        get() = prefs.getFloat(KEY_HIGH_SPEND, 0f)
+        set(value) = prefs.edit().putFloat(KEY_HIGH_SPEND, value.coerceAtLeast(0f)).apply()
+
+    var armedLow: Boolean
+        get() = prefs.getBoolean(KEY_ARMED_LOW, false)
+        set(value) = prefs.edit().putBoolean(KEY_ARMED_LOW, value).apply()
+
+    var armedHigh: Boolean
+        get() = prefs.getBoolean(KEY_ARMED_HIGH, false)
+        set(value) = prefs.edit().putBoolean(KEY_ARMED_HIGH, value).apply()
+
+    companion object {
+        private const val PREFS = "spacexai_usage_alerts"
+        private const val KEY_ENABLED = "enabled"
+        private const val KEY_LOW_BALANCE = "low_balance_usd"
+        private const val KEY_HIGH_SPEND = "high_spend_usd"
+        private const val KEY_ARMED_LOW = "armed_low"
+        private const val KEY_ARMED_HIGH = "armed_high"
+    }
+}
 
 data class UsageBucket(
     val label: String,
@@ -248,6 +302,9 @@ fun SpaceXaiUsageAnalyzerPane(
                     KeyHelpCard(context)
                 }
                 is LoadState.Ready -> {
+                    LaunchedEffect(s.data.fetchedAtMs) {
+                        evaluateUsageAlerts(context, s.data)
+                    }
                     SnapshotBody(context = context, data = s.data, onRefresh = { refresh() })
                 }
             }
@@ -446,15 +503,15 @@ private fun SnapshotBody(
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(
-                            humanOrigin(row.origin),
+                            balanceChangeTitle(row),
                             color = GrokifyColors.TextPrimary,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium,
                         )
                         val sub = listOfNotNull(
                             row.createTime?.let { formatIsoShort(it) },
-                            row.invoiceNumber?.takeIf { it.isNotBlank() }?.let { "inv $it" },
-                            row.status?.takeIf { it.isNotBlank() && it != "SUCCEEDED" },
+                            row.invoiceNumber?.let { "inv $it" },
+                            row.status?.takeIf { it != "SUCCEEDED" && it != "INVALID_STATUS" },
                         ).joinToString(" · ")
                         if (sub.isNotBlank()) {
                             Text(sub, color = GrokifyColors.TextDim, fontSize = 11.sp)
@@ -472,6 +529,9 @@ private fun SnapshotBody(
             }
         }
     }
+
+    Spacer(Modifier.height(12.dp))
+    UsageAlertsCard(context = context)
 
     data.warnings.forEach { w ->
         Spacer(Modifier.height(10.dp))
@@ -496,6 +556,135 @@ private fun SnapshotBody(
         Spacer(Modifier.height(8.dp))
         TextButton(onClick = onRefresh) {
             Text("Refresh now", color = GrokifyColors.GlowAmber)
+        }
+    }
+}
+
+@Composable
+private fun UsageAlertsCard(context: Context) {
+    val store = remember { SpaceXaiUsageAlertStore(context) }
+    var enabled by remember { mutableStateOf(store.enabled) }
+    var lowText by remember {
+        mutableStateOf(
+            store.lowBalanceUsd.let { v ->
+                if (v == v.toLong().toFloat()) v.toLong().toString() else v.toString()
+            },
+        )
+    }
+    var highText by remember {
+        mutableStateOf(
+            store.highSpendUsd.let { v ->
+                if (v <= 0f) ""
+                else if (v == v.toLong().toFloat()) v.toLong().toString()
+                else v.toString()
+            },
+        )
+    }
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = GrokifyColors.TextPrimary,
+        unfocusedTextColor = GrokifyColors.TextPrimary,
+        focusedBorderColor = GrokifyColors.GlowAmber.copy(alpha = 0.7f),
+        unfocusedBorderColor = GrokifyColors.PanelBorder,
+        focusedLabelColor = GrokifyColors.GlowAmber,
+        unfocusedLabelColor = GrokifyColors.TextDim,
+        cursorColor = GrokifyColors.GlowAmber,
+        focusedContainerColor = GrokifyColors.PanelSoft,
+        unfocusedContainerColor = GrokifyColors.PanelSoft,
+    )
+
+    fun persistThresholds() {
+        store.lowBalanceUsd = lowText.toFloatOrNull() ?: store.lowBalanceUsd
+        store.highSpendUsd = highText.toFloatOrNull() ?: 0f
+        // Re-arm so a new threshold can fire again
+        store.armedLow = false
+        store.armedHigh = false
+    }
+
+    AnalyzerCard(accent = GrokifyColors.GlowAmber) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "USAGE ALERTS",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = GrokifyColors.GlowAmber,
+                )
+                Text(
+                    "Notify when balance/spend crosses your limits",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 11.sp,
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = { on ->
+                    enabled = on
+                    store.enabled = on
+                    if (on) {
+                        persistThresholds()
+                        scheduleUsageAlertChecks(context)
+                    } else {
+                        cancelUsageAlertChecks(context)
+                    }
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = GrokifyColors.Void,
+                    checkedTrackColor = GrokifyColors.GlowAmber,
+                    uncheckedThumbColor = GrokifyColors.TextMuted,
+                    uncheckedTrackColor = GrokifyColors.PanelSoft,
+                ),
+            )
+        }
+        if (enabled) {
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = lowText,
+                onValueChange = { raw ->
+                    lowText = raw.filter { it.isDigit() || it == '.' }.take(10)
+                },
+                label = { Text("Low balance alert (USD)") },
+                placeholder = { Text("e.g. 5") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                modifier = Modifier.fillMaxWidth(),
+                colors = fieldColors,
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = highText,
+                onValueChange = { raw ->
+                    highText = raw.filter { it.isDigit() || it == '.' }.take(10)
+                },
+                label = { Text("High period spend alert (USD)") },
+                placeholder = { Text("blank = off") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                modifier = Modifier.fillMaxWidth(),
+                colors = fieldColors,
+            )
+            Spacer(Modifier.height(8.dp))
+            TextButton(
+                onClick = {
+                    persistThresholds()
+                    scheduleUsageAlertChecks(context)
+                    // Re-evaluate against last known snapshot on next refresh; force a check now
+                    Thread {
+                        runCatching { checkUsageAlertsNow(context) }
+                    }.start()
+                },
+            ) {
+                Text("Save alert thresholds", color = GrokifyColors.GlowAmber)
+            }
+            Text(
+                "Checks about once an hour in the background while alerts are on. " +
+                    "Also evaluates after each refresh in this screen.",
+                color = GrokifyColors.TextDim,
+                fontSize = 11.sp,
+                lineHeight = 14.sp,
+            )
         }
     }
 }
@@ -623,7 +812,7 @@ private fun fetchUsageSnapshot(apiKey: String): LoadState {
                 hint = "Key validated but teamId/scopeId missing. Check Management Key scope.",
             )
         }
-        val keyName = validation.optString("name").takeIf { it.isNotBlank() }
+        val keyName = jsonString(validation, "name")
         val warnings = mutableListOf<String>()
 
         val balanceJson = getJson("$MANAGEMENT_BASE/v1/billing/teams/$teamId/prepaid/balance", apiKey)
@@ -748,8 +937,8 @@ private fun fetchUsageSeries(
         val series = modelJson.optJSONArray("timeSeries") ?: JSONArray()
         for (i in 0 until series.length()) {
             val s = series.optJSONObject(i) ?: continue
-            val label = s.optJSONArray("groupLabels")?.optString(0)
-                ?: s.optJSONArray("group")?.optString(0)
+            val label = jsonArrayString(s.optJSONArray("groupLabels"), 0)
+                ?: jsonArrayString(s.optJSONArray("group"), 0)
                 ?: "Unknown"
             val points = s.optJSONArray("dataPoints") ?: JSONArray()
             var sum = 0.0
@@ -847,19 +1036,60 @@ private fun parseChanges(arr: JSONArray): List<BalanceChangeRow> {
     for (i in 0 until arr.length()) {
         val o = arr.optJSONObject(i) ?: continue
         val amount = parseCents(o.opt("amount")) ?: 0L
+        val origin = jsonString(o, "changeOrigin", "origin") ?: "UNKNOWN"
+        val status = jsonString(o, "topupStatus", "status")
+            ?.takeUnless { it.equals("INVALID_STATUS", ignoreCase = true) }
+        val createTime = jsonString(o, "createTime", "createTs", "createdAt")
+        // Prefer human invoice number; never surface the opaque invoiceId blob
+        val invoiceNumber = jsonString(o, "invoiceNumber")
+        val spendYear = o.optInt("spendBpKeyYear", 0).takeIf { it > 0 }
+            ?: o.optInt("spend_bp_key_year", 0).takeIf { it > 0 }
+        val spendMonth = o.optInt("spendBpKeyMonth", 0).takeIf { it in 1..12 }
+            ?: o.optInt("spend_bp_key_month", 0).takeIf { it in 1..12 }
         out.add(
             BalanceChangeRow(
-                origin = o.optString("changeOrigin", "UNKNOWN"),
+                origin = origin,
                 amountCents = amount,
-                status = o.optString("topupStatus").takeIf { it.isNotBlank() },
-                createTime = o.optString("createTime").ifBlank { o.optString("createTs") }
-                    .takeIf { it.isNotBlank() },
-                invoiceNumber = o.optString("invoiceNumber").takeIf { it.isNotBlank() },
+                status = status,
+                createTime = createTime,
+                invoiceNumber = invoiceNumber,
+                spendYear = spendYear,
+                spendMonth = spendMonth,
             ),
         )
     }
     // Newest first when timestamps present
     return out.sortedByDescending { it.createTime.orEmpty() }
+}
+
+/**
+ * Android's [JSONObject.optString] turns JSON `null` into the literal string `"null"`.
+ * Use this helper so history rows never show "null" under the title.
+ */
+private fun coerceJsonString(raw: Any?): String? {
+    if (raw == null || raw == JSONObject.NULL) return null
+    val s = when (raw) {
+        is String -> raw
+        is Number, is Boolean -> raw.toString()
+        else -> raw.toString()
+    }.trim()
+    if (s.isEmpty()) return null
+    if (s.equals("null", ignoreCase = true)) return null
+    if (s.equals("undefined", ignoreCase = true)) return null
+    return s
+}
+
+private fun jsonString(o: JSONObject, vararg keys: String): String? {
+    for (key in keys) {
+        if (!o.has(key)) continue
+        coerceJsonString(o.opt(key))?.let { return it }
+    }
+    return null
+}
+
+private fun jsonArrayString(arr: JSONArray?, index: Int): String? {
+    if (arr == null || index < 0 || index >= arr.length()) return null
+    return coerceJsonString(arr.opt(index))
 }
 
 /**
@@ -887,14 +1117,38 @@ private fun centsToUsdSigned(cents: Long, origin: String): String {
 
 private fun formatUsd(amount: Double): String = currency.format(amount)
 
-private fun humanOrigin(origin: String): String = when (origin.uppercase(Locale.US)) {
-    "PURCHASE" -> "Purchase"
-    "AUTO_PURCHASE" -> "Auto top-up"
-    "SPEND" -> "API spend"
-    "REFUND" -> "Refund"
-    "MANUAL" -> "Manual adjustment"
-    else -> origin.replace('_', ' ').lowercase(Locale.US)
-        .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString() }
+private fun humanOrigin(origin: String): String {
+    val key = origin.trim()
+    if (key.isEmpty() ||
+        key.equals("null", ignoreCase = true) ||
+        key.equals("UNKNOWN", ignoreCase = true) ||
+        key.equals("INVALID_ORIGIN", ignoreCase = true)
+    ) {
+        return "Balance change"
+    }
+    return when (key.uppercase(Locale.US)) {
+        "PURCHASE" -> "Purchase"
+        "AUTO_PURCHASE" -> "Auto top-up"
+        "SPEND" -> "API spend"
+        "REFUND" -> "Refund"
+        "MANUAL" -> "Manual adjustment"
+        else -> key.replace('_', ' ').lowercase(Locale.US)
+            .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString() }
+    }
+}
+
+private fun balanceChangeTitle(row: BalanceChangeRow): String {
+    val base = humanOrigin(row.origin)
+    val period = if (row.spendYear != null && row.spendMonth != null) {
+        "${row.spendYear}-${row.spendMonth.toString().padStart(2, '0')}"
+    } else {
+        null
+    }
+    return when {
+        row.origin.equals("SPEND", ignoreCase = true) && period != null -> "API spend · $period"
+        base == "Balance change" && period != null -> "Change · $period"
+        else -> base
+    }
 }
 
 private fun originColor(origin: String): Color = when (origin.uppercase(Locale.US)) {
@@ -915,4 +1169,143 @@ private fun formatIsoShort(iso: String): String {
 private fun formatLocalTime(ms: Long): String {
     val sdf = SimpleDateFormat("MMM d, HH:mm", Locale.getDefault())
     return sdf.format(ms)
+}
+
+// ── Usage threshold alerts (background + on-screen refresh) ──────────────────
+
+private const val ACTION_USAGE_ALERT_CHECK = "io.grokify.os.SPACEXAI_USAGE_ALERT_CHECK"
+private const val NOTIF_ID_LOW_BALANCE = 7101
+private const val NOTIF_ID_HIGH_SPEND = 7102
+private const val ALERT_CHECK_INTERVAL_MS = 60L * 60L * 1000L // 1 hour
+
+internal fun evaluateUsageAlerts(context: Context, data: SpaceXaiUsageSnapshot) {
+    val appCtx = context.applicationContext
+    val store = SpaceXaiUsageAlertStore(appCtx)
+    if (!store.enabled) return
+
+    val balanceUsd = data.prepaidBalanceCents?.let { abs(it) / 100.0 }
+    val spendUsd = data.periodSpendCents?.let { abs(it) / 100.0 }
+    val lowLimit = store.lowBalanceUsd.toDouble()
+    val highLimit = store.highSpendUsd.toDouble()
+
+    if (balanceUsd != null && lowLimit >= 0) {
+        val below = balanceUsd <= lowLimit
+        if (below && !store.armedLow) {
+            postUsageAlert(
+                appCtx,
+                NOTIF_ID_LOW_BALANCE,
+                title = "SpaceXAI balance low",
+                body = "Prepaid remaining ${currency.format(balanceUsd)} " +
+                    "(alert at ≤ ${currency.format(lowLimit)}).",
+            )
+            store.armedLow = true
+        } else if (!below) {
+            store.armedLow = false
+        }
+    }
+
+    if (spendUsd != null && highLimit > 0) {
+        val above = spendUsd >= highLimit
+        if (above && !store.armedHigh) {
+            postUsageAlert(
+                appCtx,
+                NOTIF_ID_HIGH_SPEND,
+                title = "SpaceXAI spend threshold",
+                body = "Period spend ${currency.format(spendUsd)} " +
+                    "(alert at ≥ ${currency.format(highLimit)}).",
+            )
+            store.armedHigh = true
+        } else if (!above) {
+            store.armedHigh = false
+        }
+    }
+}
+
+internal fun checkUsageAlertsNow(context: Context) {
+    val appCtx = context.applicationContext
+    if (!SpaceXaiUsageAlertStore(appCtx).enabled) return
+    val key = HostApiKeyStore.getSpaceXaiManagementKey(appCtx)?.takeIf { it.isNotBlank() } ?: return
+    when (val state = fetchUsageSnapshot(key)) {
+        is LoadState.Ready -> evaluateUsageAlerts(appCtx, state.data)
+        else -> Unit
+    }
+}
+
+internal fun scheduleUsageAlertChecks(context: Context) {
+    val appCtx = context.applicationContext
+    if (!SpaceXaiUsageAlertStore(appCtx).enabled) {
+        cancelUsageAlertChecks(appCtx)
+        return
+    }
+    val am = appCtx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+    val pi = usageAlertPendingIntent(appCtx)
+    am.cancel(pi)
+    am.setInexactRepeating(
+        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+        SystemClock.elapsedRealtime() + 30_000L,
+        ALERT_CHECK_INTERVAL_MS,
+        pi,
+    )
+}
+
+internal fun cancelUsageAlertChecks(context: Context) {
+    val appCtx = context.applicationContext
+    val am = appCtx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+    am.cancel(usageAlertPendingIntent(appCtx))
+}
+
+private fun usageAlertPendingIntent(context: Context): PendingIntent {
+    val intent = Intent(context, SpaceXaiUsageAlertReceiver::class.java)
+        .setAction(ACTION_USAGE_ALERT_CHECK)
+    return PendingIntent.getBroadcast(
+        context,
+        7100,
+        intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+}
+
+private fun postUsageAlert(context: Context, id: Int, title: String, body: String) {
+    if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return
+    val open = PendingIntent.getActivity(
+        context,
+        id,
+        Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+    val n = NotificationCompat.Builder(context, GrokifyApp.CHANNEL_SPACEXAI_USAGE)
+        .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setContentTitle(title)
+        .setContentText(body)
+        .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+        .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+        .setAutoCancel(true)
+        .setContentIntent(open)
+        .setCategory(NotificationCompat.CATEGORY_STATUS)
+        .build()
+    runCatching {
+        NotificationManagerCompat.from(context).notify(id, n)
+    }
+}
+
+class SpaceXaiUsageAlertReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        val action = intent?.action.orEmpty()
+        when (action) {
+            ACTION_USAGE_ALERT_CHECK,
+            Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_MY_PACKAGE_REPLACED,
+            -> {
+                if (SpaceXaiUsageAlertStore(context).enabled) {
+                    scheduleUsageAlertChecks(context)
+                    // Off main thread for network
+                    Thread {
+                        runCatching { checkUsageAlertsNow(context) }
+                    }.start()
+                } else {
+                    cancelUsageAlertChecks(context)
+                }
+            }
+        }
+    }
 }
