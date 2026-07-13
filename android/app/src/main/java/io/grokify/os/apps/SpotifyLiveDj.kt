@@ -75,6 +75,8 @@ private const val KEY_BANTER_FIXED = "banter_fixed_v1"
 private const val KEY_BANTER_MIN = "banter_min_v1"
 private const val KEY_BANTER_MAX = "banter_max_v1"
 private const val KEY_ALLOW_TALKOVER = "allow_talkover_v1"
+/** When true, re-start Live DJ after process death / OTA / reboot if it was on. */
+private const val KEY_RESUME_AFTER_RESTART = "resume_after_restart_v1"
 
 /** Inclusive bounds for “talk every N songs” settings. */
 const val BANTER_EVERY_MIN = 1
@@ -299,6 +301,11 @@ data class SpotifyDjUiState(
     val banterMax: Int = 5,
     /** When true, banter may ride over the outro; when false, music pauses for the line. */
     val allowTalkOver: Boolean = true,
+    /**
+     * When true (default), Live DJ restarts after app process death, OTA update, or reboot
+     * if it was left on. When false, a restart ends the session (queue/settings still kept).
+     */
+    val resumeAfterRestart: Boolean = true,
 )
 
 /**
@@ -359,6 +366,14 @@ class SpotifyDjStore(context: Context) {
     var allowTalkOver: Boolean
         get() = prefs.getBoolean(KEY_ALLOW_TALKOVER, true)
         set(value) = prefs.edit().putBoolean(KEY_ALLOW_TALKOVER, value).apply()
+
+    /**
+     * Resume Live DJ after process death / OTA / boot when [enabled] was true.
+     * Default on so OTA updates don't strand an active set.
+     */
+    var resumeAfterRestart: Boolean
+        get() = prefs.getBoolean(KEY_RESUME_AFTER_RESTART, true)
+        set(value) = prefs.edit().putBoolean(KEY_RESUME_AFTER_RESTART, value).apply()
 
     var lastCurrentUri: String
         get() = prefs.getString(KEY_CURRENT_URI, "") ?: ""
@@ -580,7 +595,101 @@ fun ensureDjChatHydrated(context: Context) {
             banterMin = store.banterMin,
             banterMax = store.banterMax,
             allowTalkOver = store.allowTalkOver,
+            resumeAfterRestart = store.resumeAfterRestart,
         )
+    }
+}
+
+/**
+ * Re-arm Live DJ after process start, OTA, or boot.
+ *
+ * - If [SpotifyDjStore.enabled] and [SpotifyDjStore.resumeAfterRestart]: start the service.
+ * - If enabled but resume is off: clear [enabled] (session ended with the process) and keep
+ *   queue / chat / settings on disk.
+ *
+ * Start failures no longer wipe [enabled] when resume is on — the next open can retry.
+ */
+fun maybeResumeLiveDj(context: Context) {
+    val appCtx = context.applicationContext
+    val store = SpotifyDjStore(appCtx)
+    if (!store.enabled) return
+    if (!store.resumeAfterRestart) {
+        Log.i(TAG, "resume skipped — resumeAfterRestart=false; clearing enabled flag")
+        store.enabled = false
+        val prev = SpotifyDjBus.state.value
+        val msgs = prev.messages.ifEmpty { store.loadMessages() }
+        val q = prev.queue.ifEmpty { store.loadQueue() }
+        SpotifyDjBus.publish(
+            SpotifyDjUiState(
+                enabled = false,
+                status = "Off · ended with app restart",
+                nowLine = "Live DJ not resumed",
+                messages = msgs,
+                queue = q,
+                loggedIn = SpotifyOAuth.isLoggedIn(appCtx),
+                voiceId = store.voiceId,
+                useAiRank = store.useAiRank,
+                songsSinceBanter = store.songsSinceBanter,
+                banterEvery = store.banterEvery,
+                tracksUntilTalk = tracksUntilTalk(store.songsSinceBanter, store.banterEvery),
+                banterMode = store.banterMode,
+                banterFixed = store.banterFixed,
+                banterMin = store.banterMin,
+                banterMax = store.banterMax,
+                allowTalkOver = store.allowTalkOver,
+                resumeAfterRestart = false,
+            ),
+        )
+        return
+    }
+    Log.i(TAG, "resuming Live DJ after restart (queue=${store.loadQueue().size})")
+    startLiveDjService(appCtx, fromResume = true)
+}
+
+/**
+ * Start the Live DJ foreground service without flipping [SpotifyDjStore.enabled] to false
+ * on transient FGS failures (common right after OTA / boot).
+ */
+private fun startLiveDjService(context: Context, fromResume: Boolean = false) {
+    val appCtx = context.applicationContext
+    val store = SpotifyDjStore(appCtx)
+    val intent = Intent(appCtx, SpotifyLiveDjService::class.java)
+    try {
+        ContextCompat.startForegroundService(appCtx, intent)
+        if (fromResume) {
+            // Baseline UI until service publishes real state
+            SpotifyDjBus.patch {
+                it.copy(
+                    enabled = true,
+                    status = if (it.status.isBlank() || it.status == "Off") {
+                        "Resuming after restart…"
+                    } else {
+                        it.status
+                    },
+                    resumeAfterRestart = store.resumeAfterRestart,
+                    error = null,
+                )
+            }
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "start Live DJ failed: ${e.message}", e)
+        // Keep [enabled] when user wants resume — next process/activity open can retry.
+        // Only wipe when they opted out of resume (session mode).
+        if (!store.resumeAfterRestart) {
+            store.enabled = false
+        }
+        SpotifyDjBus.patch {
+            it.copy(
+                enabled = store.enabled,
+                status = if (store.enabled) {
+                    "Start deferred: ${e.message?.take(80) ?: "blocked"} — will retry"
+                } else {
+                    "Failed to start: ${e.message}"
+                },
+                error = e.message,
+                resumeAfterRestart = store.resumeAfterRestart,
+            )
+        }
     }
 }
 
@@ -602,19 +711,10 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
     val appCtx = context.applicationContext
     val store = SpotifyDjStore(appCtx)
     store.enabled = enabled
-    val intent = Intent(appCtx, SpotifyLiveDjService::class.java)
     if (enabled) {
-        try {
-            ContextCompat.startForegroundService(appCtx, intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "start Live DJ failed: ${e.message}", e)
-            store.enabled = false
-            SpotifyDjBus.patch {
-                it.copy(enabled = false, status = "Failed to start: ${e.message}", error = e.message)
-            }
-        }
+        startLiveDjService(appCtx, fromResume = false)
     } else {
-        appCtx.stopService(intent)
+        appCtx.stopService(Intent(appCtx, SpotifyLiveDjService::class.java))
         val prevMsgs = SpotifyDjBus.state.value.messages
         val finalMsgs = (prevMsgs.map { m ->
             if (m.role == DjChatRole.Track && m.isNowPlaying) {
@@ -647,6 +747,7 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
                 banterMin = store.banterMin,
                 banterMax = store.banterMax,
                 allowTalkOver = store.allowTalkOver,
+                resumeAfterRestart = store.resumeAfterRestart,
             ),
         )
     }
@@ -4385,6 +4486,7 @@ class SpotifyLiveDjService : Service() {
                 banterMin = store.banterMin,
                 banterMax = store.banterMax,
                 allowTalkOver = store.allowTalkOver,
+                resumeAfterRestart = store.resumeAfterRestart,
             ),
         )
     }
@@ -4538,9 +4640,8 @@ class SpotifyLiveDjReceiver : android.content.BroadcastReceiver() {
         when (intent?.action) {
             SpotifyLiveDjService.ACTION_DJ_STOP -> setSpotifyLiveDjEnabled(context, false)
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
-                if (SpotifyDjStore(context).enabled) {
-                    setSpotifyLiveDjEnabled(context, true)
-                }
+                // OTA / reboot: honor resume-after-restart (keeps queue + settings)
+                maybeResumeLiveDj(context)
             }
         }
     }

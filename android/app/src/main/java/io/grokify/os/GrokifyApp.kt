@@ -117,11 +117,9 @@ class GrokifyApp : Application() {
                 io.grokify.os.apps.setSpotifyControllerEnabled(this, true)
             }
         }
-        runCatching {
-            if (io.grokify.os.apps.SpotifyDjStore(this).enabled) {
-                io.grokify.os.apps.setSpotifyLiveDjEnabled(this, true)
-            }
-        }
+        // Live DJ: resume only when “resume after restart” is on (default).
+        // Does not wipe enabled on transient FGS start failures after OTA.
+        runCatching { io.grokify.os.apps.maybeResumeLiveDj(this) }
         runCatching {
             if (io.grokify.os.apps.SpaceXaiUsageAlertStore(this).enabled) {
                 io.grokify.os.apps.scheduleUsageAlertChecks(this)

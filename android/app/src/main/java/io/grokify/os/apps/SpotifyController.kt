@@ -850,8 +850,6 @@ fun SpotifyControllerPane(
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
 
     val djState by SpotifyDjBus.state.collectAsState()
-    // Restore last ~100 Live DJ messages when the bus is empty (app reopen, DJ off).
-    LaunchedEffect(Unit) { ensureDjChatHydrated(appCtx) }
     var clientId by remember {
         mutableStateOf(HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPOTIFY_CLIENT_ID).orEmpty())
     }
@@ -864,6 +862,7 @@ fun SpotifyControllerPane(
     var banterMin by remember { mutableStateOf(djStore.banterMin) }
     var banterMax by remember { mutableStateOf(djStore.banterMax) }
     var allowTalkOver by remember { mutableStateOf(djStore.allowTalkOver) }
+    var resumeAfterRestart by remember { mutableStateOf(djStore.resumeAfterRestart) }
     var busy by remember { mutableStateOf(false) }
     var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
     var voicePreviewBusy by remember { mutableStateOf(false) }
@@ -874,6 +873,13 @@ fun SpotifyControllerPane(
     /** 0 = Chat, 1 = Queue, 2 = Settings (inner Live DJ tabs) */
     var djSubTab by remember { mutableStateOf(0) }
     val djChatListState = rememberLazyListState()
+
+    // Restore chat/queue + re-arm service after OTA/process death when resume is on.
+    LaunchedEffect(Unit) {
+        ensureDjChatHydrated(appCtx)
+        maybeResumeLiveDj(appCtx)
+        resumeAfterRestart = djStore.resumeAfterRestart
+    }
 
     // Research / build / edit playlist
     var researchPrompt by remember { mutableStateOf("") }
@@ -974,8 +980,12 @@ fun SpotifyControllerPane(
                     banterMin = djStore.banterMin,
                     banterMax = djStore.banterMax,
                     allowTalkOver = djStore.allowTalkOver,
+                    resumeAfterRestart = djStore.resumeAfterRestart,
                 ),
             )
+        } else {
+            // Service may have died while enabled=true (OTA / low memory) — re-arm.
+            maybeResumeLiveDj(appCtx)
         }
         onDispose { }
     }
@@ -2266,10 +2276,45 @@ fun SpotifyControllerPane(
                                 ),
                             )
                         }
+                        Spacer(Modifier.height(14.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "Resume after restart",
+                                    color = GrokifyColors.TextPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    if (resumeAfterRestart) {
+                                        "Keep Live DJ on across OTA, reboot, and process death"
+                                    } else {
+                                        "Live DJ ends when the app restarts (queue still kept)"
+                                    },
+                                    color = GrokifyColors.TextDim,
+                                    fontSize = 10.sp,
+                                )
+                            }
+                            Switch(
+                                checked = resumeAfterRestart,
+                                onCheckedChange = {
+                                    resumeAfterRestart = it
+                                    djStore.resumeAfterRestart = it
+                                    SpotifyDjBus.patch { s -> s.copy(resumeAfterRestart = it) }
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = GrokifyColors.Void,
+                                    checkedTrackColor = GrokifyColors.GlowCyan,
+                                    uncheckedThumbColor = GrokifyColors.TextMuted,
+                                    uncheckedTrackColor = GrokifyColors.PanelSoft,
+                                ),
+                            )
+                        }
                         Spacer(Modifier.height(12.dp))
                         Text(
                             "Radio seeds from liked, top, and recently played. " +
-                                "Queue + chat history survive app leave/return.",
+                                "Queue, chat, and settings survive leave/return. " +
+                                "With resume on, an active session continues after OTA/restart.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )
