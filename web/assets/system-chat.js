@@ -65,6 +65,21 @@
     return d.innerHTML;
   }
 
+  /**
+   * Host sessions owned by marketplace plugins / Spotify Live DJ.
+   * Titles use a leading middle-dot (·) — see HostAiClient / Android apps.
+   * Hidden from main Chat history so DJ/plugin turns stay app-scoped.
+   */
+  function isInternalAppSessionTitle(title) {
+    const t = String(title || '').trim();
+    if (!t) return false;
+    return t.charAt(0) === '·' || t.charAt(0) === '•';
+  }
+
+  function visibleSessions(sessions) {
+    return (sessions || []).filter((s) => !isInternalAppSessionTitle(s && s.title));
+  }
+
   async function apiGet(path) {
     const res = await fetch(API + path, { credentials: 'same-origin', headers: { Accept: 'application/json' } });
     const data = await res.json().catch(() => ({}));
@@ -2083,7 +2098,7 @@
     const list = $('sc-session-list');
     if (!list) return;
     list.innerHTML = '';
-    (data.sessions || []).forEach((s) => {
+    visibleSessions(data.sessions).forEach((s) => {
       const el = document.createElement('div');
       el.className = 'sc-session-item' + (s.id === currentSessionId ? ' active' : '');
       el.innerHTML = '<span class="sc-title">' + esc(s.title) + '</span><button type="button" class="sc-del" title="Delete">×</button>';
@@ -2100,6 +2115,10 @@
 
   async function switchSession(id, title, opts) {
     opts = opts || {};
+    // Refuse to open plugin / Live DJ bridge sessions in main Chat.
+    if (isInternalAppSessionTitle(title)) {
+      return;
+    }
     const prevId = currentSessionId;
     if (prevId && prevId !== id && !sessionHasMessages) {
       await discardEmptySession(prevId);
@@ -3052,7 +3071,7 @@
       try {
         const sessData = await apiGet('/admin-system-chat-sessions.php');
         const found = (sessData.sessions || []).find((s) => s.id === streamingSession);
-        if (found) {
+        if (found && !isInternalAppSessionTitle(found.title)) {
           await switchSession(found.id, found.title);
         } else {
           clearStreamState();
@@ -3064,8 +3083,9 @@
       try {
         const sessData = await apiGet('/admin-system-chat-sessions.php');
         const found = (sessData.sessions || []).find((s) => s.id === saved);
-        if (found) await switchSession(found.id, found.title, { skipStreamResume: true });
-        else localStorage.removeItem('gp_sc_session');
+        if (found && !isInternalAppSessionTitle(found.title)) {
+          await switchSession(found.id, found.title, { skipStreamResume: true });
+        } else localStorage.removeItem('gp_sc_session');
       } catch {
         localStorage.removeItem('gp_sc_session');
       }

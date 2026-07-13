@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import io.grokify.os.BuildConfig
 import io.grokify.os.GrokifyApp
 import io.grokify.os.apps.plugin.BuiltinPluginCatalog
+import io.grokify.os.apps.plugin.isInternalAppSessionTitle
 import io.grokify.os.chat.BridgeClient
 import io.grokify.os.data.ApiKeyEntry
 import io.grokify.os.data.ApiKeyIds
@@ -702,13 +703,20 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                         ensureSession("New Chat")
                     } else {
                         val title = resolveSessionTitle(sessionId)
-                        _state.update {
-                            it.copy(
-                                sessionId = sessionId,
-                                sessionTitle = title?.ifBlank { it.sessionTitle } ?: it.sessionTitle,
-                            )
+                        // Never open Live DJ / plugin bridge sessions as the main Chat thread.
+                        if (isInternalAppSessionTitle(title)) {
+                            sessionId = ""
+                            store.setSessionId("")
+                            ensureSession("New Chat")
+                        } else {
+                            _state.update {
+                                it.copy(
+                                    sessionId = sessionId,
+                                    sessionTitle = title?.ifBlank { it.sessionTitle } ?: it.sessionTitle,
+                                )
+                            }
+                            loadMessagesInternal(sessionId, clearError = false)
                         }
-                        loadMessagesInternal(sessionId, clearError = false)
                     }
                     if (wsToken.isBlank()) {
                         _state.update {
@@ -870,13 +878,15 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 val id = o.optString("id").trim()
                 if (id.isBlank()) continue
                 val title = o.optString("title").ifBlank { "Chat" }
+                if (id.equals(sid, true)) found = title
+                // Keep Live DJ / plugin sessions out of the Chat history panel.
+                if (isInternalAppSessionTitle(title)) continue
                 list += SessionItem(
                     id = id,
                     title = title,
                     updatedAt = o.optString("updated_at"),
                     messageCount = o.optInt("message_count", 0),
                 )
-                if (id.equals(sid, true)) found = title
             }
             _state.update { it.copy(sessions = list) }
             found
@@ -906,9 +916,12 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                         val o = arr.optJSONObject(i) ?: continue
                         val sid = o.optString("id").trim()
                         if (sid.isBlank()) continue
+                        val title = o.optString("title").ifBlank { "Chat" }
+                        // Plugin / Spotify Live DJ bridge sessions stay inside those apps.
+                        if (isInternalAppSessionTitle(title)) continue
                         list += SessionItem(
                             id = sid,
-                            title = o.optString("title").ifBlank { "Chat" },
+                            title = title,
                             updatedAt = o.optString("updated_at"),
                             messageCount = o.optInt("message_count", 0),
                         )
@@ -928,6 +941,13 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { it.copy(error = "Invalid session id") }
                 return@launch
             }
+            val known = _state.value.sessions.find { it.id == sid || it.id.equals(sid, true) }
+            if (known != null && isInternalAppSessionTitle(known.title)) {
+                _state.update {
+                    it.copy(error = "That session belongs to an inner app (e.g. Spotify Live DJ).")
+                }
+                return@launch
+            }
             val prevId = sessionId
             val prevEmpty = _state.value.messages.isEmpty() &&
                 (_state.value.sessions.find { it.id == prevId }?.messageCount ?: 0) == 0
@@ -939,7 +959,6 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (_: Exception) { /* ignore */ }
             }
 
-            val known = _state.value.sessions.find { it.id == sid || it.id.equals(sid, true) }
             sessionId = sid
             store.setSessionId(sid)
             _state.update {

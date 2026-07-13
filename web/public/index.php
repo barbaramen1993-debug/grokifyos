@@ -20,7 +20,7 @@ $chatReady = gos_system_chat_tables_ready();
 $devPack = $canAccess ? gos_devices_for_user((int) $user['id']) : ['devices' => [], 'active' => []];
 $activeDevices = $devPack['active'];
 $latestApk = $canAccess ? gos_latest_apk() : null;
-$assetV = '20260713-usage-meter';
+$assetV = '20260713-isolate-app-sessions';
 ?><!DOCTYPE html>
 <html lang="en" class="dark">
 <head>

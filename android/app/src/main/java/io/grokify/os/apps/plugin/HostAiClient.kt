@@ -36,11 +36,26 @@ import java.util.concurrent.atomic.AtomicReference
  *
  * **Speak / DJ banter** — prefers xAI Voice TTS (`POST /v1/tts`) when an
  * xAI API key is stored; falls back to on-device TTS.
+ *
+ * Plugin / Live DJ turns reuse dedicated [system_chat_sessions] rows whose
+ * titles start with [INTERNAL_SESSION_TITLE_PREFIX] so main Chat history can
+ * hide them. Keep that prefix if you add new app-scoped session titles.
  */
+/** Leading mark on host sessions owned by plugins / Spotify Live DJ (not user Chat). */
+const val INTERNAL_SESSION_TITLE_PREFIX = "·"
+
+/** True when [title] is a marketplace / Live DJ bridge session (hide from Chat history). */
+fun isInternalAppSessionTitle(title: String?): Boolean {
+    val t = title?.trim().orEmpty()
+    if (t.isEmpty()) return false
+    // Middle-dot (U+00B7) is canonical; bullet is a common paste/lookalike.
+    return t.startsWith(INTERNAL_SESSION_TITLE_PREFIX) || t.startsWith("•")
+}
+
 object HostAiClient {
     private const val TAG = "HostAiClient"
     private const val COMPLETE_TIMEOUT_SEC = 300L
-    private const val PLUGIN_SESSION_TITLE = "· Plugin AI"
+    private const val PLUGIN_SESSION_TITLE = INTERNAL_SESSION_TITLE_PREFIX + " Plugin AI"
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -667,16 +682,23 @@ object HostAiClient {
         return m
     }
 
-    /** Reuse an existing plugin session when possible. */
+    /**
+     * Reuse an existing plugin/DJ session when possible.
+     * Matches exact title first, then other internal sessions that share the same title
+     * (never reuses a normal user Chat session).
+     */
     private fun resolvePluginSession(api: GrokifyApi, title: String): String {
+        val want = title.trim().ifBlank { PLUGIN_SESSION_TITLE }
         runCatching {
             val list = api.listChatSessions()
             val arr = list.optJSONArray("sessions") ?: list.optJSONArray("items")
             if (arr != null) {
                 for (i in 0 until arr.length()) {
                     val s = arr.optJSONObject(i) ?: continue
-                    val t = s.optString("title", "")
-                    if (t == title || t.startsWith(title)) {
+                    val t = s.optString("title", "").trim()
+                    // Only match internal app sessions — never a user-visible Chat.
+                    if (!isInternalAppSessionTitle(t)) continue
+                    if (t == want || t.startsWith(want)) {
                         val id = s.optString("id", "").ifBlank {
                             s.optString("session_id", "")
                         }
@@ -685,7 +707,7 @@ object HostAiClient {
                 }
             }
         }
-        val created = api.createChatSession(title)
+        val created = api.createChatSession(want)
         return created.optString("id", "").ifBlank {
             created.optString("session_id", "")
         }.ifBlank {

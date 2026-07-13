@@ -12,8 +12,8 @@ android {
         applicationId = "io.grokify.os"
         minSdk = 26
         targetSdk = 35
-        versionCode = 73
-        versionName = "0.1.73"
+        versionCode = 74
+        versionName = "0.1.74"
         buildConfigField("String", "API_BASE", "\"https://grokifyos.grokpot.io/api\"")
         buildConfigField("String", "WS_URL", "\"wss://grokifyos.grokpot.io/grokify-ws/\"")
         buildConfigField("String", "SITE_URL", "\"https://grokifyos.grokpot.io\"")
