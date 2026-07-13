@@ -1870,10 +1870,10 @@ fun SpotifyControllerPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         Text(
-                            "Live DJ UP NEXT is the set Spotify should play. On every queue change " +
-                                "and ~every 12s while playing, we check Spotify’s Up Next and re-mirror " +
-                                "(context replace) so heads match — banter always names the real next cut. " +
-                                "Chat adds, removes, refill, jumps, and skips all force-mirror. " +
+                            "Live DJ UP NEXT is the set Spotify should play next. We mirror on " +
+                                "queue changes, handoffs, and near track end if the Up Next head drifted — " +
+                                "not on a mid-song timer (that thrashed Spotify’s queue). " +
+                                "Chat adds, removes, refill, jumps, and skips force-mirror. " +
                                 "If Spotify drifts to a ghost track, we reclaim the DJ next without wiping. " +
                                 "Tap a title or ▶ to jump (drops songs above · no talk). " +
                                 "Sync adopts whatever Spotify is on now (keeps UP NEXT). " +
