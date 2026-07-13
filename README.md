@@ -308,7 +308,7 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 ## Disclaimer
 
-**GrokifyOS is not affiliated with xAI, SpaceX, Grok, Grok Build, Mapbox, Spotify, or any other third party.**  
+**GrokifyOS is not affiliated with SpaceXAI/xAI/SpaceX, Grok, Grok Build, Mapbox, Spotify, or any other third party.**  
 It is a community MIT project that lets you self-host tooling which *may* call third-party APIs using credentials **you** provide. You are responsible for complying with each provider’s terms of service and for securing your own deployment.
 
 ---
