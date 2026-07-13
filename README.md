@@ -2,7 +2,7 @@
 
 **A mobile Android development kit** — self-hosted web control plane + native phone client — so you can **build custom versions of your own AI-powered phone OS** by working *through* the device, not just *on* it.
 
-Think of it as **slipping the phone on for the phone**: you pair a real Android handset to *your* server, open hardware (camera, mic, GPS, Wi‑Fi, Bluetooth, notifications, media), stream agents via [Grok Build](https://grok.com), ship features as **inner apps / plugins**, and **publish APKs OTA** so the handset updates itself.
+Think of it as **slipping the phone on for the phone**: you pair a real Android handset to *your* server, open hardware (camera, mic, GPS, Wi‑Fi, Bluetooth, notifications, media), stream agents via [Grok Build](https://grok.com), ship features as **built-in inner apps** in the host APK, and **publish APKs OTA** so the handset updates itself.
 
 | | |
 |--|--|
@@ -23,11 +23,11 @@ Most “AI phone” demos are a chat UI glued to an API. GrokifyOS is different:
 
 1. **You own the host** — chat, devices, sessions, APKs, and secrets live on *your* machine or VPS.
 2. **The phone is the runtime** — full permission model for real hardware: camera, microphone, location, nearby Wi‑Fi, Bluetooth, notifications, media session control.
-3. **Inner apps are first-class** — Wi‑Fi / BT scanners, place notes, Spotify Live DJ, maps, plus remote script plugins loaded from your server.
+3. **Inner apps are first-class** — Wi‑Fi / BT scanners, place notes, Spotify Live DJ, and maps ship as **built-in host modules** in the APK (no script sideloading).
 4. **Grok Build is the builder** — agents run against *your* Grok Build login on the host; you (or another agent) edit the repo, rebuild, and **push OTA**.
 5. **Closed loop** — change code → `publish.sh` → phone sees a new `versionCode` → install update → keep iterating without a cable.
 
-Endless surface area: new host modules, WebView plugins, vault keys, maps, scanners, media, geofences — all under one paired device token.
+Endless surface area: new Kotlin host modules, vault keys, maps, scanners, media, geofences — all under one paired device token.
 
 ---
 
@@ -36,11 +36,11 @@ Endless surface area: new host modules, WebView plugins, vault keys, maps, scann
 | Piece | Role |
 |-------|------|
 | **Web dashboard** | Login, chat sessions, notes, device pairing, APK release store |
-| **REST APIs** | Auth, devices, chat, models, live Grok Build usage, plugins, OTA |
+| **REST APIs** | Auth, devices, chat, models, live Grok Build usage, OTA |
 | **Agent bridge** | Node WebSocket gateway for streaming agents |
 | **Android host** | Compose client: Chat · Settings · **Apps** hub · permission cards · OTA |
-| **API key vault** | On-device keys for maps, Spotify, xAI voice, custom plugin secrets |
-| **Plugin catalog** | Built-in host modules + remote packages from `storage/plugins/` |
+| **API key vault** | On-device keys for maps, Spotify, xAI voice |
+| **Inner apps** | Built-in host modules in the APK (`BuiltinPluginCatalog`) |
 
 Architecture overview: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**  
 Full install (Ubuntu / Windows / macOS, TLS, bridge): **[docs/INSTALL.md](docs/INSTALL.md)**  
@@ -149,7 +149,7 @@ VPS + TLS + systemd examples: `deploy/`. Deep steps: **[docs/INSTALL.md](docs/IN
 
 ## Inner apps (built-in)
 
-Open the Android app → **Apps** tab. Built-ins ship inside the host APK (`BuiltinPluginCatalog`); remote WebView plugins can also appear from your server catalog (`storage/plugins/catalog.json`).
+Open the Android app → **Apps** tab. Every app is a **native host module** compiled into the APK (`BuiltinPluginCatalog`). There is no script sideload / remote WebView plugin path — new apps ship by editing Kotlin and publishing a new APK OTA.
 
 | App | What it does | Hardware / services | Keys |
 |-----|----------------|---------------------|------|
@@ -157,7 +157,6 @@ Open the Android app → **Apps** tab. Built-ins ship inside the host APK (`Buil
 | **Bluetooth Tracker** | BLE + classic discovery; GPS pins, distance, times seen; watch/unseen/strong alerts; map | Bluetooth, Location, Notifications | **Mapbox** for maps |
 | **Place Notes** | Pin notes to GPS spots; on enter: notify, open an app, or show an image; list + map + area monitoring | Location, Notifications | **Mapbox** for maps |
 | **Spotify** | Lockscreen / media controls; **Live AI DJ** booth (banter, queue chat); research/build/edit playlists via host Grok Build; optional Grok Voice TTS | Notifications, Media session, mic (voice), network | **Spotify Client ID** (+ optional secret); **xAI API key** for Grok Voice (device TTS works without it) |
-| **System Status** (remote sample) | Lightweight script plugin from the server: host info, connection tips; unload anytime | Scripts / WebView | None |
 
 Capabilities are gated by Android permissions (Settings → Permissions, or in-chat `[[permission_request:…]]` cards). Keys live in **Settings → API key vault** on the device — never in git.
 
@@ -220,10 +219,6 @@ Missing auth → APIs return a **clear error** (no invented usage).
 | **Used for** | Optional **Grok Voice** for Live DJ banter (eve, ara, leo, rex, sal, …) |
 | **Not used for** | Playlist research / main chat — those use **host Grok Build** + device token |
 
-### 6. Custom plugin keys
-
-Script / marketplace plugins declare `required_keys` in their manifest. The host only exposes those ids to that plugin and can gate the UI until the user adds them in Settings.
-
 ---
 
 ## Develop → rebuild → OTA
@@ -261,7 +256,7 @@ android/       Kotlin + Compose host (io.grokify.os) + inner apps
 scripts/       install.php, dev router, grok-auth helpers
 deploy/        Apache vhost + systemd unit examples
 docs/          install + architecture
-storage/       sessions, bridge runtime, APKs, plugins (gitignored contents)
+storage/       sessions, bridge runtime, APKs (gitignored contents)
 uploads/       chat media (gitignored)
 ```
 
@@ -307,7 +302,7 @@ Usage endpoints call billing with **your** credentials only. No phone-home to a 
 
 ## Contributing
 
-Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the tree. If you add an inner app, document its capabilities and required vault key ids in this README and the plugin catalog.
+Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the tree. If you add an inner app, implement it as a built-in host module (`BuiltinPluginCatalog` + Compose pane) and document its capabilities and required vault key ids in this README.
 
 ---
 
