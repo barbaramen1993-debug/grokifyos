@@ -1,89 +1,210 @@
-# GrokifyOS install
+# Install GrokifyOS
 
-Password-only admin auth. Dedicated MySQL database. Production chat (sessions, messages, notes, audit, Grok Build usage) — **no demo seed data**.
+Run your own Grokify-style assistant with **Grok Build**. Works **locally** (laptop / LAN) or on a **VPS** for remote access.
 
-Does **not** touch your private Grokpot/Grokify stack.
+Password-only admin auth. Dedicated MySQL database. Real chat and usage — no demo seed data.
+
+---
 
 ## Requirements
 
-| Component | Notes |
-|-----------|--------|
-| PHP 8.1+ | `pdo_mysql`, `curl`, `json`, `mbstring`, `session` |
-| MySQL 8+ / MariaDB 10.5+ | Dedicated database |
-| Node 18+ | Optional — only if you run the agent bridge |
-| Android SDK | Optional — only to build the APK |
+| Component | Required for | Notes |
+|-----------|--------------|--------|
+| **PHP 8.1+** | Web + API | Extensions: `pdo_mysql`, `curl`, `json`, `mbstring`, `session` |
+| **MySQL 8+** or **MariaDB 10.5+** | Persistence | Dedicated database (do not share with other apps) |
+| **Node.js 18+** | Agent bridge | Optional if you only need UI without streaming agents |
+| **Android SDK** | Building the APK | Optional if you download a prebuilt APK from your own host |
+| **Grok Build CLI auth** | Real agents + usage | `auth.json` from `grok login` |
 
-## 1. Clone & configure
+| Mode | Reachability |
+|------|----------------|
+| **Local / LAN** | Same machine or same Wi‑Fi (`php -S 0.0.0.0:8787`) |
+| **VPS + DNS + TLS** | Anywhere (phone on mobile data, etc.) |
+
+---
+
+## 1. Install the stack by OS
+
+### Ubuntu / Debian
 
 ```bash
-git clone git@github.com:iBerry420/grokifyos.git
-cd grokifyos
-cp .env.example .env
-# Edit .env: DB credentials, bridge URL, WS secret, auth.json path
+sudo apt update
+sudo apt install -y php-cli php-mysql php-curl php-mbstring php-xml \
+  mysql-server git curl
+
+# Node 20 (NodeSource) — or use nvm / distro node if ≥ 18
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# Optional: full LAMP for production
+sudo apt install -y apache2 libapache2-mod-php certbot python3-certbot-apache
+sudo a2enmod rewrite proxy proxy_http proxy_wstunnel headers ssl
 ```
 
-## 2. Database
+Create a MySQL database and user:
 
 ```bash
-# Create MySQL user + database first, then:
+sudo mysql -e "
+  CREATE DATABASE IF NOT EXISTS grokifyos CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  CREATE USER IF NOT EXISTS 'grokifyos'@'localhost' IDENTIFIED BY 'CHANGE_ME_STRONG';
+  CREATE USER IF NOT EXISTS 'grokifyos'@'127.0.0.1' IDENTIFIED BY 'CHANGE_ME_STRONG';
+  GRANT ALL ON grokifyos.* TO 'grokifyos'@'localhost';
+  GRANT ALL ON grokifyos.* TO 'grokifyos'@'127.0.0.1';
+  FLUSH PRIVILEGES;
+"
+```
+
+### macOS
+
+```bash
+# Homebrew: https://brew.sh
+brew install php mysql node git
+
+# Start MySQL (first time may need brew services)
+brew services start mysql
+
+mysql -u root -e "
+  CREATE DATABASE IF NOT EXISTS grokifyos CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  CREATE USER IF NOT EXISTS 'grokifyos'@'localhost' IDENTIFIED BY 'CHANGE_ME_STRONG';
+  GRANT ALL ON grokifyos.* TO 'grokifyos'@'localhost';
+  FLUSH PRIVILEGES;
+"
+```
+
+Optional production frontends: Caddy, nginx, or Apache via Homebrew. For day-to-day local use, the PHP built-in server is enough.
+
+### Windows
+
+**Recommended:** [WSL2](https://learn.microsoft.com/windows/wsl/install) (Ubuntu) and follow the **Ubuntu** section above. That matches production Linux closest.
+
+**Native Windows alternative:**
+
+1. Install [XAMPP](https://www.apachefriends.org/) or [php.net Windows builds](https://windows.php.net/download/) + [MySQL](https://dev.mysql.com/downloads/installer/) or [MariaDB](https://mariadb.org/download/).
+2. Install [Node.js LTS](https://nodejs.org/) (18+).
+3. Install [Git for Windows](https://git-scm.com/download/win).
+4. Enable PHP extensions in `php.ini`: `extension=pdo_mysql`, `extension=curl`, `extension=mbstring`, `extension=openssl`.
+5. Create database `grokifyos` and a user in MySQL Workbench / CLI.
+
+```powershell
+# From the repo root (PowerShell / cmd)
+copy .env.example .env
+# edit .env with Notepad
+
+php scripts\install.php --admin=admin --password=your-long-password
+php -S 0.0.0.0:8787 scripts\dev-router.php
+```
+
+Open `http://127.0.0.1:8787` in a browser.
+
+---
+
+## 2. Clone and configure
+
+```bash
+git clone https://github.com/iBerry420/grokifyos.git
+cd grokifyos
+cp .env.example .env
+```
+
+Edit `.env` (minimum):
+
+```env
+GROKIFY_APP_NAME=GrokifyOS
+GROKIFY_SITE_URL=http://127.0.0.1:8787   # or https://your.domain
+
+GROKIFY_DB_HOST=127.0.0.1
+GROKIFY_DB_PORT=3306
+GROKIFY_DB_NAME=grokifyos
+GROKIFY_DB_USER=grokifyos
+GROKIFY_DB_PASS=CHANGE_ME_STRONG
+
+# Generate with: openssl rand -hex 32
+GROKIFY_WS_AUTH_SECRET=
+GROKIFY_SECRETS_PEPPER=
+```
+
+---
+
+## 3. Install schema + first admin
+
+```bash
 php scripts/install.php --admin=YOUR_USER --password=YOUR_LONG_PASSWORD
 ```
 
 Applies `schema/*.sql` (idempotent). Creates the first admin only when the users table is empty.
 
-## 3. Run web (local LAN)
+---
+
+## 4. Run the web app
+
+### Local / LAN (easiest)
 
 ```bash
-# Dev server (LAN-only; phones on the same Wi‑Fi can use http://YOUR_LAN_IP:8787)
 php -S 0.0.0.0:8787 scripts/dev-router.php
 ```
 
-Or point Apache/nginx DocumentRoot at `web/public` and alias `/api` → `web/api`, `/assets` → `web/assets` (see `deploy/apache-vhost.conf.example`).
+| Client | URL |
+|--------|-----|
+| This machine | `http://127.0.0.1:8787` |
+| Phone on same Wi‑Fi | `http://YOUR_LAN_IP:8787` |
 
-| Mode | Reachability |
-|------|----------------|
-| **Local / LAN** | Same network only |
-| **VPS + DNS + TLS** | Anywhere |
+For Android on LAN, set the app’s API base to `http://YOUR_LAN_IP:8787/api` (or rebuild with that `API_BASE`). Cleartext HTTP is fine on a private network; use HTTPS for anything public.
 
-### VPS example (this host)
+### VPS (remote access)
 
-Live test host on the Contabo VPS:
+1. Point a DNS **A** record at your VPS IP.
+2. Install Apache or nginx + PHP-FPM, TLS (Let’s Encrypt).
+3. Document root / aliases:
 
-| Item | Value |
-|------|--------|
-| URL | https://grokifyos.grokpot.io |
-| App path | `/var/www/grokifyos` → `/root/grokifyos` |
-| Apache | `sites-available/grokifyos.grokpot.io.conf` + `-le-ssl.conf` |
-| Env (Apache) | `/etc/grokifyos/php.env` (mode `640`, group `www-data`) — **not** in git |
-| TLS | Let’s Encrypt via `certbot --apache -d grokifyos.grokpot.io` |
+| URL path | Filesystem |
+|----------|------------|
+| `/` | `web/public` |
+| `/api` | `web/api` |
+| `/assets` | `web/assets` |
+| WebSocket path (e.g. `/grokify-ws/`) | proxy to bridge (default `127.0.0.1:8876`) |
+
+Example Apache configs: `deploy/apache-vhost.conf.example`, `deploy/apache-vhost-ssl.conf.example`.
 
 ```bash
-# DNS A record → VPS IP, then:
+# Typical Ubuntu VPS outline
 sudo ln -sfn /path/to/grokifyos /var/www/grokifyos
-sudo cp deploy/apache-vhost.conf.example /etc/apache2/sites-available/grokifyos.grokpot.io.conf
-# edit ServerName / paths if needed
-sudo a2ensite grokifyos.grokpot.io.conf
+sudo cp deploy/apache-vhost.conf.example /etc/apache2/sites-available/grokifyos.conf
+# edit ServerName, paths
+sudo a2ensite grokifyos.conf
 sudo apache2ctl configtest && sudo systemctl reload apache2
-sudo certbot --apache -d grokifyos.grokpot.io --redirect
-# put secrets in /etc/grokifyos/php.env; chown root:www-data; chmod 640
-# storage must be writable: chown -R www-data:www-data storage/
+sudo certbot --apache -d your.domain --redirect
+
+# secrets for Apache PHP (optional; .env in repo root also works)
+sudo mkdir -p /etc/grokifyos
+sudo cp .env /etc/grokifyos/php.env   # or maintain separately
+sudo chown root:www-data /etc/grokifyos/php.env
+sudo chmod 640 /etc/grokifyos/php.env
+
+sudo chown -R www-data:www-data storage/
 ```
 
-HTTP redirects to HTTPS (ACME challenge path excluded). Auto-renew is handled by certbot’s timer.
+Set in env:
 
-## 4. Bridge (real agents)
+```env
+GROKIFY_SITE_URL=https://your.domain
+```
+
+---
+
+## 5. Agent bridge (streaming)
 
 Chat **persists** without a bridge (sessions/messages in MySQL). **Streaming agents** need the Node bridge:
 
 ```bash
 cd bridge
 npm ci
-# Configure env for GrokifyOS (own port, e.g. 8876 — do not steal production 8766 long-term)
-export GROKIFY_BRIDGE_PORT=8876   # or project-specific vars your bridge expects
+# Port must match .env GROKIFY_BRIDGE_URL
+export GROKIFY_BRIDGE_PORT=8876
+# or set in environment your bridge already reads
 node server.js
 ```
 
-Set in `.env`:
+`.env` on the PHP side:
 
 ```env
 GROKIFY_BRIDGE_URL=http://127.0.0.1:8876
@@ -92,43 +213,88 @@ GROKIFY_WS_PATH=/grokify-ws/
 GROKIFY_WS_AUTH_SECRET=long-random-string
 ```
 
-Proxy `GROKIFY_WS_PATH` (WebSocket) from your reverse proxy to the bridge.
+On a VPS, reverse-proxy `GROKIFY_WS_PATH` (WebSocket) to the bridge.  
+Example systemd units: `deploy/grokifyos-bridge-*.service`.
 
-## 5. Grok Build usage (optional but real)
+---
 
-Usage chip calls xAI billing with a real OAuth token:
+## 6. Grok Build (agents + usage)
 
-```env
-GROKIFY_GROK_AUTH_JSON=/path/to/auth.json   # from `grok login`
+Install the Grok / Grok Build CLI and log in on the host that runs the bridge and PHP:
+
+```bash
+# after `grok login`, point at the auth file:
+GROKIFY_GROK_AUTH_JSON=/path/to/auth.json
 ```
 
-If auth is missing, the API returns a clear error — it does **not** invent usage numbers.
+Usage endpoints call xAI billing with that token. Missing auth → clear API error, not fake numbers.
 
-## 6. Android APK
+---
 
-- Source: `android/` (package rename to `io.grokify.os` is a later phase)
-- Upload a real APK from the dashboard **Build** tab, or place via `web/api/apk-upload.php`
-- Download: `/api/apk-download.php`
-- Device tokens: dashboard **Devices** → `gos_…` tokens
+## 7. Android app
 
-## API surface (Phase 2)
+| Item | Value |
+|------|--------|
+| Source | `android/` |
+| Package | `io.grokify.os` (debug: `io.grokify.os.debug`) |
+| minSdk / targetSdk | 26 / 35 |
+
+### Build (any OS with Android SDK)
+
+```bash
+cd android
+# set JAVA_HOME (JDK 17) and ANDROID_HOME
+./gradlew :app:assembleDebug        # Linux/macOS
+# gradlew.bat :app:assembleDebug    # Windows
+```
+
+Output: `android/app/build/outputs/apk/debug/app-debug.apk`
+
+Configure `API_BASE` / `WS_URL` / `SITE_URL` in `android/app/build.gradle.kts` (BuildConfig) to your host, then rebuild.
+
+### Install on a phone
+
+1. Log into the web dashboard → **Devices** → create token (`gos_…`).
+2. Install the APK (USB `adb install -r …`, wireless ADB, or host **Download APK** after upload).
+3. Paste the token in the app; grant permissions.
+
+Helper scripts (Linux/macOS): `android/scripts/build.sh`, `publish.sh`, `install-device.sh`. Details: [android/README.md](../android/README.md).
+
+---
+
+## API surface
 
 | Path | Role |
 |------|------|
-| `/api/health.php` | Health + chat readiness |
+| `/api/health.php` | Health + readiness |
 | `/api/setup.php` / `login.php` / `logout.php` / `me.php` | Password auth |
-| `/api/devices.php` | Device token mint/list/revoke |
+| `/api/devices.php` | Device token mint / list / revoke |
 | `/api/admin-system-chat-sessions.php` | Chat sessions |
-| `/api/admin-system-chat-messages.php` | Messages (CRUD + stream_upsert) |
+| `/api/admin-system-chat-messages.php` | Messages (CRUD + stream upsert) |
 | `/api/admin-system-chat-notes.php` | Instruction notes |
 | `/api/admin-system-chat-models.php` | Models + WS token |
-| `/api/admin-system-chat-audit.php` | Audit list / SSE stream |
+| `/api/admin-system-chat-audit.php` | Audit list / SSE |
 | `/api/admin-system-chat-usage.php` | Live Grok Build usage |
-| `/api/apk-upload.php` / `apk-download.php` | APK releases |
+| `/api/apk-upload.php` / `apk-download.php` / `update.php` | APK releases / OTA |
+
+---
 
 ## Security checklist
 
-- Never commit `.env`, `storage/sessions/*`, `storage/apk/*`, or `auth.json`
-- Use HTTPS on any public host
-- Keep `GROKIFY_WS_AUTH_SECRET` and DB password strong
-- Private repo recommended until you intentionally open-source
+- [ ] Never commit `.env`, session files, APKs, or `auth.json`
+- [ ] HTTPS on any public host
+- [ ] Strong DB password + `GROKIFY_WS_AUTH_SECRET` + `GROKIFY_SECRETS_PEPPER`
+- [ ] `storage/` writable only by the service user
+- [ ] Firewall: only 80/443 public; MySQL and bridge stay on localhost unless you know better
+
+---
+
+## Troubleshooting
+
+| Symptom | Check |
+|---------|--------|
+| `db` health fails | `.env` credentials; MySQL listening; user host (`localhost` vs `127.0.0.1`) |
+| Login loop | Cookies / HTTPS mismatch (`GROKIFY_SITE_URL`); session dir writable |
+| Usage unavailable | `GROKIFY_GROK_AUTH_JSON` path + valid `grok login` token |
+| Agents don’t stream | Bridge process up; `GROKIFY_BRIDGE_*`; WS proxy path |
+| Phone can’t reach LAN server | Same Wi‑Fi; firewall allows 8787; use LAN IP not `127.0.0.1` on the phone |

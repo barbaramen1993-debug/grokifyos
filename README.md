@@ -1,52 +1,98 @@
 # GrokifyOS
 
-Self-hosted AI assistant (web dashboard + Android + agent bridge).
+**Open-source stack to run your own Grokify-style AI assistant** — web dashboard, Android app, and agent bridge — powered by [Grok Build](https://grok.com) (xAI).
 
-**Phase 2 + public test host:** password-only auth, production chat dashboard + REST APIs, device tokens, APK releases, real Grok Build usage. **No mock/demo seed data.**
+Self-host on a laptop, home lab, or VPS. Pair phones with device tokens. Chat with real agents; usage comes from your Grok Build account (no fake numbers).
 
-This repository is independent of the private Grokpot monorepo. Production Grokify-on-Grokpot is unchanged.
+| | |
+|--|--|
+| **Auth** | Username + password (browser); device Bearer tokens `gos_…` (Android) |
+| **Stack** | PHP 8.1+, MySQL/MariaDB, Node 18+ (bridge), optional Android SDK |
+| **Deploy** | Local / LAN **or** remote VPS with HTTPS |
+| **License** | [MIT](LICENSE) |
 
-**Live VPS (TLS):** https://grokifyos.grokpot.io
+> GrokifyOS is a standalone product. It does **not** require or modify any private Grokpot deployment.
+
+## What you get
+
+- **Web dashboard** — login, chat sessions, notes, device pairing, APK release upload
+- **REST APIs** — auth, devices, chat, models, live Grok Build usage
+- **Agent bridge** — WebSocket gateway for streaming agents
+- **Android app** — package `io.grokify.os` (Compose); side-by-side with other installs
 
 ## Quick start
 
 ```bash
-cp .env.example .env   # set GROKIFY_DB_*
-php scripts/install.php --admin=admin --password='long-password'
-# point web server at web/public (+ /api, /assets aliases)
+git clone https://github.com/iBerry420/grokifyos.git
+cd grokifyos
+cp .env.example .env
+# edit .env → MySQL credentials (see docs/INSTALL.md)
+
+php scripts/install.php --admin=admin --password='your-long-password'
+
+# local / LAN (phones on same Wi‑Fi can use http://YOUR_LAN_IP:8787)
+php -S 0.0.0.0:8787 scripts/dev-router.php
 ```
 
-See [docs/INSTALL.md](docs/INSTALL.md) and [docs/CONTRACT.md](docs/CONTRACT.md).
+Open `http://127.0.0.1:8787` → sign in → **Devices** → create a `gos_…` token for the Android app.
 
-## Layout
+Full install (Ubuntu, Windows, macOS), bridge, TLS, and Android: **[docs/INSTALL.md](docs/INSTALL.md)**.  
+Scope and architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
+## Repository layout
 
 ```text
-web/           PHP app (public, api, includes, assets)
-schema/        Greenfield SQL
-bridge/        Agent WebSocket gateway (port env separately)
-android/       Compose app (rename package for OSS builds)
-scripts/       install.php
-deploy/        example vhost / units
-docs/          contract + install
-storage/       sessions, runtime, apk
+web/           PHP app (public UI, API, includes, assets)
+schema/        SQL schema (greenfield install)
+bridge/        Node WebSocket agent gateway
+android/       Kotlin + Compose client (io.grokify.os)
+scripts/       install.php, dev router
+deploy/        Apache vhost + systemd unit examples
+docs/          install + architecture
+storage/       sessions, bridge runtime, APKs (gitignored contents)
 ```
 
-## Auth (v1)
+## Auth
 
 | Client | Method |
 |--------|--------|
 | Browser | Username + password → session cookie `__grokifyos_sid` |
-| Android | Device Bearer `gos_…` minted from the web UI after login |
+| Android | Device Bearer `gos_…` minted in the web UI after login |
 
-No OAuth in v1. Optional providers may appear later as pure config.
+Password-only by design for simple self-hosting. Optional OAuth can be added later as pure config — not required to run.
 
-## Status
+## Grok Build
 
-| Piece | Phase 1 |
-|-------|---------|
-| Health + setup + login + me | ✅ |
-| Device token create/list/revoke | ✅ |
-| Chat REST + full dashboard UI | ✅ |
-| Bridge HA units (8876) | ✅ |
-| Android `io.grokify.os` + API base | ✅ |
-| Public release polish | ⏳ |
+Point the app at a real Grok Build login so usage and agents work against your account:
+
+```env
+GROKIFY_GROK_AUTH_JSON=/path/to/auth.json   # from `grok login`
+```
+
+If auth is missing, APIs return a clear error — they never invent usage stats.
+
+## Features
+
+| Area | Status |
+|------|--------|
+| Health, first-admin setup, login, session | Ready |
+| Device token create / list / revoke | Ready |
+| Chat REST + dashboard UI | Ready |
+| Bridge (WebSocket agents) | Ready |
+| Android package + OTA download | Ready |
+| Grok Build live usage | Ready (needs `auth.json`) |
+
+## Security
+
+- Never commit `.env`, `storage/sessions/*`, `storage/apk/*`, or `auth.json`
+- Use HTTPS on any host reachable from the internet
+- Use strong DB password and `GROKIFY_WS_AUTH_SECRET`
+- Keep `storage/` writable only by the web/bridge user
+
+## Contributing
+
+Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the tree.
+
+## License
+
+[MIT](LICENSE) — use it, fork it, host it.

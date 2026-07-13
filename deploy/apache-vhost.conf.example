@@ -1,16 +1,15 @@
-# GrokifyOS Apache vhost (HTTP → ACME + redirect; TLS added by certbot --apache)
-# Domain used on this VPS: grokifyos.grokpot.io
-# Paths assume symlink: /var/www/grokifyos → install root
+# GrokifyOS Apache vhost (HTTP → ACME + redirect; TLS via certbot --apache)
+# Replace ServerName, paths, and email. Symlink install root → /var/www/grokifyos
 
 <VirtualHost *:80>
-    ServerName grokifyos.grokpot.io
-    ServerAdmin webmaster@grokpot.io
+    ServerName your.domain.example
+    ServerAdmin admin@your.domain.example
 
     DocumentRoot /var/www/grokifyos/web/public
 
     RewriteEngine On
     RewriteCond %{REQUEST_URI} !^/\.well-known/acme-challenge/
-    RewriteRule ^ https://grokifyos.grokpot.io%{REQUEST_URI} [R=301,L,NE]
+    RewriteRule ^ https://your.domain.example%{REQUEST_URI} [R=301,L,NE]
 
     Alias /api /var/www/grokifyos/web/api
     Alias /assets /var/www/grokifyos/web/assets
@@ -63,6 +62,6 @@
         Require all denied
     </Directory>
 
-    ErrorLog ${APACHE_LOG_DIR}/grokifyos.grokpot.io_error.log
-    CustomLog ${APACHE_LOG_DIR}/grokifyos.grokpot.io_access.log combined
+    ErrorLog ${APACHE_LOG_DIR}/your.domain.example_error.log
+    CustomLog ${APACHE_LOG_DIR}/your.domain.example_access.log combined
 </VirtualHost>

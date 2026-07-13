@@ -1,103 +1,71 @@
 # GrokifyOS Android
 
-Native Kotlin + Jetpack Compose client for **https://grokifyos.grokpot.io** (self-hosted open-source twin of private Grokify).
+Native Kotlin + Jetpack Compose client for your self-hosted **GrokifyOS** server.
 
-Package id is **`io.grokify.os`** so it installs **alongside** private `io.grokpot.grokify` without overwriting it.
+Package id: **`io.grokify.os`** (debug: `io.grokify.os.debug`).
 
 ## Architecture
 
 | Layer | Role |
-|--------|------|
-| **Dashboard** | `grokifyos.grokpot.io` — PHP, password-only admin auth |
-| **PHP API** | Device tokens (`gos_…`), APK OTA, chat (`/api/me.php`, `/api/devices.php`, …) |
-| **Bridge** | Dedicated WebSocket (`wss://…/grokify-ws/`) |
-| **App** | This project — chat + permissions + background service |
+|-------|------|
+| **Dashboard** | Your host — PHP, password admin auth |
+| **PHP API** | Device tokens (`gos_…`), APK OTA, chat |
+| **Bridge** | WebSocket agents (`wss://…/grokify-ws/` or LAN `ws://…`) |
+| **App** | Chat, permissions, background service |
 
-## Server toolchain (this VPS)
+## Requirements
 
-| Tool | Location |
-|------|----------|
-| **JDK 17** | `/usr/lib/jvm/java-17-openjdk-amd64` (`JAVA_HOME`) |
-| **Android SDK** | `/opt/android-sdk` (`ANDROID_HOME`) |
-| **platform-tools (adb)** | `$ANDROID_HOME/platform-tools` |
-| **SDK Platform 35** | `$ANDROID_HOME/platforms/android-35` |
-| **Build-Tools 34/35** | `$ANDROID_HOME/build-tools/` |
-| **Gradle wrapper** | `./gradlew` |
+| Tool | Notes |
+|------|--------|
+| **JDK 17** | `JAVA_HOME` |
+| **Android SDK** | `ANDROID_HOME` — platform 35, build-tools 34+ |
+| **Gradle wrapper** | `./gradlew` / `gradlew.bat` |
 
-```bash
-source /etc/profile.d/android-sdk.sh   # if present
-```
+## Configure API endpoints
+
+In `app/build.gradle.kts` (BuildConfig), set your host before building:
+
+| Field | Local example | VPS example |
+|-------|---------------|-------------|
+| `API_BASE` | `http://192.168.1.10:8787/api` | `https://your.domain/api` |
+| `WS_URL` | `ws://192.168.1.10:8787/grokify-ws/` * | `wss://your.domain/grokify-ws/` |
+| `SITE_URL` | `http://192.168.1.10:8787` | `https://your.domain` |
+
+\* WebSocket through the PHP dev server may need a separate bridge port or proxy; production uses reverse-proxy to the Node bridge.
 
 ## Build
 
 ```bash
-cd /root/grokifyos/android
-source /etc/profile.d/android-sdk.sh 2>/dev/null || true
-./scripts/build.sh          # debug APK
-# or
-./gradlew :app:assembleDebug
+cd android
+./gradlew :app:assembleDebug          # Linux / macOS
+# gradlew.bat :app:assembleDebug      # Windows
 ```
 
-Output:
+Output: `app/build/outputs/apk/debug/app-debug.apk`
 
-`app/build/outputs/apk/debug/app-debug.apk`  
-Package id (debug): `io.grokify.os.debug`
-
-## Deploy to your phone
-
-This host is a remote VPS — **USB ADB is not available here**. Use one of:
-
-### A) Wireless ADB (same LAN, or reverse tunnel)
+Helpers (Linux/macOS):
 
 ```bash
-source /etc/profile.d/android-sdk.sh 2>/dev/null || true
-cd /root/grokifyos/android
-./scripts/install-device.sh PHONE_IP:PORT
+./scripts/build.sh
+./scripts/publish.sh                  # build + register release on server
+./scripts/install-device.sh IP:PORT   # wireless adb
 ```
 
-### B) Download APK on the phone
+## Install on a phone
 
-1. Build + publish (below), or open the dashboard **Build** tab.
-2. On phone: open the download URL → install (allow unknown sources once).
-
-### C) Via your laptop
+1. Open your GrokifyOS dashboard → log in.
+2. **Devices** → create token (`gos_…`).
+3. Install APK via USB, wireless ADB, or dashboard **Download APK**.
+4. Paste token; grant notification / battery permissions for background.
 
 ```bash
-# on server
-scp root@YOUR_SERVER:/root/grokifyos/android/app/build/outputs/apk/debug/app-debug.apk .
-# on laptop with USB debugging
-adb install -r app-debug.apk
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## First launch
+## OTA
 
-1. Sign in on https://grokifyos.grokpot.io (password admin).
-2. Open **Devices** → create token (`gos_…`).
-3. Paste token in the app.
-4. Grant runtime permissions; open Notification access + battery unrestricted for background.
-
-## OTA / publish
-
-```bash
-source /etc/profile.d/android-sdk.sh 2>/dev/null || true
-cd /root/grokifyos/android
-./scripts/publish.sh              # build debug + register as latest release
-# or: ./scripts/publish.sh debug --no-build
-```
-
-Then open **https://grokifyos.grokpot.io** (logged in) → **Download APK**.
-
-App checks `GET /api/update.php?version_code=N`, then can **Download & install**
-via `GET /api/apk-download.php` with the device token. **versionCode must increase** each release.
-
-## Defaults (BuildConfig)
-
-| Field | Value |
-|-------|--------|
-| `API_BASE` | `https://grokifyos.grokpot.io/api` |
-| `WS_URL` | `wss://grokifyos.grokpot.io/grokify-ws/` |
-| `SITE_URL` | `https://grokifyos.grokpot.io` |
-| `applicationId` | `io.grokify.os` |
+Server: `GET /api/update.php?version_code=N` then `GET /api/apk-download.php` with the device token.  
+**versionCode must increase** each release you publish.
 
 ## Package
 

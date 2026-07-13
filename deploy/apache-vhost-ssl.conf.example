@@ -1,7 +1,9 @@
+# GrokifyOS Apache TLS vhost example — replace ServerName, cert paths, and log names
+
 <IfModule mod_ssl.c>
 <VirtualHost *:443>
-    ServerName grokifyos.grokpot.io
-    ServerAdmin webmaster@grokpot.io
+    ServerName your.domain.example
+    ServerAdmin admin@your.domain.example
 
     DocumentRoot /var/www/grokifyos/web/public
 
@@ -72,8 +74,8 @@
         Header always set Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' wss: https:; form-action 'self'"
     </IfModule>
 
-    ErrorLog ${APACHE_LOG_DIR}/grokifyos.grokpot.io_error.log
-    CustomLog ${APACHE_LOG_DIR}/grokifyos.grokpot.io_access.log combined
+    ErrorLog ${APACHE_LOG_DIR}/your.domain.example_error.log
+    CustomLog ${APACHE_LOG_DIR}/your.domain.example_access.log combined
 
 SSLCertificateFile /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem
 SSLCertificateKeyFile /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem
