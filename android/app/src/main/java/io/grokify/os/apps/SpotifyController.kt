@@ -1837,11 +1837,12 @@ fun SpotifyControllerPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         Text(
-                            "Grokify radio queue — played via Spotify Web API, not Spotify’s Up Next list. " +
-                                "Tap a title or ▶ to jump there (drops songs above · no talk). " +
+                            "Radio UP NEXT is kept in sync with Spotify’s Up Next so songs finish " +
+                                "before the next starts (no early cut). Banter may talk over the outro, " +
+                                "or pause in the last second when talkover is off. " +
+                                "Tap a title or ▶ to jump (drops songs above · no talk). " +
                                 "Sync pulls whatever Spotify is on now. " +
-                                "Add to Spotify queue appends UP NEXT into Spotify’s native Up Next. " +
-                                "Art / ↗ open Spotify. Refill adds · New queue replaces.",
+                                "Add to Spotify queue re-pushes UP NEXT. Refill adds · New queue replaces.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )

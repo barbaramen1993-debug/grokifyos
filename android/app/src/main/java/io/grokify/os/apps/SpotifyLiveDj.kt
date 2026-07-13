@@ -836,6 +836,11 @@ class SpotifyLiveDjService : Service() {
     private var current: DjQueueTrack? = null
     private var lastUri: String? = null
     private var nearEndArmed = false
+    /**
+     * URI we already launched a banter/stuck handoff for — prevents double-firing while
+     * the same cut is still on the player (talkover waits for natural end inside transition).
+     */
+    private var handoffLaunchedForUri: String? = null
     private var wasPlaying = false
     private var pendingBanter: String? = null
     /** Consecutive polls with nothing on Spotify player (leave/return / idle). */
@@ -891,6 +896,13 @@ class SpotifyLiveDjService : Service() {
     private var lastChatTrackUri: String? = null
     /** In-process cache of artist id → portrait URL (Spotify CDN). */
     private val artistImageCache = HashMap<String, String>(64)
+    /**
+     * URIs we have already POSTed into Spotify’s native Up Next.
+     * Lets silent handoffs rely on Spotify auto-advancing instead of early playTrack cuts.
+     */
+    private val syncedToSpotifyUris = LinkedHashSet<String>()
+    /** Last time we bulk-synced the AI queue into Spotify (rate-limit guard). */
+    private var lastSpotifyQueueSyncMs = 0L
 
     private lateinit var store: SpotifyDjStore
 
@@ -1069,10 +1081,10 @@ class SpotifyLiveDjService : Service() {
                 role = DjChatRole.System,
                 text = if (restored > 0) {
                     "Live DJ on — restored $restored queued track${if (restored == 1) "" else "s"}. " +
-                        "Chat for vibes · Queue tab shows the radio set (not Spotify’s native queue)."
+                        "UP NEXT is kept in sync with Spotify’s queue so cuts finish naturally."
                 } else {
                     "Live DJ on — building a radio set from liked · top · recent. " +
-                        "Chat for vibes · track bubbles are play history."
+                        "Queue syncs into Spotify Up Next · songs finish before the next starts."
                 },
             ),
         )
@@ -1084,6 +1096,9 @@ class SpotifyLiveDjService : Service() {
         withContext(Dispatchers.IO) {
             if (queue.size < 4) {
                 fillQueue(useAi = store.useAiRank, force = true)
+            } else {
+                // Push restored set into Spotify so natural advances work after leave/return
+                syncQueueToSpotify(quiet = true)
             }
             // If Spotify is idle, kick the next track immediately (common after leave/return)
             kickIfIdle()
@@ -1164,17 +1179,36 @@ class SpotifyLiveDjService : Service() {
         if (data == null || !data.has("item") || data.isNull("item")) {
             idlePolls++
             lastRemainMs = 0L
-            publish(nowLine = "Nothing playing — advancing from radio queue…")
-            // After leave/return Spotify often reports empty player even though we have a set.
-            // Advance after 1 poll if we were playing, or 2 idle polls otherwise.
+            // Between tracks Spotify often returns empty briefly while native Up Next advances.
+            // Give that a few polls before we force anything (avoids cutting into the next start).
             val hadBeenPlaying = wasPlaying
-            val shouldAdvance = queue.isNotEmpty() && !transitioning.get() &&
-                (hadBeenPlaying || idlePolls >= 2)
+            val banterDueNow = forceBanter || songsSinceBanter + 1 >= banterEvery
+            val gracePolls = when {
+                banterDueNow -> 1
+                hadBeenPlaying -> 3 // ~2s at 700ms ticks — let Spotify land the next cut
+                else -> 2
+            }
+            publish(
+                nowLine = if (hadBeenPlaying && idlePolls < gracePolls) {
+                    "Track ended — waiting for Spotify Up Next…"
+                } else {
+                    "Nothing playing — advancing from radio queue…"
+                },
+            )
+            val shouldAdvance = queue.isNotEmpty() &&
+                !transitioning.get() &&
+                idlePolls >= gracePolls
             if (shouldAdvance) {
                 wasPlaying = false
                 idlePolls = 0
                 scope.launch {
-                    runTransition(if (hadBeenPlaying) "ended" else "idle_advance")
+                    runTransition(
+                        when {
+                            banterDueNow && hadBeenPlaying -> "ended"
+                            hadBeenPlaying -> "stuck_end"
+                            else -> "idle_advance"
+                        },
+                    )
                 }
                 return
             }
@@ -1319,31 +1353,64 @@ class SpotifyLiveDjService : Service() {
         lastUri = uri
         publish(nowLine = line, clearError = true, loggedIn = true, persist = false)
 
-        // Banter / talkover needs headroom so the mic can ride the outro.
-        // Silent handoffs need a multi-second window: a ~1.2s window with ~2s polls
-        // misses almost every natural end when the app is not in the foreground.
+        // Banter needs headroom so the mic can ride the real outro.
+        // Silent handoffs do NOT call playTrack early — Spotify’s native queue (kept in
+        // sync with UP NEXT) advances when the cut actually ends. We only start a transition
+        // for banter, or when the player is stuck at the end with no auto-advance.
         val banterDue = forceBanter || songsSinceBanter + 1 >= banterEvery
-        // Silent: ~5s window + 700ms ticks when remain<8s ⇒ several chances while bg'd.
-        // Banter: longer lead-in so TTS / talkover can prep over the outro.
-        val nearThreshold = if (banterDue) 15_000L else 5_000L
-        if (playing && duration > 15_000L && remain <= nearThreshold && !nearEndArmed) {
+        val peekUri = synchronized(queue) { queue.firstOrNull()?.uri }
+        val banterPrefetched = banterDue &&
+            peekUri != null &&
+            prefetchedForUri == peekUri &&
+            !prefetchedBanter.isNullOrBlank()
+        // Fast poll near the end so we catch natural URI changes while backgrounded.
+        if (playing && duration > 15_000L && remain <= 8_000L) {
+            nearEndArmed = true
+        }
+        // Banter only: enter handoff with enough headroom to land speech on the true outro.
+        val banterThreshold = when {
+            banterDue && banterPrefetched -> 12_000L
+            banterDue -> 14_000L
+            else -> 0L
+        }
+        if (
+            banterDue &&
+            banterThreshold > 0L &&
+            playing &&
+            duration > 15_000L &&
+            remain <= banterThreshold &&
+            handoffLaunchedForUri != uri &&
+            !transitioning.get()
+        ) {
+            handoffLaunchedForUri = uri
             nearEndArmed = true
             Log.i(
                 TAG,
-                "near_end armed remain=${remain}ms banterDue=$banterDue since=$songsSinceBanter every=$banterEvery",
+                "banter near_end armed remain=${remain}ms prefetched=$banterPrefetched " +
+                    "since=$songsSinceBanter every=$banterEvery",
             )
             scope.launch { runTransition("near_end") }
             return
         }
-        // Natural end or pause-at-end (wasPlaying OR stuck for 2 polls after leave/return)
-        if (!playing && duration > 0 && remain <= 5_000L) {
+        // Stuck at end: same URI paused near 0 and Spotify did not auto-advance from Up Next.
+        if (!playing && duration > 0 && remain <= 2_500L && queue.isNotEmpty()) {
             stuckEndPolls++
-            if ((wasPlaying || stuckEndPolls >= 2) && !transitioning.get()) {
+            val canNudge = handoffLaunchedForUri != uri && !transitioning.get()
+            if (canNudge && !banterDue && (wasPlaying || stuckEndPolls >= 2)) {
                 stuckEndPolls = 0
+                handoffLaunchedForUri = uri
+                nearEndArmed = true
+                scope.launch { runTransition("stuck_end") }
+                return
+            }
+            if (canNudge && banterDue && stuckEndPolls >= 3) {
+                stuckEndPolls = 0
+                handoffLaunchedForUri = uri
+                nearEndArmed = true
                 scope.launch { runTransition("stopped_at_end") }
                 return
             }
-        } else {
+        } else if (playing || remain > 5_000L) {
             stuckEndPolls = 0
         }
 
@@ -1352,7 +1419,8 @@ class SpotifyLiveDjService : Service() {
             scope.launch(Dispatchers.IO) { fillQueue(useAi = store.useAiRank) }
         }
         // Prefetch AI banter early — research (news/shows/facts) needs tool time.
-        if (playing && banterDue && remain in 12_000L..180_000L) {
+        // Start while plenty of track remains so handoff never blocks on live research.
+        if (playing && banterDue && remain in 18_000L..240_000L) {
             val peek = synchronized(queue) { queue.firstOrNull() }
             if (peek != null && prefetchedForUri != peek.uri && !prefetchingBanter.get()) {
                 val prevSnap = current
@@ -1374,7 +1442,8 @@ class SpotifyLiveDjService : Service() {
         try {
             if (prefetchedForUri == next.uri && !prefetchedBanter.isNullOrBlank()) return
             publish(status = "🔍 Researching ${primaryArtist(next.artists).ifBlank { next.name }}…")
-            val line = generateBanter(prev, next)
+            // Research is allowed only here — never block the near-end handoff on tools.
+            val line = generateBanter(prev, next, allowResearch = true)
             if (line.isNotBlank()) {
                 prefetchedBanter = line
                 prefetchedForUri = next.uri
@@ -1384,6 +1453,292 @@ class SpotifyLiveDjService : Service() {
             Log.w(TAG, "prefetch banter: ${e.message}")
         } finally {
             prefetchingBanter.set(false)
+        }
+    }
+
+    /** Rough on-air duration for a banter line (~150 wpm + padding). */
+    private fun estimateSpeechMs(line: String): Long {
+        val words = line.trim().split(Regex("\\s+")).count { it.isNotBlank() }.coerceAtLeast(1)
+        return (words * 400L + 500L).coerceIn(2_500L, 18_000L)
+    }
+
+    private data class PlaybackSnap(
+        val uri: String,
+        val playing: Boolean,
+        val progressMs: Long,
+        val durationMs: Long,
+    ) {
+        val remainMs: Long
+            get() = if (durationMs > 0L) (durationMs - progressMs).coerceAtLeast(0L) else 0L
+    }
+
+    private fun readPlaybackSnap(): PlaybackSnap? {
+        val res = spotifyGet("/v1/me/player/currently-playing")
+        val data = res.json ?: return null
+        if (!data.has("item") || data.isNull("item")) return null
+        val item = data.optJSONObject("item") ?: return null
+        return PlaybackSnap(
+            uri = item.optString("uri", ""),
+            playing = data.optBoolean("is_playing", false),
+            progressMs = data.optLong("progress_ms", 0L),
+            durationMs = item.optLong("duration_ms", 0L),
+        )
+    }
+
+    /**
+     * Wait until the current cut has ≤ [targetRemainMs] left (or already ended / changed).
+     * Used so talkover banter lands on the real outro instead of mid-song after fast prep.
+     */
+    private suspend fun waitUntilRemainAbout(
+        expectedUri: String?,
+        targetRemainMs: Long,
+        maxWaitMs: Long,
+    ) {
+        val deadline = System.currentTimeMillis() + maxWaitMs
+        while (System.currentTimeMillis() < deadline) {
+            val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
+            if (snap == null) return // nothing playing — handoff now
+            if (expectedUri != null && snap.uri.isNotBlank() && snap.uri != expectedUri) {
+                return // already moved on
+            }
+            // Paused / stopped (any remain) — do not spin; speech + next track must proceed.
+            if (!snap.playing) return
+            if (snap.durationMs > 0L && snap.remainMs <= targetRemainMs) return
+            lastRemainMs = snap.remainMs
+            delay(450L)
+        }
+    }
+
+    /**
+     * Wait for Spotify to leave [fromUri] on its own (native Up Next), or time out.
+     * On success, adopts the new cut into Live DJ state and pops matching UP NEXT rows.
+     */
+    private suspend fun awaitNativeAdvance(
+        fromUri: String?,
+        expectedNext: DjQueueTrack?,
+        maxWaitMs: Long,
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + maxWaitMs
+        while (System.currentTimeMillis() < deadline) {
+            val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
+            if (snap != null && snap.uri.isNotBlank()) {
+                val moved = fromUri.isNullOrBlank() || snap.uri != fromUri
+                if (moved) {
+                    adoptNativeAdvance(snap.uri, expectedNext)
+                    return true
+                }
+                // Still on same cut but essentially finished — keep waiting a bit
+                if (!snap.playing && snap.remainMs <= 1_500L) {
+                    delay(400L)
+                    continue
+                }
+            } else {
+                // Empty player mid-handoff is common; keep waiting for Up Next to land
+                delay(400L)
+                continue
+            }
+            delay(450L)
+        }
+        return false
+    }
+
+    /**
+     * After Spotify advanced (or we skipped), align AI queue + now-playing with [newUri].
+     */
+    private fun adoptNativeAdvance(newUri: String, expectedNext: DjQueueTrack?) {
+        val res = spotifyGet("/v1/me/player/currently-playing")
+        val data = res.json
+        val item = data?.optJSONObject("item")
+        val uri = item?.optString("uri", "").orEmpty().ifBlank { newUri }
+        val progress = data?.optLong("progress_ms", 0L) ?: 0L
+        val duration = item?.optLong("duration_ms", 0L) ?: 0L
+        val playing = data?.optBoolean("is_playing", false) == true
+        val artistIds = if (item != null) artistIdsOf(item) else emptyList()
+        val track = if (item != null) {
+            DjQueueTrack(
+                uri = uri,
+                name = item.optString("name", expectedNext?.name.orEmpty()),
+                artists = artistsOf(item).ifBlank { expectedNext?.artists.orEmpty() },
+                artistIds = artistIds,
+                albumArtUrl = albumArtUrlOf(item).ifBlank { expectedNext?.albumArtUrl.orEmpty() },
+                artistArtUrl = artistArtUrlOf(artistIds.firstOrNull().orEmpty())
+                    .ifBlank { expectedNext?.artistArtUrl.orEmpty() },
+                albumUri = albumUriOf(item).ifBlank { expectedNext?.albumUri.orEmpty() },
+                artistUri = artistUriOf(item).ifBlank { expectedNext?.artistUri.orEmpty() },
+                reason = expectedNext?.reason.orEmpty(),
+            )
+        } else {
+            expectedNext?.copy(uri = uri) ?: DjQueueTrack(uri = uri, name = uri)
+        }
+
+        // Drop matching row (and anything ahead) from AI UP NEXT
+        synchronized(queue) {
+            val idx = queue.indexOfFirst { it.uri == uri }
+            if (idx >= 0) {
+                repeat(idx + 1) { if (queue.isNotEmpty()) queue.removeFirst() }
+            } else if (expectedNext != null && queue.firstOrNull()?.uri == expectedNext.uri) {
+                // Spotify played our expected next under a laggy URI read — still consume it
+                if (uri == expectedNext.uri || uri.isBlank()) {
+                    queue.removeFirst()
+                }
+            }
+        }
+        syncedToSpotifyUris.remove(uri)
+        expectedPlayUri = null
+        expectedPlayFromUri = null
+        handoffLaunchedForUri = null
+        nearEndArmed = false
+        stuckEndPolls = 0
+        idlePolls = 0
+        lastRemainMs = if (duration > 0) (duration - progress).coerceAtLeast(0L) else 999_999L
+        adoptExternalCurrent(track, playing, progress, duration)
+        persistRuntimeState()
+        Log.i(TAG, "native advance adopted uri=$uri q=${queue.size}")
+    }
+
+    /** Spotify Connect “next” — plays the head of native Up Next without replacing context. */
+    private fun skipToNextNative(): Boolean {
+        val res = spotifyPost("/v1/me/player/next", null)
+        val ok = res.ok || res.status in listOf(200, 202, 204)
+        if (!ok) Log.w(TAG, "skip next failed: ${res.error} status=${res.status}")
+        return ok
+    }
+
+    /**
+     * Advance to [next] preferring Spotify’s native queue:
+     * 1) skip (Up Next), 2) confirm URI, 3) fallback [playTrack].
+     * Removes [next] from the AI queue only when we commit an advance.
+     */
+    private suspend fun advanceToNext(
+        next: DjQueueTrack?,
+        prevUri: String?,
+        preferSkip: Boolean,
+        allowPlayFallback: Boolean,
+    ): Boolean {
+        if (next == null) return false
+        // Ensure our cut is sitting in Spotify Up Next when we plan to skip
+        if (preferSkip) {
+            ensureTrackInSpotifyQueue(next.uri)
+        }
+        if (preferSkip && skipToNextNative()) {
+            expectedPlayUri = next.uri
+            expectedPlayFromUri = prevUri
+            expectedPlayUntilMs = System.currentTimeMillis() + 20_000L
+            // Give Connect a moment to land
+            delay(700L)
+            if (awaitNativeAdvance(prevUri, next, maxWaitMs = 8_000L)) {
+                return true
+            }
+        }
+        // Already on a new cut (skip lag, or natural advance while we worked)?
+        val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
+        if (snap != null && snap.uri.isNotBlank() && snap.uri != prevUri) {
+            adoptNativeAdvance(snap.uri, next)
+            return true
+        }
+        if (!allowPlayFallback) return false
+        // Hard play — last resort (idle kick, empty Up Next, skip failed)
+        val taken = synchronized(queue) {
+            when {
+                queue.firstOrNull()?.uri == next.uri -> queue.removeFirst()
+                else -> {
+                    val idx = queue.indexOfFirst { it.uri == next.uri }
+                    if (idx >= 0) {
+                        repeat(idx) { if (queue.isNotEmpty()) queue.removeFirst() }
+                        queue.removeFirstOrNull()
+                    } else null
+                }
+            }
+        }
+        val play = taken ?: next
+        return playTrack(play)
+    }
+
+    /** POST a single URI into Spotify Up Next if we have not already this session. */
+    private fun ensureTrackInSpotifyQueue(uri: String) {
+        val u = uri.trim()
+        if (u.isBlank() || syncedToSpotifyUris.contains(u)) return
+        val device = pickDeviceId()
+        val deviceQ = if (!device.isNullOrBlank()) {
+            "&device_id=${java.net.URLEncoder.encode(device, "UTF-8")}"
+        } else {
+            ""
+        }
+        val enc = java.net.URLEncoder.encode(u, "UTF-8")
+        val res = spotifyPost("/v1/me/player/queue?uri=$enc$deviceQ", null)
+        if (res.ok || res.status == 204) {
+            syncedToSpotifyUris.add(u)
+        } else {
+            Log.w(TAG, "ensureQueue $u failed: ${res.error} status=${res.status}")
+        }
+    }
+
+    /**
+     * Push AI UP NEXT into Spotify’s native queue (only URIs not yet synced).
+     * Spotify cannot clear Up Next via API — we append and rely on adopt/skip for order.
+     */
+    private fun syncQueueToSpotify(quiet: Boolean = false) {
+        val tracks = synchronized(queue) { queue.toList() }
+        if (tracks.isEmpty()) {
+            if (!quiet) publish(status = "UP NEXT empty — nothing to sync", clearError = true)
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (quiet && now - lastSpotifyQueueSyncMs < 2_500L) return
+        lastSpotifyQueueSyncMs = now
+        val device = pickDeviceId()
+        val deviceQ = if (!device.isNullOrBlank()) {
+            "&device_id=${java.net.URLEncoder.encode(device, "UTF-8")}"
+        } else {
+            ""
+        }
+        val pending = tracks.filter { it.uri.isNotBlank() && !syncedToSpotifyUris.contains(it.uri) }
+            .take(25)
+        if (pending.isEmpty()) {
+            if (!quiet) {
+                publish(status = "Spotify queue already in sync · ${tracks.size} up next", clearError = true)
+            }
+            return
+        }
+        if (!quiet) {
+            publish(status = "Syncing ${pending.size} into Spotify Up Next…", clearError = true)
+        }
+        var ok = 0
+        var fail = 0
+        var lastErr: String? = null
+        for (t in pending) {
+            val enc = java.net.URLEncoder.encode(t.uri, "UTF-8")
+            val res = spotifyPost("/v1/me/player/queue?uri=$enc$deviceQ", null)
+            if (res.ok || res.status == 204) {
+                ok++
+                syncedToSpotifyUris.add(t.uri)
+            } else {
+                fail++
+                lastErr = res.error ?: "HTTP ${res.status}"
+                if (res.status == 401 || res.status == 403 || res.status == 404) break
+            }
+            try {
+                Thread.sleep(100L)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+        if (!quiet || fail > 0) {
+            val status = when {
+                ok == 0 && fail > 0 ->
+                    "Couldn't sync Spotify queue${lastErr?.let { ": $it" } ?: ""}"
+                fail == 0 ->
+                    "Synced $ok into Spotify Up Next"
+                else ->
+                    "Synced $ok · $fail failed${lastErr?.let { " ($it)" } ?: ""}"
+            }
+            publish(
+                status = status,
+                error = if (ok == 0 && fail > 0) lastErr else null,
+                clearError = ok > 0,
+            )
+        } else if (ok > 0) {
+            Log.i(TAG, "quiet sync $ok into Spotify Up Next")
         }
     }
 
@@ -1480,6 +1835,7 @@ class SpotifyLiveDjService : Service() {
         if (uri.isBlank()) return
 
         nearEndArmed = false
+        handoffLaunchedForUri = null
         prefetchedBanter = null
         prefetchedForUri = null
         expectedPlayUri = null
@@ -1491,6 +1847,7 @@ class SpotifyLiveDjService : Service() {
         } else {
             999_999L
         }
+        syncedToSpotifyUris.remove(uri)
 
         val idxInQueue = synchronized(queue) { queue.indexOfFirst { it.uri == uri } }
         val alreadyOn = lastUri != null && uri == lastUri
@@ -1686,15 +2043,19 @@ class SpotifyLiveDjService : Service() {
         val forcedTalk = forceBanter
         forceBanter = false
         // Talk-over: when the user allows it, always ride the track (duck volume) —
-        // never hard-pause mid-outro. Random "clean mic" pauses made it feel broken.
-        // When allowTalkOver is off, pause only for a clean handoff line.
+        // never hard-pause mid-outro. When allowTalkOver is off, pause at the last second.
         val allowTalk = store.allowTalkOver
+        // Manual skip always jumps now; natural ends wait for the real outro / native queue.
+        val isSkipReason = reason == "skip" || reason == "chat_skip"
+        val isIdleKick = reason == "kick_idle" || reason == "idle_advance" || reason == "poll_error_advance"
+        val isStuckEnd = reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended"
         // Provisional status; refined after we know next + prefetch below.
         val banterDueProvisional = forcedTalk || songsSinceBanter + 1 >= banterEvery
         publish(
             status = when {
                 banterDueProvisional && allowTalk -> "🎙 Prep talkover ($reason)…"
                 banterDueProvisional -> "🎙 Prep banter ($reason)…"
+                isStuckEnd -> "Nudge Up Next ($reason)…"
                 else -> "Next track ($reason)…"
             },
             transitioning = true,
@@ -1704,11 +2065,35 @@ class SpotifyLiveDjService : Service() {
                 if (queue.size < 2) {
                     fillQueue(useAi = store.useAiRank, force = true)
                 }
-                val next = synchronized(queue) { queue.removeFirstOrNull() }
+                // Keep Spotify Up Next aligned before any handoff (skip / natural).
+                syncQueueToSpotify(quiet = true)
+
+                // Peek only — do not remove until we actually advance (native path may
+                // adopt via URI change without a forced play).
+                val next = synchronized(queue) { queue.firstOrNull() }
                 val prev = current
+                val prevUri = prev?.uri ?: lastUri
                 // Plain skip: countdown −1 only. Banter only when due, already
                 // prefetched for next, or Skip + talk forced it.
                 val banterDue = songsSinceBanter + 1 >= banterEvery
+                // If research/prefetch is still in flight, wait briefly so we don't
+                // start a second tool-backed research pass mid-outro.
+                if (next != null && (forcedTalk || banterDue) && prefetchingBanter.get()) {
+                    publish(status = "🎙 Waiting on research…", transitioning = true)
+                    val waitDeadline = System.currentTimeMillis() + 14_000L
+                    while (
+                        prefetchingBanter.get() &&
+                        System.currentTimeMillis() < waitDeadline
+                    ) {
+                        if (
+                            prefetchedForUri == next.uri &&
+                            !prefetchedBanter.isNullOrBlank()
+                        ) {
+                            break
+                        }
+                        delay(200L)
+                    }
+                }
                 val banterReady = next != null &&
                     prefetchedForUri == next.uri &&
                     !prefetchedBanter.isNullOrBlank()
@@ -1717,7 +2102,7 @@ class SpotifyLiveDjService : Service() {
 
                 if (wantBanter) {
                     // Keep Spotify playing while we write + fetch TTS so the cut isn't
-                    // dead air. Skip always stays live; natural ends may talk over the tail.
+                    // dead air. Skip always stays live; natural ends talk over / pause at tail.
                     publish(
                         status = if (talkover) {
                             "🎙 Writing line over the track…"
@@ -1736,7 +2121,8 @@ class SpotifyLiveDjService : Service() {
                             prefetchedForUri = null
                             p
                         }
-                        else -> generateBanter(prev, next)
+                        // Handoff must stay fast: use cached facts / local templates only.
+                        else -> generateBanter(prev, next, allowResearch = false)
                     }
                     prefetchedBanter = null
                     prefetchedForUri = null
@@ -1753,11 +2139,40 @@ class SpotifyLiveDjService : Service() {
                         transitioning = true,
                     )
 
-                    // Clean handoff only: pause right before speech (after prep is done).
+                    val speechMs = estimateSpeechMs(line)
+
+                    // Natural ends: land speech on the true outro — never start the next
+                    // cut early via playTrack.
+                    if (!isSkipReason && !isIdleKick) {
+                        if (talkover) {
+                            publish(
+                                status = "🎙 Holding for outro (${speechMs / 1000}s line)…",
+                                transitioning = true,
+                            )
+                            waitUntilRemainAbout(
+                                expectedUri = prevUri,
+                                targetRemainMs = speechMs + 900L,
+                                maxWaitMs = 120_000L,
+                            )
+                        } else {
+                            // Clean mic: pause only in the last ~1.2s of the cut.
+                            publish(
+                                status = "🎙 Holding for last second…",
+                                transitioning = true,
+                            )
+                            waitUntilRemainAbout(
+                                expectedUri = prevUri,
+                                targetRemainMs = 1_200L,
+                                maxWaitMs = 120_000L,
+                            )
+                        }
+                    }
+
+                    // Clean handoff only: pause right before speech (after wait).
                     // Talkover / skip: leave the track running under the mic.
-                    if (!talkover) {
+                    if (!talkover && !isSkipReason) {
                         spotifyPut("/v1/me/player/pause", "{}")
-                        delay(250L)
+                        delay(200L)
                     }
 
                     var duckedFrom: Int? = null
@@ -1786,7 +2201,7 @@ class SpotifyLiveDjService : Service() {
                         )
                     } else {
                         publish(
-                            status = "🎙 spoke ($mode${if (talkover) " · talkover" else ""}) · next…",
+                            status = "🎙 spoke ($mode${if (talkover) " · talkover" else ""})…",
                             clearError = true,
                             transitioning = true,
                         )
@@ -1800,67 +2215,126 @@ class SpotifyLiveDjService : Service() {
                     banterEvery = store.rollNextBanterEvery()
                     store.songsSinceBanter = songsSinceBanter
 
-                    // Switch only after banter has finished speaking (or failed).
-                    if (next != null) {
-                        delay(if (talkover) 120L else 200L)
-                        val ok = playTrack(next)
-                        val style = when {
-                            !speak.optBoolean("ok") -> " · (banter silent)"
-                            talkover -> " · talkover $mode"
-                            else -> " · banter $mode"
+                    val style = when {
+                        !speak.optBoolean("ok") -> " · (banter silent)"
+                        talkover -> " · talkover $mode"
+                        else -> " · banter $mode"
+                    }
+
+                    // After banter: prefer native Up Next — never hard-cut leftover outro.
+                    val advanced = when {
+                        isSkipReason || isIdleKick -> {
+                            advanceToNext(
+                                next = next,
+                                prevUri = prevUri,
+                                preferSkip = isSkipReason,
+                                allowPlayFallback = true,
+                            )
                         }
-                        if (ok) {
-                            publish(status = "Playing next$style", clearError = true)
-                        } else {
-                            // Put it back and try once more with a sibling
-                            requeueFront(next)
-                            val retry = synchronized(queue) { queue.removeFirstOrNull() }
-                            if (retry != null && playTrack(retry)) {
-                                publish(status = "Playing next (retry)$style", clearError = true)
+                        talkover -> {
+                            // Let the cut finish under/after the line; nudge only if stuck.
+                            publish(
+                                status = "🎙 Waiting for track end$style…",
+                                transitioning = true,
+                            )
+                            val natural = awaitNativeAdvance(prevUri, next, maxWaitMs = 28_000L)
+                            if (natural) {
+                                true
                             } else {
-                                if (retry != null) requeueFront(retry)
-                                publish(
-                                    status = "Play failed — open Spotify on a device",
-                                    error = "play_failed",
+                                advanceToNext(
+                                    next = next,
+                                    prevUri = prevUri,
+                                    preferSkip = true,
+                                    allowPlayFallback = true,
                                 )
                             }
                         }
-                    } else {
+                        else -> {
+                            // Clean mic: we paused at ~last second → skip into synced Up Next.
+                            delay(150L)
+                            advanceToNext(
+                                next = next,
+                                prevUri = prevUri,
+                                preferSkip = true,
+                                allowPlayFallback = true,
+                            )
+                        }
+                    }
+                    if (advanced) {
+                        publish(
+                            status = "Playing next$style · ${banterCountdownLabel(songsSinceBanter, banterEvery)}",
+                            clearError = true,
+                        )
+                    } else if (next == null) {
                         publish(status = "No next track — refill queue", error = "empty_queue")
                         fillQueue(useAi = store.useAiRank, force = true)
+                    } else {
+                        publish(
+                            status = "Play failed — open Spotify on a device",
+                            error = "play_failed",
+                        )
                     }
                 } else {
-                    // Silent handoff — no pause for TTS; just start the next cut
+                    // Silent handoff — rely on native Up Next; playTrack only as fallback.
                     songsSinceBanter += 1
                     store.songsSinceBanter = songsSinceBanter
-                    if (next != null) {
-                        val ok = playTrack(next)
-                        if (ok) {
-                            publish(
-                                status = "Playing next · ${banterCountdownLabel(songsSinceBanter, banterEvery)}",
-                                clearError = true,
+                    val advanced = when {
+                        isSkipReason -> {
+                            advanceToNext(
+                                next = next,
+                                prevUri = prevUri,
+                                preferSkip = true,
+                                allowPlayFallback = true,
                             )
-                        } else {
-                            requeueFront(next)
-                            val retry = synchronized(queue) { queue.removeFirstOrNull() }
-                            if (retry != null && playTrack(retry)) {
-                                publish(status = "Playing next (retry)", clearError = true)
+                        }
+                        isIdleKick -> {
+                            // Nothing on the player — must start something.
+                            advanceToNext(
+                                next = next,
+                                prevUri = prevUri,
+                                preferSkip = false,
+                                allowPlayFallback = true,
+                            )
+                        }
+                        else -> {
+                            // stuck_end / ended: try native first, then skip, then play.
+                            publish(
+                                status = "Waiting on Spotify Up Next…",
+                                transitioning = true,
+                            )
+                            val natural = awaitNativeAdvance(prevUri, next, maxWaitMs = 5_000L)
+                            if (natural) {
+                                true
                             } else {
-                                if (retry != null) requeueFront(retry)
-                                publish(
-                                    status = "Play failed — open Spotify on a device",
-                                    error = "play_failed",
+                                advanceToNext(
+                                    next = next,
+                                    prevUri = prevUri,
+                                    preferSkip = true,
+                                    allowPlayFallback = true,
                                 )
                             }
                         }
-                    } else {
+                    }
+                    if (advanced) {
+                        publish(
+                            status = "Playing next · ${banterCountdownLabel(songsSinceBanter, banterEvery)}",
+                            clearError = true,
+                        )
+                    } else if (next == null) {
                         publish(status = "No next track — refill queue", error = "empty_queue")
                         fillQueue(useAi = store.useAiRank, force = true)
+                    } else {
+                        publish(
+                            status = "Play failed — open Spotify on a device",
+                            error = "play_failed",
+                        )
                     }
                 }
                 persistRuntimeState()
                 if (queue.size < 4) {
                     fillQueue(useAi = store.useAiRank)
+                } else {
+                    syncQueueToSpotify(quiet = true)
                 }
             }
         } catch (e: CancellationException) {
@@ -2079,6 +2553,8 @@ class SpotifyLiveDjService : Service() {
         lastUri = item.uri
         store.lastCurrentUri = item.uri
         nearEndArmed = false
+        handoffLaunchedForUri = null
+        syncedToSpotifyUris.remove(item.uri)
         // Mark ownership so the next poll doesn't treat lag / our handoff as external.
         expectedPlayUri = item.uri
         expectedPlayUntilMs = System.currentTimeMillis() + 25_000L
@@ -2718,7 +3194,8 @@ class SpotifyLiveDjService : Service() {
         }
         if (added > 0) {
             persistRuntimeState()
-            publish(status = "Chat queued $added · total ${queue.size}", clearError = true)
+            syncQueueToSpotify(quiet = true)
+            publish(status = "Chat queued $added · total ${queue.size} · synced", clearError = true)
         }
         return added
     }
@@ -2899,6 +3376,9 @@ class SpotifyLiveDjService : Service() {
         try {
             if (replace) {
                 synchronized(queue) { queue.clear() }
+                // Spotify cannot clear Up Next via API — forget our sync bookkeeping so the
+                // new set is re-POSTed; stale Up Next items may still play first once.
+                syncedToSpotifyUris.clear()
                 radioModeIdx = (radioModeIdx + 1) % 4
                 // Soft-forget oldest half of played so a “new” set has room to breathe.
                 if (playedUris.size > 40) {
@@ -2942,11 +3422,13 @@ class SpotifyLiveDjService : Service() {
             }
             persistRuntimeState()
             if (batch.isNotEmpty()) {
+                // Push into Spotify Up Next so cuts can finish and auto-advance.
+                syncQueueToSpotify(quiet = true)
                 publish(
                     status = if (replace) {
-                        "New queue · ${batch.size} tracks"
+                        "New queue · ${batch.size} tracks · synced to Spotify"
                     } else {
-                        "Queued ${batch.size} · total ${queue.size}"
+                        "Queued ${batch.size} · total ${queue.size} · synced to Spotify"
                     },
                     clearError = true,
                 )
@@ -3286,8 +3768,15 @@ class SpotifyLiveDjService : Service() {
     /**
      * Spoken banter: research recent news/shows/song facts via host Grok tools,
      * then write casual radio phrasing. Falls back to local templates.
+     *
+     * @param allowResearch when false (live handoff), only reuse cached research bullets —
+     *   never start a new tool-backed lookup mid-outro (that raced and cut songs short).
      */
-    private fun generateBanter(prev: DjQueueTrack?, next: DjQueueTrack?): String {
+    private fun generateBanter(
+        prev: DjQueueTrack?,
+        next: DjQueueTrack?,
+        allowResearch: Boolean = true,
+    ): String {
         pendingBanter?.let { cached ->
             pendingBanter = null
             val cleaned = sanitizeSpoken(cached)
@@ -3295,7 +3784,7 @@ class SpotifyLiveDjService : Service() {
                 return cleaned.take(320)
             }
         }
-        val ai = aiBanterLine(prev, next)
+        val ai = aiBanterLine(prev, next, allowResearch = allowResearch)
         if (!ai.isNullOrBlank()) return sanitizeSpoken(ai).take(320)
         return localBanterLine(prev, next)
     }
@@ -3389,10 +3878,18 @@ class SpotifyLiveDjService : Service() {
         }
     }
 
-    private fun factsForTrack(prev: DjQueueTrack?, next: DjQueueTrack?): List<String> {
+    private fun factsForTrack(
+        prev: DjQueueTrack?,
+        next: DjQueueTrack?,
+        allowResearch: Boolean,
+    ): List<String> {
         val uri = next?.uri.orEmpty()
-        if (uri.isNotBlank() && researchedForUri == uri && researchedFacts.isNotEmpty()) {
+        if (uri.isNotBlank() && researchedForUri == uri) {
             return researchedFacts
+        }
+        if (!allowResearch) {
+            // Handoff path: never block on tools; empty facts → pure handoff line.
+            return emptyList()
         }
         val nextArtist = next?.let { primaryArtist(it.artists) }.orEmpty()
         val nextTitle = next?.let { cleanTitle(it.name) }.orEmpty()
@@ -3405,7 +3902,11 @@ class SpotifyLiveDjService : Service() {
         return facts
     }
 
-    private fun aiBanterLine(prev: DjQueueTrack?, next: DjQueueTrack?): String? {
+    private fun aiBanterLine(
+        prev: DjQueueTrack?,
+        next: DjQueueTrack?,
+        allowResearch: Boolean = true,
+    ): String? {
         val prevTitle = prev?.let { cleanTitle(it.name) }.orEmpty()
         val prevArtist = prev?.let { primaryArtist(it.artists) }.orEmpty()
         val nextTitle = next?.let { cleanTitle(it.name) }.orEmpty()
@@ -3413,8 +3914,8 @@ class SpotifyLiveDjService : Service() {
         val nextAllArtists = next?.artists.orEmpty()
         val reason = next?.reason.orEmpty()
 
-        // Step 1: tool-backed research (news, shows, song facts) before writing copy.
-        val research = factsForTrack(prev, next)
+        // Step 1: tool-backed research only during prefetch; handoff reuses cache.
+        val research = factsForTrack(prev, next, allowResearch = allowResearch)
 
         val system =
             "You are a live radio AI DJ speaking aloud ON AIR. Write 1–3 short sentences (max 52 words). Rules:\n" +
@@ -3809,67 +4310,14 @@ class SpotifyLiveDjService : Service() {
     private fun spotifyPost(path: String, body: String?): ApiResult = spotifyCall("POST", path, body)
 
     /**
-     * Append Live DJ UP NEXT tracks to Spotify’s native player queue (Connect Up Next).
-     * Spotify has no bulk-add API — one POST per URI. Caps length to stay under rate limits.
+     * Manual “Add to Spotify queue” — force-sync AI UP NEXT into Connect Up Next.
+     * Clears local sync bookkeeping first so every row is re-POSTed (Spotify may
+     * still keep older Up Next items; API cannot clear the queue).
      */
     private fun pushQueueToSpotify() {
-        val tracks = synchronized(queue) { queue.toList() }
-        if (tracks.isEmpty()) {
-            publish(status = "UP NEXT empty — nothing to add to Spotify queue", clearError = true)
-            return
-        }
-        val device = pickDeviceId()
-        val deviceQ = if (!device.isNullOrBlank()) {
-            "&device_id=${java.net.URLEncoder.encode(device, "UTF-8")}"
-        } else {
-            ""
-        }
-        // Cap so we don't spam the API if the set is huge
-        val batch = tracks.take(25)
-        var ok = 0
-        var fail = 0
-        var lastErr: String? = null
-        publish(status = "Adding ${batch.size} to Spotify queue…", clearError = true)
-        for (t in batch) {
-            val uri = t.uri.trim()
-            if (uri.isBlank()) {
-                fail++
-                continue
-            }
-            val enc = java.net.URLEncoder.encode(uri, "UTF-8")
-            val path = "/v1/me/player/queue?uri=$enc$deviceQ"
-            val res = spotifyPost(path, null)
-            // 204 No Content = success; some stacks still report ok via status
-            if (res.ok || res.status == 204) {
-                ok++
-            } else {
-                fail++
-                lastErr = res.error
-                    ?: res.json?.optString("error")?.takeIf { it.isNotBlank() }
-                    ?: "HTTP ${res.status}"
-                // Stop early on auth / no active device — further posts will fail the same way
-                if (res.status == 401 || res.status == 403 || res.status == 404) break
-            }
-            // Gentle pacing between queue POSTs
-            try {
-                Thread.sleep(120L)
-            } catch (_: InterruptedException) {
-                break
-            }
-        }
-        val status = when {
-            ok == 0 && fail > 0 ->
-                "Couldn't add to Spotify queue${lastErr?.let { ": $it" } ?: ""}"
-            fail == 0 ->
-                "Added $ok to Spotify queue"
-            else ->
-                "Added $ok to Spotify queue · $fail failed${lastErr?.let { " ($it)" } ?: ""}"
-        }
-        publish(
-            status = status,
-            error = if (ok == 0 && fail > 0) lastErr else null,
-            clearError = ok > 0,
-        )
+        syncedToSpotifyUris.clear()
+        lastSpotifyQueueSyncMs = 0L
+        syncQueueToSpotify(quiet = false)
     }
 
     private fun spotifyCall(method: String, path: String, body: String?): ApiResult {
