@@ -13,7 +13,7 @@ Think of it as **slipping the phone on for the phone**: you pair a real Android 
 | **Auth** | Username + password (web) · device Bearer tokens `gos_…` (phone) |
 | **License** | [MIT](LICENSE) |
 
-> **Not affiliated.** GrokifyOS is an independent, open-source project. It is **not** affiliated with, endorsed by, or sponsored by xAI, SpaceX, X (Twitter), Grok, Grok Build, Mapbox, Spotify, or any related company. Product names above are trademarks of their respective owners; we only document how to use *your* accounts and APIs with *your* self-hosted stack.
+> **Not affiliated.** GrokifyOS is an independent, open-source project. It is **not** affiliated with, endorsed by, or sponsored by SpaceXAI/SpaceX/xAI, X (prev. Twitter), Grok, Grok Build, Mapbox, Spotify, or any related company. Product names above are trademarks of their respective owners; we only document how to use *your* accounts and APIs with *your* self-hosted stack.
 
 ---
 
