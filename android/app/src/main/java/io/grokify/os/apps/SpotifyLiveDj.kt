@@ -1672,15 +1672,21 @@ class SpotifyLiveDjService : Service() {
             expectedNext?.copy(uri = uri) ?: DjQueueTrack(uri = uri, name = uri)
         }
 
-        // Drop matching row (and anything ahead) from AI UP NEXT
+        // Drop matching row (and anything ahead) from AI UP NEXT; mark skipped-ahead as played
+        // so fillQueue will not re-queue songs the user already jumped past.
         synchronized(queue) {
             val idx = queue.indexOfFirst { it.uri == uri }
             if (idx >= 0) {
-                repeat(idx + 1) { if (queue.isNotEmpty()) queue.removeFirst() }
+                repeat(idx) {
+                    if (queue.isNotEmpty()) markPlayed(queue.removeFirst().uri)
+                }
+                if (queue.isNotEmpty() && queue.first().uri == uri) {
+                    markPlayed(queue.removeFirst().uri)
+                }
             } else if (expectedNext != null && queue.firstOrNull()?.uri == expectedNext.uri) {
                 // Spotify played our expected next under a laggy URI read — still consume it
                 if (uri == expectedNext.uri || uri.isBlank()) {
-                    queue.removeFirst()
+                    markPlayed(queue.removeFirst().uri)
                 }
             }
         }
@@ -1706,9 +1712,44 @@ class SpotifyLiveDjService : Service() {
     }
 
     /**
-     * Advance to [next] preferring Spotify’s native queue:
-     * 1) skip (Up Next), 2) confirm URI, 3) fallback [playTrack].
-     * Removes [next] from the AI queue only when we commit an advance.
+     * Peek the first URI in Spotify’s native Up Next (null if empty / failed).
+     * Used to decide whether a native skip would land on our intended cut.
+     */
+    private fun spotifyUpNextHeadUri(): String? {
+        val res = spotifyGet("/v1/me/player/queue")
+        if (!res.ok) return null
+        val q = res.json?.optJSONArray("queue") ?: return null
+        if (q.length() == 0) return null
+        val head = q.optJSONObject(0) ?: return null
+        return head.optString("uri", "").takeIf { it.isNotBlank() }
+    }
+
+    /** Pop [next] (and anything ahead of it) from the AI queue; mark discarded as played. */
+    private fun takeNextFromQueue(next: DjQueueTrack): DjQueueTrack? {
+        return synchronized(queue) {
+            when {
+                queue.firstOrNull()?.uri == next.uri -> queue.removeFirst()
+                else -> {
+                    val idx = queue.indexOfFirst { it.uri == next.uri }
+                    if (idx >= 0) {
+                        repeat(idx) {
+                            if (queue.isNotEmpty()) {
+                                markPlayed(queue.removeFirst().uri)
+                            }
+                        }
+                        queue.removeFirstOrNull()
+                    } else null
+                }
+            }
+        }
+    }
+
+    /**
+     * Advance to [next].
+     *
+     * Manual skip always hard-plays our next cut: Spotify Up Next is append-only and
+     * often has stale ghosts ahead of the Live DJ set (especially after Control skips).
+     * Native skip is only used when Spotify’s head already matches [next].
      */
     private suspend fun advanceToNext(
         next: DjQueueTrack?,
@@ -1717,42 +1758,60 @@ class SpotifyLiveDjService : Service() {
         allowPlayFallback: Boolean,
     ): Boolean {
         if (next == null) return false
-        // Ensure our cut is sitting in Spotify Up Next when we plan to skip
-        if (preferSkip) {
-            ensureTrackInSpotifyQueue(next.uri)
-        }
-        if (preferSkip && skipToNextNative()) {
-            expectedPlayUri = next.uri
-            expectedPlayFromUri = prevUri
-            expectedPlayUntilMs = System.currentTimeMillis() + 20_000L
-            // Give Connect a moment to land
-            delay(700L)
-            if (awaitNativeAdvance(prevUri, next, maxWaitMs = 8_000L)) {
+
+        // Already moved on while we prepared (natural end / lag)?
+        val early = withContext(Dispatchers.IO) { readPlaybackSnap() }
+        if (early != null && early.uri.isNotBlank() && early.uri != prevUri) {
+            // If Spotify landed on our intended next, adopt cleanly.
+            if (early.uri == next.uri || !preferSkip) {
+                adoptNativeAdvance(early.uri, next)
                 return true
             }
+            // Manual skip but Spotify is on something else — force our next below.
         }
-        // Already on a new cut (skip lag, or natural advance while we worked)?
-        val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
-        if (snap != null && snap.uri.isNotBlank() && snap.uri != prevUri) {
-            adoptNativeAdvance(snap.uri, next)
-            return true
+
+        // Only trust native skip when Up Next head is exactly our next track.
+        val headMatches = withContext(Dispatchers.IO) {
+            val head = spotifyUpNextHeadUri()
+            head != null && head == next.uri
         }
-        if (!allowPlayFallback) return false
-        // Hard play — last resort (idle kick, empty Up Next, skip failed)
-        val taken = synchronized(queue) {
-            when {
-                queue.firstOrNull()?.uri == next.uri -> queue.removeFirst()
-                else -> {
-                    val idx = queue.indexOfFirst { it.uri == next.uri }
-                    if (idx >= 0) {
-                        repeat(idx) { if (queue.isNotEmpty()) queue.removeFirst() }
-                        queue.removeFirstOrNull()
-                    } else null
+        if (preferSkip && headMatches) {
+            ensureTrackInSpotifyQueue(next.uri)
+            if (skipToNextNative()) {
+                expectedPlayUri = next.uri
+                expectedPlayFromUri = prevUri
+                expectedPlayUntilMs = System.currentTimeMillis() + 20_000L
+                delay(700L)
+                if (awaitNativeAdvance(prevUri, next, maxWaitMs = 8_000L)) {
+                    // Re-push remaining set after skip consumed head
+                    syncedToSpotifyUris.remove(next.uri)
+                    withContext(Dispatchers.IO) { syncQueueToSpotify(quiet = true) }
+                    return true
                 }
             }
         }
+
+        // Natural path: head already matches and we are not forcing skip — wait briefly.
+        if (!preferSkip && headMatches) {
+            if (awaitNativeAdvance(prevUri, next, maxWaitMs = 4_000L)) {
+                return true
+            }
+            // Fall through to hard play
+        }
+
+        if (!allowPlayFallback && !preferSkip) return false
+
+        // Hard play our next — reliable after user skips left Spotify Up Next dirty.
+        val taken = takeNextFromQueue(next)
         val play = taken ?: next
-        return playTrack(play)
+        val ok = playTrack(play)
+        if (ok) {
+            // play with uris replaces context → re-seed Spotify Up Next from our queue.
+            syncedToSpotifyUris.clear()
+            delay(350L)
+            withContext(Dispatchers.IO) { syncQueueToSpotify(quiet = true) }
+        }
+        return ok
     }
 
     /** POST a single URI into Spotify Up Next if we have not already this session. */
@@ -1957,16 +2016,16 @@ class SpotifyLiveDjService : Service() {
             // In our set — sync pointer, keep the tail
             var droppedAhead = 0
             synchronized(queue) {
-                // Drop tracks before the match
+                // Drop tracks before the match (user skipped past them — don't re-queue)
                 repeat(idxInQueue) {
                     if (queue.isNotEmpty()) {
-                        queue.removeFirst()
+                        markPlayed(queue.removeFirst().uri)
                         droppedAhead++
                     }
                 }
                 // Drop the match itself (it's now playing, not UP NEXT)
                 if (queue.isNotEmpty() && queue.first().uri == uri) {
-                    queue.removeFirst()
+                    markPlayed(queue.removeFirst().uri)
                 }
             }
             adoptExternalCurrent(track, playing, progressMs, durationMs)
@@ -2511,8 +2570,10 @@ class SpotifyLiveDjService : Service() {
                     }
                     if (idx < 0 || idx >= queue.size) return@synchronized null
                     discarded = idx
-                    // Discard tracks ahead of the selection
-                    repeat(idx) { queue.removeFirst() }
+                    // Discard tracks ahead of the selection — mark heard so we don't re-queue
+                    repeat(idx) {
+                        if (queue.isNotEmpty()) markPlayed(queue.removeFirst().uri)
+                    }
                     queue.removeFirstOrNull()
                 }
                 if (selected == null) {
@@ -3493,10 +3554,13 @@ class SpotifyLiveDjService : Service() {
             }
 
             val curForPool = current
+            // Drop any UP NEXT rows already heard (recently played / skipped past)
+            pruneQueueOfPlayed()
             var pool = gatherRadioPool(curForPool)
-            // If replace still yields nothing (everything marked played), forget more.
+            // If replace still yields nothing (everything marked played), forget more —
+            // but keep the freshest recently-played exclusions (re-fetch will re-mark).
             if (replace && pool.size < 8 && playedUris.isNotEmpty()) {
-                val keys = playedUris.keys.take(playedUris.size.coerceAtLeast(1))
+                val keys = playedUris.keys.take(playedUris.size.coerceAtLeast(1) / 2)
                 keys.forEach { playedUris.remove(it) }
                 store.savePlayedUris(playedUris.toMap())
                 pool = gatherRadioPool(curForPool)
@@ -3515,9 +3579,11 @@ class SpotifyLiveDjService : Service() {
             if (batch.isEmpty()) {
                 batch = pickFromPool(pool, curForPool, (if (replace) 8 else 6) + (0..3).random())
             }
+            // Never re-add recently played / already heard
+            batch = batch.filter { !isPlayed(it.uri) && it.uri != curForPool?.uri }
             synchronized(queue) {
                 batch.forEach { t ->
-                    if (queue.none { it.uri == t.uri }) queue.addLast(t)
+                    if (queue.none { it.uri == t.uri } && !isPlayed(t.uri)) queue.addLast(t)
                 }
                 while (queue.size > MAX_DJ_QUEUE) queue.removeLast()
             }
@@ -3608,15 +3674,41 @@ class SpotifyLiveDjService : Service() {
             )
         }
 
-        // 1) Recently played
-        val recent = spotifyGet("/v1/me/player/recently-played?limit=40")
+        // 1) Recently played — EXCLUDE from the radio queue (already listened), but still
+        // harvest artists / seed tracks for radio expansion so the set stays in the vibe.
+        val recent = spotifyGet("/v1/me/player/recently-played?limit=50")
         if (recent.ok) {
             val items = recent.json?.optJSONArray("items")
             if (items != null) {
                 for (i in 0 until items.length()) {
                     val it = items.optJSONObject(i) ?: continue
-                    addFromTrackObj(it.optJSONObject("track"), "recently played", asSeed = true)
+                    val t = it.optJSONObject("track") ?: continue
+                    if (t.optBoolean("is_local", false)) continue
+                    val uri = t.optString("uri", "")
+                    if (uri.isNotBlank()) {
+                        // Durable exclude so refill / AI pick won't re-queue this cut
+                        markPlayed(uri)
+                        seen.add(uri) // keep out of pool even if mark is flushed later mid-fill
+                    }
+                    val ids = artistIdsOf(t)
+                    ids.forEach { if (it.isNotBlank()) seedArtistIds.add(it) }
+                    // Seed for song_radio expansion only — not a queue candidate
+                    if (uri.isNotBlank()) {
+                        seedTracks.add(
+                            DjQueueTrack(
+                                uri = uri,
+                                name = t.optString("name", ""),
+                                artists = artistsOf(t),
+                                reason = "recently played (exclude)",
+                                artistIds = ids,
+                                albumArtUrl = albumArtUrlOf(t),
+                                albumUri = albumUriOf(t),
+                                artistUri = artistUriOf(t),
+                            ),
+                        )
+                    }
                 }
+                Log.i(TAG, "recently-played exclude seeds=${seedTracks.size} artists=${seedArtistIds.size}")
             }
         }
 
@@ -3787,7 +3879,7 @@ class SpotifyLiveDjService : Service() {
             when {
                 t.reason.contains("liked") -> score += 2.0
                 t.reason.contains("top tracks") -> score += 1.8
-                t.reason.contains("recently") -> score += 1.4
+                // recently played are excluded from pool (used only as radio seeds)
                 t.reason.contains("artist radio") -> score += 1.6
                 t.reason.contains("related") -> score += 1.3
                 t.reason.contains("song radio") -> score += 1.5
@@ -3835,11 +3927,13 @@ class SpotifyLiveDjService : Service() {
             "You are a radio DJ music director (Spotify DJ style). Reply ONLY with valid JSON: " +
                 "{\"picks\":[{\"uri\":\"spotify:track:...\",\"banter_note\":\"short why\"}],\"banter\":\"\"}. " +
                 "Pick exactly $n tracks from the CANDIDATES list only (use their uris). " +
-                "Blend liked/top/recent seeds with artist-radio variety. Avoid stacking the same " +
+                "Blend liked/top seeds with artist-radio variety. Candidates already exclude " +
+                "recently played and already-heard tracks — never re-pick those. Avoid stacking the same " +
                 "primary artist twice in a row. Leave banter empty (spoken lines are generated separately). " +
                 "No markdown."
         val prompt =
-            "CURRENT: $curLine\n\nCANDIDATES:\n$list\n\nPick $n next tracks for a continuous live DJ set."
+            "CURRENT: $curLine\n\nCANDIDATES (not recently played):\n$list\n\n" +
+                "Pick $n next tracks for a continuous live DJ set. Do not repeat recently heard songs."
         val opts = JSONObject()
             .put("system", system)
             .put("session_title", "· Spotify Live DJ")
@@ -4242,7 +4336,7 @@ class SpotifyLiveDjService : Service() {
     private fun markPlayed(uri: String) {
         if (uri.isBlank()) return
         playedUris[uri] = System.currentTimeMillis()
-        while (playedUris.size > 200) {
+        while (playedUris.size > 250) {
             val first = playedUris.entries.firstOrNull()?.key ?: break
             playedUris.remove(first)
         }
@@ -4253,6 +4347,25 @@ class SpotifyLiveDjService : Service() {
     }
 
     private fun isPlayed(uri: String): Boolean = playedUris.containsKey(uri)
+
+    /**
+     * Remove UP NEXT rows that are already in the played / recently-heard set so the
+     * Live DJ list cannot stay “ahead” of songs Spotify already finished or skipped.
+     */
+    private fun pruneQueueOfPlayed() {
+        val before = synchronized(queue) { queue.size }
+        synchronized(queue) {
+            val keep = queue.filterNot { isPlayed(it.uri) || it.uri == current?.uri }
+            if (keep.size == queue.size) return
+            queue.clear()
+            keep.forEach { queue.addLast(it) }
+        }
+        val after = synchronized(queue) { queue.size }
+        if (before != after) {
+            Log.i(TAG, "pruneQueueOfPlayed $before → $after")
+            persistRuntimeState()
+        }
+    }
 
     private fun pickDeviceId(): String? {
         val preferred = SpotifyControllerStore(this).preferredDeviceId.trim()

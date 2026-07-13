@@ -585,8 +585,31 @@ fun openSpotifyContent(context: Context, uri: String?) {
     SpotifyOAuth.openContentUri(context, u)
 }
 
-/** Prefer session transport controls; fall back to media key events. */
+/**
+ * Prefer session transport controls; fall back to media key events.
+ *
+ * When Live DJ is on, Next / Prev / Play-Pause go through the DJ service so the
+ * radio UP NEXT stays aligned. Media-session skip alone advances Spotify’s stale
+ * Up Next (append-only) and leaves the Live DJ queue several songs behind.
+ */
 fun dispatchMediaCommand(context: Context, action: String) {
+    val appCtx = context.applicationContext
+    if (SpotifyDjStore(appCtx).enabled) {
+        when (action) {
+            ACTION_NEXT -> {
+                spotifyLiveDjSkip(appCtx, forceTalk = false)
+                return
+            }
+            ACTION_PREV -> {
+                spotifyLiveDjPrevious(appCtx)
+                return
+            }
+            ACTION_PLAY_PAUSE -> {
+                spotifyLiveDjPauseToggle(appCtx)
+                return
+            }
+        }
+    }
     val ctrl = resolveActiveMediaController(context)
     if (ctrl != null) {
         try {
@@ -1852,7 +1875,8 @@ fun SpotifyControllerPane(
                                 "or pause in the last second when talkover is off. " +
                                 "Tap a title or ▶ to jump (drops songs above · no talk). " +
                                 "Sync pulls whatever Spotify is on now. " +
-                                "Add to Spotify queue re-pushes UP NEXT. Refill adds · New queue replaces.",
+                                "Add to Spotify queue re-pushes UP NEXT. Refill adds · New queue replaces. " +
+                                    "Recently played + skipped tracks are excluded from new picks.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )
@@ -2312,7 +2336,7 @@ fun SpotifyControllerPane(
                         }
                         Spacer(Modifier.height(12.dp))
                         Text(
-                            "Radio seeds from liked, top, and recently played. " +
+                            "Radio seeds from liked, top, and recently played (recent cuts are excluded so they are not re-queued). " +
                                 "Queue, chat, and settings survive leave/return. " +
                                 "With resume on, an active session continues after OTA/restart.",
                             color = GrokifyColors.TextDim,
