@@ -1,43 +1,255 @@
 # GrokifyOS
 
-**Open-source stack to run your own Grokify-style AI assistant** — web dashboard, Android app, and agent bridge — powered by [Grok Build](https://grok.com) (xAI).
+**A mobile Android development kit** — self-hosted web control plane + native phone client — so you can **build custom versions of your own AI-powered phone OS** by working *through* the device, not just *on* it.
 
-Self-host on a laptop, home lab, or VPS. Pair phones with device tokens. Chat with real agents; usage comes from your Grok Build account (no fake numbers).
+Think of it as **slipping the phone on for the phone**: you pair a real Android handset to *your* server, open hardware (camera, mic, GPS, Wi‑Fi, Bluetooth, notifications, media), stream agents via [Grok Build](https://grok.com), ship features as **inner apps / plugins**, and **publish APKs OTA** so the handset updates itself.
 
 | | |
 |--|--|
-| **Auth** | Username + password (browser); device Bearer tokens `gos_…` (Android) |
-| **Stack** | PHP 8.1+, MySQL/MariaDB, Node 18+ (bridge), optional Android SDK |
-| **Deploy** | Local / LAN **or** remote VPS with HTTPS |
+| **What it is** | Self-hosted Android MDK + AI assistant stack |
+| **Clients** | Web dashboard (browser) · native app (`io.grokify.os`) |
+| **Stack** | PHP 8.1+, MySQL/MariaDB, Node 18+ bridge, optional Android SDK |
+| **Run mode** | Laptop / LAN **or** remote VPS with HTTPS |
+| **Auth** | Username + password (web) · device Bearer tokens `gos_…` (phone) |
 | **License** | [MIT](LICENSE) |
 
-> GrokifyOS is a standalone product. It does **not** require or modify any private Grokpot deployment.
+> **Not affiliated.** GrokifyOS is an independent, open-source project. It is **not** affiliated with, endorsed by, or sponsored by xAI, SpaceX, X (Twitter), Grok, Grok Build, Mapbox, Spotify, or any related company. Product names above are trademarks of their respective owners; we only document how to use *your* accounts and APIs with *your* self-hosted stack.
+
+---
+
+## Why this exists
+
+Most “AI phone” demos are a chat UI glued to an API. GrokifyOS is different:
+
+1. **You own the host** — chat, devices, sessions, APKs, and secrets live on *your* machine or VPS.
+2. **The phone is the runtime** — full permission model for real hardware: camera, microphone, location, nearby Wi‑Fi, Bluetooth, notifications, media session control.
+3. **Inner apps are first-class** — Wi‑Fi / BT scanners, place notes, Spotify Live DJ, maps, plus remote script plugins loaded from your server.
+4. **Grok Build is the builder** — agents run against *your* Grok Build login on the host; you (or another agent) edit the repo, rebuild, and **push OTA**.
+5. **Closed loop** — change code → `publish.sh` → phone sees a new `versionCode` → install update → keep iterating without a cable.
+
+Endless surface area: new host modules, WebView plugins, vault keys, maps, scanners, media, geofences — all under one paired device token.
+
+---
 
 ## What you get
 
-- **Web dashboard** — login, chat sessions, notes, device pairing, APK release upload
-- **REST APIs** — auth, devices, chat, models, live Grok Build usage
-- **Agent bridge** — WebSocket gateway for streaming agents
-- **Android app** — package `io.grokify.os` (Compose); side-by-side with other installs
+| Piece | Role |
+|-------|------|
+| **Web dashboard** | Login, chat sessions, notes, device pairing, APK release store |
+| **REST APIs** | Auth, devices, chat, models, live Grok Build usage, plugins, OTA |
+| **Agent bridge** | Node WebSocket gateway for streaming agents |
+| **Android host** | Compose client: Chat · Settings · **Apps** hub · permission cards · OTA |
+| **API key vault** | On-device keys for maps, Spotify, xAI voice, custom plugin secrets |
+| **Plugin catalog** | Built-in host modules + remote packages from `storage/plugins/` |
 
-## Quick start
+Architecture overview: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**  
+Full install (Ubuntu / Windows / macOS, TLS, bridge): **[docs/INSTALL.md](docs/INSTALL.md)**  
+Android build / pair / OTA: **[android/README.md](android/README.md)**
+
+---
+
+## Quick start (humans)
 
 ```bash
 git clone https://github.com/iBerry420/grokifyos.git
 cd grokifyos
 cp .env.example .env
-# edit .env → MySQL credentials (see docs/INSTALL.md)
+# edit .env → MySQL credentials + secrets (see docs/INSTALL.md)
 
 php scripts/install.php --admin=admin --password='your-long-password'
 
-# local / LAN (phones on same Wi‑Fi can use http://YOUR_LAN_IP:8787)
+# local / LAN (phones on same Wi‑Fi: http://YOUR_LAN_IP:8787)
 php -S 0.0.0.0:8787 scripts/dev-router.php
 ```
 
-Open `http://127.0.0.1:8787` → sign in → **Devices** → create a `gos_…` token for the Android app.
+Open `http://127.0.0.1:8787` → sign in → **Devices** → mint a `gos_…` token → install the APK → paste the token.
 
-Full install (Ubuntu, Windows, macOS), bridge, TLS, and Android: **[docs/INSTALL.md](docs/INSTALL.md)**.  
-Scope and architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+For streaming agents + real usage numbers, log into Grok Build on the host and point the stack at that auth file (see [Grok Build](#grok-build-agents--usage) below).
+
+---
+
+## AI / Grok Build: clone and set up for a user
+
+Paste this block (or point an agent at this section) when you want **Grok Build or another coding agent** to stand up GrokifyOS with minimal human steps.
+
+### Agent checklist (idempotent)
+
+```text
+GOAL: Install GrokifyOS so a user can open the web UI and pair an Android app.
+
+PREREQS (install if missing):
+- PHP 8.1+ with pdo_mysql, curl, json, mbstring, session
+- MySQL 8+ or MariaDB 10.5+ (dedicated database; do not share)
+- Node.js 18+ (for agent bridge)
+- git, openssl
+- Optional: Android SDK + JDK 17 only if building APKs on this machine
+
+STEPS:
+1. Clone: git clone https://github.com/iBerry420/grokifyos.git && cd grokifyos
+2. cp .env.example .env
+3. Create MySQL database + user (utf8mb4). Put credentials in .env:
+     GROKIFY_DB_HOST, GROKIFY_DB_PORT, GROKIFY_DB_NAME, GROKIFY_DB_USER, GROKIFY_DB_PASS
+4. Generate secrets into .env:
+     openssl rand -hex 32  → GROKIFY_WS_AUTH_SECRET
+     openssl rand -hex 32  → GROKIFY_SECRETS_PEPPER
+5. Set GROKIFY_SITE_URL:
+     Local: http://127.0.0.1:8787  (or http://LAN_IP:8787 for phones)
+     VPS:   https://user.domain
+6. php scripts/install.php --admin=ADMIN_USER --password='LONG_PASSWORD'
+7. Start web: php -S 0.0.0.0:8787 scripts/dev-router.php
+8. Bridge (optional but recommended for streaming chat):
+     cd bridge && npm ci && GROKIFY_BRIDGE_PORT=8876 node server.js
+     Ensure GROKIFY_BRIDGE_URL / GROKIFY_BRIDGE_HEALTH / GROKIFY_WS_PATH match .env
+9. Grok Build auth (for real agents + usage, not fake numbers):
+     On host: grok login   (or grok login --device-code)
+     ./scripts/sync-grok-auth.sh
+     Verify: php scripts/check-grok-auth.php
+10. NEVER commit: .env, storage/sessions/*, storage/apk/*, storage/grok-auth.json,
+    android/local.properties, real API tokens, Mapbox pk. secrets, Spotify secrets.
+11. Hand user:
+     - Dashboard URL
+     - Admin username
+     - How to open Devices → create gos_… token
+     - How to install APK (dashboard Download or android/scripts/publish.sh)
+12. Android endpoints (if rebuilding APK): set API_BASE, WS_URL, SITE_URL in
+    android/app/build.gradle.kts BuildConfig to the same host as GROKIFY_SITE_URL.
+
+SUCCESS:
+- GET /api/health.php reports ok
+- Browser login works
+- Device token can be created
+- (If bridge + auth) chat streams and usage is non-empty or a clear auth error
+
+DO NOT:
+- Invent usage stats when auth.json is missing
+- Bake secrets into the repo or mapbox_access_token.xml (there is no compile-time token file)
+- Share MySQL with unrelated apps
+```
+
+### One-shot shell sketch for agents
+
+```bash
+set -euo pipefail
+git clone https://github.com/iBerry420/grokifyos.git
+cd grokifyos
+cp .env.example .env
+
+# Fill DB_* and SITE_URL in .env, then:
+echo "GROKIFY_WS_AUTH_SECRET=$(openssl rand -hex 32)" >> .env
+echo "GROKIFY_SECRETS_PEPPER=$(openssl rand -hex 32)" >> .env
+
+php scripts/install.php --admin=admin --password='CHANGE_ME_LONG'
+php -S 0.0.0.0:8787 scripts/dev-router.php &
+( cd bridge && npm ci && GROKIFY_BRIDGE_PORT=8876 node server.js ) &
+```
+
+VPS + TLS + systemd examples: `deploy/`. Deep steps: **[docs/INSTALL.md](docs/INSTALL.md)**.
+
+---
+
+## Inner apps (built-in)
+
+Open the Android app → **Apps** tab. Built-ins ship inside the host APK (`BuiltinPluginCatalog`); remote WebView plugins can also appear from your server catalog (`storage/plugins/catalog.json`).
+
+| App | What it does | Hardware / services | Keys |
+|-----|----------------|---------------------|------|
+| **Wi‑Fi Scanner** | Scan nearby networks; GPS pins, distance, times seen; alerts (SSID/MAC watch, unseen, strong nearby); Mapbox map of hits | Nearby Wi‑Fi, Location | **Mapbox** `pk.…` for maps |
+| **Bluetooth Tracker** | BLE + classic discovery; GPS pins, distance, times seen; watch/unseen/strong alerts; map | Bluetooth, Location, Notifications | **Mapbox** for maps |
+| **Place Notes** | Pin notes to GPS spots; on enter: notify, open an app, or show an image; list + map + area monitoring | Location, Notifications | **Mapbox** for maps |
+| **Spotify** | Lockscreen / media controls; **Live AI DJ** booth (banter, queue chat); research/build/edit playlists via host Grok Build; optional Grok Voice TTS | Notifications, Media session, mic (voice), network | **Spotify Client ID** (+ optional secret); **xAI API key** for Grok Voice (device TTS works without it) |
+| **System Status** (remote sample) | Lightweight script plugin from the server: host info, connection tips; unload anytime | Scripts / WebView | None |
+
+Capabilities are gated by Android permissions (Settings → Permissions, or in-chat `[[permission_request:…]]` cards). Keys live in **Settings → API key vault** on the device — never in git.
+
+---
+
+## Keys & tokens — how to get them
+
+All third-party keys are **optional until you use the feature**. Store them **on the phone** in Settings (API key vault / Mapbox / Spotify cards). The server device token (`gos_…`) is separate: it only authenticates the app to *your* GrokifyOS host.
+
+### 1. GrokifyOS device token (`gos_…`)
+
+| | |
+|--|--|
+| **Where** | Web dashboard → **Devices** → create |
+| **Used for** | Android API + WebSocket auth to *your* server |
+| **Paste** | First-run / Settings on the phone |
+
+### 2. Grok Build (server-side — agents + usage)
+
+| | |
+|--|--|
+| **Where** | Host machine: [Grok / Grok Build CLI](https://grok.com) → `grok login` |
+| **Wire-up** | `GROKIFY_GROK_AUTH_JSON=…` then `./scripts/sync-grok-auth.sh` → `storage/grok-auth.json` |
+| **Used for** | Streaming agents, chat, playlist research, live usage chip |
+| **Not** | Not the same as the on-device xAI API key |
+
+```bash
+grok login          # or: grok login --device-code
+./scripts/sync-grok-auth.sh
+php scripts/check-grok-auth.php
+```
+
+Missing auth → APIs return a **clear error** (no invented usage).
+
+### 3. Mapbox public token (`pk.…`)
+
+| | |
+|--|--|
+| **Where** | [mapbox.com](https://www.mapbox.com/) → Account → Access tokens → create a **public** token |
+| **Paste** | Android **Settings → Mapbox** (or vault id `mapbox_access_token`) |
+| **Used for** | Maps in Wi‑Fi Scanner, Bluetooth Tracker, Place Notes |
+| **Note** | Vault-only. There is **no** baked-in `mapbox_access_token.xml` fallback. |
+
+### 4. Spotify (Controller / Live DJ / playlists)
+
+| | |
+|--|--|
+| **Where** | [developer.spotify.com](https://developer.spotify.com/) → Dashboard → Create app |
+| **Client ID** | Paste in Settings / vault (`spotify_client_id`) |
+| **Client secret** | Optional (PKCE works with Client ID alone); vault `spotify_client_secret` |
+| **Redirect URI** | Must match what your app/build expects (default documented in-app; sample hosts use `https://…/spotify-callback.php`) |
+| **OAuth tokens** | Access/refresh are stored **internally** after login — not typed by hand |
+
+### 5. xAI API key (Grok Voice TTS)
+
+| | |
+|--|--|
+| **Where** | [console.x.ai](https://console.x.ai/) → API Keys → Create |
+| **Paste** | Settings vault id `xai_api_key` |
+| **Used for** | Optional **Grok Voice** for Live DJ banter (eve, ara, leo, rex, sal, …) |
+| **Not used for** | Playlist research / main chat — those use **host Grok Build** + device token |
+
+### 6. Custom plugin keys
+
+Script / marketplace plugins declare `required_keys` in their manifest. The host only exposes those ids to that plugin and can gate the UI until the user adds them in Settings.
+
+---
+
+## Develop → rebuild → OTA
+
+Closed loop for custom forks of the phone app:
+
+```bash
+# bump versionCode / versionName in android/app/build.gradle.kts
+cd android
+./scripts/publish.sh debug --changelog "What changed"
+# or: ./scripts/publish.sh release …
+```
+
+That builds the APK, registers it with your host’s APK store, and makes it downloadable for paired devices.
+
+| Phone | Server |
+|-------|--------|
+| Checks `GET /api/update.php?version_code=N` | Serves newer release metadata |
+| Downloads with device token | `GET /api/apk-download.php` |
+| Installs update | `versionCode` must **increase** each ship |
+
+Helpers: `android/scripts/build.sh`, `publish.sh`, `install-device.sh` (wireless ADB). Details: **[android/README.md](android/README.md)**.
+
+Point Grok Build at this repo on the **same host** (or a remote with deploy access) so agents can edit Kotlin/PHP, run `publish.sh`, and the handset picks up the new build without USB.
+
+---
 
 ## Repository layout
 
@@ -45,54 +257,67 @@ Scope and architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 web/           PHP app (public UI, API, includes, assets)
 schema/        SQL schema (greenfield install)
 bridge/        Node WebSocket agent gateway
-android/       Kotlin + Compose client (io.grokify.os)
-scripts/       install.php, dev router
+android/       Kotlin + Compose host (io.grokify.os) + inner apps
+scripts/       install.php, dev router, grok-auth helpers
 deploy/        Apache vhost + systemd unit examples
 docs/          install + architecture
-storage/       sessions, bridge runtime, APKs (gitignored contents)
+storage/       sessions, bridge runtime, APKs, plugins (gitignored contents)
+uploads/       chat media (gitignored)
 ```
 
-## Auth
+---
+
+## Auth model
 
 | Client | Method |
 |--------|--------|
 | Browser | Username + password → session cookie `__grokifyos_sid` |
 | Android | Device Bearer `gos_…` minted in the web UI after login |
+| Bridge WS | Shared `GROKIFY_WS_AUTH_SECRET` + device/session tokens as designed |
 
-Password-only by design for simple self-hosting. Optional OAuth can be added later as pure config — not required to run.
+Password-only admin auth keeps self-hosting simple. Optional OAuth can be added later as config — not required to run.
 
-## Grok Build
+---
 
-Point the app at a real Grok Build login so usage and agents work against your account:
+## Grok Build (agents + usage)
 
 ```env
 GROKIFY_GROK_AUTH_JSON=/path/to/auth.json   # from `grok login`
 ```
 
-If auth is missing, APIs return a clear error — they never invent usage stats.
+Prefer the synced copy for PHP-FPM readability:
 
-## Features
+```bash
+./scripts/sync-grok-auth.sh    # → storage/grok-auth.json + .env update
+```
 
-| Area | Status |
-|------|--------|
-| Health, first-admin setup, login, session | Ready |
-| Device token create / list / revoke | Ready |
-| Chat REST + dashboard UI | Ready |
-| Bridge (WebSocket agents) | Ready |
-| Android package + OTA download | Ready |
-| Grok Build live usage | Ready (needs `auth.json`) |
+Usage endpoints call billing with **your** credentials only. No phone-home to a central GrokifyOS SaaS.
+
+---
 
 ## Security
 
-- Never commit `.env`, `storage/sessions/*`, `storage/apk/*`, or `auth.json`
-- Use HTTPS on any host reachable from the internet
-- Use strong DB password and `GROKIFY_WS_AUTH_SECRET`
+- Never commit `.env`, `storage/sessions/*`, `storage/apk/*`, `storage/grok-auth.json`, or real vault keys
+- Use HTTPS on any host reachable from the public internet
+- Strong DB password, `GROKIFY_WS_AUTH_SECRET`, and `GROKIFY_SECRETS_PEPPER`
 - Keep `storage/` writable only by the web/bridge user
+- Treat Mapbox `pk.` / Spotify / xAI keys as secrets even when “public” client tokens
+
+---
 
 ## Contributing
 
-Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the tree.
+Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the tree. If you add an inner app, document its capabilities and required vault key ids in this README and the plugin catalog.
+
+---
+
+## Disclaimer
+
+**GrokifyOS is not affiliated with xAI, SpaceX, Grok, Grok Build, Mapbox, Spotify, or any other third party.**  
+It is a community MIT project that lets you self-host tooling which *may* call third-party APIs using credentials **you** provide. You are responsible for complying with each provider’s terms of service and for securing your own deployment.
+
+---
 
 ## License
 
-[MIT](LICENSE) — use it, fork it, host it.
+[MIT](LICENSE) — use it, fork it, host it, ship your own custom phone OS.
