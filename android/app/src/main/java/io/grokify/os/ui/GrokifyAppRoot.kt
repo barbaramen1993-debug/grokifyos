@@ -245,6 +245,8 @@ fun GrokifyAppRoot(
     onRenameSession: (String) -> Unit = {},
     onLoadOlder: () -> Unit = {},
     onRefreshUsage: () -> Unit = {},
+    /** Open xAI device-code OAuth link when Grok Build needs re-login. */
+    onGrokLogin: () -> Unit = {},
     onSetAppOrder: (List<String>) -> Unit = {},
 ) {
     var tab by remember { mutableIntStateOf(1) } // default Chat
@@ -423,6 +425,7 @@ fun GrokifyAppRoot(
                         state = state,
                         onBack = onCloseSettings,
                         onRefreshUsage = onRefreshUsage,
+                        onGrokLogin = onGrokLogin,
                         onSelectModel = onSelectModel,
                         onToggleHistory = onToggleHistory,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
@@ -480,6 +483,7 @@ fun GrokifyAppRoot(
                         onRenameSession = { openRename() },
                         onLoadOlder = onLoadOlder,
                         onRefreshUsage = onRefreshUsage,
+                        onGrokLogin = onGrokLogin,
                     )
                     2 -> AppsPane(
                         screen = appsScreen,
@@ -1075,6 +1079,7 @@ private fun ChatPane(
     onRenameSession: () -> Unit = {},
     onLoadOlder: () -> Unit = {},
     onRefreshUsage: () -> Unit = {},
+    onGrokLogin: () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
@@ -1233,6 +1238,7 @@ private fun ChatPane(
                 onNewChat = onNewChat,
                 onRefresh = onRefresh,
                 onRefreshUsage = onRefreshUsage,
+                onGrokLogin = onGrokLogin,
             )
 
             // Messages
@@ -1580,6 +1586,7 @@ private fun ChatToolbar(
     onNewChat: () -> Unit,
     onRefresh: () -> Unit,
     onRefreshUsage: () -> Unit = {},
+    onGrokLogin: () -> Unit = {},
 ) {
     Column(
         Modifier
@@ -1644,8 +1651,12 @@ private fun ChatToolbar(
         }
         if (!keyboardOpen) {
             val usage = state.usage
+            val loginNeeded = usage?.loginNeeded == true ||
+                (usage?.error?.contains("login", ignoreCase = true) == true) ||
+                (usage?.label?.contains("re-login", ignoreCase = true) == true)
             val usageText = when {
                 state.usageLoading && usage == null -> "Usage …"
+                loginNeeded -> usage?.label?.takeIf { it.isNotBlank() } ?: "Usage: tap to re-login"
                 usage != null && usage.label.isNotBlank() -> usage.label
                 usage?.error != null -> "Usage unavailable"
                 else -> null
@@ -1670,6 +1681,7 @@ private fun ChatToolbar(
                     Text(
                         usageText,
                         color = when {
+                            loginNeeded -> GrokifyColors.GlowRose
                             (usage?.usagePercent ?: 0.0) >= 90 -> GrokifyColors.GlowRose
                             (usage?.usagePercent ?: 0.0) >= 70 -> GrokifyColors.GlowViolet
                             else -> GrokifyColors.GlowCyan
@@ -1679,7 +1691,9 @@ private fun ChatToolbar(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier
                             .padding(start = 8.dp)
-                            .clickable { onRefreshUsage() },
+                            .clickable {
+                                if (loginNeeded) onGrokLogin() else onRefreshUsage()
+                            },
                     )
                 }
             }
@@ -2033,6 +2047,7 @@ private fun SettingsPage(
     onRefreshPermissions: () -> Unit = {},
     onOpenAppPermissionSettings: () -> Unit = {},
     onRefreshUsage: () -> Unit = {},
+    onGrokLogin: () -> Unit = {},
     onSaveMapboxAccessToken: (String) -> Unit = {},
     onClearMapboxAccessToken: () -> Unit = {},
     onSaveApiKey: (id: String, value: String, label: String?, description: String?) -> Unit = { _, _, _, _ -> },
@@ -2100,7 +2115,7 @@ private fun SettingsPage(
             }
         }
 
-        UsageCard(state = state, onRefresh = onRefreshUsage)
+        UsageCard(state = state, onRefresh = onRefreshUsage, onGrokLogin = onGrokLogin)
 
         Text("CHAT", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
         SettingRow(
@@ -2946,11 +2961,16 @@ private fun formatResetWhen(resetAt: String): String {
 private fun UsageCard(
     state: UiState,
     onRefresh: () -> Unit,
+    onGrokLogin: () -> Unit = {},
 ) {
     val usage = state.usage
     val pct = usage?.usagePercent ?: 0.0
     val remaining = usage?.remainingPercent?.takeIf { it > 0 } ?: (100.0 - pct).coerceAtLeast(0.0)
     val accent = usageAccent(pct)
+    val loginNeeded = usage?.loginNeeded == true ||
+        !usage?.loginUrl.isNullOrBlank() ||
+        (usage?.error?.contains("login", ignoreCase = true) == true) ||
+        (usage?.error?.contains("auth", ignoreCase = true) == true)
     val hardError = usage?.error != null &&
         (usage.label.isBlank() || (usage.usagePercent <= 0.0 && usage.products.isEmpty()))
 
@@ -3009,15 +3029,51 @@ private fun UsageCard(
         }
 
         when {
-            hardError -> {
+            hardError || loginNeeded -> {
                 Text(
-                    usage?.error ?: "Usage unavailable",
+                    when {
+                        usage?.loginStatus == "pending" ->
+                            "Waiting for xAI approval…"
+                        loginNeeded ->
+                            "Grok Build session expired"
+                        else ->
+                            usage?.error ?: "Usage unavailable"
+                    },
                     color = GrokifyColors.GlowRose,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                 )
-                if (!usage?.label.isNullOrBlank() && usage?.label != usage?.error) {
-                    Text(usage!!.label, color = GrokifyColors.TextMuted, fontSize = 11.sp)
+                val detail = usage?.loginMessage
+                    ?: usage?.error?.takeIf { loginNeeded }
+                    ?: "Open the Grok/xAI login page, sign in, and approve this server."
+                Text(detail, color = GrokifyColors.TextMuted, fontSize = 11.sp)
+                if (!usage?.loginUserCode.isNullOrBlank()) {
+                    Text(
+                        "Code: ${usage!!.loginUserCode}",
+                        color = GrokifyColors.TextPrimary,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                if (loginNeeded) {
+                    Button(
+                        onClick = onGrokLogin,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = GrokifyColors.GlowCyan.copy(alpha = 0.2f),
+                            contentColor = GrokifyColors.GlowCyan,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            if (usage?.loginStatus == "pending") {
+                                "Open login link again"
+                            } else {
+                                "Sign in with Grok / xAI"
+                            },
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
                 }
             }
             usage == null && state.usageLoading -> {

@@ -218,6 +218,37 @@ const httpServer = http.createServer(async (req, res) => {
         proxy.end();
         return;
     }
+    // Device-code OAuth login (start / status) — same path on any healthy worker.
+    if (url.pathname === '/grok-login/start' || url.pathname === '/grok-login/status') {
+        const be = pickBackend();
+        const q = url.search || '';
+        const method = req.method === 'POST' ? 'POST' : 'GET';
+        const proxy = http.request(
+            {
+                host: be.host,
+                port: be.port,
+                path: url.pathname + q,
+                method,
+                headers: { Accept: 'application/json' },
+                timeout: 20000,
+            },
+            (up) => {
+                res.writeHead(up.statusCode || 502, { 'Content-Type': 'application/json' });
+                up.pipe(res);
+            }
+        );
+        proxy.on('error', () => {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'backend_unavailable' }));
+        });
+        proxy.on('timeout', () => {
+            proxy.destroy();
+            res.writeHead(504, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'backend_timeout' }));
+        });
+        proxy.end();
+        return;
+    }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'not_found', role: 'gateway' }));
 });

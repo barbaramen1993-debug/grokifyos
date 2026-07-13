@@ -518,6 +518,89 @@ function gos_grok_auth_request_bridge_sync(bool $force = true): array
     return $lastResult;
 }
 
+/**
+ * Call the bridge device-login endpoints (OIDC device code → clickable xAI link).
+ *
+ * @param 'start'|'status' $action
+ * @return array<string, mixed>
+ */
+function gos_grok_auth_bridge_login(string $action = 'start', bool $force = false): array
+{
+    $action = $action === 'status' ? 'status' : 'start';
+    $base = rtrim((string) (gos_env('GROKIFY_BRIDGE_URL', 'http://127.0.0.1:8876') ?? 'http://127.0.0.1:8876'), '/');
+    $qs = [];
+    if ($force) {
+        $qs[] = 'force=1';
+    }
+    if ($action === 'status' && $force) {
+        // status?force=1 alone does not start; start=1 does.
+        $qs[] = 'start=1';
+    }
+    $url = $base . '/grok-login/' . $action . ($qs !== [] ? ('?' . implode('&', $qs)) : '');
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return ['ok' => false, 'error' => 'curl_init_failed', 'needed' => true];
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => ($action === 'start' ? 'POST' : 'GET'),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 2,
+        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+    ]);
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if (!is_string($resp) || $resp === '') {
+        return [
+            'ok' => false,
+            'needed' => true,
+            'error' => $err !== '' ? $err : 'empty_response',
+            'http_code' => $code,
+            'message' => 'Could not reach bridge to start Grok login',
+        ];
+    }
+    $json = json_decode($resp, true);
+    if (!is_array($json)) {
+        return [
+            'ok' => false,
+            'needed' => true,
+            'error' => 'parse_failed',
+            'http_code' => $code,
+            'message' => 'Invalid bridge login response',
+        ];
+    }
+    $json['http_code'] = $code;
+    if (!isset($json['needed'])) {
+        $json['needed'] = true;
+    }
+
+    return $json;
+}
+
+/**
+ * Attach a device-login payload so clients can open verification_uri_complete.
+ *
+ * @param array<string, mixed> $payload
+ * @return array<string, mixed>
+ */
+function gos_grok_auth_with_login_link(array $payload, bool $forceNew = false): array
+{
+    $login = gos_grok_auth_bridge_login('start', $forceNew);
+    $payload['login'] = $login;
+    if (!empty($login['verification_uri_complete'])) {
+        $payload['message'] = ($payload['message'] ?? 'Grok re-login needed')
+            . ' — open the login link on your phone, approve, then refresh usage.';
+        $payload['login_url'] = (string) $login['verification_uri_complete'];
+        if (!empty($login['user_code'])) {
+            $payload['login_user_code'] = (string) $login['user_code'];
+        }
+    }
+
+    return $payload;
+}
+
 /** @return array{ok: bool, token?: string, entry?: array<string, mixed>, error?: string, message?: string, http_code?: int, detail?: mixed} */
 function gos_grok_auth_ensure_token(bool $allowBridgeResync = true): array
 {
@@ -652,11 +735,26 @@ function gos_grok_build_fetch_usage(bool $forceRefresh = false): array
 
     $auth = gos_grok_auth_ensure_token();
     if (empty($auth['ok']) || empty($auth['token'])) {
-        return [
+        $err = (string) ($auth['error'] ?? 'auth_failed');
+        $needsLogin = in_array($err, [
+            'auth_missing',
+            'auth_refresh_unavailable',
+            'auth_refresh_revoked',
+            'auth_refresh_failed',
+            'auth_failed',
+        ], true);
+        $payload = [
             'ok' => false,
-            'error' => $auth['error'] ?? 'auth_failed',
-            'message' => $auth['message'] ?? 'Grok Build auth unavailable — run `grok login` and point GROKIFY_GROK_AUTH_JSON at auth.json.',
+            'error' => $err,
+            'message' => $auth['message'] ?? 'Grok Build auth unavailable — re-login required.',
+            'http_code' => $auth['http_code'] ?? null,
         ];
+        if ($needsLogin) {
+            // Auto-start device OAuth so the app can show a one-tap xAI login link.
+            return gos_grok_auth_with_login_link($payload, false);
+        }
+
+        return $payload;
     }
 
     $url = gos_env('GROKIFY_GROK_BILLING_URL', 'https://cli-chat-proxy.grok.com/v1/billing?format=credits')
@@ -701,15 +799,20 @@ function gos_grok_build_fetch_usage(bool $forceRefresh = false): array
             || str_contains($upstreamBody, 'Invalid or expired')
             || str_contains($upstreamBody, 'PermissionDenied');
 
-        return [
+        $payload = [
             'ok' => false,
             'error' => $authish ? 'billing_auth_failed' : 'billing_fetch_failed',
             'http_code' => $code,
             'message' => $authish
-                ? 'Grok billing rejected credentials (HTTP ' . $code . ') — run `./scripts/sync-grok-auth.sh` after `grok login`.'
+                ? 'Grok billing rejected credentials (HTTP ' . $code . ') — re-login required.'
                 : ($err ?: ('Billing upstream error (HTTP ' . $code . ')')),
             'detail' => $upstreamBody !== '' ? mb_substr($upstreamBody, 0, 400) : null,
         ];
+        if ($authish) {
+            return gos_grok_auth_with_login_link($payload, false);
+        }
+
+        return $payload;
     }
 
     $json = json_decode($resp, true);

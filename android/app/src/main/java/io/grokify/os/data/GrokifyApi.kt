@@ -150,6 +150,25 @@ class GrokifyApi(
         return executeJson(req)
     }
 
+    /**
+     * Start (or return existing) headless Grok Build device-code OAuth.
+     * Response includes verification_uri_complete for one-tap browser approval.
+     */
+    fun startGrokLogin(force: Boolean = false): JSONObject {
+        val q = if (force) "?force=1" else ""
+        val req = authRequest("/admin-system-chat-login.php$q")
+            .post(jsonBody(JSONObject().put("force", force)))
+            .build()
+        return executeJson(req)
+    }
+
+    /** Poll device-code login status (also continues server-side token poll). */
+    fun grokLoginStatus(start: Boolean = false): JSONObject {
+        val q = if (start) "?start=1" else ""
+        val req = authRequest("/admin-system-chat-login.php$q").get().build()
+        return executeJson(req)
+    }
+
     fun createMessage(sessionId: String, role: String, content: String): JSONObject {
         val body = JSONObject()
             .put("session_id", sessionId)

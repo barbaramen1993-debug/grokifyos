@@ -298,6 +298,465 @@ setInterval(() => {
     try { syncGrokAuthIfNeeded(false); } catch (_) {}
 }, 60 * 1000);
 
+/**
+ * Headless OIDC device-code login for Grok Build (same client as `grok login --device-code`).
+ * When refresh tokens die, PHP/app can start this flow and show verification_uri_complete
+ * so the user only taps the link, signs in, and approves — no SSH required.
+ */
+const GROK_OIDC_CLIENT_ID = process.env.GROKIFY_OIDC_CLIENT_ID
+    || 'b1a00492-073a-47ea-816f-4c329264a828';
+const GROK_OIDC_ISSUER = process.env.GROKIFY_OIDC_ISSUER || 'https://auth.x.ai';
+const GROK_OIDC_DEVICE_URL = `${GROK_OIDC_ISSUER}/oauth2/device/code`;
+const GROK_OIDC_TOKEN_URL = `${GROK_OIDC_ISSUER}/oauth2/token`;
+const GROK_OIDC_USERINFO_URL = `${GROK_OIDC_ISSUER}/oauth2/userinfo`;
+const GROK_OIDC_SCOPES = process.env.GROKIFY_OIDC_SCOPES
+    || 'openid profile email offline_access grok-cli:access api:access conversations:read conversations:write';
+const GROK_DEVICE_LOGIN_STATE_PATH = process.env.GROKIFY_DEVICE_LOGIN_STATE
+    || path.join(process.env.HOME || '/root', '.grok', 'device-login.json');
+
+let deviceLoginPollTimer = null;
+let deviceLoginPollInFlight = false;
+
+function publicDeviceLoginView(state) {
+    if (!state || typeof state !== 'object') {
+        return { ok: true, status: 'idle', needed: false };
+    }
+    const expiresAt = state.expires_at ? Date.parse(state.expires_at) : NaN;
+    const expiresIn = Number.isNaN(expiresAt)
+        ? null
+        : Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+    return {
+        ok: true,
+        needed: state.status === 'pending' || state.status === 'error' || state.status === 'denied',
+        status: state.status || 'idle',
+        user_code: state.user_code || null,
+        verification_uri: state.verification_uri || null,
+        verification_uri_complete: state.verification_uri_complete || null,
+        expires_in: expiresIn,
+        expires_at: state.expires_at || null,
+        interval: state.interval || 5,
+        started_at: state.started_at || null,
+        completed_at: state.completed_at || null,
+        error: state.error || null,
+        error_description: state.error_description || null,
+        email: state.email || null,
+        message: deviceLoginMessage(state),
+    };
+}
+
+function deviceLoginMessage(state) {
+    if (!state) return 'Grok Build login idle.';
+    switch (state.status) {
+        case 'pending':
+            return 'Open the link, sign in with xAI/Grok, and approve this device.';
+        case 'complete':
+            return state.email
+                ? `Signed in as ${state.email}. Usage should refresh automatically.`
+                : 'Signed in. Usage should refresh automatically.';
+        case 'denied':
+            return 'Login was denied. Tap re-login to try again.';
+        case 'expired':
+            return 'Login link expired. Tap re-login for a fresh link.';
+        case 'error':
+            return state.error_description
+                || state.error
+                || 'Login failed. Tap re-login to try again.';
+        default:
+            return 'Grok Build login idle.';
+    }
+}
+
+function readDeviceLoginState() {
+    try {
+        if (!fs.existsSync(GROK_DEVICE_LOGIN_STATE_PATH)) return null;
+        const raw = fs.readFileSync(GROK_DEVICE_LOGIN_STATE_PATH, 'utf8');
+        const data = JSON.parse(raw);
+        return data && typeof data === 'object' ? data : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function writeDeviceLoginState(state) {
+    const dir = path.dirname(GROK_DEVICE_LOGIN_STATE_PATH);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = GROK_DEVICE_LOGIN_STATE_PATH + '.tmp.' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    try { fs.chmodSync(tmp, 0o600); } catch (_) {}
+    fs.renameSync(tmp, GROK_DEVICE_LOGIN_STATE_PATH);
+    try { fs.chmodSync(GROK_DEVICE_LOGIN_STATE_PATH, 0o600); } catch (_) {}
+}
+
+function clearDeviceLoginPollTimer() {
+    if (deviceLoginPollTimer) {
+        clearTimeout(deviceLoginPollTimer);
+        deviceLoginPollTimer = null;
+    }
+}
+
+function scheduleDeviceLoginPoll(delayMs) {
+    clearDeviceLoginPollTimer();
+    const ms = Math.max(2000, Number(delayMs) || 5000);
+    deviceLoginPollTimer = setTimeout(() => {
+        deviceLoginPollTimer = null;
+        pollDeviceLoginOnce().catch((err) => {
+            log('warning', 'auth', `Device login poll error: ${err.message || err}`);
+        });
+    }, ms);
+}
+
+function httpFormPost(url, fields, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        const body = new URLSearchParams(fields).toString();
+        const u = new URL(url);
+        const lib = u.protocol === 'https:' ? require('https') : http;
+        const req = lib.request({
+            protocol: u.protocol,
+            hostname: u.hostname,
+            port: u.port || (u.protocol === 'https:' ? 443 : 80),
+            path: u.pathname + u.search,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                Accept: 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+                'User-Agent': 'grokifyos-bridge/device-login',
+            },
+            timeout: timeoutMs,
+        }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => {
+                let json = null;
+                try { json = data ? JSON.parse(data) : null; } catch (_) {}
+                resolve({ status: res.statusCode || 0, body: data, json });
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('timeout'));
+        });
+        req.write(body);
+        req.end();
+    });
+}
+
+function httpGetJson(url, headers = {}, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+        const u = new URL(url);
+        const lib = u.protocol === 'https:' ? require('https') : http;
+        const req = lib.request({
+            protocol: u.protocol,
+            hostname: u.hostname,
+            port: u.port || (u.protocol === 'https:' ? 443 : 80),
+            path: u.pathname + u.search,
+            method: 'GET',
+            headers: {
+                Accept: 'application/json',
+                'User-Agent': 'grokifyos-bridge/device-login',
+                ...headers,
+            },
+            timeout: timeoutMs,
+        }, (res) => {
+            let data = '';
+            res.on('data', (c) => { data += c; });
+            res.on('end', () => {
+                let json = null;
+                try { json = data ? JSON.parse(data) : null; } catch (_) {}
+                resolve({ status: res.statusCode || 0, body: data, json });
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('timeout'));
+        });
+        req.end();
+    });
+}
+
+function decodeJwtPayload(token) {
+    try {
+        const parts = String(token || '').split('.');
+        if (parts.length < 2) return null;
+        let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+    } catch (_) {
+        return null;
+    }
+}
+
+function isoNow() {
+    return new Date().toISOString();
+}
+
+function expiresAtFromSeconds(expiresIn) {
+    const sec = Math.max(60, Number(expiresIn) || 21600);
+    return new Date(Date.now() + sec * 1000).toISOString();
+}
+
+async function persistDeviceLoginTokens(tokenJson) {
+    const accessToken = String(tokenJson.access_token || '');
+    const refreshToken = String(tokenJson.refresh_token || '');
+    if (!accessToken) throw new Error('token_missing_access_token');
+
+    let email = null;
+    let firstName = null;
+    let picture = null;
+    try {
+        const ui = await httpGetJson(GROK_OIDC_USERINFO_URL, {
+            Authorization: `Bearer ${accessToken}`,
+        });
+        if (ui.json && typeof ui.json === 'object') {
+            email = ui.json.email || null;
+            firstName = ui.json.given_name || ui.json.name || null;
+            picture = ui.json.picture || null;
+        }
+    } catch (err) {
+        log('warning', 'auth', `userinfo failed after device login: ${err.message || err}`);
+    }
+
+    const claims = decodeJwtPayload(accessToken) || {};
+    const sub = String(claims.sub || claims.principal_id || '');
+    const teamId = claims.team_id ? String(claims.team_id) : null;
+    const entryKey = `${GROK_OIDC_ISSUER}::${GROK_OIDC_CLIENT_ID}`;
+    const entry = {
+        key: accessToken,
+        auth_mode: 'oidc',
+        create_time: isoNow(),
+        user_id: sub || null,
+        email: email || null,
+        first_name: firstName || null,
+        profile_image_asset_id: picture || null,
+        principal_type: claims.principal_type || 'User',
+        principal_id: sub || null,
+        team_id: teamId,
+        coding_data_retention_opt_out: false,
+        refresh_token: refreshToken || undefined,
+        expires_at: expiresAtFromSeconds(tokenJson.expires_in),
+        oidc_issuer: GROK_OIDC_ISSUER,
+        oidc_client_id: GROK_OIDC_CLIENT_ID,
+    };
+    if (!entry.refresh_token) delete entry.refresh_token;
+
+    const src = grokAuthSrcPath();
+    fs.mkdirSync(path.dirname(src), { recursive: true });
+    const tmp = src + '.tmp.' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify({ [entryKey]: entry }, null, 2) + '\n', { mode: 0o600 });
+    try { fs.chmodSync(tmp, 0o600); } catch (_) {}
+    fs.renameSync(tmp, src);
+    try { fs.chmodSync(src, 0o600); } catch (_) {}
+
+    const sync = syncGrokAuthIfNeeded(true);
+    log('info', 'auth', 'Device login completed — wrote auth.json + synced for PHP', {
+        email,
+        sync_ok: !!(sync && sync.ok),
+        sync_reason: sync && sync.reason,
+    });
+    return { email, entryKey, sync };
+}
+
+async function startDeviceLogin(forceNew = false) {
+    const existing = readDeviceLoginState();
+    if (!forceNew && existing && existing.status === 'pending' && existing.device_code) {
+        const exp = existing.expires_at ? Date.parse(existing.expires_at) : 0;
+        if (exp > Date.now() + 30000) {
+            scheduleDeviceLoginPoll((existing.interval || 5) * 1000);
+            return publicDeviceLoginView(existing);
+        }
+    }
+
+    const resp = await httpFormPost(GROK_OIDC_DEVICE_URL, {
+        client_id: GROK_OIDC_CLIENT_ID,
+        scope: GROK_OIDC_SCOPES,
+    });
+    if (!resp.json || !resp.json.device_code) {
+        const err = (resp.json && (resp.json.error_description || resp.json.error))
+            || `device_code_http_${resp.status}`;
+        const state = {
+            status: 'error',
+            error: 'device_code_request_failed',
+            error_description: String(err).slice(0, 400),
+            started_at: isoNow(),
+        };
+        writeDeviceLoginState(state);
+        return publicDeviceLoginView(state);
+    }
+
+    const interval = Math.max(3, Number(resp.json.interval) || 5);
+    const expiresIn = Math.max(60, Number(resp.json.expires_in) || 1800);
+    const state = {
+        status: 'pending',
+        device_code: String(resp.json.device_code),
+        user_code: String(resp.json.user_code || ''),
+        verification_uri: String(resp.json.verification_uri || 'https://accounts.x.ai/oauth2/device'),
+        verification_uri_complete: String(
+            resp.json.verification_uri_complete
+            || `${resp.json.verification_uri || 'https://accounts.x.ai/oauth2/device'}?user_code=${resp.json.user_code || ''}`
+        ),
+        interval,
+        expires_at: expiresAtFromSeconds(expiresIn),
+        started_at: isoNow(),
+        poll_owner: INSTANCE_ID,
+    };
+    writeDeviceLoginState(state);
+    log('info', 'auth', 'Device login started', {
+        user_code: state.user_code,
+        expires_in: expiresIn,
+        instance: INSTANCE_ID,
+    });
+    scheduleDeviceLoginPoll(interval * 1000);
+    return publicDeviceLoginView(state);
+}
+
+async function pollDeviceLoginOnce() {
+    if (deviceLoginPollInFlight) return publicDeviceLoginView(readDeviceLoginState());
+    deviceLoginPollInFlight = true;
+    try {
+        const state = readDeviceLoginState();
+        if (!state || state.status !== 'pending' || !state.device_code) {
+            return publicDeviceLoginView(state);
+        }
+        const exp = state.expires_at ? Date.parse(state.expires_at) : 0;
+        if (exp && exp <= Date.now()) {
+            const expired = {
+                ...state,
+                status: 'expired',
+                device_code: undefined,
+                error: 'expired_token',
+                error_description: 'Device login code expired',
+            };
+            delete expired.device_code;
+            writeDeviceLoginState(expired);
+            clearDeviceLoginPollTimer();
+            return publicDeviceLoginView(expired);
+        }
+
+        const resp = await httpFormPost(GROK_OIDC_TOKEN_URL, {
+            grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+            device_code: state.device_code,
+            client_id: GROK_OIDC_CLIENT_ID,
+        });
+        const errCode = resp.json && resp.json.error ? String(resp.json.error) : '';
+        if (errCode === 'authorization_pending') {
+            scheduleDeviceLoginPoll((state.interval || 5) * 1000);
+            return publicDeviceLoginView(state);
+        }
+        if (errCode === 'slow_down') {
+            const next = (state.interval || 5) + 5;
+            state.interval = next;
+            writeDeviceLoginState(state);
+            scheduleDeviceLoginPoll(next * 1000);
+            return publicDeviceLoginView(state);
+        }
+        if (errCode === 'access_denied') {
+            const denied = {
+                status: 'denied',
+                user_code: state.user_code,
+                verification_uri: state.verification_uri,
+                verification_uri_complete: state.verification_uri_complete,
+                started_at: state.started_at,
+                completed_at: isoNow(),
+                error: 'access_denied',
+                error_description: (resp.json && resp.json.error_description) || 'User denied login',
+            };
+            writeDeviceLoginState(denied);
+            clearDeviceLoginPollTimer();
+            return publicDeviceLoginView(denied);
+        }
+        if (errCode === 'expired_token') {
+            const expired = {
+                status: 'expired',
+                user_code: state.user_code,
+                started_at: state.started_at,
+                completed_at: isoNow(),
+                error: 'expired_token',
+                error_description: (resp.json && resp.json.error_description) || 'Device code expired',
+            };
+            writeDeviceLoginState(expired);
+            clearDeviceLoginPollTimer();
+            return publicDeviceLoginView(expired);
+        }
+        if (!resp.json || !resp.json.access_token) {
+            const failed = {
+                status: 'error',
+                user_code: state.user_code,
+                started_at: state.started_at,
+                completed_at: isoNow(),
+                error: errCode || `token_http_${resp.status}`,
+                error_description: (resp.json && resp.json.error_description)
+                    || String(resp.body || '').slice(0, 300)
+                    || 'Token exchange failed',
+            };
+            // Keep retrying transient errors while the code is still valid.
+            if (resp.status >= 500 || resp.status === 0) {
+                scheduleDeviceLoginPoll((state.interval || 5) * 1000);
+                return publicDeviceLoginView(state);
+            }
+            writeDeviceLoginState(failed);
+            clearDeviceLoginPollTimer();
+            return publicDeviceLoginView(failed);
+        }
+
+        const saved = await persistDeviceLoginTokens(resp.json);
+        const complete = {
+            status: 'complete',
+            user_code: state.user_code,
+            started_at: state.started_at,
+            completed_at: isoNow(),
+            email: saved.email || null,
+            message: saved.email ? `Signed in as ${saved.email}` : 'Signed in',
+        };
+        writeDeviceLoginState(complete);
+        clearDeviceLoginPollTimer();
+        return publicDeviceLoginView(complete);
+    } finally {
+        deviceLoginPollInFlight = false;
+    }
+}
+
+async function getDeviceLoginStatus({ startIfNeeded = false, forceNew = false } = {}) {
+    let state = readDeviceLoginState();
+    if (startIfNeeded) {
+        if (!state || state.status !== 'pending' || forceNew) {
+            return startDeviceLogin(forceNew);
+        }
+        const exp = state.expires_at ? Date.parse(state.expires_at) : 0;
+        if (!exp || exp <= Date.now() + 30000) {
+            return startDeviceLogin(true);
+        }
+    }
+    if (state && state.status === 'pending') {
+        // Opportunistic poll on status reads so multi-worker HA keeps progress even if
+        // the original poll timer lives on another process.
+        try {
+            return await pollDeviceLoginOnce();
+        } catch (err) {
+            scheduleDeviceLoginPoll((state.interval || 5) * 1000);
+            return {
+                ...publicDeviceLoginView(state),
+                poll_error: err.message || String(err),
+            };
+        }
+    }
+    return publicDeviceLoginView(state);
+}
+
+// Resume pending device login after bridge restart.
+(() => {
+    try {
+        const st = readDeviceLoginState();
+        if (st && st.status === 'pending' && st.device_code) {
+            const exp = st.expires_at ? Date.parse(st.expires_at) : 0;
+            if (exp > Date.now()) {
+                scheduleDeviceLoginPoll(2000);
+            }
+        }
+    } catch (_) {}
+})();
+
 function isGrokModel(model) {
     return !!(model && (model.startsWith('gb:') || model.startsWith('grok:')));
 }
@@ -1585,6 +2044,46 @@ const httpServer = http.createServer((req, res) => {
         }
         res.writeHead(result && result.ok ? 200 : 500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
+        return;
+    }
+    // OIDC device-code login: start returns a clickable verification_uri_complete;
+    // status polls until the user approves in the browser.
+    if (url.pathname === '/grok-login/start' && (req.method === 'POST' || req.method === 'GET')) {
+        const forceNew = url.searchParams.get('force') === '1';
+        startDeviceLogin(forceNew)
+            .then((result) => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            })
+            .catch((err) => {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    ok: false,
+                    status: 'error',
+                    needed: true,
+                    error: err.message || 'start_failed',
+                    message: 'Failed to start Grok device login',
+                }));
+            });
+        return;
+    }
+    if (url.pathname === '/grok-login/status' && req.method === 'GET') {
+        const startIfNeeded = url.searchParams.get('start') === '1';
+        const forceNew = url.searchParams.get('force') === '1';
+        getDeviceLoginStatus({ startIfNeeded, forceNew })
+            .then((result) => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            })
+            .catch((err) => {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    ok: false,
+                    status: 'error',
+                    needed: true,
+                    error: err.message || 'status_failed',
+                }));
+            });
         return;
     }
     // Gateway uses this to sticky-route reconnects to the worker that owns the agent

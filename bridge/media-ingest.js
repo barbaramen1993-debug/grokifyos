@@ -353,8 +353,17 @@ function createMediaIngest({ workspace, log }) {
         if (agent._mediaIngested.has(key)) {
             return agent._mediaBySource.get(key) || null;
         }
+        let parsed;
+        try {
+            parsed = new URL(key);
+        } catch (_) {
+            // Agent text often contains pseudo-URLs (e.g. auth.json entry keys like
+            // https://auth.x.ai::client-id). Skip those so harvest never crashes the worker.
+            return null;
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
         let kind = opts.kind || kindFromPath(url) || 'image';
-        let ext = path.extname(new URL(url).pathname).toLowerCase();
+        let ext = path.extname(parsed.pathname).toLowerCase();
         if (!MEDIA_EXTS.has(ext)) ext = kind === 'video' ? '.mp4' : '.jpg';
         const destDir = ensureUploadDir(agent.sessionId);
         const tmpName = `dl_${crypto.randomBytes(8).toString('hex')}${ext}`;
@@ -373,7 +382,7 @@ function createMediaIngest({ workspace, log }) {
             const media = {
                 kind,
                 url: publicUrl(agent.sessionId, stableName),
-                name: opts.name || path.basename(new URL(url).pathname) || stableName,
+                name: opts.name || path.basename(parsed.pathname) || stableName,
                 tool: opts.tool || null,
                 source: key,
                 absPath: stableAbs,

@@ -256,6 +256,10 @@ php scripts/check-grok-auth.php --refresh
 php scripts/check-grok-auth.php --probe
 
 # Re-login (headless), then sync for the PHP usage API
+# Preferred from the phone app: Settings → Weekly usage → "Sign in with Grok / xAI"
+# (or tap the usage chip when it says re-login) — that starts OIDC device-code and
+# opens https://accounts.x.ai/oauth2/device?user_code=… for one-tap approve.
+# Manual CLI fallback:
 grok login --device-code
 ./scripts/sync-grok-auth.sh
 ```

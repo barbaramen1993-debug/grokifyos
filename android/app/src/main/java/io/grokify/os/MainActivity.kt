@@ -2,6 +2,7 @@ package io.grokify.os
 
 import android.content.ComponentName
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -18,6 +19,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.grokify.os.permission.PermissionHelper
 import io.grokify.os.service.GrokifyForegroundService
@@ -27,6 +29,7 @@ import io.grokify.os.ui.GrokifyAppRoot
 import io.grokify.os.ui.GrokifyViewModel
 import io.grokify.os.ui.theme.GrokifyColors
 import io.grokify.os.ui.theme.GrokifyTheme
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     /**
@@ -131,6 +134,23 @@ class MainActivity : ComponentActivity() {
                         onRenameSession = vm::renameSession,
                         onLoadOlder = vm::loadOlderMessages,
                         onRefreshUsage = { vm.refreshUsage(force = true) },
+                        onGrokLogin = {
+                            lifecycleScope.launch {
+                                val url = vm.ensureGrokLoginUrl(forceNew = false)
+                                if (!url.isNullOrBlank()) {
+                                    try {
+                                        startActivity(
+                                            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                        )
+                                    } catch (_: Exception) {
+                                        // No browser / invalid URL — status chip still shows code.
+                                    }
+                                } else {
+                                    vm.refreshUsage(force = true)
+                                }
+                            }
+                        },
                         onSetAppOrder = vm::setAppOrder,
                     )
                 }

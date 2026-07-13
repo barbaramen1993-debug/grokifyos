@@ -95,6 +95,14 @@ data class UsageInfo(
     val fetchedAt: String = "",
     val label: String = "",
     val error: String? = null,
+    /** True when CLI/xAI OAuth is missing or revoked. */
+    val loginNeeded: Boolean = false,
+    /** Device-code status: pending | complete | denied | expired | error | idle */
+    val loginStatus: String? = null,
+    /** One-tap OIDC device URL (accounts.x.ai) — open in browser to approve. */
+    val loginUrl: String? = null,
+    val loginUserCode: String? = null,
+    val loginMessage: String? = null,
 )
 
 enum class ChatPanel { None, History, Notes }
@@ -1134,6 +1142,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private var loginPollJob: Job? = null
+
     fun refreshUsage(force: Boolean = false) {
         if (usageJob?.isActive == true && !force) return
         usageJob = viewModelScope.launch {
@@ -1143,6 +1153,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 if (!data.optBoolean("ok", false)) {
                     val err = data.optString("error", "usage_failed").ifBlank { "usage_failed" }
                     val msg = data.optString("message").ifBlank { err }
+                    val loginFields = parseLoginFields(data)
                     _state.update {
                         val prev = it.usage
                         it.copy(
@@ -1150,10 +1161,22 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                             usage = (prev ?: UsageInfo()).copy(
                                 // Keep last good label if we had one; surface short error for the chip.
                                 error = msg,
-                                label = prev?.label?.takeIf { l -> l.isNotBlank() }
-                                    ?: shortUsageError(err, msg),
+                                label = if (loginFields.loginNeeded && !loginFields.loginUrl.isNullOrBlank()) {
+                                    "Usage: tap to re-login"
+                                } else {
+                                    prev?.label?.takeIf { l -> l.isNotBlank() }
+                                        ?: shortUsageError(err, msg)
+                                },
+                                loginNeeded = loginFields.loginNeeded,
+                                loginStatus = loginFields.loginStatus,
+                                loginUrl = loginFields.loginUrl,
+                                loginUserCode = loginFields.loginUserCode,
+                                loginMessage = loginFields.loginMessage,
                             ),
                         )
+                    }
+                    if (loginFields.loginNeeded) {
+                        maybeStartLoginPoll(loginFields.loginStatus)
                     }
                     return@launch
                 }
@@ -1177,6 +1200,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 val resetAt = data.optString("reset_at")
                 val tier = data.optString("subscription_tier")
                 val label = formatUsageLabel(pct, resetAt)
+                stopLoginPoll()
                 _state.update {
                     it.copy(
                         usageLoading = false,
@@ -1191,6 +1215,11 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                             fetchedAt = data.optString("fetched_at"),
                             label = label,
                             error = null,
+                            loginNeeded = false,
+                            loginStatus = null,
+                            loginUrl = null,
+                            loginUserCode = null,
+                            loginMessage = null,
                         ),
                     )
                 }
@@ -1210,18 +1239,141 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Ensure a device-code login is running and return the browser URL to open.
+     * Call when the user taps "re-login" / "Sign in with Grok".
+     */
+    suspend fun ensureGrokLoginUrl(forceNew: Boolean = false): String? {
+        return try {
+            val data = withContext(Dispatchers.IO) { api.startGrokLogin(force = forceNew) }
+            val fields = parseLoginFields(data)
+            _state.update {
+                val prev = it.usage ?: UsageInfo()
+                it.copy(
+                    usage = prev.copy(
+                        loginNeeded = true,
+                        loginStatus = fields.loginStatus ?: "pending",
+                        loginUrl = fields.loginUrl ?: prev.loginUrl,
+                        loginUserCode = fields.loginUserCode ?: prev.loginUserCode,
+                        loginMessage = fields.loginMessage ?: prev.loginMessage,
+                        label = "Usage: tap to re-login",
+                        error = prev.error ?: "Grok re-login needed",
+                    ),
+                )
+            }
+            maybeStartLoginPoll(fields.loginStatus ?: "pending")
+            fields.loginUrl ?: _state.value.usage?.loginUrl
+        } catch (_: Exception) {
+            _state.value.usage?.loginUrl
+        }
+    }
+
+    private data class LoginFields(
+        val loginNeeded: Boolean,
+        val loginStatus: String?,
+        val loginUrl: String?,
+        val loginUserCode: String?,
+        val loginMessage: String?,
+    )
+
+    private fun parseLoginFields(data: JSONObject): LoginFields {
+        val loginObj = data.optJSONObject("login")
+        val url = data.optString("login_url").ifBlank {
+            loginObj?.optString("verification_uri_complete").orEmpty()
+        }.ifBlank { null }
+        val userCode = data.optString("login_user_code").ifBlank {
+            loginObj?.optString("user_code").orEmpty()
+        }.ifBlank { null }
+        val status = loginObj?.optString("status")?.ifBlank { null }
+        val message = loginObj?.optString("message")?.ifBlank { null }
+        val needed = when {
+            loginObj?.has("needed") == true -> loginObj.optBoolean("needed", false)
+            !url.isNullOrBlank() -> true
+            else -> {
+                val err = data.optString("error").lowercase()
+                err.contains("auth") || err.contains("billing_auth") || err.contains("revoked")
+            }
+        }
+        return LoginFields(
+            loginNeeded = needed || !url.isNullOrBlank(),
+            loginStatus = status,
+            loginUrl = url,
+            loginUserCode = userCode,
+            loginMessage = message,
+        )
+    }
+
+    private fun maybeStartLoginPoll(status: String?) {
+        if (status != "pending" && status != null && status != "idle") {
+            // Still poll briefly after start so "complete" is picked up.
+            if (status != "pending") return
+        }
+        if (loginPollJob?.isActive == true) return
+        loginPollJob = viewModelScope.launch {
+            // Poll for up to ~20 minutes (device codes last ~30m).
+            repeat(240) {
+                delay(5_000)
+                val st = try {
+                    withContext(Dispatchers.IO) { api.grokLoginStatus(start = false) }
+                } catch (_: Exception) {
+                    null
+                }
+                val login = st?.optJSONObject("login")
+                val loginStatus = login?.optString("status").orEmpty()
+                if (loginStatus == "complete") {
+                    stopLoginPoll()
+                    refreshUsage(force = true)
+                    return@launch
+                }
+                if (loginStatus == "denied" || loginStatus == "expired" || loginStatus == "error") {
+                    val fields = parseLoginFields(st ?: JSONObject())
+                    _state.update {
+                        val prev = it.usage ?: UsageInfo()
+                        it.copy(
+                            usage = prev.copy(
+                                loginNeeded = true,
+                                loginStatus = fields.loginStatus,
+                                loginUrl = fields.loginUrl ?: prev.loginUrl,
+                                loginUserCode = fields.loginUserCode ?: prev.loginUserCode,
+                                loginMessage = fields.loginMessage,
+                                label = "Usage: re-login needed",
+                                error = fields.loginMessage ?: prev.error,
+                            ),
+                        )
+                    }
+                    stopLoginPoll()
+                    return@launch
+                }
+                // Also try usage in case tokens landed via another worker.
+                if (it % 3 == 2) {
+                    refreshUsage(force = true)
+                    if (_state.value.usage?.error == null && _state.value.usage?.loginNeeded != true) {
+                        stopLoginPoll()
+                        return@launch
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopLoginPoll() {
+        loginPollJob?.cancel()
+        loginPollJob = null
+    }
+
     private fun shortUsageError(code: String, message: String): String {
         val c = code.lowercase()
         val m = message.lowercase()
         return when {
-            c.contains("auth_refresh_revoked") || m.contains("revoked") -> "Usage: re-login needed"
+            c.contains("auth_refresh_revoked") || m.contains("revoked") || m.contains("re-login") ->
+                "Usage: tap to re-login"
             c.contains("auth") || m.contains("credential") || m.contains("sync-grok-auth") ->
-                "Usage: auth error"
-            c.contains("billing_auth") -> "Usage: auth error"
+                "Usage: tap to re-login"
+            c.contains("billing_auth") -> "Usage: tap to re-login"
             c.contains("billing") -> "Usage: billing error"
             c.contains("network") || c.contains("timeout") || m.contains("timeout") ->
                 "Usage: network error"
-            message.contains("auth", ignoreCase = true) -> "Usage: auth error"
+            message.contains("auth", ignoreCase = true) -> "Usage: tap to re-login"
             else -> "Usage unavailable"
         }
     }
