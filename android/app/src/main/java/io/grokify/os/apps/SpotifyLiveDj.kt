@@ -843,9 +843,17 @@ class SpotifyLiveDjService : Service() {
      * URI we just told Spotify to play (via [playTrack]). External URI changes
      * that do not match this are user/autoplay influence — sync or recalibrate,
      * never force-play the next radio cut over what Spotify is already doing.
+     *
+     * Important: [playTrack] sets [lastUri] optimistically before Spotify's
+     * currently-playing API catches up. For several polls the API still returns
+     * the *previous* cut, which looks like an external change (new → old) and
+     * used to spam "Spotify changed outside Live DJ" + duplicate track bubbles.
+     * While [expectedPlayUri] is live we suppress those lag echoes.
      */
     private var expectedPlayUri: String? = null
     private var expectedPlayUntilMs = 0L
+    /** URI that was current when we issued the last [playTrack] (for lag detection). */
+    private var expectedPlayFromUri: String? = null
     /** Refresh partial wake lock periodically so long DJ sessions stay alive. */
     private var lastWakeRefreshMs = 0L
 
@@ -1205,22 +1213,70 @@ class SpotifyLiveDjService : Service() {
         // Old behavior always "reclaimed" by playing queue[0] — that skipped the expected cut
         // or overwrote a manual Spotify choice with something unrelated. Now: sync if the
         // new URI is already in UP NEXT, otherwise adopt + rebuild the radio queue.
+        //
+        // Race: playTrack sets lastUri to the *new* cut immediately, but currently-playing
+        // still reports the previous cut for a poll or two. That must not look "external".
         if (uri.isNotBlank() && lastUri != null && uri != lastUri && !transitioning.get()) {
             val now = System.currentTimeMillis()
-            val owned = expectedPlayUri != null &&
-                uri == expectedPlayUri &&
-                now <= expectedPlayUntilMs
-            if (owned) {
-                expectedPlayUri = null
-                Log.i(TAG, "ack our play → $uri")
-            } else {
-                Log.i(
-                    TAG,
-                    "external track change $lastUri → $uri (prevRemain=${prevRemain}ms) — sync/recalibrate",
-                )
-                handleExternalTrackChange(track, playing, progress, duration, prevRemain)
-                return
+            val expecting = expectedPlayUri
+            val withinExpect = expecting != null && now <= expectedPlayUntilMs
+            when {
+                withinExpect && uri == expecting -> {
+                    expectedPlayUri = null
+                    expectedPlayFromUri = null
+                    Log.i(TAG, "ack our play → $uri")
+                    // fall through — normal now-playing update
+                }
+                withinExpect -> {
+                    // Still waiting for our commanded play to land.
+                    // Typical: API echoes the previous cut (or a brief interstitial).
+                    // Only treat as a real override if the unexpected track is clearly
+                    // mid-song (user scrubbed / picked something else in Spotify).
+                    val fromPrev = expectedPlayFromUri != null && uri == expectedPlayFromUri
+                    val midTrackOverride =
+                        !fromPrev &&
+                            progress >= 8_000L &&
+                            remain > 20_000L &&
+                            duration > 45_000L
+                    if (!midTrackOverride) {
+                        Log.i(
+                            TAG,
+                            "await our play expected=$expecting saw=$uri " +
+                                "fromPrev=$fromPrev progress=${progress}ms — suppress external",
+                        )
+                        // Do not rewrite lastUri / chat / queue while Spotify lags.
+                        return
+                    }
+                    Log.i(
+                        TAG,
+                        "override during expected play $expecting → $uri (progress=${progress}ms)",
+                    )
+                    expectedPlayUri = null
+                    expectedPlayFromUri = null
+                    handleExternalTrackChange(track, playing, progress, duration, prevRemain)
+                    return
+                }
+                else -> {
+                    if (expecting != null) {
+                        // Window expired without seeing our URI — clear and treat as external.
+                        expectedPlayUri = null
+                        expectedPlayFromUri = null
+                    }
+                    Log.i(
+                        TAG,
+                        "external track change $lastUri → $uri (prevRemain=${prevRemain}ms) — sync/recalibrate",
+                    )
+                    handleExternalTrackChange(track, playing, progress, duration, prevRemain)
+                    return
+                }
             }
+        }
+        // playTrack already set lastUri; when Spotify catches up uri == lastUri and we
+        // never entered the branch above — still clear ownership so it cannot linger.
+        if (expectedPlayUri != null && uri == expectedPlayUri) {
+            expectedPlayUri = null
+            expectedPlayFromUri = null
+            Log.i(TAG, "ack our play (caught up) → $uri")
         }
         lastRemainMs = remain
 
@@ -1416,6 +1472,7 @@ class SpotifyLiveDjService : Service() {
         prefetchedBanter = null
         prefetchedForUri = null
         expectedPlayUri = null
+        expectedPlayFromUri = null
         stuckEndPolls = 0
         idlePolls = 0
         lastRemainMs = if (durationMs > 0) {
@@ -1449,20 +1506,24 @@ class SpotifyLiveDjService : Service() {
                 store.songsSinceBanter = songsSinceBanter
             }
             persistRuntimeState()
-            val note = buildString {
-                append("Synced to Spotify · ")
-                append(track.name.ifBlank { uri })
-                if (track.artists.isNotBlank()) append(" — ").append(track.artists)
-                if (droppedAhead > 0) append(" · dropped $droppedAhead ahead")
-                append(" · kept ${synchronized(queue) { queue.size }} up next")
+            // Only chat-spam on explicit Sync or when we actually dropped ahead tracks.
+            // Quiet in-queue advances (Spotify landed on our next cut) just adopt.
+            if (userInitiated || droppedAhead > 0) {
+                val note = buildString {
+                    append(if (userInitiated) "Synced to Spotify · " else "Caught up · ")
+                    append(track.name.ifBlank { uri })
+                    if (track.artists.isNotBlank()) append(" — ").append(track.artists)
+                    if (droppedAhead > 0) append(" · dropped $droppedAhead ahead")
+                    append(" · kept ${synchronized(queue) { queue.size }} up next")
+                }
+                appendChat(
+                    DjChatMessage(
+                        id = "sys-sync-${System.currentTimeMillis()}",
+                        role = DjChatRole.System,
+                        text = note,
+                    ),
+                )
             }
-            appendChat(
-                DjChatMessage(
-                    id = "sys-sync-${System.currentTimeMillis()}",
-                    role = DjChatRole.System,
-                    text = note,
-                ),
-            )
             val banterHint = " · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
             publish(
                 nowLine = buildExternalNowLine(track, playing, progressMs, durationMs),
@@ -1989,13 +2050,18 @@ class SpotifyLiveDjService : Service() {
             }
         }
         val ok = res.ok || res.status in listOf(202, 204)
+        // Remember what Spotify was on so lagging currently-playing polls (still the
+        // previous cut) are not treated as "Spotify changed outside Live DJ".
+        expectedPlayFromUri = lastUri
         current = item
+        // Optimistic: UI + ownership point at the track we commanded. Polls may still
+        // report the previous URI until Spotify applies the play — see tickPlayback.
         lastUri = item.uri
         store.lastCurrentUri = item.uri
         nearEndArmed = false
-        // Mark ownership so the next poll doesn't treat this as a missed handoff.
+        // Mark ownership so the next poll doesn't treat lag / our handoff as external.
         expectedPlayUri = item.uri
-        expectedPlayUntilMs = System.currentTimeMillis() + 20_000L
+        expectedPlayUntilMs = System.currentTimeMillis() + 25_000L
         lastRemainMs = 999_999L
         // Only claim "playing" when Spotify accepted the play (or deep-link path may still recover)
         wasPlaying = ok || res.status == 404
