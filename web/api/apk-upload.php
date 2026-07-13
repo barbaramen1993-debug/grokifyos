@@ -43,49 +43,29 @@ if (!preg_match('/\.apk$/i', $orig)) {
     gos_api_json(['ok' => false, 'error' => 'must_be_apk'], 400);
 }
 
-$dir = gos_root() . '/storage/apk';
-if (!is_dir($dir) && !mkdir($dir, 0750, true) && !is_dir($dir)) {
-    gos_api_json(['ok' => false, 'error' => 'storage_unavailable'], 500);
-}
-
-$safeName = 'grokifyos-' . $versionCode . '-' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $versionName) . '.apk';
-$dest = $dir . '/' . $safeName;
-if (!move_uploaded_file($tmp, $dest)) {
-    gos_api_json(['ok' => false, 'error' => 'move_failed'], 500);
-}
-
-$size = (int) filesize($dest);
-$sha = hash_file('sha256', $dest) ?: '';
 $userId = (int) $access['user']['id'];
+$result = gos_register_apk_upload(
+    $tmp,
+    $orig,
+    $versionCode,
+    $versionName,
+    $changelog !== '' ? $changelog : null,
+    $userId,
+    26
+);
 
-try {
-    $st = gos_pdo()->prepare(
-        'INSERT INTO grokify_apk_releases
-            (version_code, version_name, file_name, file_path, file_size, sha256, changelog, is_active, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-         ON DUPLICATE KEY UPDATE
-            version_name = VALUES(version_name),
-            file_name = VALUES(file_name),
-            file_path = VALUES(file_path),
-            file_size = VALUES(file_size),
-            sha256 = VALUES(sha256),
-            changelog = VALUES(changelog),
-            is_active = 1,
-            created_by = VALUES(created_by)'
-    );
-    $st->execute([$versionCode, $versionName, $safeName, $dest, $size, $sha, $changelog !== '' ? $changelog : null, $userId]);
-} catch (Throwable $e) {
-    @unlink($dest);
-    gos_api_json(['ok' => false, 'error' => 'db_failed', 'message' => $e->getMessage()], 500);
+if (empty($result['ok'])) {
+    gos_api_json(['ok' => false, 'error' => $result['error'] ?? 'upload_failed'], 500);
 }
 
+$rel = $result['release'];
 gos_api_json([
     'ok' => true,
     'release' => [
-        'version_code' => $versionCode,
-        'version_name' => $versionName,
-        'file_name' => $safeName,
-        'file_size' => $size,
-        'sha256' => $sha,
+        'version_code' => (int) $rel['version_code'],
+        'version_name' => (string) $rel['version_name'],
+        'file_name' => (string) $rel['file_name'],
+        'file_size' => (int) $rel['file_size'],
+        'sha256' => (string) $rel['sha256'],
     ],
 ]);

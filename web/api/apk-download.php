@@ -12,10 +12,12 @@ if ($apk === null) {
     exit;
 }
 
-$path = (string) ($apk['file_path'] ?? '');
+$path = function_exists('gos_apk_absolute_path')
+    ? gos_apk_absolute_path($apk)
+    : (string) ($apk['file_path'] ?? '');
 if ($path === '' || !is_readable($path)) {
     // Resolve relative to storage/apk
-    $alt = gos_root() . '/storage/apk/' . basename((string) ($apk['file_name'] ?? ''));
+    $alt = gos_root() . '/storage/apk/' . basename((string) ($apk['file_name'] ?? $apk['file_path'] ?? ''));
     if (is_readable($alt)) {
         $path = $alt;
     } else {

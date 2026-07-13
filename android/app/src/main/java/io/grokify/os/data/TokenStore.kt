@@ -8,7 +8,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
-private val Context.dataStore by preferencesDataStore("grokify_prefs")
+private val Context.dataStore by preferencesDataStore("grokifyos_prefs")
 
 class TokenStore(private val context: Context) {
     private val keyToken = stringPreferencesKey("device_token")

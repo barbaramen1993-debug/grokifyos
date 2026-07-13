@@ -33,4 +33,4 @@ fi
 
 echo "Installing $APK ..."
 "${ADB[@]}" install -r "$APK"
-echo "Done. Launch: adb shell am start -n io.grokpot.grokify.debug/io.grokpot.grokify.MainActivity"
+echo "Done. Launch: adb shell am start -n io.grokify.os.debug/io.grokify.os.MainActivity"

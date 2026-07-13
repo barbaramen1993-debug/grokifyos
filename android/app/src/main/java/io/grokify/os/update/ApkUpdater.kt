@@ -65,7 +65,7 @@ class ApkUpdater(
             ?: throw IllegalStateException("Not signed in — save your device token first")
 
         val url = downloadUrl?.takeIf { it.isNotBlank() }
-            ?: (BuildConfig.API_BASE.trimEnd('/') + "/grokify-apk-download.php")
+            ?: (BuildConfig.API_BASE.trimEnd('/') + "/apk-download.php")
 
         val req = Request.Builder()
             .url(url)

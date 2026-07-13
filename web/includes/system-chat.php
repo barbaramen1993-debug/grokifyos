@@ -675,6 +675,26 @@ function gos_devices_for_user(int $userId): array
     return ['devices' => $devices, 'active' => $active];
 }
 
+function gos_apk_storage_dir(): string
+{
+    $dir = gos_root() . '/storage/apk';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0750, true);
+    }
+
+    return $dir;
+}
+
+function gos_public_origin(): string
+{
+    $url = gos_site_url();
+    if (is_string($url) && $url !== '') {
+        return rtrim($url, '/');
+    }
+
+    return 'https://grokifyos.grokpot.io';
+}
+
 /** @return array<string, mixed>|null */
 function gos_latest_apk(): ?array
 {
@@ -682,9 +702,119 @@ function gos_latest_apk(): ?array
         return null;
     }
     $st = gos_pdo()->query(
-        'SELECT * FROM grokify_apk_releases WHERE is_active = 1 ORDER BY version_code DESC LIMIT 1'
+        'SELECT id, version_code, version_name, file_name, file_path, file_size, sha256, changelog,
+                min_sdk, is_active, created_by, created_at
+         FROM grokify_apk_releases
+         WHERE is_active = 1
+         ORDER BY version_code DESC
+         LIMIT 1'
     );
     $row = $st ? $st->fetch(PDO::FETCH_ASSOC) : false;
 
     return is_array($row) ? $row : null;
+}
+
+/**
+ * Register a built or uploaded APK as the active release.
+ *
+ * @return array{ok: bool, release?: array<string, mixed>, error?: string}
+ */
+function gos_register_apk_upload(
+    string $tmpPath,
+    string $originalName,
+    int $versionCode,
+    string $versionName,
+    ?string $changelog,
+    int $createdBy,
+    ?int $minSdk = null
+): array {
+    if ($versionCode < 1 || $versionName === '') {
+        return ['ok' => false, 'error' => 'invalid_version'];
+    }
+    if (!is_uploaded_file($tmpPath) && !is_readable($tmpPath)) {
+        return ['ok' => false, 'error' => 'invalid_file'];
+    }
+
+    $sha = hash_file('sha256', $tmpPath);
+    if ($sha === false) {
+        return ['ok' => false, 'error' => 'hash_failed'];
+    }
+    $size = filesize($tmpPath);
+    if ($size === false || $size < 1) {
+        return ['ok' => false, 'error' => 'empty_file'];
+    }
+
+    $safeName = 'grokifyos-v' . $versionCode . '-' . preg_replace('/[^a-zA-Z0-9._-]+/', '_', $versionName) . '.apk';
+    $destDir = gos_apk_storage_dir();
+    $dest = $destDir . '/' . $safeName;
+
+    $stored = false;
+    if (is_uploaded_file($tmpPath)) {
+        $stored = @move_uploaded_file($tmpPath, $dest) || @copy($tmpPath, $dest);
+    } else {
+        $stored = @copy($tmpPath, $dest);
+    }
+    if (!$stored || !is_readable($dest)) {
+        return ['ok' => false, 'error' => 'store_failed'];
+    }
+    @chmod($dest, 0640);
+    @chown($dest, 'www-data');
+    @chgrp($dest, 'www-data');
+
+    $relPath = 'storage/apk/' . $safeName;
+    $pdo = gos_pdo();
+    $pdo->beginTransaction();
+    try {
+        $pdo->prepare('UPDATE grokify_apk_releases SET is_active = 0 WHERE is_active = 1')->execute();
+        $st = $pdo->prepare(
+            'INSERT INTO grokify_apk_releases
+             (version_code, version_name, file_name, file_path, file_size, sha256, changelog, min_sdk, is_active, created_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+             ON DUPLICATE KEY UPDATE
+               version_name = VALUES(version_name),
+               file_name = VALUES(file_name),
+               file_path = VALUES(file_path),
+               file_size = VALUES(file_size),
+               sha256 = VALUES(sha256),
+               changelog = VALUES(changelog),
+               min_sdk = VALUES(min_sdk),
+               is_active = 1,
+               created_by = VALUES(created_by),
+               created_at = CURRENT_TIMESTAMP'
+        );
+        $st->execute([
+            $versionCode,
+            mb_substr($versionName, 0, 32),
+            $safeName,
+            $relPath,
+            $size,
+            $sha,
+            $changelog,
+            $minSdk,
+            $createdBy > 0 ? $createdBy : null,
+        ]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        @unlink($dest);
+
+        return ['ok' => false, 'error' => 'db_failed'];
+    }
+
+    $release = gos_latest_apk();
+
+    return $release ? ['ok' => true, 'release' => $release] : ['ok' => false, 'error' => 'not_found'];
+}
+
+function gos_apk_absolute_path(array $release): string
+{
+    $path = (string) ($release['file_path'] ?? '');
+    if ($path === '') {
+        return '';
+    }
+    if ($path[0] === '/') {
+        return $path;
+    }
+
+    return gos_root() . '/' . ltrim($path, '/');
 }

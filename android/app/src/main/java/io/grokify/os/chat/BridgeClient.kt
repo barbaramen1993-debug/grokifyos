@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * WebSocket client for the grokpot System Chat bridge (same protocol as admin UI).
+ * WebSocket client for the GrokifyOS chat bridge (same protocol as the web dashboard).
  */
 class BridgeClient(
     private val onEvent: (JSONObject) -> Unit,
