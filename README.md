@@ -1,6 +1,6 @@
-# GrokifyOS
+# GrokifyOS (open source)
 
-**A mobile Android development kit** — self-hosted web control plane + native phone client — so you can **build custom versions of your own AI-powered phone OS** by working *through* the device, not just *on* it.
+**A mobile Android development kit** — self-hosted web control plane + native phone client — so you can **build custom versions of your own AI-powered phone** by working *through* the device, not just *on* it.
 
 Think of it as **slipping the phone on for the phone**: you pair a real Android handset to *your* server, open hardware (camera, mic, GPS, Wi‑Fi, Bluetooth, notifications, media), stream agents via [Grok Build](https://grok.com), ship features as **built-in inner apps** in the host APK, and **publish APKs OTA** so the handset updates itself.
 
