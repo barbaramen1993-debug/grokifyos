@@ -60,6 +60,7 @@ import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.automirrored.filled.Notes
 import androidx.compose.material.icons.filled.Psychology
@@ -69,8 +70,11 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
+import io.grokify.os.apps.WifiScannerPane
+import io.grokify.os.permission.AppPermissionId
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -151,6 +155,8 @@ fun GrokifyAppRoot(
     onOpenNotificationAccess: () -> Unit = {},
     onRefreshNotificationAccess: () -> Unit = {},
     onTogglePermission: (String) -> Unit = {},
+    onEnsurePermission: (String) -> Unit = {},
+    onEnsurePermissions: (List<String>) -> Unit = {},
     onRefreshPermissions: () -> Unit = {},
     onAllowPermissionRequest: (String) -> Unit = {},
     onDenyPermissionRequest: (String) -> Unit = {},
@@ -170,6 +176,8 @@ fun GrokifyAppRoot(
     onRefreshUsage: () -> Unit = {},
 ) {
     var tab by remember { mutableIntStateOf(1) } // default Chat
+    /** null = Apps hub; "wifi_scanner" = mini-app. */
+    var appsScreen by remember { mutableStateOf<String?>(null) }
     var tokenDraft by remember { mutableStateOf(state.token) }
     var chatDraft by remember { mutableStateOf("") }
     var renameOpen by remember { mutableStateOf(false) }
@@ -291,7 +299,21 @@ fun GrokifyAppRoot(
                         )
                         NavigationBarItem(
                             selected = tab == 2,
-                            onClick = { tab = 2; onSetPanel(ChatPanel.None) },
+                            onClick = {
+                                tab = 2
+                                onSetPanel(ChatPanel.None)
+                            },
+                            icon = { Icon(Icons.Default.Apps, null) },
+                            label = { Text("Apps", fontSize = 11.sp) },
+                            colors = colors,
+                        )
+                        NavigationBarItem(
+                            selected = tab == 3,
+                            onClick = {
+                                tab = 3
+                                appsScreen = null
+                                onSetPanel(ChatPanel.None)
+                            },
                             icon = { Icon(Icons.Default.SystemUpdate, null) },
                             label = { Text("Update", fontSize = 11.sp) },
                             colors = colors,
@@ -357,7 +379,21 @@ fun GrokifyAppRoot(
                         onLoadOlder = onLoadOlder,
                         onRefreshUsage = onRefreshUsage,
                     )
-                    2 -> UpdatePane(
+                    2 -> AppsPane(
+                        screen = appsScreen,
+                        onOpenApp = { appsScreen = it },
+                        onBackToHub = { appsScreen = null },
+                        onRequestWifiPerms = {
+                            // Single system dialog: nearby Wi‑Fi + location (OEM-friendly).
+                            onEnsurePermissions(
+                                listOf(
+                                    AppPermissionId.NEARBY_WIFI.id,
+                                    AppPermissionId.LOCATION.id,
+                                ),
+                            )
+                        },
+                    )
+                    3 -> UpdatePane(
                         state = state,
                         onCheckUpdate = onCheckUpdate,
                         onDownloadInstall = onDownloadInstallUpdate,
@@ -490,6 +526,7 @@ private fun TopChrome(
                         when (tab) {
                             0 -> "Command center"
                             1 -> shortenTitle(state.sessionTitle.ifBlank { "Chat" })
+                            2 -> "Inner Apps"
                             else -> "Deploy"
                         },
                         style = MaterialTheme.typography.titleSmall,
@@ -2564,6 +2601,93 @@ private fun SystemLine(
             ) {
                 actions()
             }
+        }
+    }
+}
+
+@Composable
+private fun AppsPane(
+    screen: String?,
+    onOpenApp: (String) -> Unit,
+    onBackToHub: () -> Unit,
+    onRequestWifiPerms: () -> Unit,
+) {
+    when (screen) {
+        "wifi_scanner" -> WifiScannerPane(
+            onBack = onBackToHub,
+            onRequestPermissions = onRequestWifiPerms,
+        )
+        else -> AppsHub(onOpenApp = onOpenApp)
+    }
+}
+
+@Composable
+private fun AppsHub(onOpenApp: (String) -> Unit) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+    ) {
+        GlassCard {
+            Text("INNER APPS", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Mini-apps that run on your phone. Permissions are requested only when you open a tool that needs them.",
+                color = GrokifyColors.TextMuted,
+                fontSize = 13.sp,
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        AppTile(
+            title = "Wi‑Fi Scanner",
+            subtitle = "Discover nearby networks, signal strength, and channel. History kept for this session.",
+            icon = Icons.Default.Wifi,
+            accent = GrokifyColors.GlowCyan,
+            onClick = { onOpenApp("wifi_scanner") },
+        )
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "More apps soon — Bluetooth tracker, room maps, and sensor tools.",
+            color = GrokifyColors.TextDim,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
+    }
+}
+
+@Composable
+private fun AppTile(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    accent: Color,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick, role = Role.Button)
+            .padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(accent.copy(alpha = 0.12f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(24.dp))
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = GrokifyColors.TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            Spacer(Modifier.height(2.dp))
+            Text(subtitle, color = GrokifyColors.TextMuted, fontSize = 12.sp)
         }
     }
 }

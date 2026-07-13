@@ -243,6 +243,38 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         requestPermissionGroup(id, chatLineId = null)
     }
 
+    /**
+     * Request a permission group only if not already granted (never opens settings to revoke).
+     * Used by mini-apps such as Wi‑Fi Scanner.
+     */
+    fun ensurePermission(permissionKey: String) {
+        ensurePermissions(listOf(permissionKey))
+    }
+
+    /** Batch-request missing groups in a single system dialog when possible. */
+    fun ensurePermissions(permissionKeys: List<String>) {
+        val ctx = getApplication<Application>()
+        val missing = linkedSetOf<String>()
+        for (key in permissionKeys) {
+            val id = AppPermissionId.fromId(key) ?: continue
+            val status = PermissionHelper.status(ctx, id)
+            if (!status.requestable || status.granted) continue
+            missing += PermissionHelper.missing(ctx, id).toList()
+        }
+        if (missing.isEmpty()) {
+            refreshPermissions()
+            return
+        }
+        val requester = permissionRequester
+        if (requester == null) {
+            appendSystem("Cannot open permission dialog — try again from Settings.")
+            return
+        }
+        requester(missing.toTypedArray()) {
+            viewModelScope.launch { refreshPermissions() }
+        }
+    }
+
     /** User tapped Allow on an in-chat permission card. */
     fun allowPermissionRequest(lineId: String) {
         val line = _state.value.messages.firstOrNull { it.id == lineId } ?: return
@@ -1630,9 +1662,35 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     finalizeThinking("")
                 }
+                val hadError = evt.optBoolean("error", false)
+                val pending = streamBuf.toString()
                 // Keep interleaved segments — only seal remaining streamBuf, do NOT
                 // replace earlier text bubbles with the full agent output (that scrambled order).
-                finalizeAssistant(streamBuf.toString())
+                finalizeAssistant(pending)
+                // Empty silent finish (legacy path before bridge auth errors) → notice in chat
+                if (!hadError && pending.isBlank()) {
+                    val msgs = _state.value.messages
+                    val lastUser = msgs.indexOfLast { it.role == ChatRole.User }
+                    val hasReply = lastUser >= 0 && msgs.drop(lastUser + 1).any {
+                        (it.role == ChatRole.Assistant && it.text.isNotBlank()) ||
+                            it.role == ChatRole.System ||
+                            it.role == ChatRole.Tool ||
+                            it.role == ChatRole.Media
+                    }
+                    if (lastUser >= 0 && !hasReply) {
+                        appendSystem(
+                            "No reply from the agent. If Grok Build auth expired on the server, " +
+                                "run `grok login --device-code` and check with " +
+                                "`php scripts/check-grok-auth.php`.",
+                        )
+                        _state.update {
+                            it.copy(
+                                error = "No agent reply — check Grok Build auth on server",
+                                statusText = "No reply",
+                            )
+                        }
+                    }
+                }
             }
             // Keep partial text across bridge restarts / WS drops
             "interrupted", "bridge_stopping" -> {
@@ -1710,7 +1768,39 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             "error" -> {
-                finalizeAssistant("Error: " + evt.optString("content", "unknown"))
+                val content = evt.optString("content", "unknown")
+                val code = evt.optString("code")
+                val authish = code == "auth_required" ||
+                    content.contains("not signed in", ignoreCase = true) ||
+                    content.contains("Grok Build is not signed in", ignoreCase = true) ||
+                    content.contains("grok login", ignoreCase = true)
+                // Seal any streaming spinners without inventing an assistant body
+                finalizeAssistant("")
+                if (authish) {
+                    appendSystem(
+                        "⚠️ Grok Build needs sign-in on the server — no reply was produced.\n" +
+                            "On the host run:\n" +
+                            "  grok login --device-code\n" +
+                            "Check: php scripts/check-grok-auth.php\n" +
+                            "Then send your message again.",
+                    )
+                    _state.update {
+                        it.copy(
+                            error = "Grok Build auth required on server",
+                            statusText = "Auth required",
+                            busy = false,
+                        )
+                    }
+                } else {
+                    appendSystem("Error: $content")
+                    _state.update {
+                        it.copy(
+                            error = content.take(200),
+                            statusText = if (it.connected) "Bridge connected" else it.statusText,
+                            busy = false,
+                        )
+                    }
+                }
             }
             "status" -> {
                 val msg = evt.optString("content").ifBlank { evt.optString("message") }

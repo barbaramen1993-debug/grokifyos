@@ -826,9 +826,68 @@ async function gracefulShutdown(signal) {
     setTimeout(() => process.exit(0), DETACH_AGENTS ? 200 : 350);
 }
 
+/** True when CLI / stderr text indicates Grok Build auth is missing or expired. */
+function isAuthFailureMessage(msg) {
+    const s = String(msg || '').toLowerCase();
+    return /not signed in|not authenticated|authentication required|auth(?:entication)? failed|please (?:log|sign) in|run:\s*grok login|unauthorized|invalid.?token|session expired|login required|xai_api_key/.test(s);
+}
+
+function formatCliAuthError(raw) {
+    const detail = String(raw || '').trim();
+    const lines = [
+        'Grok Build is not signed in on the server (no agent reply was produced).',
+        '',
+        'On the host, re-authenticate, then send your message again:',
+        '  grok login --device-code',
+        '',
+        'Check status anytime:',
+        '  php scripts/check-grok-auth.php',
+    ];
+    if (detail && !/^not signed in/i.test(detail)) {
+        lines.push('', 'Detail: ' + detail.slice(0, 400));
+    }
+    return lines.join('\n');
+}
+
+function captureAgentCliError(agent, raw) {
+    const msg = String(raw || '').trim();
+    if (!msg) return;
+    agent._cliError = msg;
+    if (isAuthFailureMessage(msg)) {
+        agent._cliErrorIsAuth = true;
+    }
+}
+
+function emitAgentError(agent, content, code) {
+    const evt = {
+        type: 'error',
+        content: String(content || 'Agent error'),
+        code: code || 'agent_error',
+    };
+    agent.events.push(evt);
+    sendToClient(agent, evt);
+    return evt;
+}
+
 function processGrokEvent(agent, json) {
     const t = json.type;
     const data = json.data || json.content || '';
+
+    // Grok CLI auth / hard failures: {"type":"error","message":"Not signed in..."}
+    if (t === 'error') {
+        const msg = json.message || json.content || json.error || data || 'Agent error';
+        captureAgentCliError(agent, msg);
+        const content = agent._cliErrorIsAuth
+            ? formatCliAuthError(msg)
+            : String(msg);
+        emitAgentError(agent, content, agent._cliErrorIsAuth ? 'auth_required' : 'agent_error');
+        log('warning', 'error', `Grok CLI error: ${String(msg).slice(0, 200)}`, {
+            session_id: agent.sessionId,
+            user_id: agent.userId,
+            auth: !!agent._cliErrorIsAuth,
+        });
+        return;
+    }
 
     if (t === 'thought' && data) {
         agent.thinkingSummary += data;
@@ -982,7 +1041,10 @@ function attachAgentLineHandlers(agent) {
             const json = JSON.parse(clean);
             processGrokEvent(agent, json);
         } catch {
-            // Grok Build streams JSON lines only; ignore non-JSON noise.
+            // Non-JSON stderr often carries "Not signed in..." when auth is dead.
+            if (isAuthFailureMessage(clean) || /^error:/i.test(clean)) {
+                captureAgentCliError(agent, clean.replace(/^error:\s*/i, ''));
+            }
         }
     };
 }
@@ -1004,7 +1066,30 @@ function finalizeAgentClose(agent, code) {
         });
     }
 
-    if (!agent.events.some((e) => e.type === 'done')) {
+    const alreadyErrored = agent.events.some((e) => e.type === 'error');
+    const exitCode = code != null ? code : (agent._exitCode != null ? agent._exitCode : 0);
+    const emptyFail =
+        !agent.fullOutput &&
+        !(agent.media && agent.media.length) &&
+        (exitCode !== 0 || agent._cliError || alreadyErrored);
+
+    if (emptyFail && !alreadyErrored) {
+        // Silent empty exit was the auth-loss bug: surface a real chat error.
+        const raw = agent._cliError || `Agent exited with code ${exitCode} and no reply.`;
+        const content = agent._cliErrorIsAuth || isAuthFailureMessage(raw)
+            ? formatCliAuthError(raw)
+            : String(raw);
+        const errCode = (agent._cliErrorIsAuth || isAuthFailureMessage(raw))
+            ? 'auth_required'
+            : 'agent_exit';
+        emitAgentError(agent, content, errCode);
+        log('warning', 'error', 'Agent finished with no output', {
+            session_id: agent.sessionId,
+            code: exitCode,
+            auth: errCode === 'auth_required',
+            user_id: agent.userId,
+        });
+    } else if (!agent.events.some((e) => e.type === 'done') && !alreadyErrored) {
         const media = mediaIngest.mediaForMetadata(agent);
         const evt = {
             type: 'done',
@@ -1014,6 +1099,18 @@ function finalizeAgentClose(agent, code) {
             model: agent.model,
             tokens_estimated: true,
             media: media || undefined,
+        };
+        agent.events.push(evt);
+        sendToClient(agent, evt);
+    } else if (alreadyErrored && !agent.events.some((e) => e.type === 'done')) {
+        // Client clears busy on error; still emit a terminal done so reconnects settle.
+        const evt = {
+            type: 'done',
+            content: agent.fullOutput || '',
+            duration: Date.now() - agent.startTime,
+            tools: agent.toolCount,
+            model: agent.model,
+            error: true,
         };
         agent.events.push(evt);
         sendToClient(agent, evt);
@@ -1063,6 +1160,9 @@ function startAgentWatchers(agent) {
                     session_id: agent.sessionId,
                     user_id: agent.userId,
                 });
+                if (isAuthFailureMessage(text) || /^error:/i.test(text)) {
+                    captureAgentCliError(agent, text.replace(/^error:\s*/i, ''));
+                }
             }
         });
         agent.process.on('close', (code) => finalizeAgentClose(agent, code));
@@ -1072,7 +1172,7 @@ function startAgentWatchers(agent) {
                 session_id: agent.sessionId,
                 user_id: agent.userId,
             });
-            sendToClient(agent, { type: 'error', content: err.message });
+            emitAgentError(agent, err.message, 'spawn_error');
             updatePartialInDB(agent.sessionId, agent, true).catch(() => {});
         });
     }
@@ -1279,6 +1379,51 @@ function recoverDetachedAgents() {
     }
 }
 
+/**
+ * Lightweight auth.json peek for /health (no network refresh).
+ * Full check: php scripts/check-grok-auth.php
+ */
+function peekGrokAuthStatus() {
+    try {
+        const candidates = [
+            envFirst('GROKIFY_GROK_AUTH_JSON', 'GROKPOT_GROK_AUTH_JSON'),
+            path.join(WORKSPACE, 'storage', 'grok-auth.json'),
+            '/etc/grokifyos/grok-auth.json',
+            path.join(process.env.HOME || '/root', '.grok', 'auth.json'),
+            '/root/.grok/auth.json',
+        ].filter(Boolean);
+        for (const p of candidates) {
+            if (!fs.existsSync(p)) continue;
+            const raw = fs.readFileSync(p, 'utf8');
+            const data = JSON.parse(raw);
+            if (!data || typeof data !== 'object') continue;
+            for (const key of Object.keys(data)) {
+                const entry = data[key];
+                if (!entry || typeof entry !== 'object') continue;
+                const token = entry.key || entry.access_token || '';
+                if (!token) continue;
+                const expiresAt = entry.expires_at || null;
+                let expired = false;
+                if (expiresAt) {
+                    const ts = Date.parse(expiresAt);
+                    if (!Number.isNaN(ts)) expired = ts <= Date.now() + 120000;
+                }
+                return {
+                    ok: !expired,
+                    path: p,
+                    email: entry.email || null,
+                    expires_at: expiresAt,
+                    expired,
+                    has_refresh: !!(entry.refresh_token),
+                };
+            }
+        }
+        return { ok: false, error: 'auth_missing' };
+    } catch (err) {
+        return { ok: false, error: err.message || 'auth_peek_failed' };
+    }
+}
+
 const httpServer = http.createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
     if (url.pathname === '/models' && req.method === 'GET') {
@@ -1299,6 +1444,7 @@ const httpServer = http.createServer((req, res) => {
             instance: INSTANCE_ID,
             detach: DETACH_AGENTS,
             role: 'worker',
+            grok_auth: peekGrokAuthStatus(),
         }));
         return;
     }

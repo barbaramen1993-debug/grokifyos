@@ -98,6 +98,8 @@ class MainActivity : ComponentActivity() {
                         onOpenNotificationAccess = { openNotificationListenerSettings() },
                         onRefreshNotificationAccess = vm::refreshNotificationAccessState,
                         onTogglePermission = vm::togglePermission,
+                        onEnsurePermission = vm::ensurePermission,
+                        onEnsurePermissions = vm::ensurePermissions,
                         onRefreshPermissions = vm::refreshPermissions,
                         onAllowPermissionRequest = vm::allowPermissionRequest,
                         onDenyPermissionRequest = vm::denyPermissionRequest,

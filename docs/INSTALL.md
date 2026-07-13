@@ -229,6 +229,29 @@ GROKIFY_GROK_AUTH_JSON=/path/to/auth.json
 
 Usage endpoints call xAI billing with that token. Missing auth → clear API error, not fake numbers.
 
+### Check / recover auth (CLI)
+
+When chat returns no reply after an agent dies, auth often expired. On the **server**:
+
+```bash
+# Status (path, email, expiry, refresh)
+php scripts/check-grok-auth.php
+
+# JSON for scripts/monitoring
+php scripts/check-grok-auth.php --json
+
+# Force OIDC refresh from refresh_token
+php scripts/check-grok-auth.php --refresh
+
+# Live probe via Grok CLI (slower)
+php scripts/check-grok-auth.php --probe
+
+# Re-login (headless)
+grok login --device-code
+```
+
+Bridge workers also expose a peek on `GET /health` → `grok_auth`. The Android app surfaces auth failures as a **system chat message** (not a silent empty turn).
+
 ---
 
 ## 7. Android app
