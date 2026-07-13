@@ -1,10 +1,10 @@
 package io.grokify.os
 
-import android.Manifest
+import android.content.ComponentName
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -16,26 +16,40 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import io.grokify.os.permission.PermissionHelper
 import io.grokify.os.service.GrokifyForegroundService
+import io.grokify.os.service.GrokifyNotificationListener
+import io.grokify.os.service.NotificationMirror
 import io.grokify.os.ui.GrokifyAppRoot
 import io.grokify.os.ui.GrokifyViewModel
 import io.grokify.os.ui.theme.GrokifyColors
 import io.grokify.os.ui.theme.GrokifyTheme
 
 class MainActivity : ComponentActivity() {
+    /**
+     * Runtime permission launcher — invoked on demand from Settings toggles
+     * or in-chat Allow cards (never bulk-requested at first launch).
+     */
+    private var permissionResultHandler: ((Map<String, Boolean>) -> Unit)? = null
     private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* granted map available for future UX */ }
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { result ->
+        val handler = permissionResultHandler
+        permissionResultHandler = null
+        handler?.invoke(result)
+    }
+
+    private var onReturnFromSettings: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        requestRuntimePermissions()
+        // Do not request all dangerous permissions on first run — user toggles
+        // each capability in Settings or via AI-driven in-chat Allow cards.
         startAssistantService()
 
         setContent {
@@ -46,6 +60,19 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val vm: GrokifyViewModel = viewModel()
                     val state by vm.state.collectAsState()
+                    onReturnFromSettings = vm::onResumeFromSettings
+
+                    LaunchedEffect(Unit) {
+                        vm.bindPermissionRequester { perms, onResult ->
+                            if (perms.isEmpty()) {
+                                onResult(emptyMap())
+                                return@bindPermissionRequester
+                            }
+                            permissionResultHandler = onResult
+                            permissionLauncher.launch(perms)
+                        }
+                        vm.refreshPermissions()
+                    }
 
                     LaunchedEffect(state.keepScreenOn) {
                         if (state.keepScreenOn) {
@@ -67,6 +94,16 @@ class MainActivity : ComponentActivity() {
                         onToggleHistory = vm::toggleUseHistory,
                         onToggleKeepScreenOn = vm::toggleKeepScreenOn,
                         onToggleEnterForNewline = vm::toggleEnterForNewline,
+                        onToggleShareNotifications = vm::toggleShareNotifications,
+                        onOpenNotificationAccess = { openNotificationListenerSettings() },
+                        onRefreshNotificationAccess = vm::refreshNotificationAccessState,
+                        onTogglePermission = vm::togglePermission,
+                        onRefreshPermissions = vm::refreshPermissions,
+                        onAllowPermissionRequest = vm::allowPermissionRequest,
+                        onDenyPermissionRequest = vm::denyPermissionRequest,
+                        onOpenAppPermissionSettings = {
+                            PermissionHelper.openAppDetailsSettings(this@MainActivity)
+                        },
                         onNewChat = vm::newChat,
                         onSelectSession = vm::selectSession,
                         onDeleteSession = vm::deleteSession,
@@ -86,35 +123,44 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        onReturnFromSettings?.invoke()
+    }
+
+    /**
+     * Opens system UI to grant Notification access.
+     * Prefers the per-app detail screen (API 30+) so the toggle is one tap.
+     */
+    private fun openNotificationListenerSettings() {
+        val cn = ComponentName(this, GrokifyNotificationListener::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val detail = Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS).apply {
+                    putExtra(
+                        Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                        cn.flattenToString(),
+                    )
+                }
+                startActivity(detail)
+                return
+            } catch (_: Exception) {
+                // fall through to list screen
+            }
+        }
+        try {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            } catch (_: Exception) { /* ignore */ }
+        }
+        // Nudge system to bind once user returns after enabling
+        NotificationMirror.requestRebind(this)
+    }
+
     private fun startAssistantService() {
         val i = Intent(this, GrokifyForegroundService::class.java)
         ContextCompat.startForegroundService(this, i)
-    }
-
-    private fun requestRuntimePermissions() {
-        val needed = mutableListOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION,
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            needed += Manifest.permission.POST_NOTIFICATIONS
-            needed += Manifest.permission.READ_MEDIA_IMAGES
-            needed += Manifest.permission.READ_MEDIA_VIDEO
-            needed += Manifest.permission.READ_MEDIA_AUDIO
-            needed += Manifest.permission.NEARBY_WIFI_DEVICES
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            needed += Manifest.permission.BLUETOOTH_SCAN
-            needed += Manifest.permission.BLUETOOTH_CONNECT
-            needed += Manifest.permission.BLUETOOTH_ADVERTISE
-        }
-        val missing = needed.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-        if (missing.isNotEmpty()) {
-            permissionLauncher.launch(missing.toTypedArray())
-        }
     }
 }

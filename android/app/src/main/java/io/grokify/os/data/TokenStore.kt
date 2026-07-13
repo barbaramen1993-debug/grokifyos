@@ -17,6 +17,8 @@ class TokenStore(private val context: Context) {
     private val keyKeepScreenOn = booleanPreferencesKey("keep_screen_on")
     /** When true, Enter inserts a newline; when false, Enter sends the message. */
     private val keyEnterForNewline = booleanPreferencesKey("enter_for_newline")
+    /** When true, active phone notifications are shared with Grok as prompt context. */
+    private val keyShareNotifications = booleanPreferencesKey("share_notifications")
     private val keyModel = stringPreferencesKey("preferred_model")
     private val keySessionId = stringPreferencesKey("active_session_id")
 
@@ -25,6 +27,8 @@ class TokenStore(private val context: Context) {
     val useHistoryFlow: Flow<Boolean> = context.dataStore.data.map { it[keyUseHistory] ?: true }
     val keepScreenOnFlow: Flow<Boolean> = context.dataStore.data.map { it[keyKeepScreenOn] ?: true }
     val enterForNewlineFlow: Flow<Boolean> = context.dataStore.data.map { it[keyEnterForNewline] ?: true }
+    val shareNotificationsFlow: Flow<Boolean> =
+        context.dataStore.data.map { it[keyShareNotifications] ?: true }
     val modelFlow: Flow<String?> = context.dataStore.data.map { it[keyModel] }
     val sessionIdFlow: Flow<String?> = context.dataStore.data.map { it[keySessionId] }
 
@@ -46,6 +50,10 @@ class TokenStore(private val context: Context) {
 
     suspend fun setEnterForNewline(enabled: Boolean) {
         context.dataStore.edit { it[keyEnterForNewline] = enabled }
+    }
+
+    suspend fun setShareNotifications(enabled: Boolean) {
+        context.dataStore.edit { it[keyShareNotifications] = enabled }
     }
 
     suspend fun setModel(model: String) {

@@ -10,6 +10,20 @@ $userId = (int) $user['id'];
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $action = (string) ($_GET['action'] ?? '');
 
+if ($method === 'GET' && $action === 'notifications') {
+    $snapshots = gos_user_notification_snapshots($userId);
+    $asNotes = !empty($_GET['as_notes']) || !empty($_GET['notes']);
+    $payload = [
+        'ok' => true,
+        'devices' => $snapshots,
+        'total' => array_sum(array_map(static fn ($s) => (int) ($s['count'] ?? 0), $snapshots)),
+    ];
+    if ($asNotes) {
+        $payload['notes'] = gos_notification_note_lines($snapshots);
+    }
+    gos_api_json($payload);
+}
+
 if ($method === 'GET') {
     if ($access['auth'] === 'token' && $access['device']) {
         $d = $access['device'];
@@ -42,6 +56,37 @@ if ($method === 'POST' && $action === 'heartbeat') {
     $vCode = isset($body['app_version_code']) ? (int) $body['app_version_code'] : null;
     gos_touch_device($deviceId, $vName, $vCode);
     gos_api_json(['ok' => true]);
+}
+
+// Device uploads active notification snapshot (Android NotificationListenerService).
+if ($method === 'POST' && $action === 'notifications') {
+    if ($access['auth'] !== 'token' || !$access['device']) {
+        gos_api_json(['ok' => false, 'error' => 'device_token_required'], 403);
+    }
+    $deviceId = (int) $access['device']['id'];
+    $body = gos_json_body();
+    $items = $body['notifications'] ?? $body['items'] ?? null;
+    if (!is_array($items)) {
+        gos_api_json(['ok' => false, 'error' => 'notifications_required'], 400);
+    }
+    $extra = [];
+    if (array_key_exists('access_granted', $body)) {
+        $extra['access_granted'] = !empty($body['access_granted']);
+    }
+    if (array_key_exists('listener_bound', $body)) {
+        $extra['listener_bound'] = !empty($body['listener_bound']);
+    }
+    try {
+        $saved = gos_device_save_notifications($deviceId, $userId, $items, $extra);
+    } catch (Throwable $e) {
+        gos_api_json(['ok' => false, 'error' => 'save_failed', 'message' => $e->getMessage()], 500);
+    }
+    $vName = isset($body['app_version_name']) ? (string) $body['app_version_name'] : null;
+    $vCode = isset($body['app_version_code']) ? (int) $body['app_version_code'] : null;
+    if ($vName !== null || $vCode !== null) {
+        gos_touch_device($deviceId, $vName, $vCode);
+    }
+    gos_api_json(['ok' => true, 'count' => $saved['count'], 'updated_at' => $saved['updated_at']]);
 }
 
 if ($method === 'POST') {

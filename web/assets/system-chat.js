@@ -2199,6 +2199,13 @@
 
     const model = $('sc-model-select') && $('sc-model-select').value;
     const notes = getActiveNotes();
+    // Pull latest phone notification snapshots so Grok can answer "what's on my phone?"
+    try {
+      const notifRes = await apiGet('/devices.php?action=notifications&as_notes=1');
+      if (notifRes && notifRes.ok && Array.isArray(notifRes.notes) && notifRes.notes.length) {
+        notes.push(notifRes.notes.join('\n'));
+      }
+    } catch (_) { /* offline / no devices — ignore */ }
     const payload = { prompt: text, session_id: currentSessionId, model: model || '' };
     if (history.length) payload.history = history;
     if (notes.length) payload.notes = notes;

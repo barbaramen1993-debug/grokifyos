@@ -56,7 +56,9 @@ Helpers (Linux/macOS):
 1. Open your GrokifyOS dashboard → log in.
 2. **Devices** → create token (`gos_…`).
 3. Install APK via USB, wireless ADB, or dashboard **Download APK**.
-4. Paste token; grant notification / battery permissions for background.
+4. Paste token. Runtime permissions (camera, mic, location, …) are **not** requested on first launch.
+5. **Settings → Permissions** — toggle each capability when you need it. Grok can also push an in-chat **Allow / Not now** card via `[[permission_request:camera|reason]]` markers (or a `permission_request` WS event).
+6. **Settings → Notification access** — enable GrokifyOS so Grok can pull your active notifications (also toggle **Share with Grok** in app Settings).
 
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk

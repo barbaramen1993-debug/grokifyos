@@ -276,3 +276,243 @@ function gos_touch_device(int $deviceId, ?string $versionName = null, ?int $vers
     ]);
 }
 
+/**
+ * Sanitize a single notification item from the Android client.
+ *
+ * @param array<string, mixed> $raw
+ * @return array<string, mixed>|null
+ */
+function gos_sanitize_notification_item(array $raw): ?array
+{
+    $package = trim((string) ($raw['package'] ?? $raw['pkg'] ?? ''));
+    $title = trim((string) ($raw['title'] ?? ''));
+    $text = trim((string) ($raw['text'] ?? $raw['body'] ?? ''));
+    if ($package === '' && $title === '' && $text === '') {
+        return null;
+    }
+    $key = trim((string) ($raw['key'] ?? ''));
+    if ($key === '') {
+        $key = $package . '|' . (string) ($raw['id'] ?? '') . '|' . (string) ($raw['tag'] ?? '');
+    }
+    $postTime = (int) ($raw['post_time'] ?? $raw['postTime'] ?? 0);
+    if ($postTime > 1_000_000_000_000) {
+        // ms → seconds
+        $postTime = (int) floor($postTime / 1000);
+    }
+
+    return [
+        'key' => mb_substr($key, 0, 191),
+        'package' => mb_substr($package, 0, 191),
+        'app_label' => mb_substr(trim((string) ($raw['app_label'] ?? $raw['app'] ?? '')), 0, 128),
+        'title' => mb_substr($title, 0, 512),
+        'text' => mb_substr($text, 0, 2000),
+        'sub_text' => mb_substr(trim((string) ($raw['sub_text'] ?? $raw['subText'] ?? '')), 0, 512),
+        'category' => mb_substr(trim((string) ($raw['category'] ?? '')), 0, 64),
+        'is_ongoing' => !empty($raw['is_ongoing']) || !empty($raw['ongoing']),
+        'post_time' => $postTime > 0 ? $postTime : null,
+    ];
+}
+
+/**
+ * Store the latest active-notification snapshot for a device (meta + device_events).
+ *
+ * @param list<array<string, mixed>> $items
+ * @param array<string, mixed> $extra Optional client diagnostics (access_granted, listener_bound, …)
+ * @return array{count: int, updated_at: string}
+ */
+function gos_device_save_notifications(int $deviceId, int $userId, array $items, array $extra = []): array
+{
+    if ($deviceId < 1 || $userId < 1 || !gos_table_exists('grokify_devices')) {
+        throw new RuntimeException('devices_unavailable');
+    }
+
+    $clean = [];
+    foreach ($items as $raw) {
+        if (!is_array($raw)) {
+            continue;
+        }
+        $item = gos_sanitize_notification_item($raw);
+        if ($item === null) {
+            continue;
+        }
+        $clean[] = $item;
+        if (count($clean) >= 80) {
+            break;
+        }
+    }
+
+    $now = gmdate('c');
+    $snapshot = [
+        'notifications' => $clean,
+        'count' => count($clean),
+        'updated_at' => $now,
+    ];
+    if (array_key_exists('access_granted', $extra)) {
+        $snapshot['access_granted'] = (bool) $extra['access_granted'];
+    }
+    if (array_key_exists('listener_bound', $extra)) {
+        $snapshot['listener_bound'] = (bool) $extra['listener_bound'];
+    }
+
+    $pdo = gos_pdo();
+    $st = $pdo->prepare('SELECT meta FROM grokify_devices WHERE id = ? AND user_id = ? LIMIT 1');
+    $st->execute([$deviceId, $userId]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    if (!is_array($row)) {
+        throw new RuntimeException('device_not_found');
+    }
+
+    $meta = [];
+    if (!empty($row['meta'])) {
+        $decoded = json_decode((string) $row['meta'], true);
+        if (is_array($decoded)) {
+            $meta = $decoded;
+        }
+    }
+    $meta['notification_snapshot'] = $snapshot;
+
+    $upd = $pdo->prepare(
+        'UPDATE grokify_devices
+         SET meta = ?, last_seen_at = NOW(), last_ip = COALESCE(?, last_ip)
+         WHERE id = ? AND user_id = ?'
+    );
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    $upd->execute([
+        json_encode($meta, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        $ip !== '' ? $ip : null,
+        $deviceId,
+        $userId,
+    ]);
+
+    if (gos_table_exists('grokify_device_events')) {
+        $ev = $pdo->prepare(
+            'INSERT INTO grokify_device_events (device_id, user_id, event_type, payload)
+             VALUES (?, ?, ?, ?)'
+        );
+        $ev->execute([
+            $deviceId,
+            $userId,
+            'notification_snapshot',
+            json_encode($snapshot, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        ]);
+        // Keep event log bounded per device
+        $pdo->prepare(
+            'DELETE FROM grokify_device_events
+             WHERE device_id = ? AND event_type = ?
+               AND id NOT IN (
+                 SELECT id FROM (
+                   SELECT id FROM grokify_device_events
+                   WHERE device_id = ? AND event_type = ?
+                   ORDER BY id DESC LIMIT 30
+                 ) keep_rows
+               )'
+        )->execute([$deviceId, 'notification_snapshot', $deviceId, 'notification_snapshot']);
+    }
+
+    return ['count' => count($clean), 'updated_at' => $now];
+}
+
+/**
+ * Latest notification snapshots for a user's active devices.
+ *
+ * @return list<array{device_id: int, device_name: string, count: int, updated_at: ?string, notifications: list<array>}>
+ */
+function gos_user_notification_snapshots(int $userId): array
+{
+    if ($userId < 1 || !gos_table_exists('grokify_devices')) {
+        return [];
+    }
+    $st = gos_pdo()->prepare(
+        'SELECT id, device_name, meta, last_seen_at
+         FROM grokify_devices
+         WHERE user_id = ? AND revoked_at IS NULL
+         ORDER BY last_seen_at DESC, id DESC'
+    );
+    $st->execute([$userId]);
+    $out = [];
+    while ($row = $st->fetch(PDO::FETCH_ASSOC)) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $meta = [];
+        if (!empty($row['meta'])) {
+            $decoded = json_decode((string) $row['meta'], true);
+            if (is_array($decoded)) {
+                $meta = $decoded;
+            }
+        }
+        $snap = $meta['notification_snapshot'] ?? null;
+        if (!is_array($snap)) {
+            continue;
+        }
+        $notes = $snap['notifications'] ?? [];
+        if (!is_array($notes)) {
+            $notes = [];
+        }
+        $out[] = [
+            'device_id' => (int) $row['id'],
+            'device_name' => (string) $row['device_name'],
+            'count' => (int) ($snap['count'] ?? count($notes)),
+            'updated_at' => isset($snap['updated_at']) ? (string) $snap['updated_at'] : null,
+            'last_seen_at' => $row['last_seen_at'] ?? null,
+            'notifications' => array_values($notes),
+        ];
+    }
+
+    return $out;
+}
+
+/**
+ * Flatten snapshots into short plain-text lines for agent notes / prompt context.
+ *
+ * @param list<array<string, mixed>> $snapshots
+ * @return list<string>
+ */
+function gos_notification_note_lines(array $snapshots, int $maxLines = 40): array
+{
+    $lines = [];
+    foreach ($snapshots as $snap) {
+        if (!is_array($snap)) {
+            continue;
+        }
+        $device = trim((string) ($snap['device_name'] ?? 'Device'));
+        $updated = trim((string) ($snap['updated_at'] ?? ''));
+        $header = "Phone notifications on {$device}";
+        if ($updated !== '') {
+            $header .= " (synced {$updated})";
+        }
+        $header .= ':';
+        $items = $snap['notifications'] ?? [];
+        if (!is_array($items) || $items === []) {
+            $lines[] = $header . ' (none active)';
+            continue;
+        }
+        $lines[] = $header;
+        foreach ($items as $n) {
+            if (!is_array($n)) {
+                continue;
+            }
+            $app = trim((string) ($n['app_label'] ?? ''));
+            if ($app === '') {
+                $app = trim((string) ($n['package'] ?? 'app'));
+            }
+            $title = trim((string) ($n['title'] ?? ''));
+            $text = trim((string) ($n['text'] ?? ''));
+            $body = $title;
+            if ($text !== '' && $text !== $title) {
+                $body = $title === '' ? $text : "{$title}: {$text}";
+            }
+            if ($body === '') {
+                continue;
+            }
+            $lines[] = "[{$app}] {$body}";
+            if (count($lines) >= $maxLines) {
+                $lines[] = '…(truncated)';
+                return $lines;
+            }
+        }
+    }
+
+    return $lines;
+}
+

@@ -12,6 +12,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -85,6 +86,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -145,6 +147,14 @@ fun GrokifyAppRoot(
     onToggleHistory: () -> Unit = {},
     onToggleKeepScreenOn: () -> Unit = {},
     onToggleEnterForNewline: () -> Unit = {},
+    onToggleShareNotifications: () -> Unit = {},
+    onOpenNotificationAccess: () -> Unit = {},
+    onRefreshNotificationAccess: () -> Unit = {},
+    onTogglePermission: (String) -> Unit = {},
+    onRefreshPermissions: () -> Unit = {},
+    onAllowPermissionRequest: (String) -> Unit = {},
+    onDenyPermissionRequest: (String) -> Unit = {},
+    onOpenAppPermissionSettings: () -> Unit = {},
     onNewChat: () -> Unit = {},
     onSelectSession: (String) -> Unit = {},
     onDeleteSession: (String) -> Unit = {},
@@ -164,9 +174,37 @@ fun GrokifyAppRoot(
     var chatDraft by remember { mutableStateOf("") }
     var renameOpen by remember { mutableStateOf(false) }
     var renameDraft by remember { mutableStateOf("") }
+    var notifAccessDialogOpen by remember { mutableStateOf(false) }
+    var notifAccessPrompted by remember { mutableStateOf(false) }
     val density = LocalDensity.current
     val imeBottom = WindowInsets.ime.getBottom(density)
     val keyboardOpen = imeBottom > 0
+
+    // Android cannot grant Notification access via a runtime permission dialog —
+    // we must send the user to system settings. Prompt once when sharing is on.
+    LaunchedEffect(
+        state.tokenSaved,
+        state.shareNotifications,
+        state.notificationAccessGranted,
+    ) {
+        if (
+            state.tokenSaved &&
+            state.shareNotifications &&
+            !state.notificationAccessGranted &&
+            !notifAccessPrompted
+        ) {
+            delay(700)
+            notifAccessDialogOpen = true
+            notifAccessPrompted = true
+        }
+        // Reset so we re-prompt next session if they turn share back on without access
+        if (!state.shareNotifications) {
+            notifAccessPrompted = false
+        }
+        if (state.notificationAccessGranted) {
+            notifAccessDialogOpen = false
+        }
+    }
 
     fun openRename() {
         renameDraft = state.sessionTitle.ifBlank { "New Chat" }
@@ -279,6 +317,8 @@ fun GrokifyAppRoot(
                             tab = 1
                             onSetPanel(ChatPanel.Settings)
                         },
+                        onOpenNotificationAccess = onOpenNotificationAccess,
+                        onRefreshNotificationAccess = onRefreshNotificationAccess,
                     )
                     1 -> ChatPane(
                         state = state,
@@ -295,6 +335,14 @@ fun GrokifyAppRoot(
                         onToggleHistory = onToggleHistory,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
                         onToggleEnterForNewline = onToggleEnterForNewline,
+                        onToggleShareNotifications = onToggleShareNotifications,
+                        onOpenNotificationAccess = onOpenNotificationAccess,
+                        onRefreshNotificationAccess = onRefreshNotificationAccess,
+                        onTogglePermission = onTogglePermission,
+                        onRefreshPermissions = onRefreshPermissions,
+                        onAllowPermissionRequest = onAllowPermissionRequest,
+                        onDenyPermissionRequest = onDenyPermissionRequest,
+                        onOpenAppPermissionSettings = onOpenAppPermissionSettings,
                         onNewChat = onNewChat,
                         onSelectSession = onSelectSession,
                         onDeleteSession = onDeleteSession,
@@ -356,6 +404,41 @@ fun GrokifyAppRoot(
                 dismissButton = {
                     TextButton(onClick = { renameOpen = false }) {
                         Text("Cancel", color = GrokifyColors.TextMuted)
+                    }
+                },
+                containerColor = GrokifyColors.Panel,
+            )
+        }
+
+        if (notifAccessDialogOpen) {
+            AlertDialog(
+                onDismissRequest = { notifAccessDialogOpen = false },
+                title = {
+                    Text("Allow notification access", color = GrokifyColors.TextPrimary)
+                },
+                text = {
+                    Text(
+                        "Grok needs Notification access to read your status bar " +
+                            "and answer questions like “what’s in my notifications?”.\n\n" +
+                            "Tap Open settings, then enable GrokifyOS. This is a system " +
+                            "toggle — Android does not allow a one-tap runtime permission.",
+                        color = GrokifyColors.TextMuted,
+                        fontSize = 13.sp,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            notifAccessDialogOpen = false
+                            onOpenNotificationAccess()
+                        },
+                    ) {
+                        Text("Open settings", color = GrokifyColors.GlowCyan)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { notifAccessDialogOpen = false }) {
+                        Text("Not now", color = GrokifyColors.TextMuted)
                     }
                 },
                 containerColor = GrokifyColors.Panel,
@@ -486,6 +569,8 @@ private fun HomePane(
     onSaveToken: () -> Unit,
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenNotificationAccess: () -> Unit = {},
+    onRefreshNotificationAccess: () -> Unit = {},
 ) {
     Column(
         Modifier
@@ -494,6 +579,38 @@ private fun HomePane(
             .padding(horizontal = 16.dp, vertical = 8.dp)
             .navigationBarsPadding()
     ) {
+        if (state.shareNotifications && !state.notificationAccessGranted) {
+            NotificationAccessBanner(
+                onGrant = onOpenNotificationAccess,
+                onRefresh = onRefreshNotificationAccess,
+            )
+            Spacer(Modifier.height(12.dp))
+        } else if (state.shareNotifications && state.notificationAccessGranted) {
+            GlassCard {
+                Text(
+                    "NOTIFICATIONS",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = GrokifyColors.GlowCyan,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (state.notificationListenerBound) {
+                        "Mirroring ${state.notificationCount} active " +
+                            "notification${if (state.notificationCount == 1) "" else "s"} for Grok."
+                    } else {
+                        "Access granted — waiting for listener to connect " +
+                            "(${state.notificationCount} cached)."
+                    },
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 13.sp,
+                )
+                Spacer(Modifier.height(8.dp))
+                TextButton(onClick = onRefreshNotificationAccess) {
+                    Text("Refresh status", color = GrokifyColors.GlowMint, fontSize = 12.sp)
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+        }
         GlassCard {
             Text("DEVICE TOKEN", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
             Spacer(Modifier.height(6.dp))
@@ -551,6 +668,49 @@ private fun HomePane(
             Text(it, color = GrokifyColors.GlowRose, fontSize = 13.sp)
         }
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun NotificationAccessBanner(
+    onGrant: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(GrokifyColors.GlowRose.copy(alpha = 0.1f))
+            .border(1.dp, GrokifyColors.GlowRose.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            "Notification access required",
+            color = GrokifyColors.GlowRose,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 14.sp,
+        )
+        Text(
+            "Enable GrokifyOS under system Notification access so Grok can pull your shade.",
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onGrant,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GrokifyColors.GlowCyan,
+                    contentColor = Color(0xFF041016),
+                ),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text("Grant access", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+            }
+            TextButton(onClick = onRefresh) {
+                Text("I enabled it", color = GrokifyColors.TextMuted, fontSize = 12.sp)
+            }
+        }
     }
 }
 
@@ -638,6 +798,14 @@ private fun ChatPane(
     onToggleHistory: () -> Unit,
     onToggleKeepScreenOn: () -> Unit,
     onToggleEnterForNewline: () -> Unit,
+    onToggleShareNotifications: () -> Unit = {},
+    onOpenNotificationAccess: () -> Unit = {},
+    onRefreshNotificationAccess: () -> Unit = {},
+    onTogglePermission: (String) -> Unit = {},
+    onRefreshPermissions: () -> Unit = {},
+    onAllowPermissionRequest: (String) -> Unit = {},
+    onDenyPermissionRequest: (String) -> Unit = {},
+    onOpenAppPermissionSettings: () -> Unit = {},
     onNewChat: () -> Unit,
     onSelectSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
@@ -875,6 +1043,11 @@ private fun ChatPane(
                             ChatRole.Thinking -> ThinkingCard(msg) { onToggleExpand(msg.id) }
                             ChatRole.Tool -> ToolCard(msg) { onToggleExpand(msg.id) }
                             ChatRole.Media -> MediaCard(msg)
+                            ChatRole.PermissionRequest -> PermissionRequestCard(
+                                msg = msg,
+                                onAllow = { onAllowPermissionRequest(msg.id) },
+                                onDeny = { onDenyPermissionRequest(msg.id) },
+                            )
                             ChatRole.System -> SystemLine(
                                 msg = msg,
                                 selected = selected,
@@ -963,6 +1136,12 @@ private fun ChatPane(
                     onToggleHistory = onToggleHistory,
                     onToggleKeepScreenOn = onToggleKeepScreenOn,
                     onToggleEnterForNewline = onToggleEnterForNewline,
+                    onToggleShareNotifications = onToggleShareNotifications,
+                    onOpenNotificationAccess = onOpenNotificationAccess,
+                    onRefreshNotificationAccess = onRefreshNotificationAccess,
+                    onTogglePermission = onTogglePermission,
+                    onRefreshPermissions = onRefreshPermissions,
+                    onOpenAppPermissionSettings = onOpenAppPermissionSettings,
                 )
                 ChatPanel.None -> {}
             }
@@ -1539,8 +1718,18 @@ private fun SettingsPanel(
     onToggleHistory: () -> Unit,
     onToggleKeepScreenOn: () -> Unit,
     onToggleEnterForNewline: () -> Unit,
+    onToggleShareNotifications: () -> Unit = {},
+    onOpenNotificationAccess: () -> Unit = {},
+    onRefreshNotificationAccess: () -> Unit = {},
+    onTogglePermission: (String) -> Unit = {},
+    onRefreshPermissions: () -> Unit = {},
+    onOpenAppPermissionSettings: () -> Unit = {},
     onRefreshUsage: () -> Unit = {},
 ) {
+    LaunchedEffect(Unit) {
+        onRefreshNotificationAccess()
+        onRefreshPermissions()
+    }
     PanelScaffold(title = "Settings", onClose = onClose) {
         Column(
             Modifier
@@ -1570,6 +1759,77 @@ private fun SettingsPanel(
                 },
                 checked = state.enterForNewline,
                 onToggle = onToggleEnterForNewline,
+            )
+            Text(
+                "PERMISSIONS",
+                style = MaterialTheme.typography.labelSmall,
+                color = GrokifyColors.GlowCyan,
+            )
+            Text(
+                "Grant only what you need. Turning a switch on asks Android for access; " +
+                    "turning off opens system settings to revoke.",
+                color = GrokifyColors.TextMuted,
+                fontSize = 12.sp,
+            )
+            val requestable = state.permissions.filter { it.requestable }
+            if (requestable.isEmpty()) {
+                Text(
+                    "No runtime permissions on this Android version.",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 12.sp,
+                )
+            } else {
+                requestable.forEach { perm ->
+                    SettingRow(
+                        title = perm.id.title,
+                        subtitle = if (perm.granted) {
+                            "Allowed · ${perm.id.description}"
+                        } else {
+                            "Not granted · ${perm.id.description}"
+                        },
+                        checked = perm.granted,
+                        onToggle = { onTogglePermission(perm.id.id) },
+                    )
+                }
+            }
+            TextButton(
+                onClick = onOpenAppPermissionSettings,
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+            ) {
+                Text(
+                    "Open system app permissions",
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 12.sp,
+                )
+            }
+            Text(
+                "NOTIFICATIONS",
+                style = MaterialTheme.typography.labelSmall,
+                color = GrokifyColors.GlowCyan,
+            )
+            SettingRow(
+                title = "Share with Grok",
+                subtitle = if (state.shareNotifications) {
+                    "Grok receives active notification summaries with each message"
+                } else {
+                    "Phone notifications stay local and are not sent to Grok"
+                },
+                checked = state.shareNotifications,
+                onToggle = {
+                    val enabling = !state.shareNotifications
+                    onToggleShareNotifications()
+                    // System permission — open grant screen immediately when turning on.
+                    if (enabling && !state.notificationAccessGranted) {
+                        onOpenNotificationAccess()
+                    }
+                },
+            )
+            NotificationAccessCard(
+                granted = state.notificationAccessGranted,
+                count = state.notificationCount,
+                onOpenSettings = onOpenNotificationAccess,
+                onRefresh = onRefreshNotificationAccess,
+                listenerBound = state.notificationListenerBound,
             )
             Text("MODEL", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
             if (state.loadingPanel && state.models.isEmpty()) {
@@ -1718,6 +1978,66 @@ private fun UsageCard(
 }
 
 @Composable
+private fun NotificationAccessCard(
+    granted: Boolean,
+    count: Int,
+    onOpenSettings: () -> Unit,
+    onRefresh: () -> Unit,
+    listenerBound: Boolean = false,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            if (granted) "Notification access enabled" else "Notification access required",
+            color = if (granted) GrokifyColors.GlowMint else GrokifyColors.GlowRose,
+            fontWeight = FontWeight.Medium,
+            fontSize = 14.sp,
+        )
+        Text(
+            when {
+                !granted ->
+                    "Android only grants this via system settings (not a popup permission). " +
+                        "Tap Grant access → enable GrokifyOS."
+                listenerBound ->
+                    "Listener connected. Mirroring $count active " +
+                        "notification${if (count == 1) "" else "s"} so Grok can pull them."
+                else ->
+                    "Access is on, but the listener is not bound yet. " +
+                        "Tap Refresh, or toggle the system switch off/on once. Cached: $count."
+            },
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = onOpenSettings,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (granted) GrokifyColors.PanelSoft else GrokifyColors.GlowCyan,
+                    contentColor = if (granted) GrokifyColors.GlowCyan else Color(0xFF041016),
+                ),
+                shape = RoundedCornerShape(10.dp),
+            ) {
+                Text(
+                    if (granted) "Open system settings" else "Grant access",
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 12.sp,
+                )
+            }
+            TextButton(onClick = onRefresh) {
+                Text("Refresh status", color = GrokifyColors.TextMuted, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
 private fun SettingRow(
     title: String,
     subtitle: String,
@@ -1745,6 +2065,87 @@ private fun SettingRow(
                 checkedTrackColor = GrokifyColors.GlowCyan.copy(alpha = 0.35f),
             ),
         )
+    }
+}
+
+/**
+ * In-chat card when Grok (or the bridge) requests a runtime permission.
+ * Allow → system dialog; Not now → dismiss without granting.
+ */
+@Composable
+private fun PermissionRequestCard(
+    msg: ChatLine,
+    onAllow: () -> Unit,
+    onDeny: () -> Unit,
+) {
+    val title = msg.permissionId
+        .replace('_', ' ')
+        .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        .ifBlank { "Permission" }
+    val pending = msg.permissionStatus == PermissionRequestStatus.Pending
+    val statusLabel = when (msg.permissionStatus) {
+        PermissionRequestStatus.Pending -> null
+        PermissionRequestStatus.Granted -> "Allowed"
+        PermissionRequestStatus.Denied -> "Denied"
+        PermissionRequestStatus.Dismissed -> "Not now"
+    }
+    val accent = when (msg.permissionStatus) {
+        PermissionRequestStatus.Pending -> GrokifyColors.GlowViolet
+        PermissionRequestStatus.Granted -> GrokifyColors.GlowMint
+        PermissionRequestStatus.Denied -> GrokifyColors.GlowRose
+        PermissionRequestStatus.Dismissed -> GrokifyColors.TextDim
+    }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, accent.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "PERMISSION",
+                style = MaterialTheme.typography.labelSmall,
+                color = accent,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                title,
+                color = GrokifyColors.TextPrimary,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 14.sp,
+            )
+            if (statusLabel != null) {
+                Spacer(Modifier.weight(1f))
+                Text(statusLabel, color = accent, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+        if (msg.text.isNotBlank()) {
+            Text(msg.text, color = GrokifyColors.TextMuted, fontSize = 13.sp, lineHeight = 18.sp)
+        }
+        if (pending) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = onAllow,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = GrokifyColors.GlowCyan,
+                        contentColor = Color(0xFF041016),
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Text("Allow", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                }
+                OutlinedButton(
+                    onClick = onDeny,
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, GrokifyColors.PanelBorder),
+                ) {
+                    Text("Not now", color = GrokifyColors.TextMuted, fontSize = 13.sp)
+                }
+            }
+        }
     }
 }
 

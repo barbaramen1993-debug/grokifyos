@@ -7,6 +7,10 @@ import io.grokify.os.BuildConfig
 import io.grokify.os.GrokifyApp
 import io.grokify.os.chat.BridgeClient
 import io.grokify.os.data.GrokifyApi
+import io.grokify.os.permission.AppPermissionId
+import io.grokify.os.permission.PermissionHelper
+import io.grokify.os.permission.PermissionStatus
+import io.grokify.os.service.NotificationMirror
 import io.grokify.os.update.ApkUpdater
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,7 +25,10 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.UUID
 
-enum class ChatRole { User, Assistant, System, Tool, Thinking, Media }
+enum class ChatRole { User, Assistant, System, Tool, Thinking, Media, PermissionRequest }
+
+/** Lifecycle of an in-chat permission card. */
+enum class PermissionRequestStatus { Pending, Granted, Denied, Dismissed }
 
 data class ChatLine(
     val id: String = UUID.randomUUID().toString(),
@@ -42,6 +49,9 @@ data class ChatLine(
     val mediaUrl: String = "",
     /** "image" or "video" */
     val mediaKind: String = "",
+    /** Logical permission id for [ChatRole.PermissionRequest] (e.g. camera). */
+    val permissionId: String = "",
+    val permissionStatus: PermissionRequestStatus = PermissionRequestStatus.Pending,
 )
 
 data class SessionItem(
@@ -127,6 +137,16 @@ data class UiState(
     val keepScreenOn: Boolean = true,
     /** When true, Enter inserts a newline; when false, Enter sends. */
     val enterForNewline: Boolean = true,
+    /** Share active phone notifications with Grok as prompt notes. */
+    val shareNotifications: Boolean = true,
+    /** System Notification access (NotificationListenerService) granted. */
+    val notificationAccessGranted: Boolean = false,
+    /** Listener service currently bound (receiving posts). */
+    val notificationListenerBound: Boolean = false,
+    /** How many active notifications are currently mirrored. */
+    val notificationCount: Int = 0,
+    /** Runtime permission groups for Settings toggles (camera, mic, …). */
+    val permissions: List<PermissionStatus> = emptyList(),
     val panel: ChatPanel = ChatPanel.None,
     val loadingPanel: Boolean = false,
     val usage: UsageInfo? = null,
@@ -154,6 +174,12 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
     private var usageJob: Job? = null
     private var loadOlderJob: Job? = null
 
+    /**
+     * Bound from MainActivity: launches the OS multi-permission dialog.
+     * Signature: (permissions, resultCallback) -> Unit
+     */
+    private var permissionRequester: ((Array<String>, (Map<String, Boolean>) -> Unit) -> Unit)? = null
+
     companion object {
         /** Initial + page size for chat history windows (memory). */
         const val MESSAGE_PAGE_SIZE = 40
@@ -165,24 +191,195 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             val useHist = store.useHistoryFlow.first()
             val keepOn = store.keepScreenOnFlow.first()
             val enterNl = store.enterForNewlineFlow.first()
+            val shareNotifs = store.shareNotificationsFlow.first()
             val savedModel = store.modelFlow.first()
             val savedSession = store.sessionIdFlow.first()
             if (!savedSession.isNullOrBlank()) sessionId = savedSession
+            NotificationMirror.setShareEnabled(shareNotifs)
             _state.update {
                 it.copy(
                     useHistory = useHist,
                     keepScreenOn = keepOn,
                     enterForNewline = enterNl,
+                    shareNotifications = shareNotifs,
                     model = savedModel?.takeIf { it.startsWith("gb:") || it.startsWith("grok:") } ?: "",
                     sessionId = sessionId,
                 )
             }
+            refreshNotificationAccessState()
+            refreshPermissions()
             if (!t.isNullOrBlank()) {
                 _token = t
                 _state.update { it.copy(token = t, tokenSaved = true) }
                 refresh()
             }
         }
+    }
+
+    fun bindPermissionRequester(
+        requester: (Array<String>, (Map<String, Boolean>) -> Unit) -> Unit,
+    ) {
+        permissionRequester = requester
+    }
+
+    fun refreshPermissions() {
+        val ctx = getApplication<Application>()
+        _state.update { it.copy(permissions = PermissionHelper.snapshot(ctx)) }
+    }
+
+    /**
+     * Settings toggle: ON → system permission dialog when missing;
+     * OFF → open app details (Android does not allow silent revoke).
+     */
+    fun togglePermission(permissionKey: String) {
+        val id = AppPermissionId.fromId(permissionKey) ?: return
+        val ctx = getApplication<Application>()
+        val status = PermissionHelper.status(ctx, id)
+        if (!status.requestable) return
+        if (status.granted) {
+            PermissionHelper.openAppDetailsSettings(ctx)
+            return
+        }
+        requestPermissionGroup(id, chatLineId = null)
+    }
+
+    /** User tapped Allow on an in-chat permission card. */
+    fun allowPermissionRequest(lineId: String) {
+        val line = _state.value.messages.firstOrNull { it.id == lineId } ?: return
+        if (line.role != ChatRole.PermissionRequest) return
+        if (line.permissionStatus != PermissionRequestStatus.Pending) return
+        val id = AppPermissionId.fromId(line.permissionId) ?: return
+        val ctx = getApplication<Application>()
+        if (PermissionHelper.isGranted(ctx, id)) {
+            resolvePermissionCard(lineId, PermissionRequestStatus.Granted)
+            refreshPermissions()
+            return
+        }
+        requestPermissionGroup(id, chatLineId = lineId)
+    }
+
+    /** User tapped Not now on an in-chat permission card. */
+    fun denyPermissionRequest(lineId: String) {
+        resolvePermissionCard(lineId, PermissionRequestStatus.Dismissed)
+    }
+
+    private fun requestPermissionGroup(id: AppPermissionId, chatLineId: String?) {
+        val ctx = getApplication<Application>()
+        val missing = PermissionHelper.missing(ctx, id)
+        if (missing.isEmpty()) {
+            refreshPermissions()
+            if (chatLineId != null) {
+                resolvePermissionCard(chatLineId, PermissionRequestStatus.Granted)
+            }
+            return
+        }
+        val requester = permissionRequester
+        if (requester == null) {
+            if (chatLineId != null) {
+                resolvePermissionCard(chatLineId, PermissionRequestStatus.Denied)
+            }
+            appendSystem("Cannot open permission dialog — try again from Settings.")
+            return
+        }
+        requester(missing) { _ ->
+            viewModelScope.launch {
+                refreshPermissions()
+                val granted = PermissionHelper.isGranted(getApplication(), id)
+                if (chatLineId != null) {
+                    resolvePermissionCard(
+                        chatLineId,
+                        if (granted) PermissionRequestStatus.Granted
+                        else PermissionRequestStatus.Denied,
+                    )
+                } else if (!granted) {
+                    // Settings toggle path: still denied after dialog
+                    appendSystem("${id.title} was not granted.")
+                }
+            }
+        }
+    }
+
+    private fun resolvePermissionCard(lineId: String, status: PermissionRequestStatus) {
+        _state.update { st ->
+            st.copy(
+                messages = st.messages.map { m ->
+                    if (m.id == lineId && m.role == ChatRole.PermissionRequest) {
+                        m.copy(permissionStatus = status)
+                    } else m
+                },
+            )
+        }
+    }
+
+    /**
+     * Show an in-chat Allow / Not now card for [id] (from AI marker or WS event).
+     * Skips if already granted or an open pending card exists for the same permission.
+     */
+    fun pushPermissionRequest(id: AppPermissionId, reason: String = "") {
+        val ctx = getApplication<Application>()
+        if (PermissionHelper.isGranted(ctx, id)) {
+            // Already allowed — no card needed
+            return
+        }
+        val pendingExists = _state.value.messages.any {
+            it.role == ChatRole.PermissionRequest &&
+                it.permissionId == id.id &&
+                it.permissionStatus == PermissionRequestStatus.Pending
+        }
+        if (pendingExists) return
+        val body = reason.ifBlank {
+            "Grok needs ${id.title} to continue."
+        }
+        _state.update { st ->
+            st.copy(
+                messages = st.messages + ChatLine(
+                    role = ChatRole.PermissionRequest,
+                    text = body,
+                    permissionId = id.id,
+                    permissionStatus = PermissionRequestStatus.Pending,
+                ),
+                scrollToBottomNonce = st.scrollToBottomNonce + 1,
+            )
+        }
+    }
+
+    /** Extract markers from assistant text, strip them from the bubble, emit cards. */
+    private fun consumePermissionMarkers(raw: String): String {
+        val requests = PermissionHelper.parseRequestMarkers(raw)
+        for ((id, reason) in requests) {
+            pushPermissionRequest(id, reason)
+        }
+        return if (requests.isEmpty()) raw else PermissionHelper.stripRequestMarkers(raw)
+    }
+
+    fun refreshNotificationAccessState() {
+        val ctx = getApplication<Application>()
+        val granted = NotificationMirror.isNotificationAccessEnabled(ctx)
+        val wasGranted = _state.value.notificationAccessGranted
+        if (granted && !wasGranted) {
+            // User just enabled access — rebind so onListenerConnected fires promptly.
+            NotificationMirror.requestRebind(ctx)
+        }
+        _state.update {
+            it.copy(
+                notificationAccessGranted = granted,
+                notificationCount = NotificationMirror.snapshot().size,
+                notificationListenerBound = NotificationMirror.isListenerBound(),
+            )
+        }
+        if (granted && _state.value.shareNotifications) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    NotificationMirror.uploadNow()
+                } catch (_: Exception) { /* ignore */ }
+            }
+        }
+    }
+
+    /** Called from MainActivity.onResume after returning from system settings. */
+    fun onResumeFromSettings() {
+        refreshNotificationAccessState()
+        refreshPermissions()
     }
 
     fun saveToken(token: String) {
@@ -226,6 +423,27 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             val next = !_state.value.enterForNewline
             store.setEnterForNewline(next)
             _state.update { it.copy(enterForNewline = next) }
+        }
+    }
+
+    fun toggleShareNotifications() {
+        viewModelScope.launch {
+            val next = !_state.value.shareNotifications
+            store.setShareNotifications(next)
+            NotificationMirror.setShareEnabled(next)
+            _state.update { it.copy(shareNotifications = next) }
+            refreshNotificationAccessState()
+            if (next) {
+                val ctx = getApplication<Application>()
+                if (NotificationMirror.isNotificationAccessEnabled(ctx)) {
+                    NotificationMirror.requestRebind(ctx)
+                    viewModelScope.launch(Dispatchers.IO) {
+                        try {
+                            NotificationMirror.uploadNow()
+                        } catch (_: Exception) { /* ignore */ }
+                    }
+                }
+            }
         }
     }
 
@@ -1261,7 +1479,24 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                         finalizeThinking(thinkingBuf.toString())
                     }
                     streamBuf.append(c)
+                    // Surface AI permission markers as soon as a complete tag is present
+                    val cleaned = consumePermissionMarkers(streamBuf.toString())
+                    if (cleaned != streamBuf.toString()) {
+                        streamBuf = StringBuilder(cleaned)
+                    }
                     pushStream()
+                }
+            }
+            "permission_request" -> {
+                // Explicit bridge/WS protocol: {type, permission, reason?}
+                val key = evt.optString("permission")
+                    .ifBlank { evt.optString("id") }
+                    .ifBlank { evt.optString("capability") }
+                val id = AppPermissionId.fromId(key)
+                if (id != null) {
+                    pushPermissionRequest(id, evt.optString("reason").ifBlank {
+                        evt.optString("message")
+                    })
                 }
             }
             "thinking_delta" -> {
@@ -1284,7 +1519,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 ) {
                     finalizeThinking(thinkingBuf.toString())
                 }
-                streamBuf = StringBuilder(fixSentenceSpacing(evt.optString("content")))
+                val replaced = fixSentenceSpacing(evt.optString("content"))
+                streamBuf = StringBuilder(consumePermissionMarkers(replaced))
                 pushStream()
             }
             "partial_msg_id" -> {
@@ -1607,6 +1843,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
     private fun finalizeAssistant(text: String) {
         streamBuf = StringBuilder()
         thinkingBuf = StringBuilder()
+        val cleaned = consumePermissionMarkers(text)
         _state.update { st ->
             val msgs = st.messages.toMutableList()
             var appliedText = false
@@ -1615,8 +1852,9 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 when {
                     m.role == ChatRole.Assistant && m.streaming -> {
                         // Keep segmented text; only fill if the open bubble is still empty
+                        val body = m.text.ifBlank { cleaned }.let { PermissionHelper.stripRequestMarkers(it) }
                         msgs[i] = m.copy(
-                            text = m.text.ifBlank { text },
+                            text = body,
                             streaming = false,
                         )
                         appliedText = true
@@ -1629,8 +1867,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             }
-            if (!appliedText && text.isNotBlank()) {
-                msgs += ChatLine(role = ChatRole.Assistant, text = text, streaming = false)
+            if (!appliedText && cleaned.isNotBlank()) {
+                msgs += ChatLine(role = ChatRole.Assistant, text = cleaned, streaming = false)
             }
             val sealed = msgs.map { m ->
                 when {
@@ -1761,7 +1999,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             if (_state.value.useHistory) {
                 historyPayload = buildHistoryPayload(sessionId)
             }
-            val notes = _state.value.notes.filter { it.enabled }.map { it.text }
+            val notes = buildNotesForPrompt()
 
             streamBuf = StringBuilder()
             thinkingBuf = StringBuilder()
@@ -1781,6 +2019,34 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    /**
+     * Enabled user notes plus live phone notifications (when sharing is on).
+     * Notifications are also uploaded to the server for web/dashboard pull.
+     */
+    private fun buildNotesForPrompt(): List<String> {
+        val notes = _state.value.notes.filter { it.enabled }.map { it.text }.toMutableList()
+        // Always inject live permission snapshot so the agent can request toggles when needed
+        val ctx = getApplication<Application>()
+        val permLines = PermissionHelper.noteLines(ctx)
+        if (permLines.isNotEmpty()) {
+            notes += permLines.joinToString("\n")
+        }
+        if (_state.value.shareNotifications) {
+            val notifLines = NotificationMirror.noteLines()
+            if (notifLines.isNotEmpty()) {
+                // One multi-line note keeps the additional_notes block tidy for the agent
+                notes += notifLines.joinToString("\n")
+            }
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    NotificationMirror.uploadNow()
+                } catch (_: Exception) { /* ignore */ }
+            }
+            refreshNotificationAccessState()
+        }
+        return notes
     }
 
     private suspend fun buildHistoryPayload(sid: String): List<JSONObject> {

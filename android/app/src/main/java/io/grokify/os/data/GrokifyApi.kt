@@ -60,6 +60,33 @@ class GrokifyApi(
         return executeJson(req)
     }
 
+    /** Upload active notification snapshot so Grok can pull them from the server. */
+    fun uploadNotifications(
+        notifications: org.json.JSONArray,
+        versionCode: Int,
+        versionName: String,
+        accessGranted: Boolean = false,
+        listenerBound: Boolean = false,
+    ): JSONObject {
+        val body = JSONObject()
+            .put("notifications", notifications)
+            .put("app_version_code", versionCode)
+            .put("app_version_name", versionName)
+            .put("access_granted", accessGranted)
+            .put("listener_bound", listenerBound)
+        val req = authRequest("/devices.php?action=notifications")
+            .post(jsonBody(body))
+            .build()
+        return executeJson(req)
+    }
+
+    /** Pull stored phone notification snapshots (optionally as note lines). */
+    fun listNotifications(asNotes: Boolean = false): JSONObject {
+        val q = if (asNotes) "?action=notifications&as_notes=1" else "?action=notifications"
+        val req = authRequest("/devices.php$q").get().build()
+        return executeJson(req)
+    }
+
     fun createChatSession(title: String = "New Chat"): JSONObject {
         val body = JSONObject().put("title", title)
         val req = authRequest("/admin-system-chat-sessions.php")

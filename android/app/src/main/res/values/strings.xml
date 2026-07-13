@@ -5,4 +5,5 @@
     <string name="notification_channel_updates">App updates</string>
     <string name="fg_title">GrokifyOS is running</string>
     <string name="fg_text">Assistant bridge active in background</string>
+    <string name="notification_listener_label">GrokifyOS notification access</string>
 </resources>
