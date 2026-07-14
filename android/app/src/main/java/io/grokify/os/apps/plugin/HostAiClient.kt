@@ -393,7 +393,7 @@ object HostAiClient {
     }
 
     /**
-     * Speak [text] for DJ banter.
+     * Speak [text] for DJ banter, or pre-bake TTS for seamless handoffs.
      *
      * optionsJson (optional):
      * - voice_id: xAI voice (default "eve")
@@ -401,12 +401,11 @@ object HostAiClient {
      * - prefer_device: if true, skip xAI TTS
      * - wait: if true, block until audio finishes (for between-track DJ)
      * - talkover: if true, duck under live music (no exclusive focus / hard pause)
+     * - synthesize_only: generate file + duration_ms, do not play
+     * - audio_path: play a previously synthesized file (skips network TTS)
+     * - keep_file: keep the mp3 after play (default false; true when synthesize_only)
      */
     fun speak(ctx: Context, text: String?, optionsJson: String? = null): String {
-        val msg = text?.trim().orEmpty()
-        if (msg.isEmpty()) {
-            return JSONObject().put("ok", false).put("error", "empty").toString()
-        }
         val opts = runCatching {
             if (optionsJson.isNullOrBlank()) JSONObject() else JSONObject(optionsJson)
         }.getOrElse { JSONObject() }
@@ -414,7 +413,49 @@ object HostAiClient {
         val preferDevice = opts.optBoolean("prefer_device", false)
         val wait = opts.optBoolean("wait", false)
         val talkover = opts.optBoolean("talkover", false)
+        val synthesizeOnly = opts.optBoolean("synthesize_only", false)
+        val keepFile = opts.optBoolean("keep_file", false) || synthesizeOnly
+        val audioPath = opts.optString("audio_path", "").trim()
         val xaiKey = HostApiKeyStore.getValue(ctx, ApiKeyIds.SPACEXAI)
+
+        // Play pre-baked audio (Live DJ seamless handoff).
+        if (audioPath.isNotBlank()) {
+            val file = File(audioPath)
+            if (!file.isFile || file.length() <= 0L) {
+                return JSONObject()
+                    .put("ok", false)
+                    .put("error", "audio_path_missing")
+                    .put("path", audioPath)
+                    .toString()
+            }
+            return try {
+                val durationMs = measureAudioDurationMs(file)
+                playAudioFile(
+                    ctx.applicationContext,
+                    file,
+                    wait,
+                    talkover,
+                    deleteAfter = !keepFile,
+                )
+                JSONObject()
+                    .put("ok", true)
+                    .put("mode", "cached_audio")
+                    .put("path", file.absolutePath)
+                    .put("duration_ms", durationMs)
+                    .put("waited", wait)
+                    .toString()
+            } catch (e: Exception) {
+                JSONObject()
+                    .put("ok", false)
+                    .put("error", e.message ?: "cached_play_failed")
+                    .toString()
+            }
+        }
+
+        val msg = text?.trim().orEmpty()
+        if (msg.isEmpty()) {
+            return JSONObject().put("ok", false).put("error", "empty").toString()
+        }
 
         if (!preferDevice && !xaiKey.isNullOrBlank()) {
             val voice = opts.optString("voice_id", "eve").ifBlank { "eve" }
@@ -427,9 +468,12 @@ object HostAiClient {
                 language = language,
                 wait = wait,
                 talkover = talkover,
+                synthesizeOnly = synthesizeOnly,
+                keepFile = keepFile,
             )
             if (ttsResult.optBoolean("ok")) return ttsResult.toString()
-            // Fall through to device TTS with error note
+            // Fall through to device TTS with error note (no pre-bake for device)
+            if (synthesizeOnly) return ttsResult.toString()
             val device = speakDevice(ctx.applicationContext, msg, wait, talkover)
             if (device.optBoolean("ok")) {
                 return device
@@ -438,6 +482,19 @@ object HostAiClient {
                     .toString()
             }
             return ttsResult.toString()
+        }
+
+        if (synthesizeOnly) {
+            val est = (msg.split(Regex("\\s+")).size * 320L + 1200L).coerceIn(1500L, 45_000L)
+            return JSONObject()
+                .put("ok", false)
+                .put("error", "device_tts_no_synthesize")
+                .put("duration_ms", est)
+                .put(
+                    "hint",
+                    "Add a SpaceXAI API key for pre-baked Grok Voice TTS (seamless banter).",
+                )
+                .toString()
         }
 
         val device = speakDevice(ctx.applicationContext, msg, wait, talkover)
@@ -453,6 +510,22 @@ object HostAiClient {
         return device.toString()
     }
 
+    /** Media duration without playback (ms). 0 if unreadable. */
+    private fun measureAudioDurationMs(file: File): Long {
+        if (!file.isFile || file.length() <= 0L) return 0L
+        val mp = MediaPlayer()
+        return try {
+            mp.setDataSource(file.absolutePath)
+            mp.prepare()
+            mp.duration.toLong().coerceAtLeast(0L)
+        } catch (e: Exception) {
+            Log.w(TAG, "measureAudioDurationMs: ${e.message}")
+            0L
+        } finally {
+            runCatching { mp.release() }
+        }
+    }
+
     private fun speakXaiTts(
         ctx: Context,
         apiKey: String,
@@ -461,6 +534,8 @@ object HostAiClient {
         language: String,
         wait: Boolean,
         talkover: Boolean = false,
+        synthesizeOnly: Boolean = false,
+        keepFile: Boolean = false,
     ): JSONObject {
         return try {
             val body = JSONObject()
@@ -498,12 +573,29 @@ object HostAiClient {
                 }
                 val out = File(ctx.cacheDir, "plugin-tts-${UUID.randomUUID()}.mp3")
                 out.writeBytes(bytes)
-                playAudioFile(ctx, out, wait, talkover)
+                val durationMs = measureAudioDurationMs(out)
+                if (synthesizeOnly) {
+                    return@use JSONObject()
+                        .put("ok", true)
+                        .put("mode", "xai_tts_baked")
+                        .put("voice_id", voiceId)
+                        .put("bytes", bytes.size)
+                        .put("path", out.absolutePath)
+                        .put("duration_ms", durationMs)
+                        .put("waited", false)
+                        .put(
+                            "note",
+                            "Pre-baked Grok Voice TTS — play later via audio_path.",
+                        )
+                }
+                playAudioFile(ctx, out, wait, talkover, deleteAfter = !keepFile)
                 JSONObject()
                     .put("ok", true)
                     .put("mode", "xai_tts")
                     .put("voice_id", voiceId)
                     .put("bytes", bytes.size)
+                    .put("path", out.absolutePath)
+                    .put("duration_ms", durationMs)
                     .put("waited", wait)
                     .put(
                         "note",
@@ -518,7 +610,13 @@ object HostAiClient {
         }
     }
 
-    private fun playAudioFile(ctx: Context, file: File, wait: Boolean, talkover: Boolean = false) {
+    private fun playAudioFile(
+        ctx: Context,
+        file: File,
+        wait: Boolean,
+        talkover: Boolean = false,
+        deleteAfter: Boolean = true,
+    ) {
         val done = CountDownLatch(1)
         val focusHeld = AtomicBoolean(false)
         try {
@@ -541,7 +639,7 @@ object HostAiClient {
                 setOnCompletionListener { player ->
                     runCatching { player.release() }
                     mediaPlayer.compareAndSet(player, null)
-                    file.delete()
+                    if (deleteAfter) file.delete()
                     if (focusHeld.getAndSet(false)) abandonSpeechFocus(ctx)
                     done.countDown()
                 }
@@ -549,7 +647,7 @@ object HostAiClient {
                     Log.w(TAG, "MediaPlayer error what=$what extra=$extra")
                     runCatching { player.release() }
                     mediaPlayer.compareAndSet(player, null)
-                    file.delete()
+                    if (deleteAfter) file.delete()
                     if (focusHeld.getAndSet(false)) abandonSpeechFocus(ctx)
                     done.countDown()
                     true
@@ -568,13 +666,13 @@ object HostAiClient {
                         mp.release()
                     }
                     mediaPlayer.compareAndSet(mp, null)
-                    file.delete()
+                    if (deleteAfter) file.delete()
                     if (focusHeld.getAndSet(false)) abandonSpeechFocus(ctx)
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "playAudioFile failed", e)
-            file.delete()
+            if (deleteAfter) file.delete()
             if (focusHeld.getAndSet(false)) abandonSpeechFocus(ctx)
             done.countDown()
             throw e

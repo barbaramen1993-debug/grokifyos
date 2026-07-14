@@ -35,12 +35,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -638,8 +641,23 @@ private fun parseBlocks(src: String): List<MdBlock> {
     return out.ifEmpty { listOf(MdBlock.Paragraph(src)) }
 }
 
+private val LinkSpanStyle = SpanStyle(
+    color = Color(0xFF60A5FA),
+    textDecoration = TextDecoration.Underline,
+)
+
+private val LinkStyles = TextLinkStyles(style = LinkSpanStyle)
+
+/** Bare http(s):// or www. URLs (not inside markdown syntax). */
+private val BareUrlAtStart = Regex(
+    """^(https?://|www\.)[^\s<>\[\]"'`]+""",
+    RegexOption.IGNORE_CASE,
+)
+
+private val TrailingUrlPunct = setOf('.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"', '»', '”', '’')
+
 /**
- * Recursive-ish inline parse: code, bold, italic, links.
+ * Recursive-ish inline parse: code, bold, italic, clickable links (markdown + bare URLs).
  * Unpaired markers are already stripped by normalizeChatMarkdown.
  */
 private fun inlineMarkdown(src: String, base: Color): AnnotatedString = buildAnnotatedString {
@@ -694,24 +712,87 @@ private fun AnnotatedString.Builder.appendInline(src: String, base: Color) {
             i++
             continue
         }
-        // link [text](url)
+        // link [text](url) — tappable via LinkAnnotation
         if (src[i] == '[') {
             val close = src.indexOf(']', i + 1)
             if (close > i && close + 1 < src.length && src[close + 1] == '(') {
                 val urlEnd = src.indexOf(')', close + 2)
                 if (urlEnd > close) {
                     val label = src.substring(i + 1, close)
-                    withStyle(
-                        SpanStyle(color = Color(0xFF60A5FA), textDecoration = TextDecoration.Underline)
-                    ) {
-                        append(label)
+                    val rawUrl = src.substring(close + 2, urlEnd).trim()
+                    val href = normalizeHref(rawUrl)
+                    if (href != null) {
+                        withLink(LinkAnnotation.Url(href, LinkStyles)) {
+                            append(label.ifBlank { rawUrl })
+                        }
+                    } else {
+                        withStyle(LinkSpanStyle) {
+                            append(label.ifBlank { rawUrl })
+                        }
                     }
                     i = urlEnd + 1
                     continue
                 }
             }
         }
+        // bare URL (https://… / http://… / www.…)
+        val bare = matchBareUrl(src, i)
+        if (bare != null) {
+            val (display, href, end) = bare
+            withLink(LinkAnnotation.Url(href, LinkStyles)) {
+                append(display)
+            }
+            i = end
+            continue
+        }
         append(src[i])
         i++
     }
+}
+
+/**
+ * Only http(s) and mailto — never javascript: / intent: / file: from chat text.
+ * Returns navigable href or null if unsafe / empty.
+ */
+internal fun normalizeHref(raw: String): String? {
+    val t = raw.trim()
+    if (t.isEmpty()) return null
+    val lower = t.lowercase()
+    return when {
+        lower.startsWith("https://") || lower.startsWith("http://") -> t
+        lower.startsWith("mailto:") && t.length > "mailto:".length -> t
+        lower.startsWith("www.") -> "https://$t"
+        else -> null
+    }
+}
+
+/**
+ * If [src] has a bare URL starting at [start], returns (display text, href, exclusive end index).
+ * Uses a substring + ^ match so startIndex isn't broken by the start-of-input anchor.
+ */
+internal fun matchBareUrl(src: String, start: Int): Triple<String, String, Int>? {
+    if (start < 0 || start >= src.length) return null
+    // Avoid matching mid-token (e.g. foohttps://…)
+    if (start > 0) {
+        val prev = src[start - 1]
+        if (prev.isLetterOrDigit() || prev == '_' || prev == '/' || prev == '=' || prev == '@') {
+            return null
+        }
+    }
+    val rest = src.substring(start)
+    val m = BareUrlAtStart.find(rest) ?: return null
+    var display = m.value
+    // Trim common trailing sentence punctuation (keep balanced ) inside URLs)
+    while (display.isNotEmpty() && display.last() in TrailingUrlPunct) {
+        val last = display.last()
+        if (last == ')') {
+            val open = display.count { it == '(' }
+            val close = display.count { it == ')' }
+            if (open >= close) break
+        }
+        display = display.dropLast(1)
+    }
+    if (display.length < 4) return null
+    val href = normalizeHref(display) ?: return null
+    return Triple(display, href, start + display.length)
 }

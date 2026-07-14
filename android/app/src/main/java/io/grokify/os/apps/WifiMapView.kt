@@ -26,7 +26,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -40,11 +39,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import io.grokify.os.GrokifyApp
 import io.grokify.os.data.ApiKeyIds
 import io.grokify.os.ui.theme.GrokifyColors
+import java.net.URLEncoder
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Lightweight Mapbox marker for a Wi‑Fi AP (or stored sighting). */
+/** Lightweight map marker for a Wi‑Fi AP / Bluetooth device / place note. */
 data class WifiMapMarker(
     val id: String,
     val ssid: String,
@@ -55,16 +55,18 @@ data class WifiMapMarker(
     val distanceM: Double? = null,
     val seenCount: Int = 1,
     val live: Boolean = true,
+    /** Optional geofence / accuracy ring in meters (place notes, etc.). */
+    val radiusM: Double? = null,
 )
 
 /**
- * Mapbox GL JS map in a WebView — public token only, no native Maps SDK / secret download token.
- * Dots = Wi‑Fi APs with GPS; color by signal; stacked pins spiderfy in a spiral.
+ * Raster map in a WebView (Leaflet from app assets — no CDN, no WebGL).
  *
- * Notes for Android WebView:
- * - Do **not** clip the WebView with Compose clip — that blanks WebGL on many devices.
- * - Map “ready” is driven by JS after style load (not merely HTML onPageFinished).
- * - Token is resolved from the dedicated Mapbox field **or** the API key vault.
+ * Token resolution (Settings → Mapbox card **or** API vault id `mapbox_access_token`):
+ * - Public `pk.…` → Mapbox dark raster tiles
+ * - Missing / invalid / secret `sk.…` → free Carto dark tiles (map still works)
+ *
+ * Do not Compose-clip the WebView; it blanks the surface on many OEMs.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -73,9 +75,15 @@ fun WifiMapView(
     userGps: GpsFix?,
     selectedId: String? = null,
     onMarkerSelected: (String) -> Unit = {},
+    /** Empty-state chip; null hides it. */
+    emptyHint: String? = "No GPS-tagged pins yet — scan with location on",
+    /** Tap empty map (not a pin) — used to place a pin in editors. */
+    onMapTapped: ((lat: Double, lon: Double) -> Unit)? = null,
+    /** When false, skip fitBounds on each data push (smoother live radius tweaks). */
+    autoFit: Boolean = true,
     /** When false, map is edge-to-edge (fullscreen) without rounded chrome. */
     framed: Boolean = true,
-    /** Bump when container size changes so Mapbox can remeasure. */
+    /** Bump when container size changes so the map can remeasure. */
     resizeKey: Any? = null,
     modifier: Modifier = Modifier,
 ) {
@@ -83,30 +91,31 @@ fun WifiMapView(
     val store = remember { (context.applicationContext as GrokifyApp).tokenStore }
     val vaultToken by store.mapboxAccessTokenFlow.collectAsState(initial = null)
     val apiVault by store.apiKeyVaultFlow.collectAsState(initial = emptyMap())
-    // Prefer dedicated field; fall back to vault entry (mirrors Settings / HostApiKeyStore).
-    val token = remember(vaultToken, apiVault) {
+
+    val rawToken = remember(vaultToken, apiVault) {
         vaultToken?.trim()?.takeIf { it.isNotEmpty() }
             ?: apiVault[ApiKeyIds.MAPBOX]?.value?.trim()?.takeIf { it.isNotEmpty() }
             ?: ""
     }
+    val tokenInfo = remember(rawToken) { normalizeMapboxToken(rawToken) }
+
     var webView by remember { mutableStateOf<WebView?>(null) }
     var mapReady by remember { mutableStateOf(false) }
+    var basemapLabel by remember { mutableStateOf("Loading map…") }
     var loadError by remember { mutableStateOf<String?>(null) }
     val onSelectLatest = rememberUpdatedState(onMarkerSelected)
+    val onMapTappedLatest = rememberUpdatedState(onMapTapped)
     val markersLatest = rememberUpdatedState(markers)
     val userGpsLatest = rememberUpdatedState(userGps)
     val selectedIdLatest = rememberUpdatedState(selectedId)
+    val tokenInfoLatest = rememberUpdatedState(tokenInfo)
+    val autoFitLatest = rememberUpdatedState(autoFit)
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
-    val hasToken = token.isNotEmpty()
 
-    // Tear down WebView when the vault token changes or this composable leaves composition.
-    DisposableEffect(token) {
-        mapReady = false
-        loadError = null
+    DisposableEffect(Unit) {
         onDispose {
             webView?.apply {
                 stopLoading()
-                // Detach before destroy to avoid WebView / Chromium leaks.
                 (parent as? ViewGroup)?.removeView(this)
                 loadUrl("about:blank")
                 removeJavascriptInterface("GrokifyWifiMap")
@@ -117,10 +126,17 @@ fun WifiMapView(
         }
     }
 
-    LaunchedEffect(markers, userGps, mapReady) {
+    // Push basemap when token changes (no WebView recreate — avoids blank flashes).
+    LaunchedEffect(tokenInfo, mapReady) {
         val wv = webView ?: return@LaunchedEffect
         if (!mapReady) return@LaunchedEffect
-        pushMarkers(wv, markers, userGps, selectedId)
+        applyBasemap(wv, tokenInfo)
+    }
+
+    LaunchedEffect(markers, userGps, mapReady, autoFit) {
+        val wv = webView ?: return@LaunchedEffect
+        if (!mapReady) return@LaunchedEffect
+        pushMarkers(wv, markers, userGps, selectedId, autoFit)
     }
 
     LaunchedEffect(selectedId, mapReady) {
@@ -133,14 +149,12 @@ fun WifiMapView(
     LaunchedEffect(resizeKey, mapReady, framed) {
         val wv = webView ?: return@LaunchedEffect
         if (!mapReady) return@LaunchedEffect
-        // Compose layout + WebGL often need a few frames after attach.
-        repeat(4) { i ->
-            delay(if (i == 0) 50L else 120L)
+        repeat(5) { i ->
+            delay(if (i == 0) 40L else 100L)
             wv.evaluateJavascript("window.resizeWifiMap && window.resizeWifiMap();", null)
         }
     }
 
-    // Rounded chrome without clipping the WebView (clip blanks WebGL on many OEMs).
     val chrome = if (framed) {
         Modifier.border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
     } else {
@@ -150,187 +164,326 @@ fun WifiMapView(
     Box(
         modifier
             .then(chrome)
-            .background(GrokifyColors.Panel, if (framed) RoundedCornerShape(12.dp) else RoundedCornerShape(0.dp)),
+            .background(
+                GrokifyColors.Panel,
+                if (framed) RoundedCornerShape(12.dp) else RoundedCornerShape(0.dp),
+            ),
     ) {
-        if (!hasToken) {
-            Text(
-                "Add a Mapbox token in Settings to enable maps",
-                color = GrokifyColors.TextMuted,
-                fontSize = 13.sp,
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(16.dp),
-            )
-        } else {
-            key(token) {
-                AndroidView(
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            layoutParams = ViewGroup.LayoutParams(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                            )
-                            setBackgroundColor(AndroidColor.parseColor("#0B1220"))
-                            // Hardware layer required for Mapbox GL / WebGL reliability.
-                            setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.cacheMode = WebSettings.LOAD_DEFAULT
-                            settings.allowFileAccess = false
-                            settings.allowContentAccess = false
-                            settings.mediaPlaybackRequiresUserGesture = true
-                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                            settings.loadsImagesAutomatically = true
-                            settings.blockNetworkImage = false
-                            settings.blockNetworkLoads = false
-                            // Prefer desktop-ish UA bits so Mapbox serves modern GL bundle paths.
-                            settings.userAgentString = settings.userAgentString + " GrokifyOSMap/1"
-                            overScrollMode = WebView.OVER_SCROLL_NEVER
-                            isVerticalScrollBarEnabled = false
-                            isHorizontalScrollBarEnabled = false
-                            webChromeClient = object : WebChromeClient() {
-                                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                                    val msg = consoleMessage?.message().orEmpty()
-                                    if (msg.contains("error", ignoreCase = true) ||
-                                        msg.contains("failed", ignoreCase = true) ||
-                                        msg.contains("unauthorized", ignoreCase = true)
-                                    ) {
-                                        mainHandler.post {
-                                            if (loadError == null && !mapReady) {
-                                                loadError = msg.take(120)
-                                            }
-                                        }
-                                    }
-                                    return super.onConsoleMessage(consoleMessage)
+        AndroidView(
+            factory = { ctx ->
+                WebView(ctx).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                    setBackgroundColor(AndroidColor.parseColor("#0B1220"))
+                    // Default layer type — HARDWARE blanks WebView surfaces on some OEMs.
+                    setLayerType(View.LAYER_TYPE_NONE, null)
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.cacheMode = WebSettings.LOAD_DEFAULT
+                    settings.allowFileAccess = true
+                    settings.allowContentAccess = true
+                    settings.mediaPlaybackRequiresUserGesture = true
+                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                    settings.loadsImagesAutomatically = true
+                    settings.blockNetworkImage = false
+                    settings.blockNetworkLoads = false
+                    settings.useWideViewPort = true
+                    settings.loadWithOverviewMode = true
+                    settings.builtInZoomControls = false
+                    settings.displayZoomControls = false
+                    settings.userAgentString = settings.userAgentString + " GrokifyOSMap/3"
+                    @Suppress("DEPRECATION")
+                    settings.allowFileAccessFromFileURLs = true
+                    @Suppress("DEPRECATION")
+                    settings.allowUniversalAccessFromFileURLs = true
+                    overScrollMode = WebView.OVER_SCROLL_NEVER
+                    isVerticalScrollBarEnabled = false
+                    isHorizontalScrollBarEnabled = false
+
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                            val msg = consoleMessage?.message().orEmpty()
+                            if (msg.contains("error", ignoreCase = true) ||
+                                msg.contains("failed", ignoreCase = true) ||
+                                msg.contains("unauthorized", ignoreCase = true) ||
+                                msg.contains("401")
+                            ) {
+                                android.util.Log.w("WifiMapView", "JS: $msg")
+                            }
+                            return super.onConsoleMessage(consoleMessage)
+                        }
+                    }
+
+                    addJavascriptInterface(
+                        object {
+                            @JavascriptInterface
+                            fun onApSelected(id: String) {
+                                mainHandler.post { onSelectLatest.value(id) }
+                            }
+
+                            @JavascriptInterface
+                            fun onMapTapped(lat: Double, lon: Double) {
+                                mainHandler.post {
+                                    onMapTappedLatest.value?.invoke(lat, lon)
                                 }
                             }
-                            addJavascriptInterface(
-                                object {
-                                    @JavascriptInterface
-                                    fun onApSelected(id: String) {
-                                        mainHandler.post {
-                                            onSelectLatest.value(id)
-                                        }
-                                    }
 
-                                    @JavascriptInterface
-                                    fun onMapReady() {
-                                        mainHandler.post {
-                                            mapReady = true
-                                            loadError = null
-                                            val wv = webView ?: return@post
-                                            pushMarkers(
-                                                wv,
-                                                markersLatest.value,
-                                                userGpsLatest.value,
-                                                selectedIdLatest.value,
-                                            )
-                                            wv.evaluateJavascript(
-                                                "window.resizeWifiMap && window.resizeWifiMap();",
-                                                null,
-                                            )
-                                        }
-                                    }
-
-                                    @JavascriptInterface
-                                    fun onMapError(message: String?) {
-                                        mainHandler.post {
-                                            loadError = message?.take(160)
-                                                ?: "Map failed to load"
-                                        }
-                                    }
-                                },
-                                "GrokifyWifiMap",
-                            )
-                            webViewClient = object : WebViewClient() {
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    super.onPageFinished(view, url)
-                                    // Do not mark ready here — Mapbox style load is async.
-                                    // Nudge resize once HTML/CSS have dimensions.
-                                    view?.post {
-                                        view.evaluateJavascript(
-                                            "window.resizeWifiMap && window.resizeWifiMap();",
-                                            null,
-                                        )
-                                    }
-                                }
-
-                                override fun onReceivedError(
-                                    view: WebView?,
-                                    request: WebResourceRequest?,
-                                    error: WebResourceError?,
-                                ) {
-                                    // Only surface main-frame failures (CDN tile blips are noisy).
-                                    if (request?.isForMainFrame == true) {
-                                        loadError = error?.description?.toString()
-                                            ?: "Map failed to load"
-                                    }
-                                }
-
-                                @Deprecated("Deprecated in Java")
-                                override fun onReceivedError(
-                                    view: WebView?,
-                                    errorCode: Int,
-                                    description: String?,
-                                    failingUrl: String?,
-                                ) {
-                                    loadError = description ?: "Map failed to load"
+                            @JavascriptInterface
+                            fun onMapReady() {
+                                mainHandler.post {
+                                    mapReady = true
+                                    loadError = null
+                                    val wv = webView ?: return@post
+                                    applyBasemap(wv, tokenInfoLatest.value)
+                                    pushMarkers(
+                                        wv,
+                                        markersLatest.value,
+                                        userGpsLatest.value,
+                                        selectedIdLatest.value,
+                                        autoFitLatest.value,
+                                    )
+                                    wv.evaluateJavascript(
+                                        "window.resizeWifiMap && window.resizeWifiMap();",
+                                        null,
+                                    )
                                 }
                             }
+
+                            @JavascriptInterface
+                            fun onBasemap(label: String?) {
+                                mainHandler.post {
+                                    basemapLabel = label?.take(80) ?: "Map ready"
+                                }
+                            }
+
+                            @JavascriptInterface
+                            fun onMapError(message: String?) {
+                                mainHandler.post {
+                                    loadError = message?.take(160) ?: "Map failed to load"
+                                    basemapLabel = "Map error"
+                                }
+                            }
+                        },
+                        "GrokifyWifiMap",
+                    )
+
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            view?.post {
+                                view.evaluateJavascript(
+                                    "window.resizeWifiMap && window.resizeWifiMap();",
+                                    null,
+                                )
+                            }
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            error: WebResourceError?,
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                mainHandler.post {
+                                    loadError = error?.description?.toString()
+                                        ?: "Map failed to load"
+                                }
+                            }
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun onReceivedError(
+                            view: WebView?,
+                            errorCode: Int,
+                            description: String?,
+                            failingUrl: String?,
+                        ) {
+                            mainHandler.post {
+                                loadError = description ?: "Map failed to load"
+                            }
+                        }
+                    }
+
+                    fun tryLoad() {
+                        if (width <= 0 || height <= 0) return
+                        if (tag == "loaded") return
+                        tag = "loaded"
+                        // Bundle Leaflet in assets so maps work without CDN access.
+                        loadDataWithBaseURL(
+                            "file:///android_asset/map/",
+                            buildMapHtml(),
+                            "text/html",
+                            "UTF-8",
+                            null,
+                        )
+                    }
+
+                    addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                        tryLoad()
+                        if (tag == "loaded") {
+                            evaluateJavascript(
+                                "window.resizeWifiMap && window.resizeWifiMap();",
+                                null,
+                            )
+                        }
+                    }
+                    post { tryLoad() }
+                    postDelayed({ tryLoad() }, 200)
+                    postDelayed({ tryLoad() }, 600)
+                    postDelayed({ tryLoad() }, 1500)
+                    // Last resort: load even at 0 size and let JS ResizeObserver fix it.
+                    postDelayed({
+                        if (tag != "loaded") {
+                            tag = "loaded"
                             loadDataWithBaseURL(
-                                "https://api.mapbox.com/",
-                                buildMapHtml(token),
+                                "file:///android_asset/map/",
+                                buildMapHtml(),
                                 "text/html",
                                 "UTF-8",
                                 null,
                             )
-                            webView = this
                         }
-                    },
-                    update = { view ->
-                        // Keep reference if Compose reuses the view.
-                        webView = view
-                        if (mapReady) {
-                            pushMarkers(view, markers, userGps, selectedId)
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
+                    }, 2500)
 
-            if (markers.isEmpty()) {
-                Text(
-                    "No GPS-tagged pins yet — scan with location on",
-                    color = GrokifyColors.TextMuted,
-                    fontSize = 12.sp,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(10.dp)
-                        .background(
-                            GrokifyColors.Panel.copy(alpha = 0.92f),
-                            RoundedCornerShape(8.dp),
-                        )
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                )
-            }
+                    webView = this
+                }
+            },
+            update = { view ->
+                webView = view
+                // Ensure the WebView actually fills the Compose slot.
+                if (view.layoutParams == null ||
+                    view.layoutParams.width != ViewGroup.LayoutParams.MATCH_PARENT ||
+                    view.layoutParams.height != ViewGroup.LayoutParams.MATCH_PARENT
+                ) {
+                    view.layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                }
+                if (mapReady) {
+                    pushMarkers(view, markers, userGps, selectedId, autoFit)
+                }
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
 
-            loadError?.let { err ->
-                Text(
-                    err,
-                    color = GrokifyColors.GlowRose,
-                    fontSize = 11.sp,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(8.dp)
-                        .background(
-                            GrokifyColors.Panel.copy(alpha = 0.94f),
-                            RoundedCornerShape(8.dp),
-                        )
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+        // Status chip (outside WebView so blank surfaces still show diagnostics).
+        Text(
+            buildString {
+                append(basemapLabel)
+                if (tokenInfo.kind == MapboxTokenKind.PUBLIC) append(" · token ok")
+                when (tokenInfo.kind) {
+                    MapboxTokenKind.SECRET -> append(" · use pk. not sk.")
+                    MapboxTokenKind.EMPTY -> append(" · free basemap")
+                    MapboxTokenKind.INVALID -> append(" · token invalid")
+                    MapboxTokenKind.PUBLIC -> Unit
+                }
+            },
+            color = when {
+                loadError != null -> GrokifyColors.GlowRose
+                tokenInfo.kind == MapboxTokenKind.SECRET ||
+                    tokenInfo.kind == MapboxTokenKind.INVALID -> GrokifyColors.GlowAmber
+                else -> GrokifyColors.TextMuted
+            },
+            fontSize = 11.sp,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(8.dp)
+                .background(
+                    GrokifyColors.Panel.copy(alpha = 0.92f),
+                    RoundedCornerShape(8.dp),
                 )
-            }
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+        )
+
+        if (markers.isEmpty() && !emptyHint.isNullOrBlank()) {
+            Text(
+                emptyHint,
+                color = GrokifyColors.TextMuted,
+                fontSize = 12.sp,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(10.dp)
+                    .background(
+                        GrokifyColors.Panel.copy(alpha = 0.92f),
+                        RoundedCornerShape(8.dp),
+                    )
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
+        }
+
+        loadError?.let { err ->
+            Text(
+                err,
+                color = GrokifyColors.GlowRose,
+                fontSize = 11.sp,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(8.dp)
+                    .background(
+                        GrokifyColors.Panel.copy(alpha = 0.94f),
+                        RoundedCornerShape(8.dp),
+                    )
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+            )
         }
     }
+}
+
+private enum class MapboxTokenKind { EMPTY, PUBLIC, SECRET, INVALID }
+
+private data class MapboxTokenInfo(
+    val kind: MapboxTokenKind,
+    /** Cleaned token for Mapbox requests, or empty. */
+    val token: String,
+)
+
+/**
+ * Normalize what users paste into Settings.
+ * Accepts only public `pk.` tokens for client-side Mapbox tiles.
+ */
+private fun normalizeMapboxToken(raw: String): MapboxTokenInfo {
+    var t = raw.trim()
+    if (t.isEmpty()) return MapboxTokenInfo(MapboxTokenKind.EMPTY, "")
+    // Strip common paste junk.
+    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith('\'') && t.endsWith('\''))) {
+        t = t.substring(1, t.length - 1).trim()
+    }
+    if (t.startsWith("Bearer ", ignoreCase = true)) t = t.substring(7).trim()
+    if (t.startsWith("access_token=", ignoreCase = true)) t = t.substring(13).trim()
+    t = t.replace(Regex("\\s+"), "")
+    if (t.isEmpty()) return MapboxTokenInfo(MapboxTokenKind.EMPTY, "")
+    return when {
+        t.startsWith("pk.") && t.length > 20 -> MapboxTokenInfo(MapboxTokenKind.PUBLIC, t)
+        t.startsWith("sk.") -> MapboxTokenInfo(MapboxTokenKind.SECRET, "")
+        t.startsWith("pk.") -> MapboxTokenInfo(MapboxTokenKind.INVALID, "")
+        else -> MapboxTokenInfo(MapboxTokenKind.INVALID, "")
+    }
+}
+
+private fun applyBasemap(webView: WebView, info: MapboxTokenInfo) {
+    val encoded = if (info.token.isNotEmpty()) {
+        URLEncoder.encode(info.token, Charsets.UTF_8.name())
+            // URLEncoder turns pk.xxx into ok form; keep dots unescaped for Mapbox.
+            .replace("%2E", ".")
+            .replace("+", "%20")
+    } else {
+        ""
+    }
+    val kind = when (info.kind) {
+        MapboxTokenKind.PUBLIC -> "mapbox"
+        else -> "carto"
+    }
+    val tokenJs = JSONObject.quote(encoded)
+    val kindJs = JSONObject.quote(kind)
+    webView.evaluateJavascript(
+        "window.setBasemap && window.setBasemap($kindJs, $tokenJs);",
+        null,
+    )
 }
 
 private fun pushMarkers(
@@ -338,6 +491,7 @@ private fun pushMarkers(
     markers: List<WifiMapMarker>,
     userGps: GpsFix?,
     selectedId: String?,
+    autoFit: Boolean = true,
 ) {
     val features = JSONArray()
     markers.forEach { m ->
@@ -350,7 +504,10 @@ private fun pushMarkers(
             .put("seen", m.seenCount)
         m.level?.let { props.put("level", it) }
         m.distanceM?.let { props.put("dist", it) }
+        m.radiusM?.takeIf { it.isFinite() && it > 0 }?.let { props.put("radiusM", it) }
         val color = when {
+            m.radiusM != null && m.live -> "#A78BFA"
+            m.radiusM != null -> "#64748B"
             m.level == null -> "#64748B"
             m.level >= -55 -> "#34D399"
             m.level >= -70 -> "#22D3EE"
@@ -359,6 +516,7 @@ private fun pushMarkers(
         }
         props.put("color", color)
         val radius = when {
+            m.radiusM != null -> 10
             m.level == null -> 7
             m.level >= -55 -> 11
             m.level >= -70 -> 9
@@ -392,396 +550,198 @@ private fun pushMarkers(
         "null"
     }
     val selJs = selectedId?.let { JSONObject.quote(it) } ?: "null"
+    val fitJs = if (autoFit) "true" else "false"
 
-    val js = "window.setWifiData && window.setWifiData($fc, $userJson, $selJs);"
+    val js = "window.setWifiData && window.setWifiData($fc, $userJson, $selJs, $fitJs);"
     webView.evaluateJavascript(js, null)
 }
 
-private fun buildMapHtml(accessToken: String): String {
-    // Strip any accidental whitespace / newlines that would break the JS string.
-    val cleaned = accessToken.replace(Regex("\\s+"), "")
-    val tokenEsc = cleaned
-        .replace("\\", "\\\\")
-        .replace("'", "\\'")
-        .replace("\"", "\\\"")
-    return """
+/**
+ * Static HTML shell. Leaflet is loaded from [file:///android_asset/map/].
+ * Basemap URL is set at runtime via [window.setBasemap] so token updates don't reload the page.
+ */
+private fun buildMapHtml(): String = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
-<link href="https://api.mapbox.com/mapbox-gl-js/v3.9.0/mapbox-gl.css" rel="stylesheet"/>
-<script src="https://api.mapbox.com/mapbox-gl-js/v3.9.0/mapbox-gl.js"></script>
+<link rel="stylesheet" href="leaflet.css"/>
 <style>
   html, body, #map { margin:0; padding:0; width:100%; height:100%; background:#0B1220; }
-  .mapboxgl-popup-content {
-    background: #121A2B; color: #E8EEF7; border-radius: 10px;
-    padding: 10px 12px; font: 12px/1.35 system-ui, sans-serif;
-    box-shadow: 0 8px 24px rgba(0,0,0,.45); border: 1px solid #243049;
+  .leaflet-container { background:#0B1220; font: 12px/1.35 system-ui, sans-serif; }
+  .leaflet-control-zoom a {
+    background:#121A2B !important; color:#E8EEF7 !important;
+    border-color:#243049 !important; width:30px !important; height:30px !important;
+    line-height:30px !important;
   }
-  .mapboxgl-popup-tip { border-top-color: #121A2B !important; }
-  .mapboxgl-ctrl-logo { opacity: .55; }
-  .mapboxgl-ctrl-attrib { background: rgba(11,18,32,.75) !important; color: #94A3B8 !important; }
-  .mapboxgl-ctrl-attrib a { color: #22D3EE !important; }
+  .leaflet-control-attribution {
+    background: rgba(11,18,32,.8) !important; color:#94A3B8 !important;
+    max-width: 70%;
+  }
+  .leaflet-control-attribution a { color:#22D3EE !important; }
+  .popup-card { background: transparent; color: #E8EEF7; margin:0; min-width: 140px; }
+  .leaflet-popup-content-wrapper {
+    background: #121A2B; color: #E8EEF7; border-radius: 10px;
+    border: 1px solid #243049; box-shadow: 0 8px 24px rgba(0,0,0,.45);
+  }
+  .leaflet-popup-tip { background: #121A2B; }
+  .leaflet-popup-content { margin: 10px 12px; }
   .t { font-weight: 650; color: #F1F5F9; margin-bottom: 2px; }
   .m { color: #94A3B8; font-family: ui-monospace, monospace; font-size: 11px; }
   .s { color: #22D3EE; margin-top: 4px; }
   #boot {
     position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-    color:#94A3B8; font: 13px/1.4 system-ui, sans-serif; pointer-events:none; z-index:2;
+    color:#94A3B8; font: 13px/1.4 system-ui, sans-serif; pointer-events:none; z-index:1000;
+    background:#0B1220;
+  }
+  .pin {
+    border-radius: 50%;
+    border: 2px solid #0B1220;
+    box-shadow: 0 0 0 3px rgba(0,0,0,.25), 0 2px 8px rgba(0,0,0,.35);
+  }
+  .pin-halo {
+    border-radius: 50%;
+    opacity: 0.28;
+    position: absolute;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .pin-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .pin-sel {
+    box-shadow: 0 0 0 3px #22D3EE, 0 2px 10px rgba(0,0,0,.4) !important;
+  }
+  .user-dot {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #22D3EE; border: 2px solid #041016;
+    box-shadow: 0 0 0 6px rgba(34,211,238,.18);
   }
 </style>
 </head>
 <body>
 <div id="map"></div>
 <div id="boot">Loading map…</div>
+<script src="leaflet.js"></script>
 <script>
 (function() {
 function reportError(msg) {
   try { GrokifyWifiMap.onMapError(String(msg || 'Map error')); } catch (e) {}
   var b = document.getElementById('boot');
-  if (b) { b.textContent = String(msg || 'Map failed'); b.style.color = '#FB7185'; }
+  if (b) { b.textContent = String(msg || 'Map failed'); b.style.color = '#FB7185'; b.style.display = 'flex'; }
 }
 function hideBoot() {
   var b = document.getElementById('boot');
   if (b) b.style.display = 'none';
 }
+function reportBasemap(label) {
+  try { GrokifyWifiMap.onBasemap(String(label || '')); } catch (e) {}
+}
 
-if (typeof mapboxgl === 'undefined') {
-  reportError('Mapbox GL failed to load (network / WebView)');
+if (typeof L === 'undefined') {
+  reportError('Map library missing from app assets');
   return;
 }
 
-mapboxgl.accessToken = '$tokenEsc';
-var map;
-try {
-  map = new mapboxgl.Map({
-    container: 'map',
-    style: 'mapbox://styles/mapbox/dark-v11',
-    center: [-98.0, 39.5],
-    zoom: 3,
-    attributionControl: true,
-    logoPosition: 'bottom-left',
-    failIfMajorPerformanceCaveat: false,
-    preserveDrawingBuffer: true
-  });
-} catch (err) {
-  reportError(err && err.message ? err.message : err);
-  return;
-}
-map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'top-right');
+var ready = false;
+var pending = null;
+var selectedId = null;
+var displayById = {};
+var originById = {};
+var lastFcRaw = null;
+var lastUser = null;
+var map = null;
+var basemapLayer = null;
+var markersLayer = null;
+var spokesLayer = null;
+var circlesLayer = null;
+var userLayer = null;
+var markerById = {};
+var tileErrors = 0;
+var lastFitKey = '';
 
-map.on('error', function(e) {
-  var msg = (e && e.error && e.error.message) ? e.error.message
-    : (e && e.message) ? e.message : 'Map style error';
-  // Token / style failures are fatal for first paint.
-  if (!ready) reportError(msg);
-});
-
-let popup = new mapboxgl.Popup({ closeButton: true, maxWidth: '240px' });
-let ready = false;
-let pending = null;
-let selectedId = null;
-/** id -> display [lon, lat] after spiderfy */
-let displayById = {};
-/** true GPS [lon, lat] for each id */
-let originById = {};
-let lastFcRaw = null;
-let lastUser = null;
-let suppressFit = false;
-
-const CLUSTER_M = 14;       // meters — same cluster if closer
-const SPIRAL_BASE_M = 10;   // first ring radius
-const SPIRAL_STEP_M = 7;    // grow per index
-const GOLDEN = 2.399963229728653; // ~137.5° in rad
-
-function emptyFc() {
-  return { type: 'FeatureCollection', features: [] };
-}
+var CLUSTER_M = 14;
+var SPIRAL_BASE_M = 10;
+var SPIRAL_STEP_M = 7;
+var GOLDEN = 2.399963229728653;
 
 function haversineM(lon1, lat1, lon2, lat2) {
-  const R = 6371000;
-  const toR = Math.PI / 180;
-  const dLat = (lat2 - lat1) * toR;
-  const dLon = (lon2 - lon1) * toR;
-  const a = Math.sin(dLat/2)**2 +
-    Math.cos(lat1*toR) * Math.cos(lat2*toR) * Math.sin(dLon/2)**2;
+  var R = 6371000;
+  var toR = Math.PI / 180;
+  var dLat = (lat2 - lat1) * toR;
+  var dLon = (lon2 - lon1) * toR;
+  var a = Math.sin(dLat/2)*Math.sin(dLat/2) +
+    Math.cos(lat1*toR) * Math.cos(lat2*toR) * Math.sin(dLon/2)*Math.sin(dLon/2);
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
 }
 
 function offsetMeters(lon, lat, eastM, northM) {
-  const dLat = northM / 111320;
-  const dLon = eastM / (111320 * Math.cos(lat * Math.PI / 180) || 1e-6);
+  var dLat = northM / 111320;
+  var dLon = eastM / (111320 * Math.cos(lat * Math.PI / 180) || 1e-6);
   return [lon + dLon, lat + dLat];
 }
 
-/**
- * Spiral spiderfy: group nearly-identical pins, fan them out so every AP is tappable.
- * Keeps origin coords in properties for spokes + popup "true" location.
- */
 function spiderfyFeatures(features) {
-  const items = (features || []).map((f, idx) => {
-    const c = f.geometry && f.geometry.coordinates;
+  var items = (features || []).map(function(f, idx) {
+    var c = f.geometry && f.geometry.coordinates;
     return {
-      f: f,
-      idx: idx,
-      lon: c ? c[0] : 0,
-      lat: c ? c[1] : 0,
-      id: (f.properties && f.properties.id) || String(idx),
+      f: f, idx: idx,
+      lon: c ? c[0] : 0, lat: c ? c[1] : 0,
+      id: (f.properties && f.properties.id) || String(idx)
     };
   });
-  const used = new Array(items.length).fill(false);
-  const outPoints = [];
-  const spokes = [];
+  var used = new Array(items.length).fill(false);
+  var outPoints = [];
+  var spokes = [];
   displayById = {};
   originById = {};
 
-  for (let i = 0; i < items.length; i++) {
+  for (var i = 0; i < items.length; i++) {
     if (used[i]) continue;
-    const group = [items[i]];
+    var group = [items[i]];
     used[i] = true;
-    for (let j = i + 1; j < items.length; j++) {
+    for (var j = i + 1; j < items.length; j++) {
       if (used[j]) continue;
       if (haversineM(items[i].lon, items[i].lat, items[j].lon, items[j].lat) <= CLUSTER_M) {
         group.push(items[j]);
         used[j] = true;
       }
     }
-
-    // Cluster center = mean of members (stable when scan GPS is shared)
-    let cLon = 0, cLat = 0;
-    group.forEach(g => { cLon += g.lon; cLat += g.lat; });
+    var cLon = 0, cLat = 0;
+    group.forEach(function(g) { cLon += g.lon; cLat += g.lat; });
     cLon /= group.length;
     cLat /= group.length;
-
-    // Stronger signal first so ring index is stable-ish
-    group.sort((a, b) => {
-      const la = a.f.properties && a.f.properties.level != null ? a.f.properties.level : -999;
-      const lb = b.f.properties && b.f.properties.level != null ? b.f.properties.level : -999;
+    group.sort(function(a, b) {
+      var la = a.f.properties && a.f.properties.level != null ? a.f.properties.level : -999;
+      var lb = b.f.properties && b.f.properties.level != null ? b.f.properties.level : -999;
       return lb - la;
     });
-
-    group.forEach((g, k) => {
-      const props = Object.assign({}, g.f.properties || {});
+    group.forEach(function(g, k) {
+      var props = Object.assign({}, g.f.properties || {});
       props.originLon = g.lon;
       props.originLat = g.lat;
       props.clusterSize = group.length;
       props.clusterIndex = k;
-
-      let dLon = g.lon, dLat = g.lat;
+      var dLon = g.lon, dLat = g.lat;
       if (group.length > 1) {
-        // Archimedean spiral — radius grows so later pins sit further out
-        const r = SPIRAL_BASE_M + k * SPIRAL_STEP_M;
-        const ang = k * GOLDEN;
-        const east = Math.cos(ang) * r;
-        const north = Math.sin(ang) * r;
-        const off = offsetMeters(cLon, cLat, east, north);
+        var r = SPIRAL_BASE_M + k * SPIRAL_STEP_M;
+        var ang = k * GOLDEN;
+        var off = offsetMeters(cLon, cLat, Math.cos(ang) * r, Math.sin(ang) * r);
         dLon = off[0];
         dLat = off[1];
-        spokes.push({
-          type: 'Feature',
-          geometry: {
-            type: 'LineString',
-            coordinates: [[cLon, cLat], [dLon, dLat]]
-          },
-          properties: { id: g.id, color: props.color || '#64748B' }
-        });
+        spokes.push({ from: [cLat, cLon], to: [dLat, dLon], color: props.color || '#64748B' });
       }
-
       displayById[g.id] = [dLon, dLat];
       originById[g.id] = [g.lon, g.lat];
-
-      outPoints.push({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [dLon, dLat] },
-        properties: props
-      });
+      outPoints.push({ id: g.id, lat: dLat, lon: dLon, props: props });
     });
   }
-
-  return {
-    points: { type: 'FeatureCollection', features: outPoints },
-    spokes: { type: 'FeatureCollection', features: spokes }
-  };
+  return { points: outPoints, spokes: spokes };
 }
-
-map.on('load', () => {
-  map.addSource('aps', { type: 'geojson', data: emptyFc() });
-  map.addSource('spokes', { type: 'geojson', data: emptyFc() });
-  map.addSource('user', { type: 'geojson', data: emptyFc() });
-  map.addSource('selected', { type: 'geojson', data: emptyFc() });
-
-  map.addLayer({
-    id: 'ap-spokes',
-    type: 'line',
-    source: 'spokes',
-    paint: {
-      'line-color': ['get', 'color'],
-      'line-width': 1.5,
-      'line-opacity': 0.45,
-      'line-dasharray': [1.5, 1.5]
-    }
-  });
-
-  map.addLayer({
-    id: 'aps-halo',
-    type: 'circle',
-    source: 'aps',
-    paint: {
-      'circle-radius': ['+', ['get', 'radius'], 6],
-      'circle-color': ['get', 'color'],
-      'circle-opacity': 0.22,
-      'circle-blur': 0.6
-    }
-  });
-  map.addLayer({
-    id: 'aps-dots',
-    type: 'circle',
-    source: 'aps',
-    paint: {
-      'circle-radius': ['get', 'radius'],
-      'circle-color': ['get', 'color'],
-      'circle-stroke-width': 1.5,
-      'circle-stroke-color': '#0B1220',
-      'circle-opacity': 0.95
-    }
-  });
-
-  // Selection ring (above dots)
-  map.addLayer({
-    id: 'selected-ring',
-    type: 'circle',
-    source: 'selected',
-    paint: {
-      'circle-radius': 18,
-      'circle-color': 'transparent',
-      'circle-stroke-width': 3,
-      'circle-stroke-color': '#F8FAFC',
-      'circle-opacity': 1
-    }
-  });
-  map.addLayer({
-    id: 'selected-pulse',
-    type: 'circle',
-    source: 'selected',
-    paint: {
-      'circle-radius': 26,
-      'circle-color': '#22D3EE',
-      'circle-opacity': 0.18,
-      'circle-blur': 0.4
-    }
-  });
-
-  map.addLayer({
-    id: 'user-acc',
-    type: 'circle',
-    source: 'user',
-    paint: {
-      'circle-radius': [
-        'interpolate', ['linear'], ['zoom'],
-        12, 18, 16, 40, 18, 70
-      ],
-      'circle-color': '#22D3EE',
-      'circle-opacity': 0.12,
-      'circle-stroke-width': 1,
-      'circle-stroke-color': '#22D3EE',
-      'circle-stroke-opacity': 0.35
-    }
-  });
-  map.addLayer({
-    id: 'user-dot',
-    type: 'circle',
-    source: 'user',
-    paint: {
-      'circle-radius': 7,
-      'circle-color': '#22D3EE',
-      'circle-stroke-width': 2,
-      'circle-stroke-color': '#041016'
-    }
-  });
-
-  function showPopupFor(id) {
-    if (!id || !displayById[id]) return;
-    const coords = displayById[id];
-    // find feature props
-    const feats = (lastFcRaw && lastFcRaw.features) || [];
-    let p = {};
-    for (let i = 0; i < feats.length; i++) {
-      const pr = feats[i].properties || {};
-      if (pr.id === id) { p = pr; break; }
-    }
-    // After spiderfy props live on source — try source
-    const src = map.getSource('aps');
-    if (src && src._data && src._data.features) {
-      for (const f of src._data.features) {
-        if (f.properties && f.properties.id === id) { p = f.properties; break; }
-      }
-    }
-    const level = p.level != null ? (p.level + ' dBm') : '—';
-    const dist = p.dist != null ? ('≈ ' + Number(p.dist).toFixed(0) + ' m') : '';
-    const live = p.live === true || p.live === 'true' ? 'live' : 'stored';
-    const stacked = p.clusterSize > 1 ? (' · spread ' + (Number(p.clusterIndex)+1) + '/' + p.clusterSize) : '';
-    const html =
-      '<div class="t">' + esc(p.ssid || '(hidden)') + '</div>' +
-      '<div class="m">' + esc(p.bssid || '') + '</div>' +
-      '<div class="s">' + esc(level) + (dist ? ' · ' + esc(dist) : '') +
-      ' · seen ' + esc(String(p.seen || 1)) + '× · ' + live + stacked + '</div>';
-    popup.setLngLat(coords).setHTML(html).addTo(map);
-  }
-
-  function paintSelected(id, fly) {
-    selectedId = id || null;
-    const us = map.getSource('selected');
-    if (!us) return;
-    if (!id || !displayById[id]) {
-      us.setData(emptyFc());
-      if (!id) popup.remove();
-      return;
-    }
-    const coords = displayById[id];
-    us.setData({
-      type: 'FeatureCollection',
-      features: [{
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: coords },
-        properties: { id: id }
-      }]
-    });
-    showPopupFor(id);
-    if (fly) {
-      map.easeTo({
-        center: coords,
-        zoom: Math.max(map.getZoom(), 16.5),
-        duration: 500
-      });
-    }
-  }
-
-  map.on('click', 'aps-dots', (e) => {
-    const f = e.features && e.features[0];
-    if (!f) return;
-    const id = (f.properties && f.properties.id) || '';
-    if (!id) return;
-    paintSelected(id, true);
-    try { GrokifyWifiMap.onApSelected(String(id)); } catch (err) {}
-  });
-  map.on('mouseenter', 'aps-dots', () => { map.getCanvas().style.cursor = 'pointer'; });
-  map.on('mouseleave', 'aps-dots', () => { map.getCanvas().style.cursor = ''; });
-
-  ready = true;
-  hideBoot();
-  try { map.resize(); } catch (e) {}
-  try { GrokifyWifiMap.onMapReady(); } catch (err) {}
-  if (pending) {
-    applyData(pending.fc, pending.user, pending.sel);
-    pending = null;
-  }
-});
-
-// Timeout if style never loads (bad token / offline).
-setTimeout(function() {
-  if (!ready) reportError('Map timed out — check Mapbox token & network');
-}, 15000);
 
 function esc(s) {
   return String(s)
@@ -789,137 +749,352 @@ function esc(s) {
     .replace(/"/g,'&quot;');
 }
 
-function applyData(fc, user, sel) {
-  lastFcRaw = fc;
-  lastUser = user;
-  const spider = spiderfyFeatures((fc && fc.features) || []);
-  const src = map.getSource('aps');
-  if (src) src.setData(spider.points);
-  const sp = map.getSource('spokes');
-  if (sp) sp.setData(spider.spokes);
-
-  const us = map.getSource('user');
-  if (us) {
-    if (user && typeof user.lat === 'number' && typeof user.lon === 'number') {
-      us.setData({
-        type: 'FeatureCollection',
-        features: [{
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: [user.lon, user.lat] },
-          properties: { acc: user.acc || 0 }
-        }]
-      });
-    } else {
-      us.setData(emptyFc());
-    }
+function popupHtml(p) {
+  // Place-note style when a geofence radius is present.
+  if (p.radiusM != null && p.radiusM !== '') {
+    var r = Number(p.radiusM);
+    var distP = p.dist != null ? (' · ≈ ' + Number(p.dist).toFixed(0) + ' m away') : '';
+    var onOff = (p.live === true || p.live === 'true') ? 'watching' : 'paused';
+    return '<div class="popup-card">' +
+      '<div class="t">' + esc(p.ssid || 'Place') + '</div>' +
+      '<div class="m">' + esc(p.bssid || '') + '</div>' +
+      '<div class="s">radius ' + esc(String(Math.round(r))) + ' m · ' + onOff + distP + '</div></div>';
   }
-
-  if (!suppressFit) fit(spider.points, user);
-  // restore / apply selection without full re-fit when possible
-  const want = sel != null ? sel : selectedId;
-  if (want && displayById[want]) {
-    paintSelectedLocal(want, false);
-  } else if (selectedId && !displayById[selectedId]) {
-    paintSelectedLocal(null, false);
-  }
-}
-
-function paintSelectedLocal(id, fly) {
-  selectedId = id || null;
-  const us = map.getSource('selected');
-  if (!us) return;
-  if (!id || !displayById[id]) {
-    us.setData(emptyFc());
-    return;
-  }
-  const coords = displayById[id];
-  us.setData({
-    type: 'FeatureCollection',
-    features: [{
-      type: 'Feature',
-      geometry: { type: 'Point', coordinates: coords },
-      properties: { id: id }
-    }]
-  });
-  // popup
-  const src = map.getSource('aps');
-  let p = {};
-  if (src && src._data && src._data.features) {
-    for (const f of src._data.features) {
-      if (f.properties && f.properties.id === id) { p = f.properties; break; }
-    }
-  }
-  const level = p.level != null ? (p.level + ' dBm') : '—';
-  const dist = p.dist != null ? ('≈ ' + Number(p.dist).toFixed(0) + ' m') : '';
-  const live = p.live === true || p.live === 'true' ? 'live' : 'stored';
-  const stacked = p.clusterSize > 1 ? (' · spread ' + (Number(p.clusterIndex)+1) + '/' + p.clusterSize) : '';
-  const html =
+  var level = p.level != null ? (p.level + ' dBm') : '—';
+  var dist = p.dist != null ? ('≈ ' + Number(p.dist).toFixed(0) + ' m') : '';
+  var live = (p.live === true || p.live === 'true') ? 'live' : 'stored';
+  var stacked = p.clusterSize > 1
+    ? (' · spread ' + (Number(p.clusterIndex)+1) + '/' + p.clusterSize) : '';
+  return '<div class="popup-card">' +
     '<div class="t">' + esc(p.ssid || '(hidden)') + '</div>' +
     '<div class="m">' + esc(p.bssid || '') + '</div>' +
     '<div class="s">' + esc(level) + (dist ? ' · ' + esc(dist) : '') +
-    ' · seen ' + esc(String(p.seen || 1)) + '× · ' + live + stacked + '</div>';
-  popup.setLngLat(coords).setHTML(html).addTo(map);
-  if (fly) {
-    map.easeTo({
-      center: coords,
-      zoom: Math.max(map.getZoom(), 16.5),
-      duration: 500
-    });
-  }
+    ' · seen ' + esc(String(p.seen || 1)) + '× · ' + live + stacked + '</div></div>';
 }
 
-function fit(fc, user) {
-  const bounds = new mapboxgl.LngLatBounds();
-  let n = 0;
-  (fc && fc.features || []).forEach(f => {
-    const c = f.geometry && f.geometry.coordinates;
-    if (c && c.length >= 2) { bounds.extend(c); n++; }
+function pinIcon(color, radius, selected) {
+  var r = Math.max(6, Number(radius) || 8);
+  var outer = r * 2 + (selected ? 10 : 6);
+  var halo = r * 2 + 8;
+  var cls = selected ? 'pin pin-sel' : 'pin';
+  var html =
+    '<div class="pin-wrap" style="width:' + outer + 'px;height:' + outer + 'px">' +
+    '<div class="pin-halo" style="width:' + halo + 'px;height:' + halo + 'px;background:' + color + '"></div>' +
+    '<div class="' + cls + '" style="width:' + (r*2) + 'px;height:' + (r*2) + 'px;background:' + color + '"></div>' +
+    '</div>';
+  return L.divIcon({
+    className: '',
+    html: html,
+    iconSize: [outer, outer],
+    iconAnchor: [outer/2, outer/2],
+    popupAnchor: [0, -r]
   });
-  if (user && typeof user.lat === 'number') {
-    bounds.extend([user.lon, user.lat]);
-    n++;
-  }
-  if (n === 0) return;
-  if (n === 1) {
-    const c = bounds.getCenter();
-    map.easeTo({ center: [c.lng, c.lat], zoom: 16, duration: 600 });
+}
+
+function fitAll(points, user) {
+  var bounds = [];
+  (points || []).forEach(function(p) { bounds.push([p.lat, p.lon]); });
+  if (user && typeof user.lat === 'number') bounds.push([user.lat, user.lon]);
+  if (bounds.length === 0) return;
+  if (bounds.length === 1) {
+    map.setView(bounds[0], 16, { animate: true });
   } else {
-    map.fitBounds(bounds, { padding: 48, maxZoom: 17, duration: 700 });
+    map.fitBounds(bounds, { padding: [48, 48], maxZoom: 17, animate: true });
   }
 }
 
-window.setWifiData = function(fc, user, sel) {
-  if (!ready) { pending = { fc: fc, user: user, sel: sel }; return; }
-  applyData(fc, user, sel);
+function paintSelected(id, fly) {
+  selectedId = id || null;
+  Object.keys(markerById).forEach(function(mid) {
+    var entry = markerById[mid];
+    if (!entry) return;
+    entry.marker.setIcon(pinIcon(entry.color, entry.radius, mid === selectedId));
+  });
+  if (!id || !displayById[id]) return;
+  var coords = displayById[id];
+  var entry = markerById[id];
+  if (entry) entry.marker.openPopup();
+  if (fly) {
+    map.setView([coords[1], coords[0]], Math.max(map.getZoom(), 16.5), { animate: true });
+  }
+}
+
+function applyData(fc, user, sel, doFit) {
+  lastFcRaw = fc;
+  lastUser = user;
+  var spider = spiderfyFeatures((fc && fc.features) || []);
+
+  markersLayer.clearLayers();
+  spokesLayer.clearLayers();
+  if (circlesLayer) circlesLayer.clearLayers();
+  markerById = {};
+
+  spider.spokes.forEach(function(s) {
+    L.polyline([s.from, s.to], {
+      color: s.color, weight: 1.5, opacity: 0.45, dashArray: '4 4'
+    }).addTo(spokesLayer);
+  });
+
+  // Geofence rings at true origin (not spiderfied display points).
+  spider.points.forEach(function(p) {
+    var rm = p.props.radiusM != null ? Number(p.props.radiusM) : NaN;
+    if (!(rm > 0) || !circlesLayer) return;
+    var o = originById[p.id] || [p.lon, p.lat];
+    var color = p.props.color || '#A78BFA';
+    L.circle([o[1], o[0]], {
+      radius: rm,
+      color: color,
+      weight: 1.5,
+      opacity: 0.55,
+      fillColor: color,
+      fillOpacity: 0.12,
+      interactive: false
+    }).addTo(circlesLayer);
+  });
+
+  spider.points.forEach(function(p) {
+    var color = p.props.color || '#64748B';
+    var radius = p.props.radius || 8;
+    var m = L.marker([p.lat, p.lon], {
+      icon: pinIcon(color, radius, p.id === selectedId),
+      keyboard: false
+    });
+    m.bindPopup(popupHtml(p.props), { maxWidth: 240, closeButton: true });
+    m.on('click', function() {
+      paintSelected(p.id, true);
+      try { GrokifyWifiMap.onApSelected(String(p.id)); } catch (err) {}
+    });
+    m.addTo(markersLayer);
+    markerById[p.id] = { marker: m, color: color, radius: radius };
+  });
+
+  userLayer.clearLayers();
+  if (user && typeof user.lat === 'number' && typeof user.lon === 'number') {
+    var acc = Number(user.acc) || 0;
+    if (acc > 0) {
+      L.circle([user.lat, user.lon], {
+        radius: acc, color: '#22D3EE', weight: 1, opacity: 0.35,
+        fillColor: '#22D3EE', fillOpacity: 0.12
+      }).addTo(userLayer);
+    }
+    L.marker([user.lat, user.lon], {
+      icon: L.divIcon({
+        className: '',
+        html: '<div class="user-dot"></div>',
+        iconSize: [14, 14],
+        iconAnchor: [7, 7]
+      }),
+      interactive: false,
+      keyboard: false
+    }).addTo(userLayer);
+  }
+
+  // Fit only when pin set changes (or forced), so radius tweaks don't re-zoom.
+  var fitKey = spider.points.map(function(p) {
+    return p.id + ':' + p.lon.toFixed(5) + ',' + p.lat.toFixed(5);
+  }).join('|') + '|' + (user && user.lat != null ? (user.lat.toFixed(4)+','+user.lon.toFixed(4)) : '');
+  var shouldFit = doFit !== false && (fitKey !== lastFitKey || !lastFitKey);
+  if (shouldFit) {
+    lastFitKey = fitKey;
+    fitAll(spider.points, user);
+  }
+
+  var want = sel != null ? sel : selectedId;
+  if (want && displayById[want]) paintSelected(want, false);
+  else if (selectedId && !displayById[selectedId]) selectedId = null;
+}
+
+function makeCartoLayer() {
+  return L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; OSM &copy; CARTO',
+    maxZoom: 20,
+    subdomains: 'abcd',
+    crossOrigin: true
+  });
+}
+
+function makeOsmLayer() {
+  return L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap',
+    maxZoom: 19,
+    crossOrigin: true
+  });
+}
+
+function makeMapboxLayer(token) {
+  // Official style-as-raster URL for Leaflet (512px tiles, zoomOffset -1).
+  var url = 'https://api.mapbox.com/styles/v1/mapbox/dark-v11/tiles/{z}/{x}/{y}?access_token=' + token;
+  return L.tileLayer(url, {
+    attribution: '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; OSM',
+    maxZoom: 22,
+    tileSize: 512,
+    zoomOffset: -1,
+    crossOrigin: true
+  });
+}
+
+function wireTileFallback(layer, label, onFail) {
+  tileErrors = 0;
+  layer.on('tileerror', function() {
+    tileErrors++;
+    if (tileErrors >= 4) {
+      layer.off('tileerror');
+      if (onFail) onFail();
+    }
+  });
+  layer.on('load', function() {
+    reportBasemap(label);
+  });
+}
+
+function setBasemap(kind, token) {
+  if (!map) return;
+  if (basemapLayer) {
+    try { map.removeLayer(basemapLayer); } catch (e) {}
+    basemapLayer = null;
+  }
+  tileErrors = 0;
+
+  function useCarto(reason) {
+    basemapLayer = makeCartoLayer();
+    wireTileFallback(basemapLayer, reason ? ('Carto · ' + reason) : 'Carto dark', function() {
+      try { map.removeLayer(basemapLayer); } catch (e) {}
+      basemapLayer = makeOsmLayer();
+      basemapLayer.addTo(map);
+      basemapLayer.bringToBack();
+      reportBasemap('OSM (fallback)');
+    });
+    basemapLayer.addTo(map);
+    basemapLayer.bringToBack();
+    reportBasemap(reason ? ('Carto · ' + reason) : 'Carto dark');
+  }
+
+  if (kind === 'mapbox' && token) {
+    basemapLayer = makeMapboxLayer(token);
+    wireTileFallback(basemapLayer, 'Mapbox dark', function() {
+      useCarto('Mapbox tiles failed');
+    });
+    basemapLayer.addTo(map);
+    basemapLayer.bringToBack();
+    reportBasemap('Mapbox dark');
+  } else {
+    useCarto(kind === 'mapbox' ? 'no token' : null);
+  }
+  try { map.invalidateSize(false); } catch (e) {}
+}
+
+function initWhenSized() {
+  var el = document.getElementById('map');
+  if (!el) { reportError('Map container missing'); return; }
+
+  function start() {
+    if (ready) return true;
+    // Allow init even if size is still settling — invalidateSize later.
+    try {
+      map = L.map('map', {
+        zoomControl: false,
+        attributionControl: true,
+        preferCanvas: true
+      }).setView([39.5, -98.0], 3);
+      L.control.zoom({ position: 'topright' }).addTo(map);
+
+      // Default free basemap immediately so the box is never empty.
+      setBasemap('carto', '');
+
+      circlesLayer = L.layerGroup().addTo(map);
+      spokesLayer = L.layerGroup().addTo(map);
+      markersLayer = L.layerGroup().addTo(map);
+      userLayer = L.layerGroup().addTo(map);
+
+      map.on('click', function(e) {
+        if (!e || !e.latlng) return;
+        try {
+          GrokifyWifiMap.onMapTapped(e.latlng.lat, e.latlng.lng);
+        } catch (err) {}
+      });
+
+      ready = true;
+      hideBoot();
+      try { map.invalidateSize(false); } catch (e) {}
+      try { GrokifyWifiMap.onMapReady(); } catch (err) {}
+      if (pending) {
+        applyData(pending.fc, pending.user, pending.sel, pending.fit);
+        pending = null;
+      }
+      // Keep invalidating until the view has real size.
+      var n = 0;
+      var t = setInterval(function() {
+        n++;
+        try { map.invalidateSize(false); } catch (e) {}
+        if (n > 40) clearInterval(t);
+      }, 150);
+      return true;
+    } catch (err) {
+      reportError(err && err.message ? err.message : err);
+      return true;
+    }
+  }
+
+  if (start()) return;
+  var n = 0;
+  var t = setInterval(function() {
+    n++;
+    if (start() || n > 40) clearInterval(t);
+  }, 100);
+  if (typeof ResizeObserver !== 'undefined') {
+    var ro = new ResizeObserver(function() {
+      if (!ready) start();
+      else {
+        try { map.invalidateSize(false); } catch (e) {}
+      }
+    });
+    ro.observe(el);
+  }
+}
+
+setTimeout(function() {
+  if (!ready) reportError('Map timed out');
+}, 15000);
+
+window.setBasemap = setBasemap;
+
+window.setWifiData = function(fc, user, sel, doFit) {
+  if (!ready) { pending = { fc: fc, user: user, sel: sel, fit: doFit }; return; }
+  applyData(fc, user, sel, doFit);
 };
 
 window.selectWifiAp = function(id) {
   if (!ready) return;
   if (!id) {
-    paintSelectedLocal(null, false);
-    popup.remove();
+    selectedId = null;
+    Object.keys(markerById).forEach(function(mid) {
+      var entry = markerById[mid];
+      if (entry) entry.marker.setIcon(pinIcon(entry.color, entry.radius, false));
+    });
+    map.closePopup();
     return;
   }
-  // If data not applied yet, stash
-  if (!displayById[id] && lastFcRaw) {
-    applyData(lastFcRaw, lastUser, id);
-  }
-  paintSelectedLocal(id, true);
+  if (!displayById[id] && lastFcRaw) applyData(lastFcRaw, lastUser, id);
+  paintSelected(id, true);
 };
 
 window.resizeWifiMap = function() {
   try {
-    map.resize();
-    // Second pass after layout settles (Compose weight/fullscreen transitions).
-    setTimeout(function() { try { map.resize(); } catch (e2) {} }, 80);
+    if (map) {
+      map.invalidateSize(false);
+      setTimeout(function() {
+        try { map.invalidateSize(false); } catch (e2) {}
+      }, 80);
+    }
   } catch (e) {}
 };
 window.addEventListener('resize', function() {
-  try { map.resize(); } catch (e) {}
+  try { if (map) map.invalidateSize(false); } catch (e) {}
 });
+
+initWhenSized();
 })();
 </script>
 </body>
 </html>
 """.trimIndent()
-}

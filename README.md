@@ -310,6 +310,50 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 ---
 
+## Changelog
+
+Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
+
+### 0.1.102 — Spotify re-authorize without logout
+
+- **Settings → Spotify** and **Spotify → Account**: **Re-authorize** while still connected (forces consent dialog for full scopes, including Liked Songs / library modify).
+- Like / library permission errors surface a **Re-authorize Spotify** CTA instead of a dead-end message.
+- OAuth helper: `SpotifyOAuth.reauthorize()` with `show_dialog=true` so scope upgrades don’t require logout.
+
+### 0.1.98–0.1.101 — Live DJ: genre board, behavior modes, richer research
+
+- **Genre board** (optional, multi-select): chips discovered from your Spotify top artists; biases queue building and banter context when set.
+- **Behavior modes** (tone after research + queueing): Default · Hype · Hype Unhinged · Comedy · Soothing · Unhinged.
+- **Listener city**: set your metro so research can surface **upcoming shows** and lightly inject tracks from artists touring near you (including artists you already listen to).
+- **Deeper on-air research**: lyrics themes (current + next), album / release context, better artist–song–album facts, show/tour bullets — still tool-backed via host Grok, no full lyric dumps.
+- Banter / handoff polish: pre-bake TTS (`synthesize_only` / `audio_path`) for smoother talkovers; sine-style banter frequency updates retained under Default and friends.
+
+### 0.1.95–0.1.97 — Maps + Place Notes
+
+- **Leaflet assets** shipped in-app (`android/app/src/main/assets/map/`) so the WebView map shell loads offline-friendly; basemap still uses your Mapbox vault token.
+- Shared **WifiMapView** upgrades: radius rings, tap-to-pin (`onMapTapped`), auto-fit control, empty-state hints, place-friendly popups.
+- **Place Notes**: labeled **List | Map** toggle; map of all places with radius rings; editor map preview with GPS + tap-to-set pin.
+
+### 0.1.94 and earlier (highlights)
+
+| Version | Notes |
+|---------|--------|
+| **0.1.94** | Live DJ: hold auto-handoff on pause; double-tap Apps hub |
+| **0.1.92** | Mapbox maps fix; BT/Wi‑Fi scan persistence |
+| **0.1.91** | Live DJ booth mode (chat/queue/play without auto-handoff) |
+| **0.1.90** | Live DJ direct-play (stop using Spotify’s queue as source of truth) |
+| **0.1.88–0.1.89** | Queue ↔ Spotify Up Next alignment; less thrash mid-song |
+| **0.1.87** | One-tap Grok/xAI device OAuth when usage needs re-login |
+| **0.1.83–0.1.86** | Native queue sync, resume after restart, drift fixes, 1:1 mirror |
+| **0.1.79–0.1.80** | SpaceXAI Management key split; usage history/threshold fixes |
+| **0.1.76** | Chat stick-to-bottom + bubble menus |
+
+Also in this tree (chat UI): markdown **tappable links** (markdown + bare `https://` / `www.` URLs; safe href allowlist).
+
+When you ship a new APK, **bump** `versionCode` / `versionName`, publish OTA, then add a short bullet block under a new `### 0.x.y` heading at the top of this list.
+
+---
+
 ## Disclaimer
 
 **GrokifyOS is not affiliated with SpaceXAI/xAI/SpaceX, Grok, Grok Build, Mapbox, Spotify, or any other third party.**  

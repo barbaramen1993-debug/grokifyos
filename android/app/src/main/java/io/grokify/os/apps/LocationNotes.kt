@@ -726,18 +726,40 @@ fun LocationNotesPane(
             distanceMeters(gps!!.lat, gps!!.lon, it.lat, it.lon)
         }
     }
-    val mapMarkers = remember(notes) {
+    val mapMarkers = remember(notes, gps) {
         notes.map { n ->
+            val dist = gps?.let { distanceMeters(it.lat, it.lon, n.lat, n.lon) }
             WifiMapMarker(
                 id = n.id,
-                ssid = n.title,
-                bssid = "r ${n.radiusM.toInt()}m",
+                ssid = n.title.ifBlank { "Place" },
+                bssid = n.actionSummary(),
                 lat = n.lat,
                 lon = n.lon,
                 level = if (n.enabled) -50 else -90,
-                distanceM = null,
+                distanceM = dist,
                 seenCount = 1,
                 live = n.enabled,
+                radiusM = n.radiusM.toDouble(),
+            )
+        }
+    }
+    val draftMapMarkers = remember(draft, formOpen, gps, creating) {
+        if (!formOpen || !draft.lat.isFinite() || !draft.lon.isFinite()) emptyList()
+        else {
+            val dist = gps?.let { distanceMeters(it.lat, it.lon, draft.lat, draft.lon) }
+            listOf(
+                WifiMapMarker(
+                    id = draft.id.ifBlank { "draft" },
+                    ssid = draft.title.ifBlank { if (creating) "New place" else "Place" },
+                    bssid = "r ${draft.radiusM.toInt()}m · tap map to move pin",
+                    lat = draft.lat,
+                    lon = draft.lon,
+                    level = -50,
+                    distanceM = dist,
+                    seenCount = 1,
+                    live = draft.enabled,
+                    radiusM = draft.radiusM.toDouble(),
+                ),
             )
         }
     }
@@ -907,39 +929,70 @@ fun LocationNotesPane(
 
             if (formOpen) {
                 Spacer(Modifier.height(8.dp))
-                PlaceNoteEditor(
-                    draft = draft,
-                    onDraft = { draft = it },
-                    gps = gps,
-                    onUseGps = {
-                        val fix = readPlaceGps(appCtx) ?: gps
-                        if (fix != null) {
-                            draft = draft.copy(lat = fix.lat, lon = fix.lon)
-                            status = "Pinned to current GPS"
-                        } else {
-                            status = "No GPS fix"
+                // Map outside the editor scroll so WebView keeps a stable size.
+                Column(Modifier.fillMaxSize()) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(200.dp),
+                    ) {
+                        WifiMapView(
+                            markers = draftMapMarkers,
+                            userGps = gps,
+                            selectedId = draft.id.ifBlank { "draft" },
+                            emptyHint = "Tap the map to drop a pin",
+                            onMapTapped = { lat, lon ->
+                                draft = draft.copy(lat = lat, lon = lon)
+                                status = "Pin moved · ${String.format(Locale.US, "%.5f, %.5f", lat, lon)}"
+                            },
+                            autoFit = true,
+                            framed = true,
+                            resizeKey = "editor-${draft.id}",
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Tap map to place pin · ring = enter radius",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(bottom = 4.dp),
+                    )
+                    PlaceNoteEditor(
+                        draft = draft,
+                        onDraft = { draft = it },
+                        gps = gps,
+                        onUseGps = {
+                            val fix = readPlaceGps(appCtx) ?: gps
+                            if (fix != null) {
+                                draft = draft.copy(lat = fix.lat, lon = fix.lon)
+                                status = "Pinned to current GPS"
+                            } else {
+                                status = "No GPS fix"
+                                onRequestPermissions()
+                            }
+                        },
+                        onPickImage = {
                             onRequestPermissions()
-                        }
-                    },
-                    onPickImage = {
-                        onRequestPermissions()
-                        imagePicker.launch("image/*")
-                    },
-                    onClearImage = {
-                        val old = draft.imagePath
-                        if (old.isNotBlank()) runCatching { File(old).delete() }
-                        draft = draft.copy(imagePath = "")
-                    },
-                    onPickApp = { showAppPicker = true },
-                    onClearApp = {
-                        draft = draft.copy(openAppPackage = "", openAppLabel = "")
-                    },
-                    onSave = { saveDraft() },
-                    onCancel = {
-                        creating = false
-                        editing = null
-                    },
-                )
+                            imagePicker.launch("image/*")
+                        },
+                        onClearImage = {
+                            val old = draft.imagePath
+                            if (old.isNotBlank()) runCatching { File(old).delete() }
+                            draft = draft.copy(imagePath = "")
+                        },
+                        onPickApp = { showAppPicker = true },
+                        onClearApp = {
+                            draft = draft.copy(openAppPackage = "", openAppLabel = "")
+                        },
+                        onSave = { saveDraft() },
+                        onCancel = {
+                            creating = false
+                            editing = null
+                        },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             } else {
                 if (!mapFullscreen) {
                     Spacer(Modifier.height(8.dp))
@@ -961,14 +1014,46 @@ fun LocationNotesPane(
                             Spacer(Modifier.width(6.dp))
                             Text("Note here", fontWeight = FontWeight.SemiBold)
                         }
-                        IconButton(onClick = {
-                            viewMode = if (viewMode == "map") "list" else "map"
-                        }) {
-                            Icon(
-                                if (viewMode == "map") Icons.AutoMirrored.Filled.List else Icons.Default.Map,
-                                contentDescription = null,
-                                tint = if (viewMode == "map") GrokifyColors.GlowMint else GrokifyColors.GlowViolet,
-                            )
+                        // Labeled List | Map control (easier than a lone icon).
+                        Row(
+                            Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(GrokifyColors.Panel)
+                                .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(10.dp))
+                                .padding(3.dp),
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            listOf(
+                                "list" to Icons.AutoMirrored.Filled.List,
+                                "map" to Icons.Default.Map,
+                            ).forEach { (mode, icon) ->
+                                val sel = viewMode == mode
+                                Row(
+                                    Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(
+                                            if (sel) GrokifyColors.GlowViolet.copy(alpha = 0.28f)
+                                            else Color.Transparent,
+                                        )
+                                        .clickable { viewMode = mode }
+                                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        icon,
+                                        contentDescription = mode,
+                                        tint = if (sel) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        mode.replaceFirstChar { it.uppercase() },
+                                        color = if (sel) GrokifyColors.TextPrimary else GrokifyColors.TextMuted,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal,
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -1039,6 +1124,17 @@ fun LocationNotesPane(
                 }
 
                 if (viewMode == "map") {
+                    if (!mapFullscreen) {
+                        Text(
+                            buildString {
+                                append("${mapMarkers.size} place${if (mapMarkers.size == 1) "" else "s"}")
+                                append(" · rings = enter radius · tap pin for details")
+                            },
+                            color = GrokifyColors.TextDim,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(bottom = 6.dp),
+                        )
+                    }
                     Box(Modifier.weight(1f).fillMaxWidth()) {
                         WifiMapView(
                             markers = mapMarkers,
@@ -1049,6 +1145,11 @@ fun LocationNotesPane(
                                 notes.firstOrNull { it.id == id }?.let {
                                     status = "${it.title} · ${it.actionSummary()}"
                                 }
+                            },
+                            emptyHint = if (mapMarkers.isEmpty()) {
+                                "No places yet — tap Note here to pin one"
+                            } else {
+                                null
                             },
                             framed = !mapFullscreen,
                             resizeKey = mapFullscreen,
@@ -1175,10 +1276,11 @@ private fun PlaceNoteEditor(
     onClearApp: () -> Unit,
     onSave: () -> Unit,
     onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Column(
-        Modifier
-            .fillMaxSize()
+        modifier
+            .fillMaxWidth()
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {

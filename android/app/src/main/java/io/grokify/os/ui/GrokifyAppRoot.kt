@@ -13,9 +13,11 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -2227,13 +2229,14 @@ private fun SettingsPage(
             style = MaterialTheme.typography.labelSmall,
             color = GrokifyColors.GlowCyan,
         )
+        SettingsSpotifyOAuthCard()
         ApiKeyCard(
             title = "Mapbox",
-            subtitle = "Public access token (pk.…) for Wi‑Fi, Bluetooth, and Place Notes maps",
+            subtitle = "Optional pk.… token for Mapbox dark tiles (maps work without it)",
             value = mapboxDraft,
             visible = mapboxVisible,
             persistedValue = state.mapboxAccessToken,
-            defaultHint = "Paste a public pk. token to enable maps",
+            defaultHint = "Optional — free dark map if empty",
             savedFlash = mapboxSavedFlash,
             onValueChange = { mapboxDraft = it },
             onToggleVisible = { mapboxVisible = !mapboxVisible },
@@ -2526,6 +2529,115 @@ private fun SecretStatusChip(
             .border(1.dp, color.copy(alpha = 0.4f), RoundedCornerShape(999.dp))
             .padding(horizontal = 10.dp, vertical = 4.dp),
     )
+}
+
+/**
+ * Spotify OAuth lives here so users can re-authorize for new scopes
+ * (e.g. Liked Songs) without hunting the Spotify app Account tab.
+ */
+@Composable
+private fun SettingsSpotifyOAuthCard() {
+    val context = LocalContext.current
+    val appCtx = context.applicationContext
+    var loggedIn by remember {
+        mutableStateOf(io.grokify.os.apps.plugin.SpotifyOAuth.isLoggedIn(appCtx))
+    }
+    var authMsg by remember {
+        mutableStateOf(io.grokify.os.apps.plugin.SpotifyOAuth.lastAuthMessage.orEmpty())
+    }
+    var busy by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            loggedIn = io.grokify.os.apps.plugin.SpotifyOAuth.isLoggedIn(appCtx)
+            authMsg = io.grokify.os.apps.plugin.SpotifyOAuth.lastAuthMessage.orEmpty()
+            delay(1_200L)
+        }
+    }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(GrokifyColors.Panel)
+            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            "Spotify account",
+            color = GrokifyColors.TextPrimary,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 14.sp,
+        )
+        Text(
+            if (loggedIn) {
+                "Connected — re-authorize anytime when features need new permissions " +
+                    "(Liked Songs, library, etc.). Does not require logout."
+            } else {
+                "Not connected — save Spotify Client ID below, then Connect. " +
+                    "You can also do this in Apps → Spotify → Account."
+            },
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+            lineHeight = 16.sp,
+        )
+        if (authMsg.isNotBlank()) {
+            Text(authMsg, color = GrokifyColors.TextDim, fontSize = 11.sp)
+        }
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Button(
+                enabled = !busy,
+                onClick = {
+                    busy = true
+                    val raw = if (loggedIn) {
+                        io.grokify.os.apps.plugin.SpotifyOAuth.reauthorize(appCtx)
+                    } else {
+                        io.grokify.os.apps.plugin.SpotifyOAuth.startLogin(appCtx)
+                    }
+                    authMsg = runCatching {
+                        org.json.JSONObject(raw).optString("error")
+                            .ifBlank {
+                                io.grokify.os.apps.plugin.SpotifyOAuth.lastAuthMessage.orEmpty()
+                            }
+                    }.getOrElse {
+                        io.grokify.os.apps.plugin.SpotifyOAuth.lastAuthMessage.orEmpty()
+                    }
+                    if (authMsg.isBlank()) {
+                        authMsg = io.grokify.os.apps.plugin.SpotifyOAuth.lastAuthMessage
+                            ?: "Browser opened for Spotify"
+                    }
+                    busy = false
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = GrokifyColors.GlowMint.copy(alpha = 0.22f),
+                    contentColor = GrokifyColors.GlowMint,
+                    disabledContainerColor = GrokifyColors.PanelSoft,
+                    disabledContentColor = GrokifyColors.TextDim,
+                ),
+                border = BorderStroke(1.dp, GrokifyColors.GlowMint.copy(alpha = 0.45f)),
+            ) {
+                Text(
+                    if (loggedIn) "Re-authorize" else "Connect Spotify",
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 13.sp,
+                )
+            }
+            if (loggedIn) {
+                TextButton(
+                    enabled = !busy,
+                    onClick = {
+                        io.grokify.os.apps.plugin.SpotifyOAuth.logout(appCtx)
+                        loggedIn = false
+                        authMsg = "Logged out of Spotify"
+                    },
+                ) {
+                    Text("Logout", color = GrokifyColors.GlowAmber, fontSize = 13.sp)
+                }
+            }
+        }
+    }
 }
 
 /** Dedicated Settings row for a vault key (with empty fallback when not yet seeded). */
@@ -3399,6 +3511,7 @@ private fun PermissionRequestCard(
 
 // ─── Message bubbles ──────────────────────────────────────────────────
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun UserBubble(
     msg: ChatLine,
@@ -3414,6 +3527,7 @@ private fun UserBubble(
     }
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Column(Modifier.fillMaxWidth(0.88f), horizontalAlignment = Alignment.End) {
+            // Menu via header tap / long-press — body stays free for link clicks + selection
             Column(
                 Modifier
                     .fillMaxWidth()
@@ -3425,9 +3539,10 @@ private fun UserBubble(
                         color = borderColor,
                         shape = shape,
                     )
-                    .clickable(
+                    .combinedClickable(
                         enabled = !msg.streaming,
                         onClick = onTap,
+                        onLongClick = onTap,
                         role = Role.Button,
                     )
                     .padding(12.dp)
@@ -3445,7 +3560,8 @@ private fun UserBubble(
                     }
                 }
                 Spacer(Modifier.height(4.dp))
-                Text(msg.text, color = GrokifyColors.TextPrimary, fontSize = 14.sp, lineHeight = 20.sp)
+                // Links need to receive taps; consume only non-link presses via parent combinedClickable
+                MarkdownText(msg.text, textColor = GrokifyColors.TextPrimary)
             }
             AnimatedVisibility(
                 visible = selected,
@@ -3458,6 +3574,7 @@ private fun UserBubble(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun AssistantBubble(
     msg: ChatLine,
@@ -3483,9 +3600,12 @@ private fun AssistantBubble(
                     color = borderColor,
                     shape = shape,
                 )
-                .clickable(
+                // combinedClickable: short tap still opens menu on empty space;
+                // LinkAnnotation on MarkdownText consumes taps on URLs first.
+                .combinedClickable(
                     enabled = !msg.streaming,
                     onClick = onTap,
+                    onLongClick = onTap,
                     role = Role.Button,
                 )
                 .padding(12.dp)

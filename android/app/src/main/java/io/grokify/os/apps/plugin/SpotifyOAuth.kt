@@ -59,6 +59,7 @@ object SpotifyOAuth {
         "playlist-modify-public",
         "playlist-modify-private",
         "user-library-read",
+        "user-library-modify",
         "user-top-read",
     ).joinToString(" ")
 
@@ -98,7 +99,16 @@ object SpotifyOAuth {
             .toString()
     }
 
-    fun startLogin(ctx: Context): String {
+    fun startLogin(ctx: Context): String = startLogin(ctx, reauthorize = false)
+
+    /**
+     * Start OAuth even when already connected — required when scopes grow
+     * (e.g. Liked Songs / user-library-modify). [show_dialog]=true forces Spotify’s
+     * consent UI so new permissions can be granted without logging out first.
+     */
+    fun reauthorize(ctx: Context): String = startLogin(ctx, reauthorize = true)
+
+    fun startLogin(ctx: Context, reauthorize: Boolean): String {
         val clientId = HostApiKeyStore.getValue(ctx, ApiKeyIds.SPOTIFY_CLIENT_ID)
         if (clientId.isNullOrBlank()) {
             return JSONObject()
@@ -106,7 +116,7 @@ object SpotifyOAuth {
                 .put("error", "missing_spotify_client_id")
                 .put(
                     "hint",
-                    "Add Spotify Client ID in Settings → API keys (or the plugin key gate).",
+                    "Add Spotify Client ID in Settings → API keys (or Spotify Account tab).",
                 )
                 .toString()
         }
@@ -114,7 +124,11 @@ object SpotifyOAuth {
         val challenge = sha256Base64Url(verifier)
         val state = randomUrlSafe(16)
         savePending(ctx, Pending(verifier, state))
-        lastAuthMessage = "Opening Spotify login…"
+        lastAuthMessage = if (reauthorize || isLoggedIn(ctx)) {
+            "Re-authorize Spotify — approve all permissions (incl. Liked Songs)…"
+        } else {
+            "Opening Spotify login…"
+        }
 
         val uri = AUTH_URL.toUri().buildUpon()
             .appendQueryParameter("client_id", clientId)
@@ -124,7 +138,7 @@ object SpotifyOAuth {
             .appendQueryParameter("state", state)
             .appendQueryParameter("code_challenge_method", "S256")
             .appendQueryParameter("code_challenge", challenge)
-            // Always show Spotify account picker so login is obvious (not silent bounce).
+            // Always show consent so new scopes are granted (not a silent refresh).
             .appendQueryParameter("show_dialog", "true")
             .build()
 
@@ -136,10 +150,15 @@ object SpotifyOAuth {
             }
             ctx.startActivity(intent)
             lastAuthMessage =
-                "Browser opened for Spotify. After you approve, tap Open GrokifyOS if asked."
+                if (reauthorize || isLoggedIn(ctx)) {
+                    "Browser opened — approve the updated permissions, then return here."
+                } else {
+                    "Browser opened for Spotify. After you approve, tap Open GrokifyOS if asked."
+                }
             JSONObject()
                 .put("ok", true)
                 .put("status", "opened")
+                .put("reauthorize", reauthorize || isLoggedIn(ctx))
                 .put("redirectUri", REDIRECT_URI)
                 .toString()
         } catch (e: Exception) {
