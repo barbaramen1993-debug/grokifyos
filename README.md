@@ -314,6 +314,24 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.105 — Live DJ chat: like past songs
+
+- **Heart on previously played tracks** in DJ booth chat (not only now-playing) — saves/removes from Spotify Liked Songs.
+- Batch liked-status lookup for chat history so hearts reflect library state when you scroll back.
+
+### 0.1.104 — Live DJ: inter-song buffer (no false pause)
+
+- **Between-track grace**: empty / not-playing flickers after a handoff or play no longer freeze auto-handoff as “paused / idle”.
+- **Mid-pause debounce**: requires ~4.5s of sustained mid-track pause before treating it as a real user pause (Spotify often reports paused while buffering the next cut).
+- **Longer empty-player buffer** before idle advance or session-hold; sticky `wasPlaying` through end-of-track blips so the set keeps moving.
+
+### 0.1.103 — Live DJ: your name + rotating research
+
+- **Your name** in Live DJ settings (manual, or **From Spotify** display name). Auto-fills once when empty so the DJ can address you on mic.
+- **Name ≠ city**: prompts hard-separate listener name from metro/city so banter never greets you as your location.
+- **Random research angles** each talk: lyrics & meaning · album/song facts · artist facts · shows & tours (local + national) · recent X/social · classic radio host color — 1–3 angles per cycle so packs stay varied.
+- **Unhinged / Hype Unhinged**: stronger taste roasts using the current set + research pack (still no protected-class slurs).
+
 ### 0.1.102 — Spotify re-authorize without logout
 
 - **Settings → Spotify** and **Spotify → Account**: **Re-authorize** while still connected (forces consent dialog for full scopes, including Liked Songs / library modify).

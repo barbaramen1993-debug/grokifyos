@@ -88,6 +88,8 @@ private const val KEY_GENRE_BOARD = "genre_board_options_v1"
 private const val KEY_BEHAVIOR = "behavior_mode_v1"
 /** City / metro for local show research + discovery. */
 private const val KEY_CITY = "listener_city_v1"
+/** Listener first name / nickname for on-air address (not a place). */
+private const val KEY_NAME = "listener_name_v1"
 
 /** Inclusive bounds for “talk every N songs” settings. */
 const val BANTER_EVERY_MIN = 1
@@ -159,12 +161,13 @@ enum class DjBehaviorMode {
                 "\"let's go\", \"this one hits\", \"turn it up\" sparingly (not every line)."
         HypeUnhinged ->
             "PERSONALITY: HYPE UNHINGED — absolute party chaos with TEETH. Loud, explicit, " +
-                "over-the-top hype PLUS hard roasts: insult the listener's taste, the last track, " +
-                "and the next one with love-hate energy (\"this ass-kicker\", \"your trash taste " +
-                "is somehow elite\", \"shut up and turn it up\"). Swear freely (fuck/shit/damn/ass " +
-                "ok). Be cocky, crude, a little mean — still land the handoff clearly. " +
-                "NO hate speech, slurs targeting protected groups, or real threats. " +
-                "Roast songs/vibe/listener playfully savage, not bigoted."
+                "over-the-top hype PLUS hard roasts: insult the listener's music taste, the last " +
+                "track, and the next one with love-hate energy (\"this ass-kicker\", \"your trash " +
+                "taste is somehow elite\", \"shut up and turn it up\"). Use RESEARCH as roast fuel " +
+                "when present. Address by LISTENER NAME when set — NEVER treat city as a name. " +
+                "Swear freely (fuck/shit/damn/ass ok). Be cocky, crude, a little mean — still " +
+                "land the handoff clearly. NO hate speech, slurs targeting protected groups, or " +
+                "real threats. Roast songs/vibe/listener playfully savage, not bigoted."
         Comedy ->
             "PERSONALITY: COMEDY MODE — witty stand-up radio. Light jokes, wordplay, gentle " +
                 "roasts of the vibe (not cruel). Punchlines welcome. Still hand off the song " +
@@ -175,8 +178,11 @@ enum class DjBehaviorMode {
                 "or winding down."
         Unhinged ->
             "PERSONALITY: UNHINGED — chaotic mean goblin DJ. Weird tangents, absurdist takes, " +
-                "AND explicit insults: dunk on the track, the artist name, the listener, " +
-                "whatever is funny. Crude/sexual-adjacent jokes ok if brief. Swear freely. " +
+                "AND explicit insults: dunk on the track, the artist, the album, AND the " +
+                "listener's music taste (\"your trash ears\", \"this is why friends skip your " +
+                "aux\", \"of course YOU queued this\"). Use RESEARCH beats as roast fuel when " +
+                "present. Address them by LISTENER NAME when set — NEVER treat city/location " +
+                "as a name. Crude/sexual-adjacent jokes ok if brief. Swear freely. " +
                 "Sound unfiltered and a little unhinged, not corporate-safe. Still hand off " +
                 "so the listener knows what's next. Don't invent facts; weirdness + meanness " +
                 "is in delivery. NO hate speech / protected-class slurs / real threats."
@@ -201,6 +207,77 @@ enum class DjBehaviorMode {
         Comedy -> "comedy"
         Soothing -> "soothing"
         Unhinged -> "unhinged"
+    }
+}
+
+/**
+ * Research angles the Live DJ can pull before banter.
+ * Each banter cycle randomly picks 1–2 so facts / lyrics / shows / X / radio color rotate.
+ */
+enum class DjResearchAngle {
+    LyricsThemes,
+    AlbumSongFacts,
+    ArtistFacts,
+    ShowsTours,
+    RecentXSocial,
+    RadioHostColor,
+    ;
+
+    val label: String
+        get() = when (this) {
+            LyricsThemes -> "lyrics & meaning"
+            AlbumSongFacts -> "album / song facts"
+            ArtistFacts -> "artist facts"
+            ShowsTours -> "shows & tours"
+            RecentXSocial -> "recent X / social"
+            RadioHostColor -> "radio host color"
+        }
+
+    /** Focus instructions for the research agent. */
+    fun researchBrief(city: String): String = when (this) {
+        LyricsThemes ->
+            "LYRICS & MEANING: Look up what the CURRENT and NEXT songs are about — themes, " +
+                "story, vibe of the lyrics. Paraphrase only (≤28 words each). Never paste long " +
+                "lyric blocks or copyrighted lines."
+        AlbumSongFacts ->
+            "ALBUM / SONG FACTS: Album name, release year, writers, samples, chart peaks, " +
+                "awards, collabs, notable production notes. Prefer verified + recent when news."
+        ArtistFacts ->
+            "ARTIST FACTS: Career color, recent milestones, side projects, beefs (tasteful), " +
+                "band lineup notes, fun verified trivia — not Wikipedia dump."
+        ShowsTours ->
+            "SHOWS & TOURS: Real upcoming concerts / tour legs for these artists " +
+                "(city, date, venue when known). " +
+                if (city.isNotBlank()) {
+                    "Check near $city AND flag major national/international dates if more notable. " +
+                        "Also note if familiar artists are coming to $city."
+                } else {
+                    "National/global tour dates are fine — no local city set."
+                }
+        RecentXSocial ->
+            "RECENT X / SOCIAL: Search recent posts or headlines about these artists/songs " +
+                "on X (Twitter) or breaking music social buzz in the last ~2 weeks. " +
+                "Short paraphrase only — no full post quotes, no invented viral moments."
+        RadioHostColor ->
+            "RADIO HOST COLOR: Classic on-air spice — origin stories, sample credits, " +
+                "genre context, \"did you know\" moments, cultural placement, funny true " +
+                "anecdotes that a good radio host would drop. Verified only."
+    }
+
+    companion object {
+        private val ALL = entries.toList()
+
+        /**
+         * Pick [count] distinct angles (default 1–2 weighted). Always returns at least one.
+         */
+        fun pickRandom(rng: kotlin.random.Random = kotlin.random.Random.Default): List<DjResearchAngle> {
+            val count = when (rng.nextInt(10)) {
+                in 0..5 -> 1 // 60% single focus
+                in 6..8 -> 2 // 30% dual
+                else -> 3 // 10% rich pack
+            }
+            return ALL.shuffled(rng).take(count.coerceIn(1, ALL.size))
+        }
     }
 }
 
@@ -419,6 +496,8 @@ data class SpotifyDjUiState(
     val behaviorMode: DjBehaviorMode = DjBehaviorMode.Default,
     /** City / metro for local show research (optional). */
     val listenerCity: String = "",
+    /** Listener name / nickname for on-air address (optional; not a place). */
+    val listenerName: String = "",
 )
 
 /**
@@ -500,6 +579,14 @@ class SpotifyDjStore(context: Context) {
     var listenerCity: String
         get() = prefs.getString(KEY_CITY, "")?.trim()?.take(80).orEmpty()
         set(value) = prefs.edit().putString(KEY_CITY, value.trim().take(80)).apply()
+
+    /**
+     * How the DJ addresses the listener on mic (first name / nickname).
+     * Never confused with [listenerCity] — city is location only.
+     */
+    var listenerName: String
+        get() = prefs.getString(KEY_NAME, "")?.trim()?.take(40).orEmpty()
+        set(value) = prefs.edit().putString(KEY_NAME, value.trim().take(40)).apply()
 
     /** Active genre filters (optional multi-select). */
     var selectedGenres: List<String>
@@ -761,6 +848,55 @@ fun refreshDjGenreBoard(context: Context): Pair<List<String>, String?> {
     return board to null
 }
 
+/**
+ * Spotify profile display name for on-air address.
+ * @return display_name (or null) and error message (or null).
+ */
+fun fetchSpotifyDisplayName(context: Context): Pair<String?, String?> {
+    if (!SpotifyOAuth.isLoggedIn(context)) {
+        return null to "Sign in on Account tab first"
+    }
+    return try {
+        val raw = SpotifyOAuth.api(context.applicationContext, "GET", "/v1/me", null)
+        val env = runCatching { JSONObject(raw) }.getOrNull()
+            ?: return null to "Bad profile response"
+        if (!env.optBoolean("ok", env.optInt("status", 0) in 200..299)) {
+            val err = env.optString("error", "").ifBlank {
+                env.optString("body", "").take(120)
+            }
+            return null to (err.ifBlank { "Could not load Spotify profile" })
+        }
+        val body = env.optString("body", "")
+        val json = when {
+            body.isNotBlank() -> runCatching { JSONObject(body) }.getOrNull()
+            else -> env.optJSONObject("json") ?: env
+        } ?: return null to "Empty profile"
+        val name = json.optString("display_name", "").trim()
+            .ifBlank { json.optString("id", "").trim() }
+        if (name.isBlank()) null to "No display name on Spotify profile"
+        else name.take(40) to null
+    } catch (e: Exception) {
+        Log.w(TAG, "fetchSpotifyDisplayName: ${e.message}")
+        null to (e.message ?: "Profile fetch failed")
+    }
+}
+
+/**
+ * Prefer stored [SpotifyDjStore.listenerName]; if blank, pull Spotify display_name once
+ * and persist it so banter can address the listener (never uses city as a name).
+ */
+fun resolveListenerName(context: Context, store: SpotifyDjStore = SpotifyDjStore(context)): String {
+    val saved = store.listenerName.trim()
+    if (saved.isNotBlank()) return saved
+    val (pulled, _) = fetchSpotifyDisplayName(context)
+    val name = pulled?.trim().orEmpty()
+    if (name.isNotBlank()) {
+        store.listenerName = name
+        SpotifyDjBus.patch { it.copy(listenerName = name) }
+    }
+    return name
+}
+
 /** Push banter prefs + countdown into the UI bus (and live service when running). */
 fun applyDjBanterSettings(context: Context) {
     val appCtx = context.applicationContext
@@ -783,6 +919,7 @@ fun applyDjBanterSettings(context: Context) {
             genreBoard = store.genreBoard,
             behaviorMode = store.behaviorMode,
             listenerCity = store.listenerCity,
+            listenerName = store.listenerName,
             status = when {
                 !store.enabled -> it.status
                 !store.banterEnabled -> {
@@ -882,6 +1019,7 @@ fun ensureDjChatHydrated(context: Context) {
             genreBoard = store.genreBoard,
             behaviorMode = store.behaviorMode,
             listenerCity = store.listenerCity,
+            listenerName = store.listenerName,
         )
     }
 }
@@ -929,6 +1067,7 @@ fun maybeResumeLiveDj(context: Context) {
                 genreBoard = store.genreBoard,
                 behaviorMode = store.behaviorMode,
                 listenerCity = store.listenerCity,
+                listenerName = store.listenerName,
             ),
         )
         return
@@ -1045,6 +1184,7 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
                 genreBoard = store.genreBoard,
                 behaviorMode = store.behaviorMode,
                 listenerCity = store.listenerCity,
+                listenerName = store.listenerName,
             ),
         )
     }
@@ -1236,6 +1376,16 @@ class SpotifyLiveDjService : Service() {
     private var idlePolls = 0
     /** Track ended but Spotify still reports the item paused at the end. */
     private var stuckEndPolls = 0
+    /**
+     * Sustained mid-track pause detection. Spotify often flickers is_playing=false
+     * between cuts / while buffering — never hold on a single poll.
+     */
+    private var midPauseSinceMs = 0L
+    /**
+     * After a handoff or our playTrack, ignore empty/paused flickers so we don't
+     * freeze auto-handoff and leave the booth dead between songs.
+     */
+    private var interTrackGraceUntilMs = 0L
     /** Avoid thrashing play API when device is missing. */
     private var lastPlayAttemptMs = 0L
     /**
@@ -1642,6 +1792,7 @@ class SpotifyLiveDjService : Service() {
         autoHandoffHeld = true
         idlePolls = 0
         stuckEndPolls = 0
+        midPauseSinceMs = 0L
         nearEndArmed = false
     }
 
@@ -1650,6 +1801,20 @@ class SpotifyLiveDjService : Service() {
             Log.i(TAG, "auto-handoff released ($reason)")
         }
         autoHandoffHeld = false
+        midPauseSinceMs = 0L
+    }
+
+    /** True during the fragile window after a cut ends / we commanded play. */
+    private fun inInterTrackGrace(now: Long = System.currentTimeMillis()): Boolean {
+        return now <= interTrackGraceUntilMs ||
+            now <= expectedPlayUntilMs ||
+            transitioning.get() ||
+            nearEndArmed
+    }
+
+    private fun armInterTrackGrace(ms: Long = 12_000L) {
+        val until = System.currentTimeMillis() + ms
+        if (until > interTrackGraceUntilMs) interTrackGraceUntilMs = until
     }
 
     /**
@@ -1700,13 +1865,19 @@ class SpotifyLiveDjService : Service() {
             // 401/403 etc. — never auto-play through API errors while held / paused.
             publish(status = res.error ?: "Player poll failed", error = res.error)
             idlePolls++
+            // During inter-track grace, API blips are normal — don't freeze, and
+            // allow a slightly more patient advance if we were at the outro.
+            if (inInterTrackGrace()) {
+                return
+            }
             val mayAdvanceOnError = !autoHandoffHeld &&
                 wasPlaying &&
-                lastRemainMs <= 8_000L &&
+                lastRemainMs <= 12_000L &&
                 queue.isNotEmpty() &&
                 !transitioning.get()
-            if (mayAdvanceOnError && idlePolls >= 3) {
+            if (mayAdvanceOnError && idlePolls >= 4) {
                 idlePolls = 0
+                armInterTrackGrace(12_000L)
                 scope.launch { runTransition("poll_error_advance") }
             }
             return
@@ -1716,9 +1887,50 @@ class SpotifyLiveDjService : Service() {
             // Natural end: we were playing and remaining time was already low.
             // Long pause / session drop: Spotify clears currently-playing while mid-cut —
             // that must NOT banter + play next (was mis-read as idle_advance).
+            val now = System.currentTimeMillis()
             val remainBeforeEmpty = lastRemainMs
-            val likelyNaturalEnd = wasPlaying && remainBeforeEmpty <= 8_000L && !autoHandoffHeld
+            // Between cuts Spotify often returns 204/empty for several seconds —
+            // never freeze the booth during inter-track grace or right after our play.
+            if (inInterTrackGrace(now)) {
+                idlePolls++
+                lastRemainMs = 0L
+                publish(
+                    nowLine = "Between tracks — keeping the set moving…",
+                    status = "Handoff buffer · ${queue.size} queued",
+                    persist = false,
+                )
+                // If empty persists through the full grace window and we still have a
+                // queue, nudge the next cut (play may have failed silently).
+                val shouldNudge = queue.isNotEmpty() &&
+                    !transitioning.get() &&
+                    !autoHandoffHeld &&
+                    idlePolls >= 5 &&
+                    now > expectedPlayUntilMs
+                if (shouldNudge) {
+                    idlePolls = 0
+                    armInterTrackGrace(10_000L)
+                    scope.launch { runTransition("stuck_end") }
+                }
+                return
+            }
+            val likelyNaturalEnd = !autoHandoffHeld && (
+                (wasPlaying && remainBeforeEmpty <= 15_000L) ||
+                    nearEndArmed ||
+                    handoffLaunchedForUri != null ||
+                    remainBeforeEmpty <= 5_000L && wasPlaying
+                )
             if (!likelyNaturalEnd) {
+                // Require a few empty polls before treating as a real session pause —
+                // single empty flashes mid-set used to freeze auto-handoff.
+                idlePolls++
+                if (idlePolls < 4) {
+                    publish(
+                        nowLine = "Spotify blip — waiting…",
+                        status = "Buffer · empty player ($idlePolls/4)",
+                        persist = false,
+                    )
+                    return
+                }
                 holdAutoHandoff(
                     if (autoHandoffHeld) "empty_while_held"
                     else "empty_not_near_end remainWas=${remainBeforeEmpty}ms",
@@ -1743,19 +1955,21 @@ class SpotifyLiveDjService : Service() {
             }
             idlePolls++
             lastRemainMs = 0L
-            // Between tracks currently-playing can flash empty briefly after a natural end.
-            // Direct-play: only a short grace, then we start the next URI ourselves.
+            // Between tracks currently-playing can flash empty for a few seconds.
+            // Buffer several polls, then start the next URI ourselves.
             val hadBeenPlaying = wasPlaying
             val banterDueNow = store.banterEnabled &&
                 (forceBanter || songsSinceBanter + 1 >= banterEvery)
+            // ~2–4s buffer at 1s idle poll rate before we force next (avoids double-fire
+            // while Spotify is still settling, without leaving dead air forever).
             val gracePolls = when {
-                banterDueNow -> 1
-                hadBeenPlaying -> 2
-                else -> 2
+                banterDueNow -> 3
+                hadBeenPlaying -> 4
+                else -> 3
             }
             publish(
                 nowLine = if (idlePolls < gracePolls) {
-                    "Track ended — starting next from app list…"
+                    "Track ended — buffer before next…"
                 } else {
                     "Track ended — next from app list…"
                 },
@@ -1766,6 +1980,7 @@ class SpotifyLiveDjService : Service() {
             if (shouldAdvance) {
                 wasPlaying = false
                 idlePolls = 0
+                armInterTrackGrace(12_000L)
                 scope.launch {
                     runTransition(
                         when {
@@ -1785,7 +2000,7 @@ class SpotifyLiveDjService : Service() {
                 status = if (queue.isEmpty()) {
                     "Queue empty — filling…$banterHint"
                 } else {
-                    "Idle · ${queue.size} queued$banterHint"
+                    "Between songs · ${queue.size} queued$banterHint"
                 },
             )
             return
@@ -1806,13 +2021,40 @@ class SpotifyLiveDjService : Service() {
         val playing = data.optBoolean("is_playing", false)
         val remain = if (duration > 0) (duration - progress).coerceAtLeast(0L) else 999_999L
         val prevRemain = lastRemainMs
+        val nowMs = System.currentTimeMillis()
 
         // Resume / hold based on live transport state.
+        // Spotify flickers is_playing=false between cuts and while buffering the next
+        // track (full remain, not playing). Require a sustained mid-track pause before
+        // freezing auto-handoff — otherwise the booth "pauses itself" between songs.
         if (playing) {
+            midPauseSinceMs = 0L
             releaseAutoHandoff("playing")
-        } else if (duration > 0 && remain > 5_000L) {
-            // User (or Spotify) paused mid-cut — freeze auto handoff + banter.
-            holdAutoHandoff("mid_track_pause remain=${remain}ms")
+        } else if (duration > 0 && remain > 8_000L) {
+            val inGrace = inInterTrackGrace(nowMs) ||
+                handoffLaunchedForUri == uri ||
+                (expectedPlayUri != null && nowMs <= expectedPlayUntilMs)
+            if (inGrace) {
+                midPauseSinceMs = 0L
+                // Soft UI only — do not hold.
+            } else {
+                if (midPauseSinceMs == 0L) midPauseSinceMs = nowMs
+                val pausedFor = nowMs - midPauseSinceMs
+                if (pausedFor >= 4_500L) {
+                    // User (or Spotify) paused mid-cut for real — freeze auto handoff.
+                    holdAutoHandoff(
+                        "mid_track_pause remain=${remain}ms for=${pausedFor}ms",
+                    )
+                } else {
+                    Log.d(
+                        TAG,
+                        "mid-pause debounce ${pausedFor}ms remain=${remain}ms (need 4500)",
+                    )
+                }
+            }
+        } else {
+            // At/near end while not playing — end-of-track, not a user pause.
+            midPauseSinceMs = 0L
         }
 
         val track = DjQueueTrack(
@@ -1970,6 +2212,7 @@ class SpotifyLiveDjService : Service() {
         ) {
             handoffLaunchedForUri = uri
             nearEndArmed = true
+            armInterTrackGrace(20_000L)
             Log.i(
                 TAG,
                 "banter near_end armed remain=${remain}ms prefetched=$banterPrefetched " +
@@ -1991,19 +2234,23 @@ class SpotifyLiveDjService : Service() {
         ) {
             handoffLaunchedForUri = uri
             nearEndArmed = true
+            armInterTrackGrace(15_000L)
             Log.i(TAG, "silent near_end direct-play remain=${remain}ms")
             scope.launch { runTransition("near_end_direct") }
             return
         }
         // Stuck at end: same URI paused near 0 — start next ourselves.
         // Never while auto-handoff is held (user pause / empty session).
-        if (!autoHandoffHeld && !playing && duration > 0 && remain <= 2_500L && queue.isNotEmpty()) {
+        // Slightly wider than 2.5s so brief pause-at-outro doesn't sit in the
+        // dead zone between mid-pause debounce and stuck detection.
+        if (!autoHandoffHeld && !playing && duration > 0 && remain <= 5_000L && queue.isNotEmpty()) {
             stuckEndPolls++
             val canNudge = handoffLaunchedForUri != uri && !transitioning.get()
             if (canNudge && !banterDue && (wasPlaying || stuckEndPolls >= 2)) {
                 stuckEndPolls = 0
                 handoffLaunchedForUri = uri
                 nearEndArmed = true
+                armInterTrackGrace(15_000L)
                 scope.launch { runTransition("stuck_end") }
                 return
             }
@@ -2011,6 +2258,7 @@ class SpotifyLiveDjService : Service() {
                 stuckEndPolls = 0
                 handoffLaunchedForUri = uri
                 nearEndArmed = true
+                armInterTrackGrace(20_000L)
                 scope.launch { runTransition("stopped_at_end") }
                 return
             }
@@ -2018,7 +2266,16 @@ class SpotifyLiveDjService : Service() {
             stuckEndPolls = 0
         }
 
-        wasPlaying = playing
+        // Sticky wasPlaying: brief not-playing flickers near the end / after our play
+        // must not clear the flag or the next empty poll freezes the booth.
+        wasPlaying = when {
+            playing -> true
+            inInterTrackGrace(nowMs) -> true
+            remain <= 12_000L && wasPlaying -> true
+            midPauseSinceMs > 0L && nowMs - midPauseSinceMs >= 4_500L -> false
+            autoHandoffHeld -> false
+            else -> wasPlaying // keep last known while debounce runs
+        }
         if (queue.size < 3 && !filling.get()) {
             scope.launch(Dispatchers.IO) { fillQueue(useAi = store.useAiRank) }
         }
@@ -3011,6 +3268,11 @@ class SpotifyLiveDjService : Service() {
                             prevUri == null ||
                             preSpeakSnap.uri == prevUri
                         if (stillOnPrev) {
+                            // Clean mic pause — arm grace so poll never freezes us mid-banter
+                            // after transition ends, and so empty player between pause→play
+                            // is treated as handoff buffer not "user paused".
+                            armInterTrackGrace(45_000L)
+                            wasPlaying = true // sticky: we own this pause for banter
                             spotifyPut("/v1/me/player/pause", "{}")
                             delay(150L)
                         }
@@ -3224,6 +3486,9 @@ class SpotifyLiveDjService : Service() {
         } finally {
             nearEndArmed = false
             lastRemainMs = 999_999L
+            midPauseSinceMs = 0L
+            // Keep treating empty/paused flickers as between-song buffer, not user pause.
+            armInterTrackGrace(12_000L)
             transitioning.set(false)
             // Always flush countdown after a handoff so UI + leave/return stay honest.
             store.songsSinceBanter = songsSinceBanter
@@ -3461,6 +3726,9 @@ class SpotifyLiveDjService : Service() {
         wasPlaying = ok || res.status == 404
         idlePolls = 0
         stuckEndPolls = 0
+        midPauseSinceMs = 0L
+        // Buffering the new cut often reports paused + full remain — grace covers it.
+        armInterTrackGrace(14_000L)
         if (ok || res.status == 404) {
             releaseAutoHandoff("play_track")
         }
@@ -3744,8 +4012,15 @@ class SpotifyLiveDjService : Service() {
             if (store.selectedGenres.isNotEmpty()) {
                 append("Genre board: ${store.selectedGenres.joinToString(", ")}\n")
             }
+            val lName = store.listenerName
+            if (lName.isNotBlank()) {
+                append("Listener NAME (person — not a place): $lName\n")
+            }
             if (store.listenerCity.isNotBlank()) {
-                append("Listener city: ${store.listenerCity}\n")
+                append(
+                    "Listener CITY (location only — never address them as this): " +
+                        "${store.listenerCity}\n",
+                )
             }
             if (vibeHint.isNotBlank()) append("Current vibe hint: $vibeHint\n")
             append("User said: $userText")
@@ -5045,8 +5320,9 @@ class SpotifyLiveDjService : Service() {
     }
 
     /**
-     * Tool-backed research for on-air color: lyrics themes, album context, news,
-     * local shows, song/artist facts. Cached per next-track URI.
+     * Tool-backed research for on-air color. Each call randomly picks 1–3
+     * [DjResearchAngle]s (lyrics, album/song facts, artist facts, shows/tours,
+     * recent X/social, radio host color) so banter stays varied. Cached per next URI.
      */
     private fun researchMusicFacts(
         prev: DjQueueTrack?,
@@ -5055,6 +5331,7 @@ class SpotifyLiveDjService : Service() {
         genres: List<String>,
         upcoming: List<DjQueueTrack> = emptyList(),
         tracksUntilTalk: Int = 0,
+        listenerName: String = "",
     ): List<String> {
         val nextArtist = next?.let { primaryArtist(it.artists) }.orEmpty()
         val nextSong = next?.let { cleanTitle(it.name) }.orEmpty()
@@ -5065,36 +5342,50 @@ class SpotifyLiveDjService : Service() {
         val (nextAlbum, nextYear) = spotifyAlbumMeta(next)
         val (prevAlbum, prevYear) = spotifyAlbumMeta(prev)
         val cityLine = city.trim()
+        val nameLine = listenerName.trim()
+        val angles = DjResearchAngle.pickRandom()
+        val angleLabels = angles.joinToString(" + ") { it.label }
 
-        val system =
-            "You are a music fact + lyrics researcher for a live radio AI DJ. " +
-                "You HAVE tools/web search — USE them for real information. Research:\n" +
-                "1) CURRENT song (just finishing): lyrics themes / what the song is about " +
-                "(paraphrase — never quote long lyric blocks; 1 short thematic summary)\n" +
-                "2) NEXT song: lyrics themes / meaning (same rules)\n" +
-                "3) Album context for next (and current if useful): album name, release year, " +
-                "notable album facts if verified\n" +
-                "4) Better artist/song facts: writers, samples, chart peaks, awards, collabs " +
-                "(prefer last ~18 months when news)\n" +
-                "5) Upcoming shows / tours — especially near the listener city when provided; " +
-                "also flag if artists they already listen to are coming to town\n" +
-                "6) SETLIST LOOKAHEAD (when provided): quick color on 1–2 songs further " +
-                "down the set so the DJ can tease them like real radio\n" +
-                "Reply with JSON ONLY (no markdown fences):\n" +
-                "{" +
-                "\"current_lyrics_theme\":\"≤28 words or empty\"," +
-                "\"next_lyrics_theme\":\"≤28 words or empty\"," +
-                "\"album_facts\":[\"≤22 words\"]," +
-                "\"facts\":[\"≤22 words\"]," +
-                "\"shows\":[\"city/date/venue or tour if real\"]," +
-                "\"setlist_tease\":[\"≤20 words each for later cuts\"]" +
-                "}\n" +
-                "Rules: max 2 album_facts, 4 facts, 3 shows, 3 setlist_tease; prefer verifiable/recent; " +
-                "empty strings/arrays if nothing solid; NEVER invent tour dates, chart numbers, " +
-                "lyrics meaning you're unsure of, or news. No commentary outside JSON."
+        val system = buildString {
+            append(
+                "You are a music researcher for a live radio AI DJ. " +
+                    "You HAVE tools/web search — USE them for REAL information. " +
+                    "This turn focuses ONLY on these research angles (ignore others):\n",
+            )
+            angles.forEachIndexed { i, a ->
+                append("${i + 1}) ${a.researchBrief(cityLine)}\n")
+            }
+            append(
+                "Also: if SETLIST LOOKAHEAD is provided, you may add 0–2 short teases for later cuts.\n" +
+                    "Reply with JSON ONLY (no markdown fences):\n" +
+                    "{" +
+                    "\"current_lyrics_theme\":\"≤28 words or empty\"," +
+                    "\"next_lyrics_theme\":\"≤28 words or empty\"," +
+                    "\"album_facts\":[\"≤22 words\"]," +
+                    "\"facts\":[\"≤22 words\"]," +
+                    "\"shows\":[\"city/date/venue or tour if real\"]," +
+                    "\"x_social\":[\"≤22 words recent X/social buzz\"]," +
+                    "\"radio_color\":[\"≤22 words host-y verified color\"]," +
+                    "\"setlist_tease\":[\"≤20 words each for later cuts\"]" +
+                    "}\n" +
+                    "Rules: fill ONLY fields that match this turn's angles (others empty); " +
+                    "max 2 album_facts, 4 facts, 3 shows, 3 x_social, 3 radio_color, 2 setlist_tease; " +
+                    "prefer verifiable/recent; NEVER invent tour dates, chart numbers, lyric meaning, " +
+                    "or viral posts. No commentary outside JSON. " +
+                    "Listener NAME and CITY are different — city is a place, not a person.",
+            )
+        }
 
         val prompt = buildString {
-            appendLine("Listener city / metro: ${cityLine.ifBlank { "(not set — national/global shows only)" }}")
+            appendLine("RESEARCH ANGLES THIS TURN: $angleLabels")
+            appendLine(
+                "Listener NAME (person — never a place): " +
+                    nameLine.ifBlank { "(not set — do not invent a name)" },
+            )
+            appendLine(
+                "Listener CITY (location only — never address them as this): " +
+                    cityLine.ifBlank { "(not set — national/global shows only)" },
+            )
             if (genres.isNotEmpty()) {
                 appendLine("Active genre board (taste bias): ${genres.joinToString(", ")}")
             }
@@ -5112,7 +5403,6 @@ class SpotifyLiveDjService : Service() {
             if (nextAlbum.isNotBlank()) {
                 appendLine("  album: $nextAlbum${if (nextYear.isNotBlank()) " ($nextYear)" else ""}")
             }
-            // Radio-style setlist: more than just the immediate next cut.
             val look = upcoming.filter { it.uri != next?.uri }.take(5)
             if (look.isNotEmpty() || tracksUntilTalk > 0) {
                 appendLine()
@@ -5132,16 +5422,14 @@ class SpotifyLiveDjService : Service() {
             }
             appendLine()
             appendLine(
-                "Use web search / tools now. Look up lyrics themes (not full lyrics), " +
-                    "album/release context, artist facts, setlist color, and upcoming shows" +
-                    if (cityLine.isNotBlank()) " near $cityLine." else ".",
+                "Use web search / tools now for: $angleLabels. " +
+                    "Skip angles not listed. " +
+                    if (cityLine.isNotBlank() && DjResearchAngle.ShowsTours in angles) {
+                        "For shows: check near $cityLine AND broader tour news."
+                    } else {
+                        ""
+                    },
             )
-            if (cityLine.isNotBlank()) {
-                appendLine(
-                    "Prioritize real upcoming shows for these artists (or similar artists " +
-                        "the listener likely knows) in/near $cityLine.",
-                )
-            }
         }
 
         val opts = JSONObject()
@@ -5159,16 +5447,20 @@ class SpotifyLiveDjService : Service() {
             val text = env.optString("text", "").trim()
             if (text.isBlank()) return emptyList()
             val json = extractJson(text) ?: return emptyList()
-            val out = ArrayList<String>(12)
+            val out = ArrayList<String>(14)
+            // Tag so banter knows what this pack focused on.
+            out.add("Research focus: $angleLabels")
 
             fun addLabeled(label: String, value: String, max: Int = 180) {
                 val v = value.trim()
                 if (v.isNotBlank()) out.add("$label: ${v.take(max)}")
             }
-            addLabeled("Current song theme", json.optString("current_lyrics_theme", ""))
-            addLabeled("Next song theme", json.optString("next_lyrics_theme", ""))
+            if (DjResearchAngle.LyricsThemes in angles) {
+                addLabeled("Current song theme", json.optString("current_lyrics_theme", ""))
+                addLabeled("Next song theme", json.optString("next_lyrics_theme", ""))
+            }
 
-            // Always surface Spotify album meta we already know (even if model skips it).
+            // Always surface Spotify album meta we already know.
             if (nextAlbum.isNotBlank()) {
                 val y = if (nextYear.isNotBlank()) " ($nextYear)" else ""
                 out.add("Next album: $nextAlbum$y")
@@ -5189,18 +5481,28 @@ class SpotifyLiveDjService : Service() {
                     n++
                 }
             }
-            drainArray("album_facts", "Album", 2)
-            drainArray("facts", null, 4)
-            drainArray("shows", "Upcoming", 3)
-            drainArray("setlist_tease", "Later in set", 3)
-            // Flat fallback
-            if (out.none { !it.startsWith("Next album:") && !it.startsWith("Current album:") }) {
+            if (DjResearchAngle.AlbumSongFacts in angles || DjResearchAngle.ArtistFacts in angles) {
+                drainArray("album_facts", "Album", 2)
+                drainArray("facts", null, 4)
+            }
+            if (DjResearchAngle.ShowsTours in angles) {
+                drainArray("shows", "Upcoming", 3)
+            }
+            if (DjResearchAngle.RecentXSocial in angles) {
+                drainArray("x_social", "X/social", 3)
+            }
+            if (DjResearchAngle.RadioHostColor in angles) {
+                drainArray("radio_color", "Host color", 3)
+            }
+            drainArray("setlist_tease", "Later in set", 2)
+            // Flat fallback if angle fields empty
+            if (out.size <= 2) {
                 drainArray("bullets", null, 4)
             }
             Log.i(
                 TAG,
-                "research facts next=“$nextArtist/$nextSong” prev=“$prevArtist/$prevSong” " +
-                    "city=$cityLine → ${out.size} bullets",
+                "research facts next=“$nextArtist/$nextSong” angles=[$angleLabels] " +
+                    "city=$cityLine name=$nameLine → ${out.size} bullets",
             )
             out
         } catch (e: Exception) {
@@ -5226,6 +5528,10 @@ class SpotifyLiveDjService : Service() {
         }
         val city = store.listenerCity
         val genres = store.selectedGenres
+        val name = store.listenerName.ifBlank {
+            // One-shot pull so unhinged can roast by name without a settings visit.
+            resolveListenerName(applicationContext, store)
+        }
         val facts = researchMusicFacts(
             prev,
             next,
@@ -5233,6 +5539,7 @@ class SpotifyLiveDjService : Service() {
             genres,
             upcoming = upcoming,
             tracksUntilTalk = tracksUntilTalk,
+            listenerName = name,
         )
         if (uri.isNotBlank()) {
             researchedForUri = uri
@@ -5256,6 +5563,9 @@ class SpotifyLiveDjService : Service() {
         val reason = next?.reason.orEmpty()
         val behavior = store.behaviorMode
         val city = store.listenerCity
+        val listenerName = store.listenerName.ifBlank {
+            resolveListenerName(applicationContext, store)
+        }
 
         // Step 1: tool-backed research only during prefetch; handoff reuses cache.
         val research = factsForTrack(
@@ -5267,34 +5577,55 @@ class SpotifyLiveDjService : Service() {
         )
 
         val wordCap = when (behavior) {
-            DjBehaviorMode.HypeUnhinged, DjBehaviorMode.Unhinged -> 70
+            DjBehaviorMode.HypeUnhinged, DjBehaviorMode.Unhinged -> 75
             DjBehaviorMode.Comedy -> 55
             DjBehaviorMode.Soothing -> 48
             else -> 52
         }
 
+        val unhingedTaste = when (behavior) {
+            DjBehaviorMode.Unhinged, DjBehaviorMode.HypeUnhinged ->
+                "• TASTE ROAST (required for this mode): insult the listener's music taste at least " +
+                    "once — their picks, the last track, the next one, or genre board vibes. " +
+                    "Use RESEARCH as roast ammo when present. Playful-savage, not bigoted.\n"
+            else -> ""
+        }
+
         val system =
             "You are a live radio AI DJ speaking aloud ON AIR. Write 1–3 short sentences (max $wordCap words). Rules:\n" +
                 "• ${behavior.systemStyleBlock()}\n" +
+                unhingedTaste +
+                "• NAME vs CITY (critical): LISTENER NAME is how you address the person. " +
+                "LISTENER CITY is only a place for shows/weather/local color. " +
+                "NEVER greet or address the listener using the city as if it were their name " +
+                "(wrong: \"what's up, Aurora\" when Aurora is only the city field). " +
+                if (listenerName.isNotBlank()) {
+                    "NAME is set to \"$listenerName\" — you MAY use it once naturally " +
+                        "(or roast them by that name in unhinged modes). "
+                } else {
+                    "NAME is blank — use \"you\" / \"folks\"; do not invent a name; " +
+                        "do not use the city as a nickname. "
+                } +
+                "\n" +
                 "• Prefer vibe intros over full titles: e.g. \"finishing up with some Morgan Wallen\" " +
                 "or \"sliding into a little [short title]\" — not \"That was Song Name by Artist Name\".\n" +
                 "• Song titles often include (feat. X) / (with X) / - feat. X. NEVER read parentheses " +
                 "featuring credits. NEVER say the artist name twice because it appears in the title " +
                 "and the artist field. Use the CLEAN title and PRIMARY artist only.\n" +
-                "• RESEARCH pack (when provided): you may weave ONE of — lyric theme/meaning, " +
-                "album+year color, artist/song fact, a real upcoming show " +
-                "(especially near the listener city), or a brief setlist tease of a later cut " +
-                "— then hand off with " +
-                "\"here's [clean title] by [primary artist]\" or similar. Prefer the most vivid bullet.\n" +
+                "• RESEARCH pack varies each talk (lyrics, album/song facts, artist facts, shows/tours, " +
+                "X/social, radio host color). Weave ONE vivid beat that matches what the pack has " +
+                "— lyric theme, album+year, artist fact, show date (city only as location), " +
+                "X/social buzz, host color, or a later-set tease — then hand off with " +
+                "\"here's [clean title] by [primary artist]\" or similar.\n" +
                 "• Lyric themes: comment on what the song is about in your own words; " +
                 "do NOT recite long lyrics or copyrighted lines.\n" +
                 "• If RESEARCH is empty, still do a solid handoff; do not invent tour dates, " +
-                "lyrics meaning, or news.\n" +
+                "lyrics meaning, X posts, or news.\n" +
                 "• CRITICAL: Output ONLY words a listener would hear on the radio. " +
                 "NEVER narrate process, research, tools, planning, or drafting. Forbidden phrases include: " +
                 "\"Checking for…\", \"Looking up…\", \"Searching…\", \"Before writing…\", \"Let me…\", " +
                 "\"I'll check…\", \"public tidbit\", \"writing the DJ line\", \"as I research\", " +
-                "\"according to my research\". " +
+                "\"according to my research\", \"Research focus\". " +
                 "Do not mention that you looked anything up.\n" +
                 "• No markdown, no hashtags, no emoji, no quotation marks wrapping the whole line.\n" +
                 "• Always put a space after periods, commas, question marks, and exclamation points " +
@@ -5303,9 +5634,16 @@ class SpotifyLiveDjService : Service() {
 
         val prompt = buildString {
             appendLine("Behavior mode: ${behavior.label}")
-            if (city.isNotBlank()) appendLine("Listener city: $city")
+            appendLine(
+                "LISTENER NAME (person to address — NOT a place): " +
+                    listenerName.ifBlank { "(not set — say you/folks, never use city as name)" },
+            )
+            appendLine(
+                "LISTENER CITY (location only for shows/local color — NEVER a greeting name): " +
+                    city.ifBlank { "(not set)" },
+            )
             val gens = store.selectedGenres
-            if (gens.isNotEmpty()) appendLine("Genre board: ${gens.joinToString(", ")}")
+            if (gens.isNotEmpty()) appendLine("Genre board (taste signal): ${gens.joinToString(", ")}")
             appendLine("Just played:")
             if (prev != null) {
                 appendLine("  raw title: ${prev.name}")
@@ -5345,17 +5683,24 @@ class SpotifyLiveDjService : Service() {
             }
             appendLine()
             if (research.isNotEmpty()) {
-                appendLine("RESEARCH (use at most one beat if it fits naturally):")
+                appendLine(
+                    "RESEARCH (random angle pack this cycle — use at most one beat if it fits):",
+                )
                 research.forEachIndexed { i, f -> appendLine("  ${i + 1}. $f") }
             } else {
                 appendLine("RESEARCH: (none solid — pure handoff, no invented news)")
             }
             appendLine()
             appendLine(
-                "Write the on-air line in ${behavior.label} style: close out the previous vibe " +
-                    "(optional lyric-theme nod), optionally drop one researched beat " +
-                    "(lyric theme / album / fact / local show / later-set tease), " +
-                    "then introduce the next track clearly.",
+                "Write the on-air line in ${behavior.label} style: close out the previous vibe, " +
+                    "optionally drop one researched beat (whichever angle this pack has), " +
+                    if (behavior == DjBehaviorMode.Unhinged || behavior == DjBehaviorMode.HypeUnhinged) {
+                        "roast their taste, "
+                    } else {
+                        ""
+                    } +
+                    "then introduce the next track clearly. " +
+                    "Filter delivery through ${behavior.label} personality only after research is chosen.",
             )
             appendLine("On-air DJ line only:")
         }
@@ -5806,6 +6151,7 @@ class SpotifyLiveDjService : Service() {
                 genreBoard = store.genreBoard,
                 behaviorMode = store.behaviorMode,
                 listenerCity = store.listenerCity,
+                listenerName = store.listenerName,
             ),
         )
     }

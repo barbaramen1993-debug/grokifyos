@@ -612,30 +612,43 @@ fun spotifyTrackIdFromUri(uri: String?): String {
 fun checkSpotifyTrackLiked(context: Context, trackUri: String?): Boolean? {
     val id = spotifyTrackIdFromUri(trackUri)
     if (id.isBlank()) return null
-    if (!SpotifyOAuth.isLoggedIn(context)) return null
-    return try {
-        val raw = SpotifyOAuth.api(
-            context,
-            "GET",
-            "/v1/me/tracks/contains?ids=$id",
-            null,
-        )
-        val o = JSONObject(raw)
-        val status = o.optInt("status", 0)
-        if (status == 401 || status == 403) return null
-        if (!o.optBoolean("ok", false) && status !in listOf(200, 201)) return null
-        val body = o.optString("body", "").trim()
-        when {
-            body.startsWith("[") -> {
-                val arr = JSONArray(body)
-                if (arr.length() > 0) arr.optBoolean(0) else false
+    val map = checkSpotifyTracksLiked(context, listOf(trackUri.orEmpty()))
+    return map[id]
+}
+
+/**
+ * Batch Liked Songs lookup for many track URIs (Spotify allows ≤50 ids/request).
+ * Keys in the result are Spotify track ids.
+ */
+fun checkSpotifyTracksLiked(context: Context, trackUris: List<String>): Map<String, Boolean> {
+    if (!SpotifyOAuth.isLoggedIn(context)) return emptyMap()
+    val ids = trackUris.map { spotifyTrackIdFromUri(it) }.filter { it.isNotBlank() }.distinct()
+    if (ids.isEmpty()) return emptyMap()
+    val out = LinkedHashMap<String, Boolean>(ids.size)
+    // Spotify hard-caps contains queries at 50 ids.
+    for (chunk in ids.chunked(50)) {
+        try {
+            val raw = SpotifyOAuth.api(
+                context,
+                "GET",
+                "/v1/me/tracks/contains?ids=${chunk.joinToString(",")}",
+                null,
+            )
+            val o = JSONObject(raw)
+            val status = o.optInt("status", 0)
+            if (status == 401 || status == 403) continue
+            if (!o.optBoolean("ok", false) && status !in listOf(200, 201)) continue
+            val body = o.optString("body", "").trim()
+            if (!body.startsWith("[")) continue
+            val arr = JSONArray(body)
+            for (i in chunk.indices) {
+                if (i < arr.length()) out[chunk[i]] = arr.optBoolean(i)
             }
-            else -> null
+        } catch (e: Exception) {
+            Log.w(TAG, "check liked batch: ${e.message}")
         }
-    } catch (e: Exception) {
-        Log.w(TAG, "check liked: ${e.message}")
-        null
     }
+    return out
 }
 
 /**
@@ -996,8 +1009,10 @@ fun SpotifyControllerPane(
     var selectedGenres by remember { mutableStateOf(djStore.selectedGenres) }
     var genreBoard by remember { mutableStateOf(djStore.genreBoard) }
     var listenerCity by remember { mutableStateOf(djStore.listenerCity) }
+    var listenerName by remember { mutableStateOf(djStore.listenerName) }
     var genreBoardBusy by remember { mutableStateOf(false) }
     var genreBoardMsg by remember { mutableStateOf<String?>(null) }
+    var nameBusy by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
     var voicePreviewBusy by remember { mutableStateOf(false) }
@@ -1037,11 +1052,15 @@ fun SpotifyControllerPane(
     var devicesTransferringId by remember { mutableStateOf<String?>(null) }
     var preferredDeviceId by remember { mutableStateOf(store.preferredDeviceId) }
 
-    // Liked Songs heart (Control + Live DJ now-playing)
+    // Liked Songs heart (Control + Live DJ chat tracks, including past cuts)
     var trackLiked by remember { mutableStateOf(false) }
     var trackLikedBusy by remember { mutableStateOf(false) }
     var trackLikedMsg by remember { mutableStateOf<String?>(null) }
     var likedCheckUri by remember { mutableStateOf("") }
+    /** Spotify track-id → in Liked Songs (chat history hearts). */
+    var likedByTrackId by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    /** Track URI currently toggling like (busy spinner on that bubble). */
+    var likeBusyUri by remember { mutableStateOf("") }
 
     val vibeChips = remember {
         listOf(
@@ -1091,6 +1110,35 @@ fun SpotifyControllerPane(
             trackLiked = liked
             likedCheckUri = likeTrackUri
             trackLikedMsg = null
+            val id = spotifyTrackIdFromUri(likeTrackUri)
+            if (id.isNotBlank()) {
+                likedByTrackId = likedByTrackId + (id to liked)
+            }
+        }
+    }
+
+    // Batch-check Liked status for past (and current) track bubbles in DJ chat.
+    val chatTrackUrisKey = remember(djState.messages) {
+        djState.messages
+            .asSequence()
+            .filter { it.role == DjChatRole.Track }
+            .mapNotNull { it.trackUri?.takeIf { u -> u.isNotBlank() } }
+            .distinct()
+            .joinToString("\n")
+    }
+    LaunchedEffect(chatTrackUrisKey, loggedIn) {
+        if (!loggedIn || chatTrackUrisKey.isBlank()) return@LaunchedEffect
+        val uris = chatTrackUrisKey.lineSequence().filter { it.isNotBlank() }.toList()
+        val missing = uris.filter { uri ->
+            val id = spotifyTrackIdFromUri(uri)
+            id.isNotBlank() && !likedByTrackId.containsKey(id)
+        }
+        if (missing.isEmpty()) return@LaunchedEffect
+        val found = withContext(Dispatchers.IO) {
+            checkSpotifyTracksLiked(appCtx, missing)
+        }
+        if (found.isNotEmpty()) {
+            likedByTrackId = likedByTrackId + found
         }
     }
 
@@ -1153,6 +1201,7 @@ fun SpotifyControllerPane(
                     genreBoard = djStore.genreBoard,
                     behaviorMode = djStore.behaviorMode,
                     listenerCity = djStore.listenerCity,
+                    listenerName = djStore.listenerName,
                 ),
             )
         } else {
@@ -1163,12 +1212,36 @@ fun SpotifyControllerPane(
     }
 
     // Keep local settings mirrors in sync with bus / store
-    LaunchedEffect(djState.selectedGenres, djState.genreBoard, djState.behaviorMode, djState.listenerCity) {
+    LaunchedEffect(
+        djState.selectedGenres,
+        djState.genreBoard,
+        djState.behaviorMode,
+        djState.listenerCity,
+        djState.listenerName,
+    ) {
         selectedGenres = djState.selectedGenres.ifEmpty { djStore.selectedGenres }
         genreBoard = djState.genreBoard.ifEmpty { djStore.genreBoard }
         behaviorMode = djState.behaviorMode
         if (djState.listenerCity.isNotBlank() || listenerCity.isBlank()) {
             listenerCity = djState.listenerCity.ifBlank { djStore.listenerCity }
+        }
+        if (djState.listenerName.isNotBlank() || listenerName.isBlank()) {
+            listenerName = djState.listenerName.ifBlank { djStore.listenerName }
+        }
+    }
+
+    // One-shot: pull Spotify display_name into settings if name is still empty.
+    LaunchedEffect(loggedIn) {
+        if (!loggedIn || djStore.listenerName.isNotBlank() || listenerName.isNotBlank()) return@LaunchedEffect
+        nameBusy = true
+        val (pulled, _) = withContext(Dispatchers.IO) {
+            fetchSpotifyDisplayName(appCtx)
+        }
+        nameBusy = false
+        if (!pulled.isNullOrBlank()) {
+            listenerName = pulled
+            djStore.listenerName = pulled
+            applyDjBanterSettings(appCtx)
         }
     }
 
@@ -1511,6 +1584,10 @@ fun SpotifyControllerPane(
                                         if (err == null) {
                                             trackLiked = want
                                             likedCheckUri = uri
+                                            val tid = spotifyTrackIdFromUri(uri)
+                                            if (tid.isNotBlank()) {
+                                                likedByTrackId = likedByTrackId + (tid to want)
+                                            }
                                             trackLikedMsg = if (want) "Saved to Liked Songs" else "Removed from Liked"
                                         } else {
                                             trackLikedMsg = err
@@ -2040,9 +2117,10 @@ fun SpotifyControllerPane(
                                         Spacer(Modifier.height(4.dp))
                                         Text(
                                             "Chat, queue, and play work even when Live DJ auto-handoff is off. " +
-                                                "Tracks & banter show here. Heart a cut to Liked Songs. Ask for a new queue, " +
-                                                "top-up, drop songs, or song/artist info. Tap ▶ on past songs to replay. " +
-                                                "Queue tab is the app radio set (not Spotify’s Up Next).",
+                                                "Tracks & banter show here. Heart any cut (now or past) to Liked Songs. " +
+                                                "Ask for a new queue, top-up, drop songs, or song/artist info. " +
+                                                "Tap ▶ on past songs to replay. Queue tab is the app radio set " +
+                                                "(not Spotify’s Up Next).",
                                             color = GrokifyColors.TextDim,
                                             fontSize = 12.sp,
                                         )
@@ -2050,33 +2128,66 @@ fun SpotifyControllerPane(
                                 }
                             }
                             items(djState.messages, key = { it.id }) { msg ->
+                                val msgUri = msg.trackUri.orEmpty()
+                                val msgTrackId = spotifyTrackIdFromUri(msgUri)
+                                val msgLiked = when {
+                                    msg.isNowPlaying -> trackLiked
+                                    msgTrackId.isNotBlank() ->
+                                        likedByTrackId[msgTrackId] == true
+                                    else -> false
+                                }
+                                val msgLikeBusy = msgUri.isNotBlank() &&
+                                    (likeBusyUri == msgUri || (msg.isNowPlaying && trackLikedBusy))
                                 DjChatBubble(
                                     msg = msg,
                                     onPrev = { spotifyLiveDjPrevious(appCtx) },
                                     onPauseToggle = { spotifyLiveDjPauseToggle(appCtx) },
                                     onSkip = { spotifyLiveDjSkip(appCtx, forceTalk = false) },
-                                    liked = if (msg.isNowPlaying) trackLiked else false,
-                                    likeBusy = trackLikedBusy,
-                                    onLikeToggle = if (msg.isNowPlaying) {
+                                    liked = msgLiked,
+                                    likeBusy = msgLikeBusy,
+                                    onLikeToggle = if (
+                                        msg.role == DjChatRole.Track &&
+                                        (msgUri.isNotBlank() || (msg.isNowPlaying && now.trackUri.isNotBlank()))
+                                    ) {
                                         {
-                                            val uri = msg.trackUri.orEmpty().ifBlank { now.trackUri }
-                                            if (uri.isBlank() || trackLikedBusy) return@DjChatBubble
+                                            val uri = msgUri.ifBlank { now.trackUri }
+                                            if (uri.isBlank() || likeBusyUri == uri ||
+                                                (msg.isNowPlaying && trackLikedBusy)
+                                            ) {
+                                                return@DjChatBubble
+                                            }
+                                            val tid = spotifyTrackIdFromUri(uri)
+                                            val currentlyLiked = when {
+                                                msg.isNowPlaying -> trackLiked
+                                                tid.isNotBlank() -> likedByTrackId[tid] == true
+                                                else -> false
+                                            }
                                             scope.launch {
-                                                trackLikedBusy = true
+                                                likeBusyUri = uri
+                                                if (msg.isNowPlaying) trackLikedBusy = true
                                                 trackLikedMsg = null
-                                                val want = !trackLiked
+                                                val want = !currentlyLiked
                                                 val err = withContext(Dispatchers.IO) {
                                                     setSpotifyTrackLiked(appCtx, uri, want)
                                                 }
                                                 if (err == null) {
-                                                    trackLiked = want
-                                                    likedCheckUri = uri
+                                                    if (tid.isNotBlank()) {
+                                                        likedByTrackId = likedByTrackId + (tid to want)
+                                                    }
+                                                    if (msg.isNowPlaying ||
+                                                        uri == likeTrackUri ||
+                                                        uri == now.trackUri
+                                                    ) {
+                                                        trackLiked = want
+                                                        likedCheckUri = uri
+                                                    }
                                                     trackLikedMsg =
                                                         if (want) "Saved to Liked Songs" else "Removed from Liked"
                                                 } else {
                                                     trackLikedMsg = err
                                                 }
-                                                trackLikedBusy = false
+                                                if (likeBusyUri == uri) likeBusyUri = ""
+                                                if (msg.isNowPlaying) trackLikedBusy = false
                                             }
                                         }
                                     } else null,
@@ -2635,14 +2746,105 @@ fun SpotifyControllerPane(
 
                         Spacer(Modifier.height(16.dp))
                         Text(
+                            "YOUR NAME",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = GrokifyColors.GlowMint,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "How the DJ addresses you on mic. Pulled from Spotify display name " +
+                                "when possible — city is never used as a name.",
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = listenerName,
+                            onValueChange = { v ->
+                                listenerName = v.take(40)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            label = { Text("Name or nickname", fontSize = 12.sp) },
+                            placeholder = { Text("e.g. Audicle", fontSize = 12.sp) },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = GrokifyColors.TextPrimary,
+                                unfocusedTextColor = GrokifyColors.TextPrimary,
+                                focusedBorderColor = GrokifyColors.GlowMint,
+                                unfocusedBorderColor = GrokifyColors.PanelBorder,
+                                focusedLabelColor = GrokifyColors.GlowMint,
+                                unfocusedLabelColor = GrokifyColors.TextDim,
+                                cursorColor = GrokifyColors.GlowMint,
+                                focusedPlaceholderColor = GrokifyColors.TextMuted,
+                                unfocusedPlaceholderColor = GrokifyColors.TextMuted,
+                            ),
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextButton(
+                                onClick = {
+                                    djStore.listenerName = listenerName.trim()
+                                    listenerName = djStore.listenerName
+                                    applyDjBanterSettings(appCtx)
+                                    genreBoardMsg = if (listenerName.isBlank()) {
+                                        "Name cleared"
+                                    } else {
+                                        "Name set · $listenerName"
+                                    }
+                                },
+                            ) {
+                                Text("Save name", fontSize = 12.sp, color = GrokifyColors.GlowMint)
+                            }
+                            TextButton(
+                                onClick = {
+                                    if (nameBusy) return@TextButton
+                                    nameBusy = true
+                                    genreBoardMsg = null
+                                    scope.launch {
+                                        val (pulled, err) = withContext(Dispatchers.IO) {
+                                            fetchSpotifyDisplayName(appCtx)
+                                        }
+                                        nameBusy = false
+                                        if (err != null && pulled.isNullOrBlank()) {
+                                            genreBoardMsg = err
+                                        } else if (!pulled.isNullOrBlank()) {
+                                            listenerName = pulled
+                                            djStore.listenerName = pulled
+                                            applyDjBanterSettings(appCtx)
+                                            genreBoardMsg = "From Spotify · $pulled"
+                                        } else {
+                                            genreBoardMsg = "No display name on Spotify"
+                                        }
+                                    }
+                                },
+                                enabled = !nameBusy && loggedIn,
+                            ) {
+                                Text(
+                                    if (nameBusy) "Pulling…" else "From Spotify",
+                                    fontSize = 12.sp,
+                                    color = GrokifyColors.GlowCyan,
+                                )
+                            }
+                            if (listenerName.isNotBlank() && listenerName != djStore.listenerName) {
+                                Text("Unsaved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
+                            } else if (djStore.listenerName.isNotBlank()) {
+                                Text("Saved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
+                            }
+                        }
+
+                        Spacer(Modifier.height(16.dp))
+                        Text(
                             "LOCATION",
                             style = MaterialTheme.typography.labelSmall,
                             color = GrokifyColors.GlowViolet,
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "City / metro for local show research — banter can mention dates, " +
-                                "and queue fills can inject cuts from artists coming to town.",
+                            "City / metro only — used for local show research & discovery. " +
+                                "Never used as your name on air.",
                             color = GrokifyColors.TextDim,
                             fontSize = 10.sp,
                         )
@@ -2938,8 +3140,11 @@ fun SpotifyControllerPane(
                                 "Radio seeds from liked, top, recently played" +
                                 (if (selectedGenres.isNotEmpty()) ", plus genre board" else "") +
                                 (if (listenerCity.isNotBlank()) ", and local-show discovery" else "") +
-                                ". Research pulls lyric themes, album/year, artist facts, and shows. " +
-                                "Behavior modes only change delivery. " +
+                                ". Each talk randomly picks research angles " +
+                                "(lyrics, album/song facts, artist facts, tours, X/social, radio color). " +
+                                "Your name is for on-air address; city is location only. " +
+                                "Behavior modes filter how research is delivered " +
+                                "(Unhinged roasts your taste). " +
                                 "UP NEXT is in-app only — each track is direct-played when due. " +
                                 "Queue, chat, and settings survive leave/return.",
                             color = GrokifyColors.TextDim,
@@ -3897,13 +4102,42 @@ private fun DjChatBubble(
                             }
                         }
                     } else if (!msg.trackUri.isNullOrBlank()) {
-                        // Replay past songs from chat history
+                        // Replay past songs + heart into Liked Songs from chat history
                         Spacer(Modifier.height(8.dp))
                         Row(
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.End,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            if (onLikeToggle != null) {
+                                IconButton(
+                                    onClick = onLikeToggle,
+                                    enabled = !likeBusy && !msg.trackUri.isNullOrBlank(),
+                                ) {
+                                    if (likeBusy) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            strokeWidth = 2.dp,
+                                            color = GrokifyColors.GlowMint,
+                                        )
+                                    } else {
+                                        Icon(
+                                            if (liked) Icons.Default.Favorite
+                                            else Icons.Default.FavoriteBorder,
+                                            contentDescription = if (liked) {
+                                                "Unlike — remove from Liked Songs"
+                                            } else {
+                                                "Like — save to Liked Songs"
+                                            },
+                                            tint = if (liked) {
+                                                GrokifyColors.GlowMint
+                                            } else {
+                                                GrokifyColors.TextPrimary
+                                            },
+                                        )
+                                    }
+                                }
+                            }
                             TextButton(onClick = { onPlayTrack(msg) }) {
                                 Icon(
                                     Icons.Filled.PlayArrow,
