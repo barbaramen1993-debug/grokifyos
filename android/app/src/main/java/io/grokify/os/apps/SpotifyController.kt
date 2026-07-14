@@ -885,6 +885,7 @@ fun SpotifyControllerPane(
     var banterMin by remember { mutableStateOf(djStore.banterMin) }
     var banterMax by remember { mutableStateOf(djStore.banterMax) }
     var allowTalkOver by remember { mutableStateOf(djStore.allowTalkOver) }
+    var banterEnabled by remember { mutableStateOf(djStore.banterEnabled) }
     var resumeAfterRestart by remember { mutableStateOf(djStore.resumeAfterRestart) }
     var busy by remember { mutableStateOf(false) }
     var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
@@ -986,12 +987,14 @@ fun SpotifyControllerPane(
         // Publish baseline DJ UI when pane opens (keep chat history if any)
         if (!djStore.enabled) {
             val prev = SpotifyDjBus.state.value
+            val q = prev.queue.ifEmpty { djStore.loadQueue() }
+            val qLabel = if (q.isNotEmpty()) " · ${q.size} queued" else ""
             SpotifyDjBus.publish(
                 SpotifyDjUiState(
                     enabled = false,
-                    status = "Off",
-                    messages = prev.messages,
-                    queue = prev.queue.ifEmpty { djStore.loadQueue() },
+                    status = "Booth ready$qLabel",
+                    messages = prev.messages.ifEmpty { djStore.loadMessages() },
+                    queue = q,
                     loggedIn = SpotifyOAuth.isLoggedIn(appCtx),
                     voiceId = djStore.voiceId,
                     useAiRank = djStore.useAiRank,
@@ -1003,6 +1006,7 @@ fun SpotifyControllerPane(
                     banterMin = djStore.banterMin,
                     banterMax = djStore.banterMax,
                     allowTalkOver = djStore.allowTalkOver,
+                    banterEnabled = djStore.banterEnabled,
                     resumeAfterRestart = djStore.resumeAfterRestart,
                 ),
             )
@@ -1651,14 +1655,21 @@ fun SpotifyControllerPane(
                             fontSize = 14.sp,
                         )
                         Text(
-                            if (djState.enabled || djStore.enabled) {
-                                when {
-                                    djState.transitioning -> "Transition…"
-                                    djState.filling -> "Filling queue…"
-                                    djState.chatBusy -> "Reading chat…"
-                                    else -> {
-                                        val base = djState.status.ifBlank { "On" }
-                                        // Prefer structured countdown so leave/return stays correct.
+                            when {
+                                djState.transitioning -> "Transition…"
+                                djState.filling -> "Filling queue…"
+                                djState.chatBusy -> "Reading chat…"
+                                djState.enabled || djStore.enabled -> {
+                                    val base = djState.status.ifBlank { "On" }
+                                    if (!djState.banterEnabled && !djStore.banterEnabled) {
+                                        if (base.contains("banter off")) base
+                                        else {
+                                            val root = base
+                                                .substringBefore(" · talk in")
+                                                .substringBefore(" · banter")
+                                            "$root · banter off"
+                                        }
+                                    } else {
                                         val cd = banterCountdownLabel(
                                             djState.songsSinceBanter,
                                             djState.banterEvery,
@@ -1667,8 +1678,10 @@ fun SpotifyControllerPane(
                                         else "$base · $cd"
                                     }
                                 }
-                            } else {
-                                "Off"
+                                else -> djState.status.ifBlank {
+                                    val n = djState.queue.size
+                                    if (n > 0) "Booth ready · $n queued" else "Booth ready"
+                                }
                             },
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
@@ -1787,9 +1800,10 @@ fun SpotifyControllerPane(
                                         )
                                         Spacer(Modifier.height(4.dp))
                                         Text(
-                                            "Turn on Live AI DJ. Tracks & banter show here. " +
-                                                "Chat can new-queue, top-up, drop songs, or pull song/artist info. " +
-                                                "Queue tab lists the radio set (not Spotify’s native queue).",
+                                            "Chat, queue, and play work even when Live DJ auto-handoff is off. " +
+                                                "Tracks & banter show here. Ask for a new queue, top-up, drop songs, " +
+                                                "or song/artist info. Tap ▶ on past songs to replay. " +
+                                                "Queue tab is the app radio set (not Spotify’s Up Next).",
                                             color = GrokifyColors.TextDim,
                                             fontSize = 12.sp,
                                         )
@@ -1799,10 +1813,23 @@ fun SpotifyControllerPane(
                             items(djState.messages, key = { it.id }) { msg ->
                                 DjChatBubble(
                                     msg = msg,
-                                    djOn = djStore.enabled || djState.enabled,
                                     onPrev = { spotifyLiveDjPrevious(appCtx) },
                                     onPauseToggle = { spotifyLiveDjPauseToggle(appCtx) },
                                     onSkip = { spotifyLiveDjSkip(appCtx, forceTalk = false) },
+                                    onPlayTrack = { m ->
+                                        val uri = m.trackUri.orEmpty()
+                                        if (uri.isBlank()) return@DjChatBubble
+                                        spotifyLiveDjPlayUri(
+                                            appCtx,
+                                            trackUri = uri,
+                                            name = m.trackName.orEmpty(),
+                                            artists = m.trackArtists.orEmpty(),
+                                            albumArtUrl = m.albumArtUrl.orEmpty(),
+                                            artistArtUrl = m.artistArtUrl.orEmpty(),
+                                            albumUri = m.albumUri.orEmpty(),
+                                            artistUri = m.artistUri.orEmpty(),
+                                        )
+                                    },
                                 )
                             }
                         }
@@ -1823,11 +1850,7 @@ fun SpotifyControllerPane(
                                 maxLines = 3,
                                 placeholder = {
                                     Text(
-                                        if (djStore.enabled || djState.enabled) {
-                                            "Vibes, new queue, remove a song, artist info…"
-                                        } else {
-                                            "Turn on Live DJ to chat"
-                                        },
+                                        "Vibes, new queue, remove a song, artist info…",
                                         color = GrokifyColors.TextDim,
                                         fontSize = 13.sp,
                                     )
@@ -1870,12 +1893,11 @@ fun SpotifyControllerPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         Text(
-                            "UP NEXT lives only in this app. When a cut ends (or you skip/jump), " +
-                                "Live DJ direct-plays the next URI — Spotify’s native queue is never written. " +
-                                "If Spotify autoplays something else, we reclaim our next track. " +
+                            "UP NEXT lives only in this app. Queue / play / skip work with Live DJ off. " +
+                                "When auto-handoff is on, ending a cut (or skip/jump) direct-plays the next URI — " +
+                                "Spotify’s native queue is never written. " +
                                 "Tap a title or ▶ to jump (drops songs above · no talk). " +
-                                "Sync adopts whatever Spotify is on now (keeps the app list). " +
-                                "Refill adds · New queue replaces.",
+                                "Sync adopts whatever Spotify is on now. Refill adds · New queue replaces.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )
@@ -1886,27 +1908,27 @@ fun SpotifyControllerPane(
                         ) {
                             TextButton(
                                 onClick = { spotifyLiveDjSyncToSpotify(appCtx) },
-                                enabled = djStore.enabled || djState.enabled,
                             ) {
                                 Text("Sync to Spotify", color = GrokifyColors.GlowMint, fontSize = 12.sp)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjNewQueue(appCtx) },
-                                enabled = djStore.enabled || djState.enabled,
                             ) {
                                 Text("New queue", color = GrokifyColors.GlowMint, fontSize = 12.sp)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjRefill(appCtx) },
-                                enabled = djStore.enabled || djState.enabled,
                             ) {
                                 Text("Refill", color = GrokifyColors.GlowCyan, fontSize = 12.sp)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjSkip(appCtx, forceTalk = true) },
-                                enabled = djStore.enabled || djState.enabled,
                             ) {
-                                Text("Skip + talk", color = GrokifyColors.GlowCyan, fontSize = 12.sp)
+                                Text(
+                                    if (banterEnabled) "Skip + talk" else "Skip",
+                                    color = GrokifyColors.GlowCyan,
+                                    fontSize = 12.sp,
+                                )
                             }
                         }
                         Spacer(Modifier.height(8.dp))
@@ -1933,11 +1955,7 @@ fun SpotifyControllerPane(
                         Spacer(Modifier.height(4.dp))
                         if (djState.queue.isEmpty()) {
                             Text(
-                                if (djState.enabled || djStore.enabled) {
-                                    "Empty — New queue or Refill builds from liked · top · recent."
-                                } else {
-                                    "Turn on Live DJ to build a radio set."
-                                },
+                                "Empty — New queue or Refill builds from liked · top · recent.",
                                 color = GrokifyColors.TextMuted,
                                 fontSize = 12.sp,
                             )
@@ -1973,7 +1991,7 @@ fun SpotifyControllerPane(
                                     Column(
                                         Modifier
                                             .weight(1f)
-                                            .clickable(enabled = djStore.enabled || djState.enabled) {
+                                            .clickable {
                                                 // Tap title row → play this cut (silent jump)
                                                 spotifyLiveDjPlayFromQueue(appCtx, t.uri, i)
                                             },
@@ -2025,8 +2043,7 @@ fun SpotifyControllerPane(
                                     }
                                     IconButton(
                                         onClick = { spotifyLiveDjPlayFromQueue(appCtx, t.uri, i) },
-                                        enabled = (djStore.enabled || djState.enabled) &&
-                                            (t.uri.isNotBlank() || i >= 0),
+                                        enabled = t.uri.isNotBlank() || i >= 0,
                                         modifier = Modifier.size(36.dp),
                                     ) {
                                         Icon(
@@ -2038,7 +2055,7 @@ fun SpotifyControllerPane(
                                     }
                                     IconButton(
                                         onClick = { spotifyLiveDjRemoveFromQueue(appCtx, t.uri) },
-                                        enabled = (djStore.enabled || djState.enabled) && t.uri.isNotBlank(),
+                                        enabled = t.uri.isNotBlank(),
                                         modifier = Modifier.size(36.dp),
                                     ) {
                                         Icon(
@@ -2134,14 +2151,48 @@ fun SpotifyControllerPane(
                         }
                         Spacer(Modifier.height(14.dp))
                         Text(
-                            "BANTER FREQUENCY",
+                            "BANTER",
                             style = MaterialTheme.typography.labelSmall,
                             color = GrokifyColors.GlowViolet,
                         )
                         Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "Spoken banter",
+                                    color = GrokifyColors.TextPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Text(
+                                    if (banterEnabled) {
+                                        "DJ talks between songs (Grok Voice / TTS)"
+                                    } else {
+                                        "Silent handoffs only — chat replies stay text"
+                                    },
+                                    color = GrokifyColors.TextDim,
+                                    fontSize = 10.sp,
+                                )
+                            }
+                            Switch(
+                                checked = banterEnabled,
+                                onCheckedChange = {
+                                    banterEnabled = it
+                                    djStore.banterEnabled = it
+                                    applyDjBanterSettings(appCtx)
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = GrokifyColors.Void,
+                                    checkedTrackColor = GrokifyColors.GlowViolet,
+                                    uncheckedThumbColor = GrokifyColors.TextMuted,
+                                    uncheckedTrackColor = GrokifyColors.PanelSoft,
+                                ),
+                            )
+                        }
+                        Spacer(Modifier.height(10.dp))
                         Text(
                             "How often the DJ talks between songs",
-                            color = GrokifyColors.TextDim,
+                            color = if (banterEnabled) GrokifyColors.TextDim else GrokifyColors.TextMuted,
                             fontSize = 11.sp,
                         )
                         Spacer(Modifier.height(8.dp))
@@ -2152,10 +2203,12 @@ fun SpotifyControllerPane(
                             FilterChip(
                                 selected = banterMode == BanterFrequencyMode.Fixed,
                                 onClick = {
+                                    if (!banterEnabled) return@FilterChip
                                     banterMode = BanterFrequencyMode.Fixed
                                     djStore.banterMode = BanterFrequencyMode.Fixed
                                     applyDjBanterSettings(appCtx)
                                 },
+                                enabled = banterEnabled,
                                 label = { Text("Every N songs", fontSize = 12.sp, maxLines = 1) },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
@@ -2164,7 +2217,7 @@ fun SpotifyControllerPane(
                                     labelColor = GrokifyColors.TextPrimary,
                                 ),
                                 border = FilterChipDefaults.filterChipBorder(
-                                    enabled = true,
+                                    enabled = banterEnabled,
                                     selected = banterMode == BanterFrequencyMode.Fixed,
                                     borderColor = GrokifyColors.PanelBorder,
                                     selectedBorderColor = GrokifyColors.GlowCyan,
@@ -2173,10 +2226,12 @@ fun SpotifyControllerPane(
                             FilterChip(
                                 selected = banterMode == BanterFrequencyMode.Random,
                                 onClick = {
+                                    if (!banterEnabled) return@FilterChip
                                     banterMode = BanterFrequencyMode.Random
                                     djStore.banterMode = BanterFrequencyMode.Random
                                     applyDjBanterSettings(appCtx)
                                 },
+                                enabled = banterEnabled,
                                 label = { Text("Random range", fontSize = 12.sp, maxLines = 1) },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
@@ -2185,7 +2240,7 @@ fun SpotifyControllerPane(
                                     labelColor = GrokifyColors.TextPrimary,
                                 ),
                                 border = FilterChipDefaults.filterChipBorder(
-                                    enabled = true,
+                                    enabled = banterEnabled,
                                     selected = banterMode == BanterFrequencyMode.Random,
                                     borderColor = GrokifyColors.PanelBorder,
                                     selectedBorderColor = GrokifyColors.GlowCyan,
@@ -2252,9 +2307,13 @@ fun SpotifyControllerPane(
                         }
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "Next line: ${
-                                banterCountdownLabel(djState.songsSinceBanter, djState.banterEvery)
-                            } (target every ${djState.banterEvery})",
+                            if (banterEnabled) {
+                                "Next line: ${
+                                    banterCountdownLabel(djState.songsSinceBanter, djState.banterEvery)
+                                } (target every ${djState.banterEvery})"
+                            } else {
+                                "Banter muted — frequency settings saved for when you re-enable"
+                            },
                             color = GrokifyColors.TextMuted,
                             fontSize = 11.sp,
                         )
@@ -2279,6 +2338,7 @@ fun SpotifyControllerPane(
                             }
                             Switch(
                                 checked = allowTalkOver,
+                                enabled = banterEnabled,
                                 onCheckedChange = {
                                     allowTalkOver = it
                                     djStore.allowTalkOver = it
@@ -2328,10 +2388,11 @@ fun SpotifyControllerPane(
                         }
                         Spacer(Modifier.height(12.dp))
                         Text(
-                            "Radio seeds from liked, top, and recently played (recent cuts are excluded so they are not re-queued). " +
-                                "UP NEXT is an in-app list only — each track is direct-played when due (Spotify’s queue unused). " +
-                                "Queue, chat, and settings survive leave/return. " +
-                                "With resume on, an active session continues after OTA/restart.",
+                            "Live DJ toggle = auto-handoff between songs. Chat, queue build, play, and " +
+                                "Spotify control work with it off (booth mode). " +
+                                "Radio seeds from liked, top, and recently played. " +
+                                "UP NEXT is in-app only — each track is direct-played when due. " +
+                                "Queue, chat, and settings survive leave/return.",
                             color = GrokifyColors.TextDim,
                             fontSize = 11.sp,
                         )
@@ -2902,10 +2963,10 @@ fun SpotifyControllerPane(
 @Composable
 private fun DjChatBubble(
     msg: DjChatMessage,
-    djOn: Boolean,
     onPrev: () -> Unit,
     onPauseToggle: () -> Unit,
     onSkip: () -> Unit,
+    onPlayTrack: (DjChatMessage) -> Unit = {},
 ) {
     when (msg.role) {
         DjChatRole.User -> {
@@ -3121,8 +3182,8 @@ private fun DjChatBubble(
                             }
                         }
                     }
-                    // Transport on the latest (now-playing) bubble
-                    if (msg.isNowPlaying && djOn) {
+                    // Transport on the latest (now-playing) bubble — works in booth mode too
+                    if (msg.isNowPlaying) {
                         Spacer(Modifier.height(8.dp))
                         Row(
                             Modifier.fillMaxWidth(),
@@ -3149,6 +3210,25 @@ private fun DjChatBubble(
                                     contentDescription = "Skip (countdown −1, no forced talk)",
                                     tint = GrokifyColors.TextPrimary,
                                 )
+                            }
+                        }
+                    } else if (!msg.trackUri.isNullOrBlank()) {
+                        // Replay past songs from chat history
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextButton(onClick = { onPlayTrack(msg) }) {
+                                Icon(
+                                    Icons.Filled.PlayArrow,
+                                    contentDescription = null,
+                                    tint = GrokifyColors.GlowMint,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text("Play", color = GrokifyColors.GlowMint, fontSize = 12.sp)
                             }
                         }
                     }

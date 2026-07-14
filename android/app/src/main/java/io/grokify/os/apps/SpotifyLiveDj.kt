@@ -75,6 +75,8 @@ private const val KEY_BANTER_FIXED = "banter_fixed_v1"
 private const val KEY_BANTER_MIN = "banter_min_v1"
 private const val KEY_BANTER_MAX = "banter_max_v1"
 private const val KEY_ALLOW_TALKOVER = "allow_talkover_v1"
+/** Master switch: when false, never speak banter (Skip + talk becomes silent skip). */
+private const val KEY_BANTER_ENABLED = "banter_enabled_v1"
 /** When true, re-start Live DJ after process death / OTA / reboot if it was on. */
 private const val KEY_RESUME_AFTER_RESTART = "resume_after_restart_v1"
 
@@ -301,6 +303,8 @@ data class SpotifyDjUiState(
     val banterMax: Int = 5,
     /** When true, banter may ride over the outro; when false, music pauses for the line. */
     val allowTalkOver: Boolean = true,
+    /** Master banter switch — off = silent handoffs only (no TTS / banter bubbles). */
+    val banterEnabled: Boolean = true,
     /**
      * When true (default), Live DJ restarts after app process death, OTA update, or reboot
      * if it was left on. When false, a restart ends the session (queue/settings still kept).
@@ -366,6 +370,11 @@ class SpotifyDjStore(context: Context) {
     var allowTalkOver: Boolean
         get() = prefs.getBoolean(KEY_ALLOW_TALKOVER, true)
         set(value) = prefs.edit().putBoolean(KEY_ALLOW_TALKOVER, value).apply()
+
+    /** When false, Live DJ never speaks banter (chat replies still work as text). */
+    var banterEnabled: Boolean
+        get() = prefs.getBoolean(KEY_BANTER_ENABLED, true)
+        set(value) = prefs.edit().putBoolean(KEY_BANTER_ENABLED, value).apply()
 
     /**
      * Resume Live DJ after process death / OTA / boot when [enabled] was true.
@@ -529,8 +538,20 @@ fun applyDjBanterSettings(context: Context) {
             banterMin = store.banterMin,
             banterMax = store.banterMax,
             allowTalkOver = store.allowTalkOver,
+            banterEnabled = store.banterEnabled,
             status = when {
                 !store.enabled -> it.status
+                !store.banterEnabled -> {
+                    val base = it.status
+                        .substringBefore(" · talk in")
+                        .substringBefore(" · banter")
+                        .substringBefore(" · banter off")
+                    if (base.isBlank() || base == it.status) {
+                        "Watching playback · banter off"
+                    } else {
+                        "$base · banter off"
+                    }
+                }
                 it.status.contains("talk in") || it.status.contains("banter") ||
                     it.status.startsWith("Watching") || it.status.startsWith("Paused") -> {
                     val base = it.status
@@ -571,10 +592,19 @@ fun ensureDjChatHydrated(context: Context) {
     val every = store.banterEvery
     val until = tracksUntilTalk(songsSince, every)
     val countdown = banterCountdownLabel(songsSince, every)
+    val qLabel = if (q.isNotEmpty()) " · ${q.size} queued" else ""
     val statusFromStore = when {
-        !store.enabled -> if (bus.status.isBlank() || bus.status == "Off") "Off" else bus.status
+        !store.enabled -> {
+            val base = if (bus.status.isBlank() || bus.status == "Off") {
+                "Booth ready$qLabel"
+            } else {
+                bus.status
+            }
+            base
+        }
         bus.enabled && bus.status.isNotBlank() &&
             (bus.status.contains("talk in") || bus.status.contains("banter")) -> bus.status
+        store.enabled && !store.banterEnabled -> "Watching playback · banter off"
         store.enabled -> "Watching playback · $countdown"
         else -> bus.status
     }
@@ -595,6 +625,7 @@ fun ensureDjChatHydrated(context: Context) {
             banterMin = store.banterMin,
             banterMax = store.banterMax,
             allowTalkOver = store.allowTalkOver,
+            banterEnabled = store.banterEnabled,
             resumeAfterRestart = store.resumeAfterRestart,
         )
     }
@@ -637,6 +668,7 @@ fun maybeResumeLiveDj(context: Context) {
                 banterMin = store.banterMin,
                 banterMax = store.banterMax,
                 allowTalkOver = store.allowTalkOver,
+                banterEnabled = store.banterEnabled,
                 resumeAfterRestart = false,
             ),
         )
@@ -723,17 +755,18 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
         } + DjChatMessage(
             id = "sys-stop-${System.currentTimeMillis()}",
             role = DjChatRole.System,
-            text = "Live DJ off — queue kept for next session",
+            text = "Auto-handoff off — booth stays open (chat, queue, play still work)",
         )).takeLast(MAX_DJ_CHAT_MESSAGES)
         store.saveMessages(finalMsgs)
         // Keep queue on disk so turning DJ back on resumes the set
         val keptQueue = store.loadQueue().ifEmpty { SpotifyDjBus.state.value.queue }
         if (keptQueue.isNotEmpty()) store.saveQueue(keptQueue)
+        val qLabel = if (keptQueue.isNotEmpty()) " · ${keptQueue.size} queued" else ""
         SpotifyDjBus.publish(
             SpotifyDjUiState(
                 enabled = false,
-                status = "Off",
-                nowLine = "Live DJ stopped",
+                status = "Booth ready$qLabel",
+                nowLine = "Live DJ auto-handoff off — booth still works",
                 messages = finalMsgs,
                 queue = keptQueue,
                 loggedIn = SpotifyOAuth.isLoggedIn(appCtx),
@@ -747,9 +780,19 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
                 banterMin = store.banterMin,
                 banterMax = store.banterMax,
                 allowTalkOver = store.allowTalkOver,
+                banterEnabled = store.banterEnabled,
                 resumeAfterRestart = store.resumeAfterRestart,
             ),
         )
+    }
+}
+
+/** Start a one-shot DJ service action (works with Live DJ auto-handoff off). */
+private fun startDjServiceAction(context: Context, intent: Intent, tag: String) {
+    try {
+        ContextCompat.startForegroundService(context.applicationContext, intent)
+    } catch (e: Exception) {
+        Log.w(TAG, "$tag: ${e.message}")
     }
 }
 
@@ -764,54 +807,35 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
  */
 fun spotifyLiveDjSkip(context: Context, forceTalk: Boolean = false) {
     val appCtx = context.applicationContext
-    if (!SpotifyDjStore(appCtx).enabled) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_SKIP)
         .putExtra(SpotifyLiveDjService.EXTRA_FORCE_TALK, forceTalk)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "skip: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "skip")
 }
 
 fun spotifyLiveDjRefill(context: Context) {
     val appCtx = context.applicationContext
-    if (!SpotifyDjStore(appCtx).enabled) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java).setAction(SpotifyLiveDjService.ACTION_DJ_REFILL)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "refill: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "refill")
 }
 
 /** Clear the radio queue and build a fresh set (unlike refill, which appends). */
 fun spotifyLiveDjNewQueue(context: Context) {
     val appCtx = context.applicationContext
-    if (!SpotifyDjStore(appCtx).enabled) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_NEW_QUEUE)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "newQueue: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "newQueue")
 }
 
 /** Remove a track from the Live DJ radio queue by Spotify URI. */
 fun spotifyLiveDjRemoveFromQueue(context: Context, trackUri: String) {
     val appCtx = context.applicationContext
     val uri = trackUri.trim()
-    if (uri.isBlank() || !SpotifyDjStore(appCtx).enabled) return
+    if (uri.isBlank()) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_REMOVE_TRACK)
         .putExtra(SpotifyLiveDjService.EXTRA_TRACK_URI, uri)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "removeTrack: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "removeTrack")
 }
 
 /**
@@ -823,40 +847,55 @@ fun spotifyLiveDjRemoveFromQueue(context: Context, trackUri: String) {
 fun spotifyLiveDjPlayFromQueue(context: Context, trackUri: String, queueIndex: Int = -1) {
     val appCtx = context.applicationContext
     val uri = trackUri.trim()
-    if ((uri.isBlank() && queueIndex < 0) || !SpotifyDjStore(appCtx).enabled) return
+    if (uri.isBlank() && queueIndex < 0) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_PLAY_FROM_QUEUE)
         .putExtra(SpotifyLiveDjService.EXTRA_TRACK_URI, uri)
         .putExtra(SpotifyLiveDjService.EXTRA_QUEUE_INDEX, queueIndex)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "playFromQueue: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "playFromQueue")
+}
+
+/**
+ * Direct-play a track URI from chat history (or anywhere) without requiring Live DJ on.
+ * Does not mutate the UP NEXT list.
+ */
+fun spotifyLiveDjPlayUri(
+    context: Context,
+    trackUri: String,
+    name: String = "",
+    artists: String = "",
+    albumArtUrl: String = "",
+    artistArtUrl: String = "",
+    albumUri: String = "",
+    artistUri: String = "",
+) {
+    val appCtx = context.applicationContext
+    val uri = trackUri.trim()
+    if (uri.isBlank()) return
+    val i = Intent(appCtx, SpotifyLiveDjService::class.java)
+        .setAction(SpotifyLiveDjService.ACTION_DJ_PLAY_URI)
+        .putExtra(SpotifyLiveDjService.EXTRA_TRACK_URI, uri)
+        .putExtra(SpotifyLiveDjService.EXTRA_TRACK_NAME, name)
+        .putExtra(SpotifyLiveDjService.EXTRA_TRACK_ARTISTS, artists)
+        .putExtra(SpotifyLiveDjService.EXTRA_ALBUM_ART, albumArtUrl)
+        .putExtra(SpotifyLiveDjService.EXTRA_ARTIST_ART, artistArtUrl)
+        .putExtra(SpotifyLiveDjService.EXTRA_ALBUM_URI, albumUri)
+        .putExtra(SpotifyLiveDjService.EXTRA_ARTIST_URI, artistUri)
+    startDjServiceAction(appCtx, i, "playUri")
 }
 
 fun spotifyLiveDjPauseToggle(context: Context) {
     val appCtx = context.applicationContext
-    if (!SpotifyDjStore(appCtx).enabled) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_PAUSE_TOGGLE)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "pause: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "pause")
 }
 
 fun spotifyLiveDjPrevious(context: Context) {
     val appCtx = context.applicationContext
-    if (!SpotifyDjStore(appCtx).enabled) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_PREVIOUS)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "previous: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "previous")
 }
 
 /**
@@ -867,14 +906,9 @@ fun spotifyLiveDjPrevious(context: Context) {
  */
 fun spotifyLiveDjSyncToSpotify(context: Context) {
     val appCtx = context.applicationContext
-    if (!SpotifyDjStore(appCtx).enabled) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_SYNC_SPOTIFY)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "syncToSpotify: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "syncToSpotify")
 }
 
 /**
@@ -883,14 +917,9 @@ fun spotifyLiveDjSyncToSpotify(context: Context) {
  */
 fun spotifyLiveDjAddToSpotifyQueue(context: Context) {
     val appCtx = context.applicationContext
-    if (!SpotifyDjStore(appCtx).enabled) return
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_ADD_TO_SPOTIFY_QUEUE)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "addToSpotifyQueue: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "addToSpotifyQueue")
 }
 
 /** Send a chat message to the Live DJ AI (queue suggestions / vibe changes). */
@@ -898,24 +927,10 @@ fun spotifyLiveDjChat(context: Context, text: String) {
     val appCtx = context.applicationContext
     val body = text.trim()
     if (body.isBlank()) return
-    if (!SpotifyDjStore(appCtx).enabled) {
-        val next = (SpotifyDjBus.state.value.messages + DjChatMessage(
-            id = "sys-${System.currentTimeMillis()}",
-            role = DjChatRole.System,
-            text = "Turn on Live AI DJ to chat with the booth.",
-        )).takeLast(MAX_DJ_CHAT_MESSAGES)
-        SpotifyDjStore(appCtx).saveMessages(next)
-        SpotifyDjBus.patch { it.copy(messages = next) }
-        return
-    }
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_CHAT)
         .putExtra(SpotifyLiveDjService.EXTRA_CHAT_TEXT, body)
-    try {
-        ContextCompat.startForegroundService(appCtx, i)
-    } catch (e: Exception) {
-        Log.w(TAG, "chat: ${e.message}")
-    }
+    startDjServiceAction(appCtx, i, "chat")
 }
 
 /**
@@ -1056,6 +1071,8 @@ class SpotifyLiveDjService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Session actions work with Live DJ auto-handoff off (booth mode).
+        var sessionWork = false
         when (intent?.action) {
             ACTION_DJ_STOP -> {
                 store.enabled = false
@@ -1063,95 +1080,195 @@ class SpotifyLiveDjService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_DJ_RELOAD_SETTINGS -> {
-                if (store.enabled) {
-                    banterEvery = store.banterEvery.coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
-                    songsSinceBanter = store.songsSinceBanter
-                    publish(
-                        status = "Watching playback · ${banterCountdownLabel(songsSinceBanter, banterEvery)}",
-                        persist = false,
-                    )
+                banterEvery = store.banterEvery.coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
+                songsSinceBanter = store.songsSinceBanter
+                val status = when {
+                    !store.enabled -> SpotifyDjBus.state.value.status.ifBlank { "Booth ready" }
+                    !store.banterEnabled -> "Watching playback · banter off"
+                    else -> "Watching playback · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
                 }
+                publish(status = status, persist = false)
             }
             ACTION_DJ_SKIP -> {
-                if (store.enabled) {
-                    // Only Skip + talk forces banter; plain skip follows the countdown.
-                    forceBanter = intent.getBooleanExtra(EXTRA_FORCE_TALK, false)
-                    scope.launch { runTransition("skip") }
+                // Only Skip + talk forces banter; plain skip follows the countdown.
+                forceBanter = intent.getBooleanExtra(EXTRA_FORCE_TALK, false) && store.banterEnabled
+                sessionWork = true
+                scope.launch {
+                    try {
+                        runTransition("skip")
+                    } finally {
+                        finishSessionIfNeeded()
+                    }
                 }
             }
             ACTION_DJ_REFILL -> {
-                if (store.enabled) {
-                    scope.launch(Dispatchers.IO) {
+                sessionWork = true
+                scope.launch(Dispatchers.IO) {
+                    try {
                         fillQueue(useAi = store.useAiRank, force = true, replace = false)
+                    } finally {
+                        finishSessionIfNeeded()
                     }
                 }
             }
             ACTION_DJ_NEW_QUEUE -> {
-                if (store.enabled) {
-                    scope.launch(Dispatchers.IO) {
+                sessionWork = true
+                scope.launch(Dispatchers.IO) {
+                    try {
                         fillQueue(useAi = store.useAiRank, force = true, replace = true)
+                    } finally {
+                        finishSessionIfNeeded()
                     }
                 }
             }
             ACTION_DJ_REMOVE_TRACK -> {
-                if (store.enabled) {
-                    val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty()
-                    if (uri.isNotBlank()) {
-                        scope.launch(Dispatchers.IO) {
+                val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty()
+                if (uri.isNotBlank()) {
+                    sessionWork = true
+                    scope.launch(Dispatchers.IO) {
+                        try {
                             val n = removeTracksMatching(uri)
                             publish(
                                 status = if (n > 0) "Removed $n from queue" else "Track not in queue",
                                 clearError = n > 0,
                             )
+                        } finally {
+                            finishSessionIfNeeded()
                         }
                     }
                 }
             }
             ACTION_DJ_PLAY_FROM_QUEUE -> {
-                if (store.enabled) {
-                    val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty()
-                    val index = intent.getIntExtra(EXTRA_QUEUE_INDEX, -1)
-                    if (uri.isNotBlank() || index >= 0) {
-                        scope.launch { jumpToQueueTrack(uri, index) }
+                val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty()
+                val index = intent.getIntExtra(EXTRA_QUEUE_INDEX, -1)
+                if (uri.isNotBlank() || index >= 0) {
+                    sessionWork = true
+                    scope.launch {
+                        try {
+                            jumpToQueueTrack(uri, index)
+                        } finally {
+                            finishSessionIfNeeded()
+                        }
+                    }
+                }
+            }
+            ACTION_DJ_PLAY_URI -> {
+                val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty().trim()
+                if (uri.isNotBlank()) {
+                    sessionWork = true
+                    val track = DjQueueTrack(
+                        uri = uri,
+                        name = intent.getStringExtra(EXTRA_TRACK_NAME).orEmpty(),
+                        artists = intent.getStringExtra(EXTRA_TRACK_ARTISTS).orEmpty(),
+                        albumArtUrl = intent.getStringExtra(EXTRA_ALBUM_ART).orEmpty(),
+                        artistArtUrl = intent.getStringExtra(EXTRA_ARTIST_ART).orEmpty(),
+                        albumUri = intent.getStringExtra(EXTRA_ALBUM_URI).orEmpty(),
+                        artistUri = intent.getStringExtra(EXTRA_ARTIST_URI).orEmpty(),
+                        reason = "from chat",
+                    )
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val ok = playTrack(track)
+                            publish(
+                                status = if (ok) "Playing from history" else "Play failed — open Spotify on a device",
+                                clearError = ok,
+                                error = if (ok) null else "play_failed",
+                            )
+                            if (ok) {
+                                appendChat(
+                                    DjChatMessage(
+                                        id = "sys-hist-${System.currentTimeMillis()}",
+                                        role = DjChatRole.System,
+                                        text = "Replayed ${track.name.ifBlank { track.uri }}" +
+                                            if (track.artists.isNotBlank()) " — ${track.artists}" else "",
+                                    ),
+                                )
+                            }
+                        } finally {
+                            finishSessionIfNeeded()
+                        }
                     }
                 }
             }
             ACTION_DJ_PAUSE_TOGGLE -> {
-                if (store.enabled) {
-                    scope.launch(Dispatchers.IO) { togglePause() }
+                sessionWork = true
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        togglePause()
+                    } finally {
+                        finishSessionIfNeeded()
+                    }
                 }
             }
             ACTION_DJ_PREVIOUS -> {
-                if (store.enabled) {
-                    scope.launch(Dispatchers.IO) { restartOrPrevious() }
+                sessionWork = true
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        restartOrPrevious()
+                    } finally {
+                        finishSessionIfNeeded()
+                    }
                 }
             }
             ACTION_DJ_SYNC_SPOTIFY -> {
-                if (store.enabled) {
-                    scope.launch(Dispatchers.IO) { forceSyncToSpotify() }
+                sessionWork = true
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        forceSyncToSpotify()
+                    } finally {
+                        finishSessionIfNeeded()
+                    }
                 }
             }
             ACTION_DJ_ADD_TO_SPOTIFY_QUEUE -> {
-                if (store.enabled) {
-                    scope.launch(Dispatchers.IO) { pushQueueToSpotify() }
+                sessionWork = true
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        pushQueueToSpotify()
+                    } finally {
+                        finishSessionIfNeeded()
+                    }
                 }
             }
             ACTION_DJ_CHAT -> {
                 val text = intent.getStringExtra(EXTRA_CHAT_TEXT).orEmpty().trim()
-                if (store.enabled && text.isNotBlank()) {
-                    scope.launch { handleUserChat(text) }
+                if (text.isNotBlank()) {
+                    sessionWork = true
+                    scope.launch {
+                        try {
+                            handleUserChat(text)
+                        } finally {
+                            finishSessionIfNeeded()
+                        }
+                    }
                 }
             }
         }
-        if (!store.enabled) {
-            stopSelf()
+        if (store.enabled) {
+            startAsForeground(SpotifyDjBus.state.value.status.ifBlank { "Watching playback…" })
+            if (loopJob?.isActive != true) {
+                loopJob = scope.launch { runLoop() }
+            }
+            return START_STICKY
+        }
+        // Booth session: keep FGS alive only while a one-shot action runs.
+        if (sessionWork) {
+            startAsForeground(SpotifyDjBus.state.value.status.ifBlank { "DJ booth…" })
             return START_NOT_STICKY
         }
-        startAsForeground(SpotifyDjBus.state.value.status.ifBlank { "Watching playback…" })
-        if (loopJob?.isActive != true) {
-            loopJob = scope.launch { runLoop() }
+        stopSelf()
+        return START_NOT_STICKY
+    }
+
+    /** Stop the FGS after a one-shot booth action when auto-handoff is off. */
+    private fun finishSessionIfNeeded() {
+        if (!store.enabled) {
+            persistRuntimeState()
+            val qSize = synchronized(queue) { queue.size }
+            val label = if (qSize > 0) "Booth ready · $qSize queued" else "Booth ready"
+            publish(status = label, transitioning = false, filling = false, chatBusy = false)
+            stopSelf()
         }
-        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -1288,7 +1405,8 @@ class SpotifyLiveDjService : Service() {
             // Between tracks currently-playing can flash empty briefly after a natural end.
             // Direct-play: only a short grace, then we start the next URI ourselves.
             val hadBeenPlaying = wasPlaying
-            val banterDueNow = forceBanter || songsSinceBanter + 1 >= banterEvery
+            val banterDueNow = store.banterEnabled &&
+                (forceBanter || songsSinceBanter + 1 >= banterEvery)
             val gracePolls = when {
                 banterDueNow -> 1
                 hadBeenPlaying -> 2
@@ -1462,7 +1580,8 @@ class SpotifyLiveDjService : Service() {
         // Direct-play mode: we start the next cut ourselves (no Spotify Up Next).
         // Banter needs headroom for talkover; silent cuts fire in the last ~1.2s so
         // Spotify autoplay never steals the booth.
-        val banterDue = forceBanter || songsSinceBanter + 1 >= banterEvery
+        val banterDue = store.banterEnabled &&
+            (forceBanter || songsSinceBanter + 1 >= banterEvery)
         val peekUri = synchronized(queue) { queue.firstOrNull()?.uri }
         val banterPrefetched = banterDue &&
             peekUri != null &&
@@ -2178,21 +2297,23 @@ class SpotifyLiveDjService : Service() {
     }
 
     private suspend fun runTransition(reason: String) {
-        if (!store.enabled) return
+        // Works in booth mode (Live DJ auto-handoff off) for skip/chat; auto poll only when enabled.
         if (!transitioning.compareAndSet(false, true)) return
         // Capture before clear — Skip + talk sets this; plain skip / natural end do not.
-        val forcedTalk = forceBanter
+        // Master banter switch kills all spoken lines (including forced talk).
+        val forcedTalk = forceBanter && store.banterEnabled
         forceBanter = false
         // Talk-over: when the user allows it, always ride the track (duck volume) —
         // never hard-pause mid-outro. When allowTalkOver is off, pause at the last second.
-        val allowTalk = store.allowTalkOver
+        val allowTalk = store.allowTalkOver && store.banterEnabled
         // Manual skip jumps now; natural ends may hold for banter outro then direct-play.
         val isSkipReason = reason == "skip" || reason == "chat_skip"
         val isIdleKick = reason == "kick_idle" || reason == "idle_advance" || reason == "poll_error_advance"
         val isStuckEnd = reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended" ||
             reason == "near_end_direct"
         // Provisional status; refined after we know next + prefetch below.
-        val banterDueProvisional = forcedTalk || songsSinceBanter + 1 >= banterEvery
+        val banterDueProvisional = store.banterEnabled &&
+            (forcedTalk || songsSinceBanter + 1 >= banterEvery) // countdown or forced
         publish(
             status = when {
                 banterDueProvisional && allowTalk -> "🎙 Prep talkover ($reason)…"
@@ -2236,8 +2357,9 @@ class SpotifyLiveDjService : Service() {
                 invalidateStaleBanterCaches(next?.uri)
 
                 // Plain skip: countdown −1 only. Banter only when due, already
-                // prefetched for next, or Skip + talk forced it.
-                val banterDue = songsSinceBanter + 1 >= banterEvery
+                // prefetched for next, or Skip + talk forced it. Master switch can mute all.
+                val banterDueCountdown = songsSinceBanter + 1 >= banterEvery
+                val banterDue = store.banterEnabled && (forcedTalk || banterDueCountdown)
                 // If research/prefetch is still in flight, wait briefly so we don't
                 // start a second tool-backed research pass mid-outro.
                 if (next != null && (forcedTalk || banterDue) && prefetchingBanter.get()) {
@@ -2259,10 +2381,11 @@ class SpotifyLiveDjService : Service() {
                 // Re-resolve after wait — queue or Spotify may have shifted.
                 next = synchronized(queue) { queue.firstOrNull() }
                 invalidateStaleBanterCaches(next?.uri)
-                val banterReady = next != null &&
-                    prefetchedForUri == next.uri &&
+                val banterReady = store.banterEnabled &&
+                    next != null &&
+                    prefetchedForUri == next?.uri &&
                     !prefetchedBanter.isNullOrBlank()
-                val wantBanter = forcedTalk || banterDue || banterReady
+                val wantBanter = store.banterEnabled && (forcedTalk || banterDueCountdown || banterReady)
                 val talkover = wantBanter && allowTalk
 
                 if (wantBanter) {
@@ -2536,7 +2659,6 @@ class SpotifyLiveDjService : Service() {
      * no banter / talk for this change.
      */
     private suspend fun jumpToQueueTrack(trackUri: String, queueIndex: Int) {
-        if (!store.enabled) return
         if (!transitioning.compareAndSet(false, true)) {
             publish(status = "Busy — try again in a moment", persist = false)
             return
@@ -4661,6 +4783,7 @@ class SpotifyLiveDjService : Service() {
                 banterMin = store.banterMin,
                 banterMax = store.banterMax,
                 allowTalkOver = store.allowTalkOver,
+                banterEnabled = store.banterEnabled,
                 resumeAfterRestart = store.resumeAfterRestart,
             ),
         )
@@ -4798,6 +4921,8 @@ class SpotifyLiveDjService : Service() {
         const val ACTION_DJ_NEW_QUEUE = "io.grokify.os.SPOTIFY_DJ_NEW_QUEUE"
         const val ACTION_DJ_REMOVE_TRACK = "io.grokify.os.SPOTIFY_DJ_REMOVE_TRACK"
         const val ACTION_DJ_PLAY_FROM_QUEUE = "io.grokify.os.SPOTIFY_DJ_PLAY_FROM_QUEUE"
+        /** Direct-play a URI from chat history (no queue membership required). */
+        const val ACTION_DJ_PLAY_URI = "io.grokify.os.SPOTIFY_DJ_PLAY_URI"
         const val ACTION_DJ_PAUSE_TOGGLE = "io.grokify.os.SPOTIFY_DJ_PAUSE_TOGGLE"
         const val ACTION_DJ_PREVIOUS = "io.grokify.os.SPOTIFY_DJ_PREVIOUS"
         const val ACTION_DJ_SYNC_SPOTIFY = "io.grokify.os.SPOTIFY_DJ_SYNC_SPOTIFY"
@@ -4807,6 +4932,12 @@ class SpotifyLiveDjService : Service() {
         const val EXTRA_CHAT_TEXT = "chat_text"
         const val EXTRA_TRACK_URI = "track_uri"
         const val EXTRA_QUEUE_INDEX = "queue_index"
+        const val EXTRA_TRACK_NAME = "track_name"
+        const val EXTRA_TRACK_ARTISTS = "track_artists"
+        const val EXTRA_ALBUM_ART = "album_art"
+        const val EXTRA_ARTIST_ART = "artist_art"
+        const val EXTRA_ALBUM_URI = "album_uri"
+        const val EXTRA_ARTIST_URI = "artist_uri"
     }
 }
 
