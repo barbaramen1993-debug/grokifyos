@@ -232,14 +232,98 @@ class BtSightingStore(context: Context) {
             lastSeenMs = System.currentTimeMillis(),
             firstSighting = first,
         )
-        val o = JSONObject()
-            .put("name", next.name)
-            .put("count", next.count)
-            .put("lastSeenMs", next.lastSeenMs)
-        next.lat?.let { o.put("lat", it) }
-        next.lon?.let { o.put("lon", it) }
-        prefs.edit().putString(key(address), o.toString()).apply()
+        writeEntry(next)
         return next
+    }
+
+    /**
+     * Update GPS / name for an already-seen address without bumping [Entry.count].
+     * Used when the first BLE hit arrived before a GPS fix was available.
+     */
+    fun updateLocation(address: String, name: String, gps: GpsFix): Entry? {
+        if (!gps.lat.isFinite() || !gps.lon.isFinite()) return null
+        val prev = get(address) ?: return null
+        val next = prev.copy(
+            name = name.ifBlank { prev.name },
+            lat = gps.lat,
+            lon = gps.lon,
+            lastSeenMs = System.currentTimeMillis().coerceAtLeast(prev.lastSeenMs),
+            firstSighting = false,
+        )
+        writeEntry(next)
+        return next
+    }
+
+    private fun writeEntry(entry: Entry) {
+        val o = JSONObject()
+            .put("name", entry.name)
+            .put("count", entry.count)
+            .put("lastSeenMs", entry.lastSeenMs)
+        entry.lat?.let { o.put("lat", it) }
+        entry.lon?.let { o.put("lon", it) }
+        // commit() so a quick leave/kill after scan does not drop the write.
+        prefs.edit().putString(key(entry.address), o.toString()).commit()
+    }
+
+    /** Persist recent scan snapshots across app restarts (max 20). */
+    fun saveHistory(snaps: List<BtScanSnapshot>) {
+        val arr = JSONArray()
+        snaps.take(20).forEach { snap ->
+            arr.put(btSnapshotToJson(snap))
+        }
+        prefs.edit().putString(KEY_HISTORY, arr.toString()).commit()
+    }
+
+    fun loadHistory(): List<BtScanSnapshot> {
+        val raw = prefs.getString(KEY_HISTORY, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    btSnapshotFromJson(o)?.let { add(it) }
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** Last live results so reopening the app still shows the previous scan. */
+    fun saveLastResults(devices: List<BtDevice>, gps: GpsFix?) {
+        val o = JSONObject()
+            .put("atMs", System.currentTimeMillis())
+            .put("devices", btDevicesToJson(devices))
+        if (gps != null) {
+            o.put(
+                "gps",
+                JSONObject()
+                    .put("lat", gps.lat)
+                    .put("lon", gps.lon)
+                    .put("accuracyM", gps.accuracyM.toDouble())
+                    .put("atMs", gps.atMs),
+            )
+        }
+        prefs.edit().putString(KEY_LAST_RESULTS, o.toString()).commit()
+    }
+
+    fun loadLastResults(): Pair<List<BtDevice>, GpsFix?>? {
+        val raw = prefs.getString(KEY_LAST_RESULTS, null) ?: return null
+        return runCatching {
+            val o = JSONObject(raw)
+            val devices = btDevicesFromJson(o.optJSONArray("devices"))
+            if (devices.isEmpty()) return@runCatching null
+            val gpsObj = o.optJSONObject("gps")
+            val gps = if (gpsObj != null) {
+                GpsFix(
+                    lat = gpsObj.optDouble("lat"),
+                    lon = gpsObj.optDouble("lon"),
+                    accuracyM = gpsObj.optDouble("accuracyM", -1.0).toFloat(),
+                    atMs = gpsObj.optLong("atMs", 0L),
+                ).takeIf { it.lat.isFinite() && it.lon.isFinite() }
+            } else {
+                null
+            }
+            devices to gps
+        }.getOrNull()
     }
 
     fun nearbyAlertsEnabled(): Boolean = prefs.getBoolean(KEY_ALERTS, false)
@@ -376,8 +460,111 @@ class BtSightingStore(context: Context) {
         private const val KEY_ALERT_WATCHED = "alert_watched"
         private const val KEY_WATCHES = "alert_watches"
         private const val KEY_SORT = "sort_mode"
+        private const val KEY_HISTORY = "scan_history_json"
+        private const val KEY_LAST_RESULTS = "last_results_json"
         private fun key(address: String) = "dev_${address.lowercase(Locale.US)}"
     }
+}
+
+private fun btDevicesToJson(devices: List<BtDevice>): JSONArray {
+    val arr = JSONArray()
+    devices.forEach { d ->
+        val o = JSONObject()
+            .put("name", d.name)
+            .put("address", d.address)
+            .put("rssi", d.rssi)
+            .put("radio", d.radio.name)
+            .put("deviceClassLabel", d.deviceClassLabel)
+            .put("bondLabel", d.bondLabel)
+            .put("services", d.services)
+            .put("manufacturer", d.manufacturer)
+            .put("seenAtMs", d.seenAtMs)
+            .put("seenCount", d.seenCount)
+            .put("firstSighting", d.firstSighting)
+        d.distanceM?.let { o.put("distanceM", it) }
+        d.lat?.let { o.put("lat", it) }
+        d.lon?.let { o.put("lon", it) }
+        arr.put(o)
+    }
+    return arr
+}
+
+private fun btDevicesFromJson(arr: JSONArray?): List<BtDevice> {
+    if (arr == null) return emptyList()
+    return buildList {
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val address = o.optString("address", "").trim()
+            if (address.isEmpty()) continue
+            val radio = runCatching {
+                BtRadioKind.valueOf(o.optString("radio", BtRadioKind.BLE.name))
+            }.getOrDefault(BtRadioKind.BLE)
+            add(
+                BtDevice(
+                    name = o.optString("name", "(unnamed)"),
+                    address = address,
+                    rssi = o.optInt("rssi", -100),
+                    radio = radio,
+                    deviceClassLabel = o.optString("deviceClassLabel", ""),
+                    bondLabel = o.optString("bondLabel", ""),
+                    services = o.optString("services", ""),
+                    manufacturer = o.optString("manufacturer", ""),
+                    seenAtMs = o.optLong("seenAtMs", 0L),
+                    distanceM = if (o.has("distanceM") && !o.isNull("distanceM")) {
+                        o.optDouble("distanceM")
+                    } else {
+                        null
+                    },
+                    seenCount = o.optInt("seenCount", 1),
+                    firstSighting = o.optBoolean("firstSighting", false),
+                    lat = if (o.has("lat") && !o.isNull("lat")) o.optDouble("lat") else null,
+                    lon = if (o.has("lon") && !o.isNull("lon")) o.optDouble("lon") else null,
+                ),
+            )
+        }
+    }
+}
+
+private fun btSnapshotToJson(snap: BtScanSnapshot): JSONObject {
+    val o = JSONObject()
+        .put("id", snap.id)
+        .put("atMs", snap.atMs)
+        .put("devices", btDevicesToJson(snap.devices))
+    snap.gps?.let { g ->
+        o.put(
+            "gps",
+            JSONObject()
+                .put("lat", g.lat)
+                .put("lon", g.lon)
+                .put("accuracyM", g.accuracyM.toDouble())
+                .put("atMs", g.atMs),
+        )
+    }
+    return o
+}
+
+private fun btSnapshotFromJson(o: JSONObject): BtScanSnapshot? {
+    val devices = btDevicesFromJson(o.optJSONArray("devices"))
+    val id = o.optLong("id", 0L)
+    val atMs = o.optLong("atMs", id)
+    if (id == 0L && devices.isEmpty()) return null
+    val gpsObj = o.optJSONObject("gps")
+    val gps = if (gpsObj != null) {
+        GpsFix(
+            lat = gpsObj.optDouble("lat"),
+            lon = gpsObj.optDouble("lon"),
+            accuracyM = gpsObj.optDouble("accuracyM", -1.0).toFloat(),
+            atMs = gpsObj.optLong("atMs", atMs),
+        ).takeIf { it.lat.isFinite() && it.lon.isFinite() }
+    } else {
+        null
+    }
+    return BtScanSnapshot(
+        id = if (id != 0L) id else atMs,
+        atMs = atMs,
+        devices = devices,
+        gps = gps,
+    )
 }
 
 fun sortBtList(list: List<BtDevice>, mode: BtSortMode): List<BtDevice> = when (mode) {
@@ -721,8 +908,43 @@ class BtLiveScanSession(
                 existing.lon = entry.lon ?: existing.lon
                 existing.recorded = true
             } else if (gps != null) {
+                // Prefer live GPS; backfill store when first record had no fix yet.
+                val needStoreGps = existing.lat == null || existing.lon == null
                 existing.lat = existing.lat ?: gps.lat
                 existing.lon = existing.lon ?: gps.lon
+                if (needStoreGps && existing.recorded) {
+                    store.updateLocation(address, existing.name, gps)
+                }
+            }
+        }
+    }
+
+    /** Attach GPS to in-memory devices + persisted ledger (e.g. fix arrived mid-scan). */
+    fun applyGpsToAll(gps: GpsFix?) {
+        if (gps == null || !gps.lat.isFinite() || !gps.lon.isFinite()) return
+        for (m in map.values) {
+            val missing = m.lat == null || m.lon == null
+            m.lat = m.lat ?: gps.lat
+            m.lon = m.lon ?: gps.lon
+            if (missing && m.recorded) {
+                store.updateLocation(m.address, m.name, gps)
+            }
+        }
+    }
+
+    /** Ensure every recorded device in this session is written with the best known GPS. */
+    fun flushLocations(gps: GpsFix?) {
+        if (gps == null || !gps.lat.isFinite() || !gps.lon.isFinite()) return
+        for (m in map.values) {
+            if (!m.recorded) continue
+            m.lat = m.lat ?: gps.lat
+            m.lon = m.lon ?: gps.lon
+            if (m.lat != null && m.lon != null) {
+                store.updateLocation(
+                    m.address,
+                    m.name,
+                    GpsFix(m.lat!!, m.lon!!, gps.accuracyM, gps.atMs),
+                )
             }
         }
     }
@@ -774,16 +996,22 @@ fun BluetoothScannerPane(
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
 
     var scanning by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf("Tap Scan to discover nearby Bluetooth / BLE devices") }
-    var results by remember { mutableStateOf<List<BtDevice>>(emptyList()) }
-    var history by remember { mutableStateOf<List<BtScanSnapshot>>(emptyList()) }
+    var status by remember {
+        mutableStateOf("Tap Scan to discover nearby Bluetooth / BLE devices")
+    }
+    // Restore last scan + history so leaving the app does not wipe results.
+    val restored = remember { store.loadLastResults() }
+    var results by remember { mutableStateOf(restored?.first.orEmpty()) }
+    var history by remember { mutableStateOf(store.loadHistory()) }
     var showHistory by remember { mutableStateOf(false) }
     var viewMode by remember { mutableStateOf("list") }
     var selectedMapId by remember { mutableStateOf<String?>(null) }
     var mapFullscreen by remember { mutableStateOf(false) }
     val mapListState = rememberLazyListState()
-    var lastScanAt by remember { mutableStateOf(0L) }
-    var gps by remember { mutableStateOf<GpsFix?>(null) }
+    var lastScanAt by remember {
+        mutableStateOf(history.firstOrNull()?.atMs ?: 0L)
+    }
+    var gps by remember { mutableStateOf(restored?.second) }
     var sortMode by remember { mutableStateOf(store.sortMode()) }
     var nearbyAlerts by remember { mutableStateOf(store.nearbyAlertsEnabled()) }
     var alertStrong by remember { mutableStateOf(store.alertStrongNearby()) }
@@ -819,6 +1047,8 @@ fun BluetoothScannerPane(
     }
 
     fun finalizeScan(fromUser: Boolean) {
+        // Backfill GPS into the ledger before snapshot so map pins persist.
+        session.flushLocations(gpsState.value)
         val list = session.snapshot(sortModeState.value)
         results = list
         scanning = false
@@ -832,6 +1062,8 @@ fun BluetoothScannerPane(
         if (fromUser || list.isNotEmpty()) {
             history = (listOf(snap) + history).take(20)
             lastScanAt = snap.atMs
+            store.saveHistory(history)
+            store.saveLastResults(list, fix)
         }
         status = if (list.isEmpty()) {
             "Scan finished — no devices (check Bluetooth / permissions)"
@@ -839,9 +1071,11 @@ fun BluetoothScannerPane(
             val near = list.count { it.isNearby() }
             val first = list.count { it.firstSighting }
             val ble = list.count { it.radio == BtRadioKind.BLE || it.radio == BtRadioKind.DUAL }
+            val pinned = list.count { it.lat != null && it.lon != null }
             buildString {
                 append("Found ${list.size} · $ble BLE · $near nearby")
                 if (first > 0) append(" · $first new")
+                if (pinned > 0) append(" · $pinned mapped")
                 append(" · sorted by ${sortModeState.value.label.lowercase()}")
             }
         }
@@ -1033,11 +1267,32 @@ fun BluetoothScannerPane(
         }
     }
 
+    // Surface restored data once on first composition.
+    LaunchedEffect(Unit) {
+        if (results.isNotEmpty()) {
+            val pinned = results.count { it.lat != null && it.lon != null }
+            status = buildString {
+                append("Restored ${results.size} device${if (results.size == 1) "" else "s"}")
+                if (pinned > 0) append(" · $pinned mapped")
+                if (history.isNotEmpty()) append(" · ${history.size} saved scan${if (history.size == 1) "" else "s"}")
+                append(" — tap Scan to refresh")
+            }
+        } else if (history.isNotEmpty()) {
+            status = "${history.size} saved scan${if (history.size == 1) "" else "s"} — tap Scan to refresh"
+        }
+    }
+
     DisposableEffect(Unit) {
         refreshGpsFromCache()
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
-                gps = location.toGpsFixBt()
+                val fix = location.toGpsFixBt()
+                gps = fix
+                // Mid-scan GPS: stamp devices + ledger so pins survive.
+                if (scanningState.value) {
+                    session.applyGpsToAll(fix)
+                    mainHandler.post { if (scanningState.value) publishLive() }
+                }
             }
             @Deprecated("Deprecated in Java")
             override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}

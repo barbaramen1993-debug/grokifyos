@@ -262,8 +262,67 @@ class WifiSightingStore(context: Context) {
             .put("lastSeenMs", next.lastSeenMs)
         next.lat?.let { o.put("lat", it) }
         next.lon?.let { o.put("lon", it) }
-        prefs.edit().putString(key(bssid), o.toString()).apply()
+        // commit() so leave/kill right after a scan does not drop the write.
+        prefs.edit().putString(key(bssid), o.toString()).commit()
         return next
+    }
+
+    /** Persist recent scan snapshots across app restarts (max 20). */
+    fun saveHistory(snaps: List<WifiScanSnapshot>) {
+        val arr = JSONArray()
+        snaps.take(20).forEach { snap -> arr.put(wifiSnapshotToJson(snap)) }
+        prefs.edit().putString(KEY_HISTORY, arr.toString()).commit()
+    }
+
+    fun loadHistory(): List<WifiScanSnapshot> {
+        val raw = prefs.getString(KEY_HISTORY, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    wifiSnapshotFromJson(o)?.let { add(it) }
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun saveLastResults(networks: List<WifiAp>, gps: GpsFix?) {
+        val o = JSONObject()
+            .put("atMs", System.currentTimeMillis())
+            .put("networks", wifiApsToJson(networks))
+        if (gps != null) {
+            o.put(
+                "gps",
+                JSONObject()
+                    .put("lat", gps.lat)
+                    .put("lon", gps.lon)
+                    .put("accuracyM", gps.accuracyM.toDouble())
+                    .put("atMs", gps.atMs),
+            )
+        }
+        prefs.edit().putString(KEY_LAST_RESULTS, o.toString()).commit()
+    }
+
+    fun loadLastResults(): Pair<List<WifiAp>, GpsFix?>? {
+        val raw = prefs.getString(KEY_LAST_RESULTS, null) ?: return null
+        return runCatching {
+            val o = JSONObject(raw)
+            val networks = wifiApsFromJson(o.optJSONArray("networks"))
+            if (networks.isEmpty()) return@runCatching null
+            val gpsObj = o.optJSONObject("gps")
+            val gps = if (gpsObj != null) {
+                GpsFix(
+                    lat = gpsObj.optDouble("lat"),
+                    lon = gpsObj.optDouble("lon"),
+                    accuracyM = gpsObj.optDouble("accuracyM", -1.0).toFloat(),
+                    atMs = gpsObj.optLong("atMs", 0L),
+                ).takeIf { it.lat.isFinite() && it.lon.isFinite() }
+            } else {
+                null
+            }
+            networks to gps
+        }.getOrNull()
     }
 
     fun nearbyAlertsEnabled(): Boolean = prefs.getBoolean(KEY_ALERTS, false)
@@ -406,8 +465,104 @@ class WifiSightingStore(context: Context) {
         private const val KEY_ALERT_WATCHED = "alert_watched"
         private const val KEY_WATCHES = "alert_watches"
         private const val KEY_SORT = "sort_mode"
+        private const val KEY_HISTORY = "scan_history_json"
+        private const val KEY_LAST_RESULTS = "last_results_json"
         private fun key(bssid: String) = "ap_${bssid.lowercase(Locale.US)}"
     }
+}
+
+private fun wifiApsToJson(networks: List<WifiAp>): JSONArray {
+    val arr = JSONArray()
+    networks.forEach { a ->
+        val o = JSONObject()
+            .put("ssid", a.ssid)
+            .put("bssid", a.bssid)
+            .put("level", a.level)
+            .put("frequency", a.frequency)
+            .put("channel", a.channel)
+            .put("capabilities", a.capabilities)
+            .put("seenAtMs", a.seenAtMs)
+            .put("seenCount", a.seenCount)
+            .put("firstSighting", a.firstSighting)
+        a.distanceM?.let { o.put("distanceM", it) }
+        a.lat?.let { o.put("lat", it) }
+        a.lon?.let { o.put("lon", it) }
+        arr.put(o)
+    }
+    return arr
+}
+
+private fun wifiApsFromJson(arr: JSONArray?): List<WifiAp> {
+    if (arr == null) return emptyList()
+    return buildList {
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val bssid = o.optString("bssid", "").trim()
+            if (bssid.isEmpty()) continue
+            add(
+                WifiAp(
+                    ssid = o.optString("ssid", "(hidden)"),
+                    bssid = bssid,
+                    level = o.optInt("level", -100),
+                    frequency = o.optInt("frequency", 0),
+                    channel = o.optInt("channel", 0),
+                    capabilities = o.optString("capabilities", ""),
+                    seenAtMs = o.optLong("seenAtMs", 0L),
+                    distanceM = if (o.has("distanceM") && !o.isNull("distanceM")) {
+                        o.optDouble("distanceM")
+                    } else {
+                        null
+                    },
+                    seenCount = o.optInt("seenCount", 1),
+                    firstSighting = o.optBoolean("firstSighting", false),
+                    lat = if (o.has("lat") && !o.isNull("lat")) o.optDouble("lat") else null,
+                    lon = if (o.has("lon") && !o.isNull("lon")) o.optDouble("lon") else null,
+                ),
+            )
+        }
+    }
+}
+
+private fun wifiSnapshotToJson(snap: WifiScanSnapshot): JSONObject {
+    val o = JSONObject()
+        .put("id", snap.id)
+        .put("atMs", snap.atMs)
+        .put("networks", wifiApsToJson(snap.networks))
+    snap.gps?.let { g ->
+        o.put(
+            "gps",
+            JSONObject()
+                .put("lat", g.lat)
+                .put("lon", g.lon)
+                .put("accuracyM", g.accuracyM.toDouble())
+                .put("atMs", g.atMs),
+        )
+    }
+    return o
+}
+
+private fun wifiSnapshotFromJson(o: JSONObject): WifiScanSnapshot? {
+    val networks = wifiApsFromJson(o.optJSONArray("networks"))
+    val id = o.optLong("id", 0L)
+    val atMs = o.optLong("atMs", id)
+    if (id == 0L && networks.isEmpty()) return null
+    val gpsObj = o.optJSONObject("gps")
+    val gps = if (gpsObj != null) {
+        GpsFix(
+            lat = gpsObj.optDouble("lat"),
+            lon = gpsObj.optDouble("lon"),
+            accuracyM = gpsObj.optDouble("accuracyM", -1.0).toFloat(),
+            atMs = gpsObj.optLong("atMs", atMs),
+        ).takeIf { it.lat.isFinite() && it.lon.isFinite() }
+    } else {
+        null
+    }
+    return WifiScanSnapshot(
+        id = if (id != 0L) id else atMs,
+        atMs = atMs,
+        networks = networks,
+        gps = gps,
+    )
 }
 
 /** Pretty-print MAC if we have 12 hex digits. */
@@ -663,8 +818,9 @@ fun WifiScannerPane(
 
     var scanning by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Tap Scan to discover nearby networks") }
-    var results by remember { mutableStateOf<List<WifiAp>>(emptyList()) }
-    var history by remember { mutableStateOf<List<WifiScanSnapshot>>(emptyList()) }
+    val restored = remember { store.loadLastResults() }
+    var results by remember { mutableStateOf(restored?.first.orEmpty()) }
+    var history by remember { mutableStateOf(store.loadHistory()) }
     var showHistory by remember { mutableStateOf(false) }
     /** list | map | history */
     var viewMode by remember { mutableStateOf("list") }
@@ -673,8 +829,10 @@ fun WifiScannerPane(
     /** Edge-to-edge map; hides chrome + AP list under the map. */
     var mapFullscreen by remember { mutableStateOf(false) }
     val mapListState = rememberLazyListState()
-    var lastScanAt by remember { mutableStateOf(0L) }
-    var gps by remember { mutableStateOf<GpsFix?>(null) }
+    var lastScanAt by remember {
+        mutableStateOf(history.firstOrNull()?.atMs ?: 0L)
+    }
+    var gps by remember { mutableStateOf(restored?.second) }
     var sortMode by remember { mutableStateOf(store.sortMode()) }
     var nearbyAlerts by remember { mutableStateOf(store.nearbyAlertsEnabled()) }
     var alertStrong by remember { mutableStateOf(store.alertStrongNearby()) }
@@ -709,14 +867,18 @@ fun WifiScannerPane(
             )
             history = (listOf(snap) + history).take(20)
             lastScanAt = snap.atMs
+            store.saveHistory(history)
+            store.saveLastResults(list, scanGps)
             status = if (list.isEmpty()) {
                 "Scan finished — no networks (check location/Wi‑Fi permissions)"
             } else {
                 val near = list.count { it.isNearby() }
                 val first = list.count { it.firstSighting }
+                val pinned = list.count { it.lat != null && it.lon != null }
                 buildString {
                     append("Found ${list.size} · $near nearby")
                     if (first > 0) append(" · $first new")
+                    if (pinned > 0) append(" · $pinned mapped")
                     append(" · sorted by ${mode.label.lowercase()}")
                 }
             }
@@ -855,6 +1017,15 @@ fun WifiScannerPane(
             if (cached.isNotEmpty()) {
                 results = cached
                 status = "Cached ${cached.size} network(s) — tap Scan to refresh"
+            } else if (results.isNotEmpty()) {
+                val pinned = results.count { it.lat != null && it.lon != null }
+                status = buildString {
+                    append("Restored ${results.size} network${if (results.size == 1) "" else "s"}")
+                    if (pinned > 0) append(" · $pinned mapped")
+                    append(" — tap Scan to refresh")
+                }
+            } else if (history.isNotEmpty()) {
+                status = "${history.size} saved scan${if (history.size == 1) "" else "s"} — tap Scan to refresh"
             }
         }
         onDispose {

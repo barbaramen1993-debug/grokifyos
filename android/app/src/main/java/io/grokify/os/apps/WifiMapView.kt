@@ -4,9 +4,13 @@ import android.annotation.SuppressLint
 import android.graphics.Color as AndroidColor
 import android.os.Handler
 import android.os.Looper
+import android.view.View
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -29,13 +33,14 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import io.grokify.os.GrokifyApp
+import io.grokify.os.data.ApiKeyIds
 import io.grokify.os.ui.theme.GrokifyColors
+import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -55,6 +60,11 @@ data class WifiMapMarker(
 /**
  * Mapbox GL JS map in a WebView — public token only, no native Maps SDK / secret download token.
  * Dots = Wi‑Fi APs with GPS; color by signal; stacked pins spiderfy in a spiral.
+ *
+ * Notes for Android WebView:
+ * - Do **not** clip the WebView with Compose clip — that blanks WebGL on many devices.
+ * - Map “ready” is driven by JS after style load (not merely HTML onPageFinished).
+ * - Token is resolved from the dedicated Mapbox field **or** the API key vault.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -72,25 +82,38 @@ fun WifiMapView(
     val context = LocalContext.current
     val store = remember { (context.applicationContext as GrokifyApp).tokenStore }
     val vaultToken by store.mapboxAccessTokenFlow.collectAsState(initial = null)
-    val token = vaultToken?.trim().orEmpty()
+    val apiVault by store.apiKeyVaultFlow.collectAsState(initial = emptyMap())
+    // Prefer dedicated field; fall back to vault entry (mirrors Settings / HostApiKeyStore).
+    val token = remember(vaultToken, apiVault) {
+        vaultToken?.trim()?.takeIf { it.isNotEmpty() }
+            ?: apiVault[ApiKeyIds.MAPBOX]?.value?.trim()?.takeIf { it.isNotEmpty() }
+            ?: ""
+    }
     var webView by remember { mutableStateOf<WebView?>(null) }
     var mapReady by remember { mutableStateOf(false) }
     var loadError by remember { mutableStateOf<String?>(null) }
     val onSelectLatest = rememberUpdatedState(onMarkerSelected)
+    val markersLatest = rememberUpdatedState(markers)
+    val userGpsLatest = rememberUpdatedState(userGps)
+    val selectedIdLatest = rememberUpdatedState(selectedId)
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val hasToken = token.isNotEmpty()
 
-    // Rebuild the WebView when the vault token changes.
+    // Tear down WebView when the vault token changes or this composable leaves composition.
     DisposableEffect(token) {
         mapReady = false
         loadError = null
         onDispose {
             webView?.apply {
                 stopLoading()
+                // Detach before destroy to avoid WebView / Chromium leaks.
+                (parent as? ViewGroup)?.removeView(this)
                 loadUrl("about:blank")
+                removeJavascriptInterface("GrokifyWifiMap")
                 destroy()
             }
             webView = null
+            mapReady = false
         }
     }
 
@@ -110,15 +133,16 @@ fun WifiMapView(
     LaunchedEffect(resizeKey, mapReady, framed) {
         val wv = webView ?: return@LaunchedEffect
         if (!mapReady) return@LaunchedEffect
-        // Let Compose finish layout, then tell Mapbox the container size changed.
-        kotlinx.coroutines.delay(80)
-        wv.evaluateJavascript("window.resizeWifiMap && window.resizeWifiMap();", null)
+        // Compose layout + WebGL often need a few frames after attach.
+        repeat(4) { i ->
+            delay(if (i == 0) 50L else 120L)
+            wv.evaluateJavascript("window.resizeWifiMap && window.resizeWifiMap();", null)
+        }
     }
 
+    // Rounded chrome without clipping the WebView (clip blanks WebGL on many OEMs).
     val chrome = if (framed) {
-        Modifier
-            .clip(RoundedCornerShape(12.dp))
-            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
+        Modifier.border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
     } else {
         Modifier
     }
@@ -126,7 +150,7 @@ fun WifiMapView(
     Box(
         modifier
             .then(chrome)
-            .background(GrokifyColors.Panel),
+            .background(GrokifyColors.Panel, if (framed) RoundedCornerShape(12.dp) else RoundedCornerShape(0.dp)),
     ) {
         if (!hasToken) {
             Text(
@@ -147,15 +171,39 @@ fun WifiMapView(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                             )
                             setBackgroundColor(AndroidColor.parseColor("#0B1220"))
+                            // Hardware layer required for Mapbox GL / WebGL reliability.
+                            setLayerType(View.LAYER_TYPE_HARDWARE, null)
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
                             settings.cacheMode = WebSettings.LOAD_DEFAULT
                             settings.allowFileAccess = false
                             settings.allowContentAccess = false
                             settings.mediaPlaybackRequiresUserGesture = true
-                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                            settings.loadsImagesAutomatically = true
+                            settings.blockNetworkImage = false
+                            settings.blockNetworkLoads = false
+                            // Prefer desktop-ish UA bits so Mapbox serves modern GL bundle paths.
+                            settings.userAgentString = settings.userAgentString + " GrokifyOSMap/1"
                             overScrollMode = WebView.OVER_SCROLL_NEVER
-                            webChromeClient = WebChromeClient()
+                            isVerticalScrollBarEnabled = false
+                            isHorizontalScrollBarEnabled = false
+                            webChromeClient = object : WebChromeClient() {
+                                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                                    val msg = consoleMessage?.message().orEmpty()
+                                    if (msg.contains("error", ignoreCase = true) ||
+                                        msg.contains("failed", ignoreCase = true) ||
+                                        msg.contains("unauthorized", ignoreCase = true)
+                                    ) {
+                                        mainHandler.post {
+                                            if (loadError == null && !mapReady) {
+                                                loadError = msg.take(120)
+                                            }
+                                        }
+                                    }
+                                    return super.onConsoleMessage(consoleMessage)
+                                }
+                            }
                             addJavascriptInterface(
                                 object {
                                     @JavascriptInterface
@@ -164,15 +212,58 @@ fun WifiMapView(
                                             onSelectLatest.value(id)
                                         }
                                     }
+
+                                    @JavascriptInterface
+                                    fun onMapReady() {
+                                        mainHandler.post {
+                                            mapReady = true
+                                            loadError = null
+                                            val wv = webView ?: return@post
+                                            pushMarkers(
+                                                wv,
+                                                markersLatest.value,
+                                                userGpsLatest.value,
+                                                selectedIdLatest.value,
+                                            )
+                                            wv.evaluateJavascript(
+                                                "window.resizeWifiMap && window.resizeWifiMap();",
+                                                null,
+                                            )
+                                        }
+                                    }
+
+                                    @JavascriptInterface
+                                    fun onMapError(message: String?) {
+                                        mainHandler.post {
+                                            loadError = message?.take(160)
+                                                ?: "Map failed to load"
+                                        }
+                                    }
                                 },
                                 "GrokifyWifiMap",
                             )
                             webViewClient = object : WebViewClient() {
                                 override fun onPageFinished(view: WebView?, url: String?) {
                                     super.onPageFinished(view, url)
-                                    if (url != null && url != "about:blank") {
-                                        mapReady = true
-                                        pushMarkers(view ?: return, markers, userGps, selectedId)
+                                    // Do not mark ready here — Mapbox style load is async.
+                                    // Nudge resize once HTML/CSS have dimensions.
+                                    view?.post {
+                                        view.evaluateJavascript(
+                                            "window.resizeWifiMap && window.resizeWifiMap();",
+                                            null,
+                                        )
+                                    }
+                                }
+
+                                override fun onReceivedError(
+                                    view: WebView?,
+                                    request: WebResourceRequest?,
+                                    error: WebResourceError?,
+                                ) {
+                                    // Only surface main-frame failures (CDN tile blips are noisy).
+                                    if (request?.isForMainFrame == true) {
+                                        loadError = error?.description?.toString()
+                                            ?: "Map failed to load"
                                     }
                                 }
 
@@ -187,7 +278,7 @@ fun WifiMapView(
                                 }
                             }
                             loadDataWithBaseURL(
-                                "https://api.mapbox.com",
+                                "https://api.mapbox.com/",
                                 buildMapHtml(token),
                                 "text/html",
                                 "UTF-8",
@@ -196,21 +287,29 @@ fun WifiMapView(
                             webView = this
                         }
                     },
-                    update = { /* markers / selection via LaunchedEffect */ },
+                    update = { view ->
+                        // Keep reference if Compose reuses the view.
+                        webView = view
+                        if (mapReady) {
+                            pushMarkers(view, markers, userGps, selectedId)
+                        }
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
             }
 
             if (markers.isEmpty()) {
                 Text(
-                    "No GPS-tagged APs yet — scan with location on",
+                    "No GPS-tagged pins yet — scan with location on",
                     color = GrokifyColors.TextMuted,
                     fontSize = 12.sp,
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(10.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(GrokifyColors.Panel.copy(alpha = 0.92f))
+                        .background(
+                            GrokifyColors.Panel.copy(alpha = 0.92f),
+                            RoundedCornerShape(8.dp),
+                        )
                         .padding(horizontal = 10.dp, vertical = 6.dp),
                 )
             }
@@ -222,7 +321,12 @@ fun WifiMapView(
                     fontSize = 11.sp,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(8.dp),
+                        .padding(8.dp)
+                        .background(
+                            GrokifyColors.Panel.copy(alpha = 0.94f),
+                            RoundedCornerShape(8.dp),
+                        )
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
                 )
             }
         }
@@ -237,6 +341,7 @@ private fun pushMarkers(
 ) {
     val features = JSONArray()
     markers.forEach { m ->
+        if (!m.lat.isFinite() || !m.lon.isFinite()) return@forEach
         val props = JSONObject()
             .put("id", m.id)
             .put("ssid", m.ssid)
@@ -277,7 +382,7 @@ private fun pushMarkers(
         .put("type", "FeatureCollection")
         .put("features", features)
 
-    val userJson = if (userGps != null) {
+    val userJson = if (userGps != null && userGps.lat.isFinite() && userGps.lon.isFinite()) {
         JSONObject()
             .put("lat", userGps.lat)
             .put("lon", userGps.lon)
@@ -293,7 +398,12 @@ private fun pushMarkers(
 }
 
 private fun buildMapHtml(accessToken: String): String {
-    val tokenEsc = accessToken.replace("\\", "\\\\").replace("'", "\\'")
+    // Strip any accidental whitespace / newlines that would break the JS string.
+    val cleaned = accessToken.replace(Regex("\\s+"), "")
+    val tokenEsc = cleaned
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\"", "\\\"")
     return """
 <!DOCTYPE html>
 <html>
@@ -316,21 +426,57 @@ private fun buildMapHtml(accessToken: String): String {
   .t { font-weight: 650; color: #F1F5F9; margin-bottom: 2px; }
   .m { color: #94A3B8; font-family: ui-monospace, monospace; font-size: 11px; }
   .s { color: #22D3EE; margin-top: 4px; }
+  #boot {
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    color:#94A3B8; font: 13px/1.4 system-ui, sans-serif; pointer-events:none; z-index:2;
+  }
 </style>
 </head>
 <body>
 <div id="map"></div>
+<div id="boot">Loading map…</div>
 <script>
+(function() {
+function reportError(msg) {
+  try { GrokifyWifiMap.onMapError(String(msg || 'Map error')); } catch (e) {}
+  var b = document.getElementById('boot');
+  if (b) { b.textContent = String(msg || 'Map failed'); b.style.color = '#FB7185'; }
+}
+function hideBoot() {
+  var b = document.getElementById('boot');
+  if (b) b.style.display = 'none';
+}
+
+if (typeof mapboxgl === 'undefined') {
+  reportError('Mapbox GL failed to load (network / WebView)');
+  return;
+}
+
 mapboxgl.accessToken = '$tokenEsc';
-const map = new mapboxgl.Map({
-  container: 'map',
-  style: 'mapbox://styles/mapbox/dark-v11',
-  center: [-98.0, 39.5],
-  zoom: 3,
-  attributionControl: true,
-  logoPosition: 'bottom-left'
-});
+var map;
+try {
+  map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/mapbox/dark-v11',
+    center: [-98.0, 39.5],
+    zoom: 3,
+    attributionControl: true,
+    logoPosition: 'bottom-left',
+    failIfMajorPerformanceCaveat: false,
+    preserveDrawingBuffer: true
+  });
+} catch (err) {
+  reportError(err && err.message ? err.message : err);
+  return;
+}
 map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'top-right');
+
+map.on('error', function(e) {
+  var msg = (e && e.error && e.error.message) ? e.error.message
+    : (e && e.message) ? e.message : 'Map style error';
+  // Token / style failures are fatal for first paint.
+  if (!ready) reportError(msg);
+});
 
 let popup = new mapboxgl.Popup({ closeButton: true, maxWidth: '240px' });
 let ready = false;
@@ -623,11 +769,19 @@ map.on('load', () => {
   map.on('mouseleave', 'aps-dots', () => { map.getCanvas().style.cursor = ''; });
 
   ready = true;
+  hideBoot();
+  try { map.resize(); } catch (e) {}
+  try { GrokifyWifiMap.onMapReady(); } catch (err) {}
   if (pending) {
     applyData(pending.fc, pending.user, pending.sel);
     pending = null;
   }
 });
+
+// Timeout if style never loads (bad token / offline).
+setTimeout(function() {
+  if (!ready) reportError('Map timed out — check Mapbox token & network');
+}, 15000);
 
 function esc(s) {
   return String(s)
@@ -754,11 +908,16 @@ window.selectWifiAp = function(id) {
 };
 
 window.resizeWifiMap = function() {
-  try { map.resize(); } catch (e) {}
+  try {
+    map.resize();
+    // Second pass after layout settles (Compose weight/fullscreen transitions).
+    setTimeout(function() { try { map.resize(); } catch (e2) {} }, 80);
+  } catch (e) {}
 };
 window.addEventListener('resize', function() {
   try { map.resize(); } catch (e) {}
 });
+})();
 </script>
 </body>
 </html>
