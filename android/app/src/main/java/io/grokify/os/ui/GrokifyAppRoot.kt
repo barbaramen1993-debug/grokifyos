@@ -127,9 +127,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.os.SystemClock
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -252,6 +254,8 @@ fun GrokifyAppRoot(
     var tab by remember { mutableIntStateOf(1) } // default Chat
     /** null = Apps hub; else built-in mini-app id. */
     var appsScreen by remember { mutableStateOf<String?>(null) }
+    /** For double-tap Apps tab → leave inner app and show the Apps hub. */
+    var lastAppsTabTapMs by remember { mutableLongStateOf(0L) }
     var tokenDraft by remember { mutableStateOf(state.token) }
     var chatDraft by remember { mutableStateOf("") }
     var renameOpen by remember { mutableStateOf(false) }
@@ -390,9 +394,16 @@ fun GrokifyAppRoot(
                         NavigationBarItem(
                             selected = !state.showSettings && tab == 2,
                             onClick = {
+                                val now = SystemClock.elapsedRealtime()
+                                val doubleTap = now - lastAppsTabTapMs < 450L
+                                lastAppsTabTapMs = now
                                 tab = 2
                                 onCloseSettings()
                                 onSetPanel(ChatPanel.None)
+                                // Double-tap Apps while in an inner app → Apps hub.
+                                if (doubleTap && appsScreen != null) {
+                                    appsScreen = null
+                                }
                             },
                             icon = { Icon(Icons.Default.Apps, null) },
                             label = { Text("Apps", fontSize = 11.sp) },

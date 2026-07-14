@@ -958,6 +958,12 @@ class SpotifyLiveDjService : Service() {
     private var handoffLaunchedForUri: String? = null
     private var wasPlaying = false
     /**
+     * When true, Live DJ must not auto-speak or auto-advance.
+     * Set on mid-track pause, user pause, or empty player after a pause / non-end drop.
+     * Cleared when Spotify is playing again or the user explicitly skips/plays.
+     */
+    private var autoHandoffHeld = false
+    /**
      * Optional one-shot banter from AI queue-shape (fill).
      * **Must** be paired with [pendingBanterForUri] — never speak it for a different next cut.
      */
@@ -1355,26 +1361,54 @@ class SpotifyLiveDjService : Service() {
         stopSelf()
     }
 
+    private fun holdAutoHandoff(reason: String) {
+        if (!autoHandoffHeld) {
+            Log.i(TAG, "auto-handoff held ($reason)")
+        }
+        autoHandoffHeld = true
+        idlePolls = 0
+        stuckEndPolls = 0
+        nearEndArmed = false
+    }
+
+    private fun releaseAutoHandoff(reason: String) {
+        if (autoHandoffHeld) {
+            Log.i(TAG, "auto-handoff released ($reason)")
+        }
+        autoHandoffHeld = false
+    }
+
     /**
-     * If Spotify has nothing active and we have a radio queue, start the next cut.
-     * Fixes leave/return where the booth still has songs but the player is idle.
+     * On service start: only nudge a cut that is stuck finished (paused at ~0 remain).
+     * Mid-track pause and empty player must not auto-speak / auto-play — that used to
+     * fire after a long pause when Spotify cleared currently-playing.
      */
     private fun kickIfIdle() {
-        if (transitioning.get() || queue.isEmpty()) return
+        if (transitioning.get() || queue.isEmpty() || autoHandoffHeld) return
         val res = spotifyGet("/v1/me/player/currently-playing")
         val data = res.json
         val hasItem = data != null && data.has("item") && !data.isNull("item")
         val playing = data?.optBoolean("is_playing", false) == true
-        if (hasItem && playing) return
+        if (hasItem && playing) {
+            releaseAutoHandoff("kick_playing")
+            return
+        }
         if (hasItem && !playing) {
             val item = data!!.optJSONObject("item")
             val duration = item?.optLong("duration_ms", 0L) ?: 0L
             val progress = data.optLong("progress_ms", 0L)
             val remain = if (duration > 0) duration - progress else 0L
-            // Mid-track pause — don't steal control
-            if (duration > 0 && remain > 5_000L && progress > 2_000L) return
+            // Truly stuck at end — safe to advance once.
+            if (duration > 0 && remain <= 2_500L) {
+                scope.launch { runTransition("kick_idle") }
+                return
+            }
+            // Mid-track / unknown pause — wait for the user to press play.
+            holdAutoHandoff("kick_paused remain=${remain}ms")
+            return
         }
-        scope.launch { runTransition("kick_idle") }
+        // Nothing on the player — do not invent a next track.
+        holdAutoHandoff("kick_empty")
     }
 
     private fun pollOnce() {
@@ -1389,10 +1423,15 @@ class SpotifyLiveDjService : Service() {
         val res = spotifyGet("/v1/me/player/currently-playing")
         // 204 = nothing playing
         if (!res.ok && res.status != 204) {
-            // 401/403 etc. — still try to keep going if we can
+            // 401/403 etc. — never auto-play through API errors while held / paused.
             publish(status = res.error ?: "Player poll failed", error = res.error)
             idlePolls++
-            if (idlePolls >= 3 && queue.isNotEmpty() && !transitioning.get()) {
+            val mayAdvanceOnError = !autoHandoffHeld &&
+                wasPlaying &&
+                lastRemainMs <= 8_000L &&
+                queue.isNotEmpty() &&
+                !transitioning.get()
+            if (mayAdvanceOnError && idlePolls >= 3) {
                 idlePolls = 0
                 scope.launch { runTransition("poll_error_advance") }
             }
@@ -1400,6 +1439,34 @@ class SpotifyLiveDjService : Service() {
         }
         val data = res.json
         if (data == null || !data.has("item") || data.isNull("item")) {
+            // Natural end: we were playing and remaining time was already low.
+            // Long pause / session drop: Spotify clears currently-playing while mid-cut —
+            // that must NOT banter + play next (was mis-read as idle_advance).
+            val remainBeforeEmpty = lastRemainMs
+            val likelyNaturalEnd = wasPlaying && remainBeforeEmpty <= 8_000L && !autoHandoffHeld
+            if (!likelyNaturalEnd) {
+                holdAutoHandoff(
+                    if (autoHandoffHeld) "empty_while_held"
+                    else "empty_not_near_end remainWas=${remainBeforeEmpty}ms",
+                )
+                wasPlaying = false
+                idlePolls = 0
+                lastRemainMs = 0L
+                val banterHint = " · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
+                store.songsSinceBanter = songsSinceBanter
+                publish(
+                    nowLine = "Nothing playing — Live DJ waiting for play…",
+                    status = if (queue.isEmpty()) {
+                        "Paused · queue empty$banterHint"
+                    } else {
+                        "Paused · ${queue.size} queued$banterHint"
+                    },
+                )
+                if (queue.isEmpty() && !filling.get()) {
+                    scope.launch(Dispatchers.IO) { fillQueue(useAi = store.useAiRank) }
+                }
+                return
+            }
             idlePolls++
             lastRemainMs = 0L
             // Between tracks currently-playing can flash empty briefly after a natural end.
@@ -1413,10 +1480,10 @@ class SpotifyLiveDjService : Service() {
                 else -> 2
             }
             publish(
-                nowLine = if (hadBeenPlaying && idlePolls < gracePolls) {
+                nowLine = if (idlePolls < gracePolls) {
                     "Track ended — starting next from app list…"
                 } else {
-                    "Nothing playing — playing next from app list…"
+                    "Track ended — next from app list…"
                 },
             )
             val shouldAdvance = queue.isNotEmpty() &&
@@ -1429,8 +1496,7 @@ class SpotifyLiveDjService : Service() {
                     runTransition(
                         when {
                             banterDueNow && hadBeenPlaying -> "ended"
-                            hadBeenPlaying -> "stuck_end"
-                            else -> "idle_advance"
+                            else -> "stuck_end"
                         },
                     )
                 }
@@ -1466,6 +1532,14 @@ class SpotifyLiveDjService : Service() {
         val playing = data.optBoolean("is_playing", false)
         val remain = if (duration > 0) (duration - progress).coerceAtLeast(0L) else 999_999L
         val prevRemain = lastRemainMs
+
+        // Resume / hold based on live transport state.
+        if (playing) {
+            releaseAutoHandoff("playing")
+        } else if (duration > 0 && remain > 5_000L) {
+            // User (or Spotify) paused mid-cut — freeze auto handoff + banter.
+            holdAutoHandoff("mid_track_pause remain=${remain}ms")
+        }
 
         val track = DjQueueTrack(
             uri = uri,
@@ -1598,6 +1672,7 @@ class SpotifyLiveDjService : Service() {
             else -> 0L
         }
         if (
+            !autoHandoffHeld &&
             banterDue &&
             banterThreshold > 0L &&
             playing &&
@@ -1618,6 +1693,7 @@ class SpotifyLiveDjService : Service() {
         }
         // Silent: direct-play the next cut in the last second (Spotify has no queue from us).
         if (
+            !autoHandoffHeld &&
             !banterDue &&
             playing &&
             duration > 15_000L &&
@@ -1633,7 +1709,8 @@ class SpotifyLiveDjService : Service() {
             return
         }
         // Stuck at end: same URI paused near 0 — start next ourselves.
-        if (!playing && duration > 0 && remain <= 2_500L && queue.isNotEmpty()) {
+        // Never while auto-handoff is held (user pause / empty session).
+        if (!autoHandoffHeld && !playing && duration > 0 && remain <= 2_500L && queue.isNotEmpty()) {
             stuckEndPolls++
             val canNudge = handoffLaunchedForUri != uri && !transitioning.get()
             if (canNudge && !banterDue && (wasPlaying || stuckEndPolls >= 2)) {
@@ -1660,7 +1737,8 @@ class SpotifyLiveDjService : Service() {
         }
         // Prefetch AI banter early — research (news/shows/facts) needs tool time.
         // Start while plenty of track remains so handoff never blocks on live research.
-        if (playing && banterDue && remain in 18_000L..240_000L) {
+        // Skip while paused so we don't burn AI after a long hold then suddenly speak.
+        if (!autoHandoffHeld && playing && banterDue && remain in 18_000L..240_000L) {
             val peek = synchronized(queue) { queue.firstOrNull() }
             if (peek != null && prefetchedForUri != peek.uri && !prefetchingBanter.get()) {
                 val prevSnap = current
@@ -1672,7 +1750,11 @@ class SpotifyLiveDjService : Service() {
         store.banterEvery = banterEvery
         val banterHint = " · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
         publish(
-            status = if (playing) "Watching playback$banterHint" else "Paused$banterHint · ${queue.size} queued",
+            status = when {
+                playing -> "Watching playback$banterHint"
+                autoHandoffHeld -> "Paused · waiting for play$banterHint · ${queue.size} queued"
+                else -> "Paused$banterHint · ${queue.size} queued"
+            },
         )
         updateNotif(line)
     }
@@ -2299,6 +2381,24 @@ class SpotifyLiveDjService : Service() {
     private suspend fun runTransition(reason: String) {
         // Works in booth mode (Live DJ auto-handoff off) for skip/chat; auto poll only when enabled.
         if (!transitioning.compareAndSet(false, true)) return
+        // Manual user actions always run; automatic idle kicks respect pause hold.
+        val isSkipReason = reason == "skip" || reason == "chat_skip"
+        val isIdleKick = reason == "kick_idle" || reason == "idle_advance" || reason == "poll_error_advance"
+        val isUserForced = isSkipReason ||
+            reason.startsWith("chat_") ||
+            reason == "play_from_queue" ||
+            reason == "play_uri"
+        if (autoHandoffHeld && isIdleKick && !isUserForced) {
+            Log.i(TAG, "skip transition $reason — auto-handoff held (paused / no now playing)")
+            transitioning.set(false)
+            return
+        }
+        if (isUserForced || reason == "near_end" || reason == "near_end_direct" ||
+            reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended"
+        ) {
+            // User skipped/played or natural handoff — leave pause-hold.
+            releaseAutoHandoff("transition:$reason")
+        }
         // Capture before clear — Skip + talk sets this; plain skip / natural end do not.
         // Master banter switch kills all spoken lines (including forced talk).
         val forcedTalk = forceBanter && store.banterEnabled
@@ -2307,8 +2407,6 @@ class SpotifyLiveDjService : Service() {
         // never hard-pause mid-outro. When allowTalkOver is off, pause at the last second.
         val allowTalk = store.allowTalkOver && store.banterEnabled
         // Manual skip jumps now; natural ends may hold for banter outro then direct-play.
-        val isSkipReason = reason == "skip" || reason == "chat_skip"
-        val isIdleKick = reason == "kick_idle" || reason == "idle_advance" || reason == "poll_error_advance"
         val isStuckEnd = reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended" ||
             reason == "near_end_direct"
         // Provisional status; refined after we know next + prefetch below.
@@ -2861,6 +2959,9 @@ class SpotifyLiveDjService : Service() {
         wasPlaying = ok || res.status == 404
         idlePolls = 0
         stuckEndPolls = 0
+        if (ok || res.status == 404) {
+            releaseAutoHandoff("play_track")
+        }
         if (item.uri != lastChatTrackUri) {
             lastChatTrackUri = item.uri
             postTrackMessage(item, playing = ok)
@@ -2889,9 +2990,15 @@ class SpotifyLiveDjService : Service() {
         val res = spotifyPut(path, if (curPlaying) "{}" else "{}")
         if (res.ok || res.status in listOf(202, 204)) {
             wasPlaying = !curPlaying
+            if (curPlaying) {
+                // User paused from the booth — freeze auto banter / next-track.
+                holdAutoHandoff("user_pause_toggle")
+            } else {
+                releaseAutoHandoff("user_play_toggle")
+            }
             current?.uri?.let { updateNowPlayingFlags(it, playing = !curPlaying) }
             publish(
-                status = if (!curPlaying) "Playing" else "Paused",
+                status = if (!curPlaying) "Playing" else "Paused · auto-handoff waiting",
                 nowLine = current?.let { t ->
                     val mark = if (!curPlaying) "▶ " else "⏸ "
                     "$mark${t.name.ifBlank { t.uri }}${if (t.artists.isNotBlank()) " — ${t.artists}" else ""}"
