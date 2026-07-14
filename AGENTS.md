@@ -5,9 +5,7 @@
 After any Android app change the user can install:
 
 1. Bump `versionCode` / `versionName` in `android/app/build.gradle.kts`.
-2. Commit the change(s) with a message that includes the version (e.g. `… (v79)`).
-3. Push to `origin` (`git push origin HEAD`).
-4. Publish the OTA APK so the in-app updater can pick it up:
+2. Publish the OTA APK so the in-app updater can pick it up:
 
 ```bash
 cd android && ./scripts/publish.sh debug --changelog "short notes"
