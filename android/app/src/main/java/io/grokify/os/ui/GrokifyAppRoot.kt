@@ -129,11 +129,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import android.os.SystemClock
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -254,10 +252,8 @@ fun GrokifyAppRoot(
     onSetAppOrder: (List<String>) -> Unit = {},
 ) {
     var tab by remember { mutableIntStateOf(1) } // default Chat
-    /** null = Apps hub; else built-in mini-app id. */
+    /** null = Apps hub; else built-in mini-app id (kept while on other tabs). */
     var appsScreen by remember { mutableStateOf<String?>(null) }
-    /** For double-tap Apps tab → leave inner app and show the Apps hub. */
-    var lastAppsTabTapMs by remember { mutableLongStateOf(0L) }
     var tokenDraft by remember { mutableStateOf(state.token) }
     var chatDraft by remember { mutableStateOf("") }
     var renameOpen by remember { mutableStateOf(false) }
@@ -393,22 +389,49 @@ fun GrokifyAppRoot(
                             label = { Text("Chat", fontSize = 11.sp) },
                             colors = colors,
                         )
+                        // Elsewhere + last app open → show that app's icon/name (resume on tap).
+                        // Inside an app → show Apps so one tap returns to the hub drawer.
+                        val lastAppManifest = appsScreen?.let { id ->
+                            val resolved =
+                                if (id == "spotify_dj") BuiltinPluginCatalog.SPOTIFY_CONTROLLER
+                                else id
+                            BuiltinPluginCatalog.get(resolved)
+                        }
+                        val showLastAppOnTab = tab != 2 && lastAppManifest != null
                         NavigationBarItem(
                             selected = !state.showSettings && tab == 2,
                             onClick = {
-                                val now = SystemClock.elapsedRealtime()
-                                val doubleTap = now - lastAppsTabTapMs < 450L
-                                lastAppsTabTapMs = now
-                                tab = 2
                                 onCloseSettings()
                                 onSetPanel(ChatPanel.None)
-                                // Double-tap Apps while in an inner app → Apps hub.
-                                if (doubleTap && appsScreen != null) {
+                                if (tab == 2 && appsScreen != null) {
+                                    // Viewing an inner app → back to Apps hub.
                                     appsScreen = null
+                                } else {
+                                    // Resume last app (or hub if none).
+                                    tab = 2
                                 }
                             },
-                            icon = { Icon(Icons.Default.Apps, null) },
-                            label = { Text("Apps", fontSize = 11.sp) },
+                            icon = {
+                                Icon(
+                                    if (showLastAppOnTab) {
+                                        pluginIcon(lastAppManifest!!.icon)
+                                    } else {
+                                        Icons.Default.Apps
+                                    },
+                                    contentDescription = null,
+                                )
+                            },
+                            label = {
+                                Text(
+                                    if (showLastAppOnTab) {
+                                        appsNavShortTitle(lastAppManifest!!)
+                                    } else {
+                                        "Apps"
+                                    },
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                )
+                            },
                             colors = colors,
                         )
                         NavigationBarItem(
@@ -4191,6 +4214,16 @@ private fun pluginIcon(key: PluginIconKey): ImageVector = when (key) {
     PluginIconKey.Apps -> Icons.Default.Apps
     PluginIconKey.Extension -> Icons.Default.Extension
     PluginIconKey.Chart -> Icons.Default.BarChart
+}
+
+/** Compact bottom-nav label for a last-opened mini-app (fits under the icon). */
+private fun appsNavShortTitle(app: PluginManifest): String = when (app.id) {
+    BuiltinPluginCatalog.WIFI_SCANNER -> "Wi‑Fi"
+    BuiltinPluginCatalog.BT_SCANNER -> "Bluetooth"
+    BuiltinPluginCatalog.PLACE_NOTES -> "Places"
+    BuiltinPluginCatalog.SPOTIFY_CONTROLLER -> "Spotify"
+    BuiltinPluginCatalog.SPACEXAI_USAGE -> "Usage"
+    else -> app.title.take(12)
 }
 
 @Composable

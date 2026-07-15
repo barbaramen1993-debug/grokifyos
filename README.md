@@ -314,6 +314,28 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.109 — Apps tab: last-app icon & name
+
+- When you’re on **Home / Chat / Update** and a mini-app was last open, the **Apps** tab shows that app’s **icon + short name** (resume on tap).
+- While **inside** a mini-app, the tab switches back to **Apps** (grid) so one tap returns to the hub drawer (replaces double-tap).
+
+### 0.1.108 — Live DJ: more-like-this summary + prompt templates
+
+- **More like this**: sticky “Finding…” indicator clears when done; system chat lists every added track (no talk).
+- **Prompt templates** in Live DJ → Settings: research angles (enable for random pack), behaviors (pick / edit / add custom), plus editable banter / research / chat system prompts with placeholders.
+
+### 0.1.107 — Live DJ: More like this
+
+- **More like this** on current + past chat tracks (and Control transport): same artist top cuts + related-artist radio, **prepended** to UP NEXT so they play next.
+- Listener-attributed queue reason so banter can credit the request correctly.
+
+### 0.1.106 — Live DJ: banter cadence + queue attribution
+
+- **Talk only when due**: prefetched banter no longer forces speech every handoff — countdown / Skip+talk only.
+- **No double-count** on play landing: silent handoffs and late Spotify syncs no longer both increment the banter counter (was accelerating to “every song”).
+- **Who queued it**: DJ radio picks (liked/top/artist/genre) are labeled LIVE DJ; only chat/request cuts count as LISTENER. Prompts forbid “you queued this” on AI-picked tracks.
+- Keep original pool `reason` on AI set picks (don’t overwrite with banter notes that looked like user requests).
+
 ### 0.1.105 — Live DJ chat: like past songs
 
 - **Heart on previously played tracks** in DJ booth chat (not only now-playing) — saves/removes from Spotify Liked Songs.

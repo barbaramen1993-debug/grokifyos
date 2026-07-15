@@ -64,6 +64,7 @@ import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -996,26 +997,7 @@ fun SpotifyControllerPane(
     }
     var authMsg by remember { mutableStateOf(SpotifyOAuth.lastAuthMessage.orEmpty()) }
     var loggedIn by remember { mutableStateOf(SpotifyOAuth.isLoggedIn(appCtx)) }
-    var voiceId by remember { mutableStateOf(djStore.voiceId) }
-    var useAiRank by remember { mutableStateOf(djStore.useAiRank) }
-    var banterMode by remember { mutableStateOf(djStore.banterMode) }
-    var banterFixed by remember { mutableStateOf(djStore.banterFixed) }
-    var banterMin by remember { mutableStateOf(djStore.banterMin) }
-    var banterMax by remember { mutableStateOf(djStore.banterMax) }
-    var allowTalkOver by remember { mutableStateOf(djStore.allowTalkOver) }
-    var banterEnabled by remember { mutableStateOf(djStore.banterEnabled) }
-    var resumeAfterRestart by remember { mutableStateOf(djStore.resumeAfterRestart) }
-    var behaviorMode by remember { mutableStateOf(djStore.behaviorMode) }
-    var selectedGenres by remember { mutableStateOf(djStore.selectedGenres) }
-    var genreBoard by remember { mutableStateOf(djStore.genreBoard) }
-    var listenerCity by remember { mutableStateOf(djStore.listenerCity) }
-    var listenerName by remember { mutableStateOf(djStore.listenerName) }
-    var genreBoardBusy by remember { mutableStateOf(false) }
-    var genreBoardMsg by remember { mutableStateOf<String?>(null) }
-    var nameBusy by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
-    var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
-    var voicePreviewBusy by remember { mutableStateOf(false) }
     var hasXaiKey by remember {
         mutableStateOf(!HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank())
     }
@@ -1028,7 +1010,6 @@ fun SpotifyControllerPane(
     LaunchedEffect(Unit) {
         ensureDjChatHydrated(appCtx)
         maybeResumeLiveDj(appCtx)
-        resumeAfterRestart = djStore.resumeAfterRestart
     }
 
     // Research / build / edit playlist
@@ -1056,6 +1037,21 @@ fun SpotifyControllerPane(
     var trackLiked by remember { mutableStateOf(false) }
     var trackLikedBusy by remember { mutableStateOf(false) }
     var trackLikedMsg by remember { mutableStateOf<String?>(null) }
+
+    // Clear sticky "Finding more like this…" once the service finishes (status / chat).
+    LaunchedEffect(djState.status, djState.messages.lastOrNull()?.id) {
+        val pending = trackLikedMsg?.startsWith("Finding more") == true
+        if (!pending) return@LaunchedEffect
+        val st = djState.status
+        val lastSys = djState.messages.lastOrNull { it.role == DjChatRole.System }?.text.orEmpty()
+        val done = st.startsWith("More like") ||
+            st.contains("More like this failed", ignoreCase = true) ||
+            lastSys.startsWith("More like") ||
+            lastSys.contains("More like this", ignoreCase = true)
+        if (done) {
+            trackLikedMsg = null
+        }
+    }
     var likedCheckUri by remember { mutableStateOf("") }
     /** Spotify track-id → in Liked Songs (chat history hearts). */
     var likedByTrackId by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
@@ -1211,35 +1207,13 @@ fun SpotifyControllerPane(
         onDispose { }
     }
 
-    // Keep local settings mirrors in sync with bus / store
-    LaunchedEffect(
-        djState.selectedGenres,
-        djState.genreBoard,
-        djState.behaviorMode,
-        djState.listenerCity,
-        djState.listenerName,
-    ) {
-        selectedGenres = djState.selectedGenres.ifEmpty { djStore.selectedGenres }
-        genreBoard = djState.genreBoard.ifEmpty { djStore.genreBoard }
-        behaviorMode = djState.behaviorMode
-        if (djState.listenerCity.isNotBlank() || listenerCity.isBlank()) {
-            listenerCity = djState.listenerCity.ifBlank { djStore.listenerCity }
-        }
-        if (djState.listenerName.isNotBlank() || listenerName.isBlank()) {
-            listenerName = djState.listenerName.ifBlank { djStore.listenerName }
-        }
-    }
-
-    // One-shot: pull Spotify display_name into settings if name is still empty.
+    // One-shot: pull Spotify display_name if name is still empty (booth settings).
     LaunchedEffect(loggedIn) {
-        if (!loggedIn || djStore.listenerName.isNotBlank() || listenerName.isNotBlank()) return@LaunchedEffect
-        nameBusy = true
+        if (!loggedIn || djStore.listenerName.isNotBlank()) return@LaunchedEffect
         val (pulled, _) = withContext(Dispatchers.IO) {
             fetchSpotifyDisplayName(appCtx)
         }
-        nameBusy = false
         if (!pulled.isNullOrBlank()) {
-            listenerName = pulled
             djStore.listenerName = pulled
             applyDjBanterSettings(appCtx)
         }
@@ -1596,13 +1570,34 @@ fun SpotifyControllerPane(
                                     }
                                 },
                             )
+                            // More like this → prepend same-artist + related to DJ UP NEXT
+                            TransportButton(
+                                icon = Icons.Default.PlaylistAdd,
+                                label = "More",
+                                onClick = {
+                                    val uri = now.trackUri
+                                    if (uri.isBlank() && now.title.isBlank()) return@TransportButton
+                                    trackLikedMsg = "Finding more like this…"
+                                    spotifyLiveDjMoreLikeThis(
+                                        appCtx,
+                                        trackUri = uri,
+                                        name = now.title,
+                                        artists = now.artist,
+                                        artistUri = now.artistUri,
+                                        albumArtUrl = now.albumArtUrl,
+                                    )
+                                },
+                            )
                         }
                         if (!trackLikedMsg.isNullOrBlank() && tab == 0) {
                             Spacer(Modifier.height(6.dp))
                             Text(
                                 trackLikedMsg!!,
-                                color = if (trackLikedMsg!!.startsWith("Saved") ||
-                                    trackLikedMsg!!.startsWith("Removed")
+                                color = if (
+                                    trackLikedMsg!!.startsWith("Saved") ||
+                                    trackLikedMsg!!.startsWith("Removed") ||
+                                    trackLikedMsg!!.startsWith("Finding more") ||
+                                    trackLikedMsg!!.startsWith("More like")
                                 ) {
                                     GrokifyColors.GlowMint
                                 } else {
@@ -2118,6 +2113,7 @@ fun SpotifyControllerPane(
                                         Text(
                                             "Chat, queue, and play work even when Live DJ auto-handoff is off. " +
                                                 "Tracks & banter show here. Heart any cut (now or past) to Liked Songs. " +
+                                                "More like this prepends same-artist + related cuts to UP NEXT. " +
                                                 "Ask for a new queue, top-up, drop songs, or song/artist info. " +
                                                 "Tap ▶ on past songs to replay. Queue tab is the app radio set " +
                                                 "(not Spotify’s Up Next).",
@@ -2205,14 +2201,39 @@ fun SpotifyControllerPane(
                                             artistUri = m.artistUri.orEmpty(),
                                         )
                                     },
+                                    onMoreLikeThis = { m ->
+                                        val uri = m.trackUri.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.trackUri else "" }
+                                        val name = m.trackName.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.title else "" }
+                                        val artists = m.trackArtists.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.artist else "" }
+                                        val aUri = m.artistUri.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.artistUri else "" }
+                                        if (uri.isBlank() && name.isBlank() && artists.isBlank()) {
+                                            return@DjChatBubble
+                                        }
+                                        trackLikedMsg = "Finding more like this…"
+                                        spotifyLiveDjMoreLikeThis(
+                                            appCtx,
+                                            trackUri = uri,
+                                            name = name,
+                                            artists = artists,
+                                            artistUri = aUri,
+                                            albumArtUrl = m.albumArtUrl.orEmpty(),
+                                        )
+                                    },
                                 )
                             }
                         }
                         if (!trackLikedMsg.isNullOrBlank() && tab == 1 && djSubTab == 0) {
                             Text(
                                 trackLikedMsg!!,
-                                color = if (trackLikedMsg!!.startsWith("Saved") ||
-                                    trackLikedMsg!!.startsWith("Removed")
+                                color = if (
+                                    trackLikedMsg!!.startsWith("Saved") ||
+                                    trackLikedMsg!!.startsWith("Removed") ||
+                                    trackLikedMsg!!.startsWith("Finding more") ||
+                                    trackLikedMsg!!.startsWith("More like")
                                 ) {
                                     GrokifyColors.GlowMint
                                 } else {
@@ -2339,7 +2360,7 @@ fun SpotifyControllerPane(
                                 onClick = { spotifyLiveDjSkip(appCtx, forceTalk = true) },
                             ) {
                                 Text(
-                                    if (banterEnabled) "Skip + talk" else "Skip",
+                                    if (djState.banterEnabled) "Skip + talk" else "Skip",
                                     color = GrokifyColors.GlowCyan,
                                     fontSize = 12.sp,
                                 )
@@ -2486,672 +2507,15 @@ fun SpotifyControllerPane(
                     }
 
                     // ── Settings ──────────────────────────────────────────
-                    else -> Column(
-                        Modifier
-                            .weight(1f, fill = true)
-                            .fillMaxWidth()
-                            .verticalScroll(rememberScrollState()),
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(
-                                    "AI rank next tracks",
-                                    color = GrokifyColors.TextPrimary,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                Text(
-                                    "Host Grok shapes the set (optional)",
-                                    color = GrokifyColors.TextDim,
-                                    fontSize = 10.sp,
-                                )
-                            }
-                            Switch(
-                                checked = useAiRank,
-                                onCheckedChange = {
-                                    useAiRank = it
-                                    djStore.useAiRank = it
-                                },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = GrokifyColors.Void,
-                                    checkedTrackColor = GrokifyColors.GlowViolet,
-                                    uncheckedThumbColor = GrokifyColors.TextMuted,
-                                    uncheckedTrackColor = GrokifyColors.PanelSoft,
-                                ),
-                            )
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        Text(
-                            if (hasXaiKey) "Grok Voice · xAI key found" else "Grok Voice · add xAI key or use device TTS",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 11.sp,
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        val voiceScroll = rememberScrollState()
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(voiceScroll),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            GROK_VOICES.forEach { v ->
-                                val selected = voiceId.equals(v.id, ignoreCase = true)
-                                FilterChip(
-                                    selected = selected,
-                                    onClick = {
-                                        voiceId = v.id
-                                        djStore.voiceId = v.id
-                                        voicePreviewMsg = "${v.label} — ${v.tone}"
-                                    },
-                                    label = { Text(v.label, fontSize = 12.sp, maxLines = 1) },
-                                    colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = GrokifyColors.GlowMint.copy(alpha = 0.25f),
-                                        selectedLabelColor = GrokifyColors.GlowMint,
-                                        containerColor = GrokifyColors.PanelSoft,
-                                        labelColor = GrokifyColors.TextPrimary,
-                                    ),
-                                    border = FilterChipDefaults.filterChipBorder(
-                                        enabled = true,
-                                        selected = selected,
-                                        borderColor = GrokifyColors.PanelBorder,
-                                        selectedBorderColor = GrokifyColors.GlowMint,
-                                    ),
-                                )
-                            }
-                        }
-                        if (!voicePreviewMsg.isNullOrBlank()) {
-                            Spacer(Modifier.height(6.dp))
-                            Text(voicePreviewMsg!!, color = GrokifyColors.TextMuted, fontSize = 11.sp)
-                        }
-
-                        Spacer(Modifier.height(16.dp))
-                        Text(
-                            "BEHAVIOR",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = GrokifyColors.GlowMint,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            "How the DJ talks after research & queueing — does not replace research.",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 10.sp,
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        val behaviorScroll = rememberScrollState()
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(behaviorScroll),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            DjBehaviorMode.entries.forEach { mode ->
-                                val selected = behaviorMode == mode
-                                FilterChip(
-                                    selected = selected,
-                                    onClick = {
-                                        behaviorMode = mode
-                                        djStore.behaviorMode = mode
-                                        applyDjBanterSettings(appCtx)
-                                    },
-                                    label = {
-                                        Text(mode.label, fontSize = 12.sp, maxLines = 1)
-                                    },
-                                    colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = GrokifyColors.GlowMint.copy(alpha = 0.25f),
-                                        selectedLabelColor = GrokifyColors.GlowMint,
-                                        containerColor = GrokifyColors.PanelSoft,
-                                        labelColor = GrokifyColors.TextPrimary,
-                                    ),
-                                    border = FilterChipDefaults.filterChipBorder(
-                                        enabled = true,
-                                        selected = selected,
-                                        borderColor = GrokifyColors.PanelBorder,
-                                        selectedBorderColor = GrokifyColors.GlowMint,
-                                    ),
-                                )
-                            }
-                        }
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            behaviorMode.blurb,
-                            color = GrokifyColors.TextMuted,
-                            fontSize = 11.sp,
-                        )
-
-                        Spacer(Modifier.height(16.dp))
-                        Text(
-                            "GENRE BOARD",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = GrokifyColors.GlowCyan,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            "Optional multi-select from genres in your listening history. " +
-                                "Empty = full taste blend. Selected genres bias the radio pool.",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 10.sp,
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            TextButton(
-                                onClick = {
-                                    if (genreBoardBusy) return@TextButton
-                                    genreBoardBusy = true
-                                    genreBoardMsg = null
-                                    scope.launch {
-                                        val (board, err) = withContext(Dispatchers.IO) {
-                                            refreshDjGenreBoard(appCtx)
-                                        }
-                                        genreBoardBusy = false
-                                        if (err != null) {
-                                            genreBoardMsg = err
-                                        } else {
-                                            genreBoard = board
-                                            genreBoardMsg = "Loaded ${board.size} genres from your top artists"
-                                            selectedGenres = djStore.selectedGenres
-                                            applyDjBanterSettings(appCtx)
-                                        }
-                                    }
-                                },
-                                enabled = !genreBoardBusy && loggedIn,
-                            ) {
-                                Text(
-                                    if (genreBoardBusy) "Refreshing…" else "Refresh from my taste",
-                                    fontSize = 12.sp,
-                                    color = GrokifyColors.GlowCyan,
-                                )
-                            }
-                            if (selectedGenres.isNotEmpty()) {
-                                TextButton(
-                                    onClick = {
-                                        selectedGenres = emptyList()
-                                        djStore.selectedGenres = emptyList()
-                                        applyDjBanterSettings(appCtx)
-                                    },
-                                ) {
-                                    Text("Clear", fontSize = 12.sp, color = GrokifyColors.TextDim)
-                                }
-                            }
-                        }
-                        if (!genreBoardMsg.isNullOrBlank()) {
-                            Text(genreBoardMsg!!, color = GrokifyColors.TextMuted, fontSize = 10.sp)
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        val boardChips = remember(genreBoard, selectedGenres) {
-                            (genreBoard + selectedGenres).distinct()
-                        }
-                        if (boardChips.isEmpty()) {
-                            Text(
-                                if (loggedIn) {
-                                    "Tap Refresh to build a board from artists you actually play."
-                                } else {
-                                    "Sign in on Account tab, then refresh the genre board."
-                                },
-                                color = GrokifyColors.TextMuted,
-                                fontSize = 11.sp,
-                            )
-                        } else {
-                            val genreScroll = rememberScrollState()
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(genreScroll),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                boardChips.forEach { g ->
-                                    val on = selectedGenres.any { it.equals(g, ignoreCase = true) }
-                                    FilterChip(
-                                        selected = on,
-                                        onClick = {
-                                            val next = if (on) {
-                                                selectedGenres.filterNot { it.equals(g, ignoreCase = true) }
-                                            } else {
-                                                (selectedGenres + g).distinct().take(MAX_DJ_GENRES)
-                                            }
-                                            selectedGenres = next
-                                            djStore.selectedGenres = next
-                                            applyDjBanterSettings(appCtx)
-                                        },
-                                        label = {
-                                            Text(g, fontSize = 11.sp, maxLines = 1)
-                                        },
-                                        colors = FilterChipDefaults.filterChipColors(
-                                            selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
-                                            selectedLabelColor = GrokifyColors.GlowCyan,
-                                            containerColor = GrokifyColors.PanelSoft,
-                                            labelColor = GrokifyColors.TextPrimary,
-                                        ),
-                                        border = FilterChipDefaults.filterChipBorder(
-                                            enabled = true,
-                                            selected = on,
-                                            borderColor = GrokifyColors.PanelBorder,
-                                            selectedBorderColor = GrokifyColors.GlowCyan,
-                                        ),
-                                    )
-                                }
-                            }
-                            if (selectedGenres.isNotEmpty()) {
-                                Spacer(Modifier.height(4.dp))
-                                Text(
-                                    "Active: ${selectedGenres.joinToString(" · ")}",
-                                    color = GrokifyColors.GlowCyan,
-                                    fontSize = 10.sp,
-                                )
-                            }
-                        }
-
-                        Spacer(Modifier.height(16.dp))
-                        Text(
-                            "YOUR NAME",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = GrokifyColors.GlowMint,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            "How the DJ addresses you on mic. Pulled from Spotify display name " +
-                                "when possible — city is never used as a name.",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 10.sp,
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        OutlinedTextField(
-                            value = listenerName,
-                            onValueChange = { v ->
-                                listenerName = v.take(40)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("Name or nickname", fontSize = 12.sp) },
-                            placeholder = { Text("e.g. Audicle", fontSize = 12.sp) },
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = GrokifyColors.TextPrimary,
-                                unfocusedTextColor = GrokifyColors.TextPrimary,
-                                focusedBorderColor = GrokifyColors.GlowMint,
-                                unfocusedBorderColor = GrokifyColors.PanelBorder,
-                                focusedLabelColor = GrokifyColors.GlowMint,
-                                unfocusedLabelColor = GrokifyColors.TextDim,
-                                cursorColor = GrokifyColors.GlowMint,
-                                focusedPlaceholderColor = GrokifyColors.TextMuted,
-                                unfocusedPlaceholderColor = GrokifyColors.TextMuted,
-                            ),
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            TextButton(
-                                onClick = {
-                                    djStore.listenerName = listenerName.trim()
-                                    listenerName = djStore.listenerName
-                                    applyDjBanterSettings(appCtx)
-                                    genreBoardMsg = if (listenerName.isBlank()) {
-                                        "Name cleared"
-                                    } else {
-                                        "Name set · $listenerName"
-                                    }
-                                },
-                            ) {
-                                Text("Save name", fontSize = 12.sp, color = GrokifyColors.GlowMint)
-                            }
-                            TextButton(
-                                onClick = {
-                                    if (nameBusy) return@TextButton
-                                    nameBusy = true
-                                    genreBoardMsg = null
-                                    scope.launch {
-                                        val (pulled, err) = withContext(Dispatchers.IO) {
-                                            fetchSpotifyDisplayName(appCtx)
-                                        }
-                                        nameBusy = false
-                                        if (err != null && pulled.isNullOrBlank()) {
-                                            genreBoardMsg = err
-                                        } else if (!pulled.isNullOrBlank()) {
-                                            listenerName = pulled
-                                            djStore.listenerName = pulled
-                                            applyDjBanterSettings(appCtx)
-                                            genreBoardMsg = "From Spotify · $pulled"
-                                        } else {
-                                            genreBoardMsg = "No display name on Spotify"
-                                        }
-                                    }
-                                },
-                                enabled = !nameBusy && loggedIn,
-                            ) {
-                                Text(
-                                    if (nameBusy) "Pulling…" else "From Spotify",
-                                    fontSize = 12.sp,
-                                    color = GrokifyColors.GlowCyan,
-                                )
-                            }
-                            if (listenerName.isNotBlank() && listenerName != djStore.listenerName) {
-                                Text("Unsaved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
-                            } else if (djStore.listenerName.isNotBlank()) {
-                                Text("Saved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
-                            }
-                        }
-
-                        Spacer(Modifier.height(16.dp))
-                        Text(
-                            "LOCATION",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = GrokifyColors.GlowViolet,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            "City / metro only — used for local show research & discovery. " +
-                                "Never used as your name on air.",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 10.sp,
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        OutlinedTextField(
-                            value = listenerCity,
-                            onValueChange = { v ->
-                                listenerCity = v.take(80)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("City or metro", fontSize = 12.sp) },
-                            placeholder = { Text("e.g. Aurora, CO / Denver", fontSize = 12.sp) },
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = GrokifyColors.TextPrimary,
-                                unfocusedTextColor = GrokifyColors.TextPrimary,
-                                focusedBorderColor = GrokifyColors.GlowViolet,
-                                unfocusedBorderColor = GrokifyColors.PanelBorder,
-                                focusedLabelColor = GrokifyColors.GlowViolet,
-                                unfocusedLabelColor = GrokifyColors.TextDim,
-                                cursorColor = GrokifyColors.GlowViolet,
-                                focusedPlaceholderColor = GrokifyColors.TextMuted,
-                                unfocusedPlaceholderColor = GrokifyColors.TextMuted,
-                            ),
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            TextButton(
-                                onClick = {
-                                    djStore.listenerCity = listenerCity.trim()
-                                    listenerCity = djStore.listenerCity
-                                    applyDjBanterSettings(appCtx)
-                                    genreBoardMsg = if (listenerCity.isBlank()) {
-                                        "Location cleared"
-                                    } else {
-                                        "Location set · $listenerCity"
-                                    }
-                                },
-                            ) {
-                                Text("Save location", fontSize = 12.sp, color = GrokifyColors.GlowViolet)
-                            }
-                            if (listenerCity.isNotBlank() && listenerCity != djStore.listenerCity) {
-                                Text("Unsaved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
-                            } else if (djStore.listenerCity.isNotBlank()) {
-                                Text("Saved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
-                            }
-                        }
-
-                        Spacer(Modifier.height(14.dp))
-                        Text(
-                            "BANTER",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = GrokifyColors.GlowViolet,
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(
-                                    "Spoken banter",
-                                    color = GrokifyColors.TextPrimary,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                Text(
-                                    if (banterEnabled) {
-                                        "DJ talks between songs (Grok Voice / TTS)"
-                                    } else {
-                                        "Silent handoffs only — chat replies stay text"
-                                    },
-                                    color = GrokifyColors.TextDim,
-                                    fontSize = 10.sp,
-                                )
-                            }
-                            Switch(
-                                checked = banterEnabled,
-                                onCheckedChange = {
-                                    banterEnabled = it
-                                    djStore.banterEnabled = it
-                                    applyDjBanterSettings(appCtx)
-                                },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = GrokifyColors.Void,
-                                    checkedTrackColor = GrokifyColors.GlowViolet,
-                                    uncheckedThumbColor = GrokifyColors.TextMuted,
-                                    uncheckedTrackColor = GrokifyColors.PanelSoft,
-                                ),
-                            )
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        Text(
-                            "How often the DJ talks between songs",
-                            color = if (banterEnabled) GrokifyColors.TextDim else GrokifyColors.TextMuted,
-                            fontSize = 11.sp,
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            FilterChip(
-                                selected = banterMode == BanterFrequencyMode.Fixed,
-                                onClick = {
-                                    if (!banterEnabled) return@FilterChip
-                                    banterMode = BanterFrequencyMode.Fixed
-                                    djStore.banterMode = BanterFrequencyMode.Fixed
-                                    applyDjBanterSettings(appCtx)
-                                },
-                                enabled = banterEnabled,
-                                label = { Text("Every N songs", fontSize = 12.sp, maxLines = 1) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
-                                    selectedLabelColor = GrokifyColors.GlowCyan,
-                                    containerColor = GrokifyColors.PanelSoft,
-                                    labelColor = GrokifyColors.TextPrimary,
-                                ),
-                                border = FilterChipDefaults.filterChipBorder(
-                                    enabled = banterEnabled,
-                                    selected = banterMode == BanterFrequencyMode.Fixed,
-                                    borderColor = GrokifyColors.PanelBorder,
-                                    selectedBorderColor = GrokifyColors.GlowCyan,
-                                ),
-                            )
-                            FilterChip(
-                                selected = banterMode == BanterFrequencyMode.Random,
-                                onClick = {
-                                    if (!banterEnabled) return@FilterChip
-                                    banterMode = BanterFrequencyMode.Random
-                                    djStore.banterMode = BanterFrequencyMode.Random
-                                    applyDjBanterSettings(appCtx)
-                                },
-                                enabled = banterEnabled,
-                                label = { Text("Random range", fontSize = 12.sp, maxLines = 1) },
-                                colors = FilterChipDefaults.filterChipColors(
-                                    selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
-                                    selectedLabelColor = GrokifyColors.GlowCyan,
-                                    containerColor = GrokifyColors.PanelSoft,
-                                    labelColor = GrokifyColors.TextPrimary,
-                                ),
-                                border = FilterChipDefaults.filterChipBorder(
-                                    enabled = banterEnabled,
-                                    selected = banterMode == BanterFrequencyMode.Random,
-                                    borderColor = GrokifyColors.PanelBorder,
-                                    selectedBorderColor = GrokifyColors.GlowCyan,
-                                ),
-                            )
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        if (banterMode == BanterFrequencyMode.Fixed) {
-                            BanterStepperRow(
-                                label = "Talk every",
-                                value = banterFixed,
-                                suffix = "songs",
-                                onDec = {
-                                    banterFixed = (banterFixed - 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
-                                    djStore.banterFixed = banterFixed
-                                    applyDjBanterSettings(appCtx)
-                                },
-                                onInc = {
-                                    banterFixed = (banterFixed + 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
-                                    djStore.banterFixed = banterFixed
-                                    applyDjBanterSettings(appCtx)
-                                },
-                            )
-                        } else {
-                            BanterStepperRow(
-                                label = "Random min",
-                                value = banterMin,
-                                suffix = "songs",
-                                onDec = {
-                                    banterMin = (banterMin - 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
-                                    djStore.banterMin = banterMin
-                                    applyDjBanterSettings(appCtx)
-                                },
-                                onInc = {
-                                    banterMin = (banterMin + 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
-                                    if (banterMin > banterMax) {
-                                        banterMax = banterMin
-                                        djStore.banterMax = banterMax
-                                    }
-                                    djStore.banterMin = banterMin
-                                    applyDjBanterSettings(appCtx)
-                                },
-                            )
-                            Spacer(Modifier.height(8.dp))
-                            BanterStepperRow(
-                                label = "Random max",
-                                value = banterMax,
-                                suffix = "songs",
-                                onDec = {
-                                    banterMax = (banterMax - 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
-                                    if (banterMax < banterMin) {
-                                        banterMin = banterMax
-                                        djStore.banterMin = banterMin
-                                    }
-                                    djStore.banterMax = banterMax
-                                    applyDjBanterSettings(appCtx)
-                                },
-                                onInc = {
-                                    banterMax = (banterMax + 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
-                                    djStore.banterMax = banterMax
-                                    applyDjBanterSettings(appCtx)
-                                },
-                            )
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            if (banterEnabled) {
-                                "Next line: ${
-                                    banterCountdownLabel(djState.songsSinceBanter, djState.banterEvery)
-                                } (target every ${djState.banterEvery})"
-                            } else {
-                                "Banter muted — frequency settings saved for when you re-enable"
-                            },
-                            color = GrokifyColors.TextMuted,
-                            fontSize = 11.sp,
-                        )
-                        Spacer(Modifier.height(14.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(
-                                    "Allow talk over",
-                                    color = GrokifyColors.TextPrimary,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                Text(
-                                    if (allowTalkOver) {
-                                        "Banter can ride the outro under the music"
-                                    } else {
-                                        "Music pauses so the line is exclusive"
-                                    },
-                                    color = GrokifyColors.TextDim,
-                                    fontSize = 10.sp,
-                                )
-                            }
-                            Switch(
-                                checked = allowTalkOver,
-                                enabled = banterEnabled,
-                                onCheckedChange = {
-                                    allowTalkOver = it
-                                    djStore.allowTalkOver = it
-                                    applyDjBanterSettings(appCtx)
-                                },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = GrokifyColors.Void,
-                                    checkedTrackColor = GrokifyColors.GlowMint,
-                                    uncheckedThumbColor = GrokifyColors.TextMuted,
-                                    uncheckedTrackColor = GrokifyColors.PanelSoft,
-                                ),
-                            )
-                        }
-                        Spacer(Modifier.height(14.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(
-                                    "Resume after restart",
-                                    color = GrokifyColors.TextPrimary,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Medium,
-                                )
-                                Text(
-                                    if (resumeAfterRestart) {
-                                        "Keep Live DJ on across OTA, reboot, and process death"
-                                    } else {
-                                        "Live DJ ends when the app restarts (queue still kept)"
-                                    },
-                                    color = GrokifyColors.TextDim,
-                                    fontSize = 10.sp,
-                                )
-                            }
-                            Switch(
-                                checked = resumeAfterRestart,
-                                onCheckedChange = {
-                                    resumeAfterRestart = it
-                                    djStore.resumeAfterRestart = it
-                                    SpotifyDjBus.patch { s -> s.copy(resumeAfterRestart = it) }
-                                },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = GrokifyColors.Void,
-                                    checkedTrackColor = GrokifyColors.GlowCyan,
-                                    uncheckedThumbColor = GrokifyColors.TextMuted,
-                                    uncheckedTrackColor = GrokifyColors.PanelSoft,
-                                ),
-                            )
-                        }
-                        Spacer(Modifier.height(12.dp))
-                        Text(
-                            "Live DJ toggle = auto-handoff between songs. Chat, queue build, play, and " +
-                                "Spotify control work with it off (booth mode). " +
-                                "Radio seeds from liked, top, recently played" +
-                                (if (selectedGenres.isNotEmpty()) ", plus genre board" else "") +
-                                (if (listenerCity.isNotBlank()) ", and local-show discovery" else "") +
-                                ". Each talk randomly picks research angles " +
-                                "(lyrics, album/song facts, artist facts, tours, X/social, radio color). " +
-                                "Your name is for on-air address; city is location only. " +
-                                "Behavior modes filter how research is delivered " +
-                                "(Unhinged roasts your taste). " +
-                                "UP NEXT is in-app only — each track is direct-played when due. " +
-                                "Queue, chat, and settings survive leave/return.",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 11.sp,
-                        )
-                        Spacer(Modifier.height(12.dp))
-                    }
+                    else -> LiveDjSettingsTab(
+                        modifier = Modifier.weight(1f, fill = true),
+                        appCtx = appCtx,
+                        djStore = djStore,
+                        djState = djState,
+                        scope = scope,
+                        loggedIn = loggedIn,
+                        hasXaiKey = hasXaiKey,
+                    )
                 }
             }
 
@@ -3827,6 +3191,7 @@ private fun DjChatBubble(
     likeBusy: Boolean = false,
     onLikeToggle: (() -> Unit)? = null,
     onPlayTrack: (DjChatMessage) -> Unit = {},
+    onMoreLikeThis: (DjChatMessage) -> Unit = {},
 ) {
     when (msg.role) {
         DjChatRole.User -> {
@@ -4100,9 +3465,22 @@ private fun DjChatBubble(
                                     }
                                 }
                             }
+                            // More like this — same artist + related, prepend to UP NEXT
+                            IconButton(
+                                onClick = { onMoreLikeThis(msg) },
+                                enabled = !msg.trackUri.isNullOrBlank() ||
+                                    !msg.trackName.isNullOrBlank() ||
+                                    !msg.trackArtists.isNullOrBlank(),
+                            ) {
+                                Icon(
+                                    Icons.Default.PlaylistAdd,
+                                    contentDescription = "More like this — queue similar cuts next",
+                                    tint = GrokifyColors.GlowCyan,
+                                )
+                            }
                         }
                     } else if (!msg.trackUri.isNullOrBlank()) {
-                        // Replay past songs + heart into Liked Songs from chat history
+                        // Replay past songs + heart + more-like-this from chat history
                         Spacer(Modifier.height(8.dp))
                         Row(
                             Modifier.fillMaxWidth(),
@@ -4138,6 +3516,16 @@ private fun DjChatBubble(
                                     }
                                 }
                             }
+                            TextButton(onClick = { onMoreLikeThis(msg) }) {
+                                Icon(
+                                    Icons.Default.PlaylistAdd,
+                                    contentDescription = null,
+                                    tint = GrokifyColors.GlowCyan,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text("More like this", color = GrokifyColors.GlowCyan, fontSize = 12.sp)
+                            }
                             TextButton(onClick = { onPlayTrack(msg) }) {
                                 Icon(
                                     Icons.Filled.PlayArrow,
@@ -4167,6 +3555,1113 @@ private fun DjChatBubble(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun LiveDjSettingsTab(
+    modifier: Modifier = Modifier,
+    appCtx: Context,
+    djStore: SpotifyDjStore,
+    djState: SpotifyDjUiState,
+    scope: kotlinx.coroutines.CoroutineScope,
+    loggedIn: Boolean,
+    hasXaiKey: Boolean,
+) {
+    var voiceId by remember { mutableStateOf(djStore.voiceId) }
+    var useAiRank by remember { mutableStateOf(djStore.useAiRank) }
+    var banterMode by remember { mutableStateOf(djStore.banterMode) }
+    var banterFixed by remember { mutableStateOf(djStore.banterFixed) }
+    var banterMin by remember { mutableStateOf(djStore.banterMin) }
+    var banterMax by remember { mutableStateOf(djStore.banterMax) }
+    var allowTalkOver by remember { mutableStateOf(djStore.allowTalkOver) }
+    var banterEnabled by remember { mutableStateOf(djStore.banterEnabled) }
+    var resumeAfterRestart by remember { mutableStateOf(djStore.resumeAfterRestart) }
+    var behaviorMode by remember { mutableStateOf(djStore.behaviorMode) }
+    var activeBehaviorId by remember { mutableStateOf(djStore.activeBehaviorId) }
+    var promptTemplates by remember { mutableStateOf(djStore.loadPromptTemplates()) }
+    var editingPromptId by remember { mutableStateOf<String?>(null) }
+    var editPromptLabel by remember { mutableStateOf("") }
+    var editPromptBlurb by remember { mutableStateOf("") }
+    var editPromptBody by remember { mutableStateOf("") }
+    var promptEditorKind by remember { mutableStateOf(DjPromptKind.Research) }
+    var promptEditorMsg by remember { mutableStateOf<String?>(null) }
+    var selectedGenres by remember { mutableStateOf(djStore.selectedGenres) }
+    var genreBoard by remember { mutableStateOf(djStore.genreBoard) }
+    var listenerCity by remember { mutableStateOf(djStore.listenerCity) }
+    var listenerName by remember { mutableStateOf(djStore.listenerName) }
+    var genreBoardBusy by remember { mutableStateOf(false) }
+    var genreBoardMsg by remember { mutableStateOf<String?>(null) }
+    var nameBusy by remember { mutableStateOf(false) }
+    var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(
+        djState.selectedGenres,
+        djState.genreBoard,
+        djState.behaviorMode,
+        djState.listenerCity,
+        djState.listenerName,
+        djState.banterEnabled,
+        djState.banterMode,
+    ) {
+        selectedGenres = djState.selectedGenres.ifEmpty { djStore.selectedGenres }
+        genreBoard = djState.genreBoard.ifEmpty { djStore.genreBoard }
+        behaviorMode = djState.behaviorMode
+        activeBehaviorId = djStore.activeBehaviorId
+        if (djState.listenerCity.isNotBlank() || listenerCity.isBlank()) {
+            listenerCity = djState.listenerCity.ifBlank { djStore.listenerCity }
+        }
+        if (djState.listenerName.isNotBlank() || listenerName.isBlank()) {
+            listenerName = djState.listenerName.ifBlank { djStore.listenerName }
+        }
+        banterEnabled = djState.banterEnabled
+        banterMode = djState.banterMode
+        allowTalkOver = djState.allowTalkOver
+        resumeAfterRestart = djState.resumeAfterRestart
+        voiceId = djState.voiceId.ifBlank { djStore.voiceId }
+        useAiRank = djState.useAiRank
+    }
+
+    Column(
+        modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState()),
+    ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "AI rank next tracks",
+                                color = GrokifyColors.TextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                "Host Grok shapes the set (optional)",
+                                color = GrokifyColors.TextDim,
+                                fontSize = 10.sp,
+                            )
+                        }
+                        Switch(
+                            checked = useAiRank,
+                            onCheckedChange = {
+                                useAiRank = it
+                                djStore.useAiRank = it
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = GrokifyColors.Void,
+                                checkedTrackColor = GrokifyColors.GlowViolet,
+                                uncheckedThumbColor = GrokifyColors.TextMuted,
+                                uncheckedTrackColor = GrokifyColors.PanelSoft,
+                            ),
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        if (hasXaiKey) "Grok Voice · xAI key found" else "Grok Voice · add xAI key or use device TTS",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    val voiceScroll = rememberScrollState()
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(voiceScroll),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        GROK_VOICES.forEach { v ->
+                            val selected = voiceId.equals(v.id, ignoreCase = true)
+                            FilterChip(
+                                selected = selected,
+                                onClick = {
+                                    voiceId = v.id
+                                    djStore.voiceId = v.id
+                                    voicePreviewMsg = "${v.label} — ${v.tone}"
+                                },
+                                label = { Text(v.label, fontSize = 12.sp, maxLines = 1) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = GrokifyColors.GlowMint.copy(alpha = 0.25f),
+                                    selectedLabelColor = GrokifyColors.GlowMint,
+                                    containerColor = GrokifyColors.PanelSoft,
+                                    labelColor = GrokifyColors.TextPrimary,
+                                ),
+                                border = FilterChipDefaults.filterChipBorder(
+                                    enabled = true,
+                                    selected = selected,
+                                    borderColor = GrokifyColors.PanelBorder,
+                                    selectedBorderColor = GrokifyColors.GlowMint,
+                                ),
+                            )
+                        }
+                    }
+                    if (!voicePreviewMsg.isNullOrBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(voicePreviewMsg!!, color = GrokifyColors.TextMuted, fontSize = 11.sp)
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "BEHAVIOR",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GrokifyColors.GlowMint,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "How the DJ talks after research & queueing — pick a template below " +
+                            "(edit / add under Prompt templates).",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 10.sp,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    val behaviorTemplates = remember(promptTemplates) {
+                        promptTemplates.filter { it.kind == DjPromptKind.Behavior }
+                    }
+                    val behaviorScroll = rememberScrollState()
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(behaviorScroll),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        behaviorTemplates.forEach { tpl ->
+                            val selected = activeBehaviorId == tpl.id
+                            FilterChip(
+                                selected = selected,
+                                onClick = {
+                                    activeBehaviorId = tpl.id
+                                    djStore.activeBehaviorId = tpl.id
+                                    behaviorMode = DjBehaviorMode.fromPref(tpl.id)
+                                    applyDjBanterSettings(appCtx)
+                                },
+                                label = {
+                                    Text(tpl.label, fontSize = 12.sp, maxLines = 1)
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = GrokifyColors.GlowMint.copy(alpha = 0.25f),
+                                    selectedLabelColor = GrokifyColors.GlowMint,
+                                    containerColor = GrokifyColors.PanelSoft,
+                                    labelColor = GrokifyColors.TextPrimary,
+                                ),
+                                border = FilterChipDefaults.filterChipBorder(
+                                    enabled = true,
+                                    selected = selected,
+                                    borderColor = GrokifyColors.PanelBorder,
+                                    selectedBorderColor = GrokifyColors.GlowMint,
+                                ),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        behaviorTemplates.firstOrNull { it.id == activeBehaviorId }?.blurb
+                            ?: behaviorMode.blurb,
+                        color = GrokifyColors.TextMuted,
+                        fontSize = 11.sp,
+                    )
+
+                    Spacer(Modifier.height(16.dp))
+                    DjPromptTemplatesSection(
+                        appCtx = appCtx,
+                        djStore = djStore,
+                        promptTemplates = promptTemplates,
+                        onTemplatesChanged = { promptTemplates = it },
+                        promptEditorKind = promptEditorKind,
+                        onKindChange = { k ->
+                            promptEditorKind = k
+                            editingPromptId = null
+                            promptEditorMsg = null
+                        },
+                        editingPromptId = editingPromptId,
+                        onEditingIdChange = { editingPromptId = it },
+                        editPromptLabel = editPromptLabel,
+                        onEditLabelChange = { editPromptLabel = it },
+                        editPromptBlurb = editPromptBlurb,
+                        onEditBlurbChange = { editPromptBlurb = it },
+                        editPromptBody = editPromptBody,
+                        onEditBodyChange = { editPromptBody = it },
+                        promptEditorMsg = promptEditorMsg,
+                        onMsgChange = { promptEditorMsg = it },
+                        activeBehaviorId = activeBehaviorId,
+                        onActiveBehavior = { id ->
+                            activeBehaviorId = id
+                            djStore.activeBehaviorId = id
+                            behaviorMode = DjBehaviorMode.fromPref(id)
+                            applyDjBanterSettings(appCtx)
+                        },
+                        onBehaviorModeSync = { mode -> behaviorMode = mode },
+                    )
+
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "GENRE BOARD",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GrokifyColors.GlowCyan,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Optional multi-select from genres in your listening history. " +
+                            "Empty = full taste blend. Selected genres bias the radio pool.",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 10.sp,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TextButton(
+                            onClick = {
+                                if (genreBoardBusy) return@TextButton
+                                genreBoardBusy = true
+                                genreBoardMsg = null
+                                scope.launch {
+                                    val (board, err) = withContext(Dispatchers.IO) {
+                                        refreshDjGenreBoard(appCtx)
+                                    }
+                                    genreBoardBusy = false
+                                    if (err != null) {
+                                        genreBoardMsg = err
+                                    } else {
+                                        genreBoard = board
+                                        genreBoardMsg = "Loaded ${board.size} genres from your top artists"
+                                        selectedGenres = djStore.selectedGenres
+                                        applyDjBanterSettings(appCtx)
+                                    }
+                                }
+                            },
+                            enabled = !genreBoardBusy && loggedIn,
+                        ) {
+                            Text(
+                                if (genreBoardBusy) "Refreshing…" else "Refresh from my taste",
+                                fontSize = 12.sp,
+                                color = GrokifyColors.GlowCyan,
+                            )
+                        }
+                        if (selectedGenres.isNotEmpty()) {
+                            TextButton(
+                                onClick = {
+                                    selectedGenres = emptyList()
+                                    djStore.selectedGenres = emptyList()
+                                    applyDjBanterSettings(appCtx)
+                                },
+                            ) {
+                                Text("Clear", fontSize = 12.sp, color = GrokifyColors.TextDim)
+                            }
+                        }
+                    }
+                    if (!genreBoardMsg.isNullOrBlank()) {
+                        Text(genreBoardMsg!!, color = GrokifyColors.TextMuted, fontSize = 10.sp)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    val boardChips = remember(genreBoard, selectedGenres) {
+                        (genreBoard + selectedGenres).distinct()
+                    }
+                    if (boardChips.isEmpty()) {
+                        Text(
+                            if (loggedIn) {
+                                "Tap Refresh to build a board from artists you actually play."
+                            } else {
+                                "Sign in on Account tab, then refresh the genre board."
+                            },
+                            color = GrokifyColors.TextMuted,
+                            fontSize = 11.sp,
+                        )
+                    } else {
+                        val genreScroll = rememberScrollState()
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(genreScroll),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            boardChips.forEach { g ->
+                                val on = selectedGenres.any { it.equals(g, ignoreCase = true) }
+                                FilterChip(
+                                    selected = on,
+                                    onClick = {
+                                        val next = if (on) {
+                                            selectedGenres.filterNot { it.equals(g, ignoreCase = true) }
+                                        } else {
+                                            (selectedGenres + g).distinct().take(MAX_DJ_GENRES)
+                                        }
+                                        selectedGenres = next
+                                        djStore.selectedGenres = next
+                                        applyDjBanterSettings(appCtx)
+                                    },
+                                    label = {
+                                        Text(g, fontSize = 11.sp, maxLines = 1)
+                                    },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
+                                        selectedLabelColor = GrokifyColors.GlowCyan,
+                                        containerColor = GrokifyColors.PanelSoft,
+                                        labelColor = GrokifyColors.TextPrimary,
+                                    ),
+                                    border = FilterChipDefaults.filterChipBorder(
+                                        enabled = true,
+                                        selected = on,
+                                        borderColor = GrokifyColors.PanelBorder,
+                                        selectedBorderColor = GrokifyColors.GlowCyan,
+                                    ),
+                                )
+                            }
+                        }
+                        if (selectedGenres.isNotEmpty()) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "Active: ${selectedGenres.joinToString(" · ")}",
+                                color = GrokifyColors.GlowCyan,
+                                fontSize = 10.sp,
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "YOUR NAME",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GrokifyColors.GlowMint,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "How the DJ addresses you on mic. Pulled from Spotify display name " +
+                            "when possible — city is never used as a name.",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 10.sp,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = listenerName,
+                        onValueChange = { v ->
+                            listenerName = v.take(40)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("Name or nickname", fontSize = 12.sp) },
+                        placeholder = { Text("e.g. Audicle", fontSize = 12.sp) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = GrokifyColors.TextPrimary,
+                            unfocusedTextColor = GrokifyColors.TextPrimary,
+                            focusedBorderColor = GrokifyColors.GlowMint,
+                            unfocusedBorderColor = GrokifyColors.PanelBorder,
+                            focusedLabelColor = GrokifyColors.GlowMint,
+                            unfocusedLabelColor = GrokifyColors.TextDim,
+                            cursorColor = GrokifyColors.GlowMint,
+                            focusedPlaceholderColor = GrokifyColors.TextMuted,
+                            unfocusedPlaceholderColor = GrokifyColors.TextMuted,
+                        ),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(
+                            onClick = {
+                                djStore.listenerName = listenerName.trim()
+                                listenerName = djStore.listenerName
+                                applyDjBanterSettings(appCtx)
+                                genreBoardMsg = if (listenerName.isBlank()) {
+                                    "Name cleared"
+                                } else {
+                                    "Name set · $listenerName"
+                                }
+                            },
+                        ) {
+                            Text("Save name", fontSize = 12.sp, color = GrokifyColors.GlowMint)
+                        }
+                        TextButton(
+                            onClick = {
+                                if (nameBusy) return@TextButton
+                                nameBusy = true
+                                genreBoardMsg = null
+                                scope.launch {
+                                    val (pulled, err) = withContext(Dispatchers.IO) {
+                                        fetchSpotifyDisplayName(appCtx)
+                                    }
+                                    nameBusy = false
+                                    if (err != null && pulled.isNullOrBlank()) {
+                                        genreBoardMsg = err
+                                    } else if (!pulled.isNullOrBlank()) {
+                                        listenerName = pulled
+                                        djStore.listenerName = pulled
+                                        applyDjBanterSettings(appCtx)
+                                        genreBoardMsg = "From Spotify · $pulled"
+                                    } else {
+                                        genreBoardMsg = "No display name on Spotify"
+                                    }
+                                }
+                            },
+                            enabled = !nameBusy && loggedIn,
+                        ) {
+                            Text(
+                                if (nameBusy) "Pulling…" else "From Spotify",
+                                fontSize = 12.sp,
+                                color = GrokifyColors.GlowCyan,
+                            )
+                        }
+                        if (listenerName.isNotBlank() && listenerName != djStore.listenerName) {
+                            Text("Unsaved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
+                        } else if (djStore.listenerName.isNotBlank()) {
+                            Text("Saved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "LOCATION",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GrokifyColors.GlowViolet,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "City / metro only — used for local show research & discovery. " +
+                            "Never used as your name on air.",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 10.sp,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = listenerCity,
+                        onValueChange = { v ->
+                            listenerCity = v.take(80)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("City or metro", fontSize = 12.sp) },
+                        placeholder = { Text("e.g. Aurora, CO / Denver", fontSize = 12.sp) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = GrokifyColors.TextPrimary,
+                            unfocusedTextColor = GrokifyColors.TextPrimary,
+                            focusedBorderColor = GrokifyColors.GlowViolet,
+                            unfocusedBorderColor = GrokifyColors.PanelBorder,
+                            focusedLabelColor = GrokifyColors.GlowViolet,
+                            unfocusedLabelColor = GrokifyColors.TextDim,
+                            cursorColor = GrokifyColors.GlowViolet,
+                            focusedPlaceholderColor = GrokifyColors.TextMuted,
+                            unfocusedPlaceholderColor = GrokifyColors.TextMuted,
+                        ),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(
+                            onClick = {
+                                djStore.listenerCity = listenerCity.trim()
+                                listenerCity = djStore.listenerCity
+                                applyDjBanterSettings(appCtx)
+                                genreBoardMsg = if (listenerCity.isBlank()) {
+                                    "Location cleared"
+                                } else {
+                                    "Location set · $listenerCity"
+                                }
+                            },
+                        ) {
+                            Text("Save location", fontSize = 12.sp, color = GrokifyColors.GlowViolet)
+                        }
+                        if (listenerCity.isNotBlank() && listenerCity != djStore.listenerCity) {
+                            Text("Unsaved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
+                        } else if (djStore.listenerCity.isNotBlank()) {
+                            Text("Saved", color = GrokifyColors.TextMuted, fontSize = 10.sp)
+                        }
+                    }
+
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        "BANTER",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GrokifyColors.GlowViolet,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Spoken banter",
+                                color = GrokifyColors.TextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                if (banterEnabled) {
+                                    "DJ talks between songs (Grok Voice / TTS)"
+                                } else {
+                                    "Silent handoffs only — chat replies stay text"
+                                },
+                                color = GrokifyColors.TextDim,
+                                fontSize = 10.sp,
+                            )
+                        }
+                        Switch(
+                            checked = banterEnabled,
+                            onCheckedChange = {
+                                banterEnabled = it
+                                djStore.banterEnabled = it
+                                applyDjBanterSettings(appCtx)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = GrokifyColors.Void,
+                                checkedTrackColor = GrokifyColors.GlowViolet,
+                                uncheckedThumbColor = GrokifyColors.TextMuted,
+                                uncheckedTrackColor = GrokifyColors.PanelSoft,
+                            ),
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "How often the DJ talks between songs",
+                        color = if (banterEnabled) GrokifyColors.TextDim else GrokifyColors.TextMuted,
+                        fontSize = 11.sp,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FilterChip(
+                            selected = banterMode == BanterFrequencyMode.Fixed,
+                            onClick = {
+                                if (!banterEnabled) return@FilterChip
+                                banterMode = BanterFrequencyMode.Fixed
+                                djStore.banterMode = BanterFrequencyMode.Fixed
+                                applyDjBanterSettings(appCtx)
+                            },
+                            enabled = banterEnabled,
+                            label = { Text("Every N songs", fontSize = 12.sp, maxLines = 1) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = GrokifyColors.GlowCyan,
+                                containerColor = GrokifyColors.PanelSoft,
+                                labelColor = GrokifyColors.TextPrimary,
+                            ),
+                            border = FilterChipDefaults.filterChipBorder(
+                                enabled = banterEnabled,
+                                selected = banterMode == BanterFrequencyMode.Fixed,
+                                borderColor = GrokifyColors.PanelBorder,
+                                selectedBorderColor = GrokifyColors.GlowCyan,
+                            ),
+                        )
+                        FilterChip(
+                            selected = banterMode == BanterFrequencyMode.Random,
+                            onClick = {
+                                if (!banterEnabled) return@FilterChip
+                                banterMode = BanterFrequencyMode.Random
+                                djStore.banterMode = BanterFrequencyMode.Random
+                                applyDjBanterSettings(appCtx)
+                            },
+                            enabled = banterEnabled,
+                            label = { Text("Random range", fontSize = 12.sp, maxLines = 1) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = GrokifyColors.GlowCyan,
+                                containerColor = GrokifyColors.PanelSoft,
+                                labelColor = GrokifyColors.TextPrimary,
+                            ),
+                            border = FilterChipDefaults.filterChipBorder(
+                                enabled = banterEnabled,
+                                selected = banterMode == BanterFrequencyMode.Random,
+                                borderColor = GrokifyColors.PanelBorder,
+                                selectedBorderColor = GrokifyColors.GlowCyan,
+                            ),
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    if (banterMode == BanterFrequencyMode.Fixed) {
+                        BanterStepperRow(
+                            label = "Talk every",
+                            value = banterFixed,
+                            suffix = "songs",
+                            onDec = {
+                                banterFixed = (banterFixed - 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
+                                djStore.banterFixed = banterFixed
+                                applyDjBanterSettings(appCtx)
+                            },
+                            onInc = {
+                                banterFixed = (banterFixed + 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
+                                djStore.banterFixed = banterFixed
+                                applyDjBanterSettings(appCtx)
+                            },
+                        )
+                    } else {
+                        BanterStepperRow(
+                            label = "Random min",
+                            value = banterMin,
+                            suffix = "songs",
+                            onDec = {
+                                banterMin = (banterMin - 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
+                                djStore.banterMin = banterMin
+                                applyDjBanterSettings(appCtx)
+                            },
+                            onInc = {
+                                banterMin = (banterMin + 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
+                                if (banterMin > banterMax) {
+                                    banterMax = banterMin
+                                    djStore.banterMax = banterMax
+                                }
+                                djStore.banterMin = banterMin
+                                applyDjBanterSettings(appCtx)
+                            },
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        BanterStepperRow(
+                            label = "Random max",
+                            value = banterMax,
+                            suffix = "songs",
+                            onDec = {
+                                banterMax = (banterMax - 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
+                                if (banterMax < banterMin) {
+                                    banterMin = banterMax
+                                    djStore.banterMin = banterMin
+                                }
+                                djStore.banterMax = banterMax
+                                applyDjBanterSettings(appCtx)
+                            },
+                            onInc = {
+                                banterMax = (banterMax + 1).coerceIn(BANTER_EVERY_MIN, BANTER_EVERY_MAX)
+                                djStore.banterMax = banterMax
+                                applyDjBanterSettings(appCtx)
+                            },
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (banterEnabled) {
+                            "Next line: ${
+                                banterCountdownLabel(djState.songsSinceBanter, djState.banterEvery)
+                            } (target every ${djState.banterEvery})"
+                        } else {
+                            "Banter muted — frequency settings saved for when you re-enable"
+                        },
+                        color = GrokifyColors.TextMuted,
+                        fontSize = 11.sp,
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Allow talk over",
+                                color = GrokifyColors.TextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                if (allowTalkOver) {
+                                    "Banter can ride the outro under the music"
+                                } else {
+                                    "Music pauses so the line is exclusive"
+                                },
+                                color = GrokifyColors.TextDim,
+                                fontSize = 10.sp,
+                            )
+                        }
+                        Switch(
+                            checked = allowTalkOver,
+                            enabled = banterEnabled,
+                            onCheckedChange = {
+                                allowTalkOver = it
+                                djStore.allowTalkOver = it
+                                applyDjBanterSettings(appCtx)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = GrokifyColors.Void,
+                                checkedTrackColor = GrokifyColors.GlowMint,
+                                uncheckedThumbColor = GrokifyColors.TextMuted,
+                                uncheckedTrackColor = GrokifyColors.PanelSoft,
+                            ),
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Resume after restart",
+                                color = GrokifyColors.TextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                if (resumeAfterRestart) {
+                                    "Keep Live DJ on across OTA, reboot, and process death"
+                                } else {
+                                    "Live DJ ends when the app restarts (queue still kept)"
+                                },
+                                color = GrokifyColors.TextDim,
+                                fontSize = 10.sp,
+                            )
+                        }
+                        Switch(
+                            checked = resumeAfterRestart,
+                            onCheckedChange = {
+                                resumeAfterRestart = it
+                                djStore.resumeAfterRestart = it
+                                SpotifyDjBus.patch { s -> s.copy(resumeAfterRestart = it) }
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = GrokifyColors.Void,
+                                checkedTrackColor = GrokifyColors.GlowCyan,
+                                uncheckedThumbColor = GrokifyColors.TextMuted,
+                                uncheckedTrackColor = GrokifyColors.PanelSoft,
+                            ),
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "Live DJ toggle = auto-handoff between songs. Chat, queue build, play, and " +
+                            "Spotify control work with it off (booth mode). " +
+                            "Radio seeds from liked, top, recently played" +
+                            (if (selectedGenres.isNotEmpty()) ", plus genre board" else "") +
+                            (if (listenerCity.isNotBlank()) ", and local-show discovery" else "") +
+                            ". Each talk randomly picks from your enabled research templates. " +
+                            "Your name is for on-air address; city is location only. " +
+                            "Prompt templates (research, behavior, banter/chat/research systems) " +
+                            "are fully editable. " +
+                            "UP NEXT is in-app only — each track is direct-played when due. " +
+                            "Queue, chat, and settings survive leave/return.",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                    )
+                    Spacer(Modifier.height(12.dp))
+    }
+}
+
+/**
+ * Editable Live DJ prompt templates (research angles, behaviors, system cores).
+ * Kept out of [SpotifyControllerPane] so the main composable stays under the JVM method size limit.
+ */
+@Composable
+private fun DjPromptTemplatesSection(
+    appCtx: Context,
+    djStore: SpotifyDjStore,
+    promptTemplates: List<DjPromptTemplate>,
+    onTemplatesChanged: (List<DjPromptTemplate>) -> Unit,
+    promptEditorKind: DjPromptKind,
+    onKindChange: (DjPromptKind) -> Unit,
+    editingPromptId: String?,
+    onEditingIdChange: (String?) -> Unit,
+    editPromptLabel: String,
+    onEditLabelChange: (String) -> Unit,
+    editPromptBlurb: String,
+    onEditBlurbChange: (String) -> Unit,
+    editPromptBody: String,
+    onEditBodyChange: (String) -> Unit,
+    promptEditorMsg: String?,
+    onMsgChange: (String?) -> Unit,
+    activeBehaviorId: String,
+    onActiveBehavior: (String) -> Unit,
+    onBehaviorModeSync: (DjBehaviorMode) -> Unit,
+) {
+    Text(
+        "PROMPT TEMPLATES",
+        style = MaterialTheme.typography.labelSmall,
+        color = GrokifyColors.GlowAmber,
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "Full control: research angles (random pack), behaviors, and the " +
+            "system prompts for banter / research / chat. Toggle research angles " +
+            "on for the random list, edit any body, or add your own.",
+        color = GrokifyColors.TextDim,
+        fontSize = 10.sp,
+    )
+    Spacer(Modifier.height(8.dp))
+    val kindScroll = rememberScrollState()
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .horizontalScroll(kindScroll),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        DjPromptKind.entries.forEach { kind ->
+            val on = promptEditorKind == kind
+            FilterChip(
+                selected = on,
+                onClick = { onKindChange(kind) },
+                label = {
+                    Text(kind.sectionLabel, fontSize = 11.sp, maxLines = 1)
+                },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = GrokifyColors.GlowAmber.copy(alpha = 0.22f),
+                    selectedLabelColor = GrokifyColors.GlowAmber,
+                    containerColor = GrokifyColors.PanelSoft,
+                    labelColor = GrokifyColors.TextPrimary,
+                ),
+                border = FilterChipDefaults.filterChipBorder(
+                    enabled = true,
+                    selected = on,
+                    borderColor = GrokifyColors.PanelBorder,
+                    selectedBorderColor = GrokifyColors.GlowAmber,
+                ),
+            )
+        }
+    }
+    Spacer(Modifier.height(4.dp))
+    Text(
+        promptEditorKind.sectionBlurb,
+        color = GrokifyColors.TextMuted,
+        fontSize = 10.sp,
+    )
+    Spacer(Modifier.height(8.dp))
+    val kindTemplates = remember(promptTemplates, promptEditorKind) {
+        promptTemplates.filter { it.kind == promptEditorKind }
+    }
+    kindTemplates.forEach { tpl ->
+        val isEditing = editingPromptId == tpl.id
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(GrokifyColors.PanelSoft)
+                .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(10.dp))
+                .padding(10.dp),
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        tpl.label + if (tpl.builtIn) "" else " · custom",
+                        color = GrokifyColors.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    if (tpl.blurb.isNotBlank()) {
+                        Text(
+                            tpl.blurb,
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                if (promptEditorKind == DjPromptKind.Research) {
+                    Switch(
+                        checked = tpl.enabled,
+                        onCheckedChange = { on ->
+                            djStore.setTemplateEnabled(tpl.id, on)
+                            onTemplatesChanged(djStore.loadPromptTemplates())
+                            onMsgChange(
+                                if (on) "Enabled · ${tpl.label}" else "Off pool · ${tpl.label}",
+                            )
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = GrokifyColors.Void,
+                            checkedTrackColor = GrokifyColors.GlowAmber,
+                            uncheckedThumbColor = GrokifyColors.TextMuted,
+                            uncheckedTrackColor = GrokifyColors.PanelSoft,
+                        ),
+                    )
+                }
+                if (promptEditorKind == DjPromptKind.Behavior) {
+                    TextButton(
+                        onClick = {
+                            onActiveBehavior(tpl.id)
+                            onMsgChange("Active · ${tpl.label}")
+                        },
+                    ) {
+                        Text(
+                            if (activeBehaviorId == tpl.id) "Active" else "Use",
+                            fontSize = 11.sp,
+                            color = if (activeBehaviorId == tpl.id) {
+                                GrokifyColors.GlowMint
+                            } else {
+                                GrokifyColors.GlowCyan
+                            },
+                        )
+                    }
+                }
+            }
+            if (!isEditing) {
+                Text(
+                    tpl.body.take(120) + if (tpl.body.length > 120) "…" else "",
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 10.sp,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(
+                        onClick = {
+                            onEditingIdChange(tpl.id)
+                            onEditLabelChange(tpl.label)
+                            onEditBlurbChange(tpl.blurb)
+                            onEditBodyChange(tpl.body)
+                            onMsgChange(null)
+                        },
+                    ) {
+                        Text("Edit", fontSize = 11.sp, color = GrokifyColors.GlowCyan)
+                    }
+                    if (tpl.builtIn) {
+                        TextButton(
+                            onClick = {
+                                djStore.resetPromptTemplate(tpl.id)
+                                onTemplatesChanged(djStore.loadPromptTemplates())
+                                if (editingPromptId == tpl.id) onEditingIdChange(null)
+                                onMsgChange("Reset · ${tpl.label}")
+                            },
+                        ) {
+                            Text("Reset", fontSize = 11.sp, color = GrokifyColors.TextDim)
+                        }
+                    } else {
+                        TextButton(
+                            onClick = {
+                                djStore.deletePromptTemplate(tpl.id)
+                                onTemplatesChanged(djStore.loadPromptTemplates())
+                                if (activeBehaviorId == tpl.id) {
+                                    onActiveBehavior(djStore.activeBehaviorId)
+                                    onBehaviorModeSync(djStore.behaviorMode)
+                                }
+                                if (editingPromptId == tpl.id) onEditingIdChange(null)
+                                onMsgChange("Deleted · ${tpl.label}")
+                            },
+                        ) {
+                            Text("Delete", fontSize = 11.sp, color = GrokifyColors.GlowAmber)
+                        }
+                    }
+                }
+            } else {
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = editPromptLabel,
+                    onValueChange = { onEditLabelChange(it.take(48)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Label", fontSize = 11.sp) },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = GrokifyColors.TextPrimary,
+                        unfocusedTextColor = GrokifyColors.TextPrimary,
+                        focusedBorderColor = GrokifyColors.GlowAmber,
+                        unfocusedBorderColor = GrokifyColors.PanelBorder,
+                        focusedLabelColor = GrokifyColors.GlowAmber,
+                        unfocusedLabelColor = GrokifyColors.TextDim,
+                        cursorColor = GrokifyColors.GlowAmber,
+                    ),
+                )
+                Spacer(Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = editPromptBlurb,
+                    onValueChange = { onEditBlurbChange(it.take(120)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Short blurb", fontSize = 11.sp) },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = GrokifyColors.TextPrimary,
+                        unfocusedTextColor = GrokifyColors.TextPrimary,
+                        focusedBorderColor = GrokifyColors.GlowAmber,
+                        unfocusedBorderColor = GrokifyColors.PanelBorder,
+                        focusedLabelColor = GrokifyColors.GlowAmber,
+                        unfocusedLabelColor = GrokifyColors.TextDim,
+                        cursorColor = GrokifyColors.GlowAmber,
+                    ),
+                )
+                Spacer(Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = editPromptBody,
+                    onValueChange = { onEditBodyChange(it.take(6000)) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(160.dp),
+                    label = { Text("Prompt body", fontSize = 11.sp) },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = GrokifyColors.TextPrimary,
+                        unfocusedTextColor = GrokifyColors.TextPrimary,
+                        focusedBorderColor = GrokifyColors.GlowAmber,
+                        unfocusedBorderColor = GrokifyColors.PanelBorder,
+                        focusedLabelColor = GrokifyColors.GlowAmber,
+                        unfocusedLabelColor = GrokifyColors.TextDim,
+                        cursorColor = GrokifyColors.GlowAmber,
+                    ),
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = {
+                            val body = editPromptBody.trim()
+                            if (body.isBlank()) {
+                                onMsgChange("Body can’t be empty")
+                                return@TextButton
+                            }
+                            val updated = tpl.copy(
+                                label = editPromptLabel.trim().ifBlank { tpl.label },
+                                blurb = editPromptBlurb.trim(),
+                                body = body,
+                            )
+                            djStore.upsertPromptTemplate(updated)
+                            onTemplatesChanged(djStore.loadPromptTemplates())
+                            onEditingIdChange(null)
+                            applyDjBanterSettings(appCtx)
+                            onMsgChange("Saved · ${updated.label}")
+                        },
+                    ) {
+                        Text("Save", fontSize = 12.sp, color = GrokifyColors.GlowMint)
+                    }
+                    TextButton(onClick = {
+                        onEditingIdChange(null)
+                        onMsgChange(null)
+                    }) {
+                        Text("Cancel", fontSize = 12.sp, color = GrokifyColors.TextDim)
+                    }
+                }
+            }
+        }
+    }
+    if (promptEditorKind == DjPromptKind.Research || promptEditorKind == DjPromptKind.Behavior) {
+        Spacer(Modifier.height(4.dp))
+        TextButton(
+            onClick = {
+                val id = "custom_${promptEditorKind.storageKey}_" +
+                    System.currentTimeMillis().toString(36)
+                val draft = DjPromptTemplate(
+                    id = id,
+                    kind = promptEditorKind,
+                    label = if (promptEditorKind == DjPromptKind.Research) {
+                        "Custom angle"
+                    } else {
+                        "Custom behavior"
+                    },
+                    blurb = "Your template",
+                    body = if (promptEditorKind == DjPromptKind.Research) {
+                        "CUSTOM ANGLE: Research one vivid, verified fact about " +
+                            "these artists/songs useful for a radio handoff. " +
+                            "≤22 words. City context: {{CITY}}."
+                    } else {
+                        "PERSONALITY: Describe how the DJ should sound on mic. " +
+                            "Keep handoffs clear. No hate speech."
+                    },
+                    enabled = true,
+                    builtIn = false,
+                )
+                djStore.upsertPromptTemplate(draft)
+                onTemplatesChanged(djStore.loadPromptTemplates())
+                onEditingIdChange(id)
+                onEditLabelChange(draft.label)
+                onEditBlurbChange(draft.blurb)
+                onEditBodyChange(draft.body)
+                onMsgChange("New template — edit & save")
+            },
+        ) {
+            Text(
+                if (promptEditorKind == DjPromptKind.Research) {
+                    "+ Add research angle"
+                } else {
+                    "+ Add behavior"
+                },
+                fontSize = 12.sp,
+                color = GrokifyColors.GlowAmber,
+            )
+        }
+    }
+    if (!promptEditorMsg.isNullOrBlank()) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            promptEditorMsg,
+            color = GrokifyColors.GlowMint,
+            fontSize = 10.sp,
+        )
     }
 }
 
