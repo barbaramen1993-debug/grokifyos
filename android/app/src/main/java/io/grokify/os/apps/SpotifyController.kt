@@ -1037,18 +1037,41 @@ class SpotifyControllerService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     /** Only push home widgets when track / play state actually changes. */
     @Volatile private var lastWidgetSig: String = ""
+    private var trackedController: MediaController? = null
+    private val playbackCallback = object : MediaController.Callback() {
+        override fun onPlaybackStateChanged(state: PlaybackState?) {
+            wakeRefresh()
+        }
+
+        override fun onMetadataChanged(metadata: android.media.MediaMetadata?) {
+            wakeRefresh()
+        }
+    }
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
             val now = refreshNotification()
-            // Tick progress bar smoothly while playing; idle slower to save battery
-            val delayMs = if (now?.isPlaying == true) 1_000L else 4_000L
+            // Only actively tick while audio is playing. Paused / no session: go nearly
+            // idle and rely on playback callbacks + control intents to wake us.
+            // (Previously 4s forever while paused — kept the FGS "working" for hours.)
+            val delayMs = when {
+                now?.isPlaying == true -> 1_000L
+                now?.hasSession == true -> 30_000L
+                else -> 90_000L
+            }
             handler.postDelayed(this, delayMs)
         }
     }
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { _ ->
+        wakeRefresh()
+    }
+
+    /** Immediate notif refresh + reschedule tick (play just started, button tap, etc.). */
+    private fun wakeRefresh() {
+        handler.removeCallbacks(refreshRunnable)
         refreshNotification()
+        handler.post(refreshRunnable)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -1075,7 +1098,9 @@ class SpotifyControllerService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        val n = buildNotification(readNowPlaying(this))
+        // Button taps re-enter here — wake the tick so play resumes 1s progress updates.
+        val now = readNowPlaying(this)
+        val n = buildNotification(now)
         // specialUse: we control other apps' media — we are not a player.
         // mediaPlayback FGS is killed on Android 14+ when not actually playing.
         val fgsType = when {
@@ -1097,11 +1122,15 @@ class SpotifyControllerService : Service() {
                     ?.notify(SPOTIFY_CTRL_NOTIF_ID, n)
             }
         }
+        handler.removeCallbacks(refreshRunnable)
+        // After a control action, poll a few times quickly then settle into idle/play rate.
+        handler.postDelayed(refreshRunnable, 400L)
         return START_STICKY
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(refreshRunnable)
+        untrackController()
         try {
             getSystemService(MediaSessionManager::class.java)
                 ?.removeOnActiveSessionsChangedListener(sessionListener)
@@ -1110,12 +1139,42 @@ class SpotifyControllerService : Service() {
         super.onDestroy()
     }
 
+    private fun untrackController() {
+        try {
+            trackedController?.unregisterCallback(playbackCallback)
+        } catch (_: Exception) {
+        }
+        trackedController = null
+    }
+
+    private fun trackActiveController() {
+        if (!isNotificationListenerEnabled(this)) {
+            untrackController()
+            return
+        }
+        val ctrl = try {
+            resolveActiveMediaController(this)
+        } catch (_: Exception) {
+            null
+        }
+        if (ctrl === trackedController) return
+        untrackController()
+        if (ctrl == null) return
+        try {
+            ctrl.registerCallback(playbackCallback, handler)
+            trackedController = ctrl
+        } catch (e: Exception) {
+            Log.w(TAG, "register playback callback: ${e.message}")
+        }
+    }
+
     /** @return latest snapshot (for refresh scheduling), or null if stopped. */
     private fun refreshNotification(): SpotifyNowPlaying? {
         if (!SpotifyControllerStore(this).enabled) {
             stopSelf()
             return null
         }
+        trackActiveController()
         val now = readNowPlaying(this)
         val nm = getSystemService(NotificationManager::class.java) ?: return now
         nm.notify(SPOTIFY_CTRL_NOTIF_ID, buildNotification(now))
@@ -1501,7 +1560,8 @@ fun SpotifyControllerPane(
             if (enabled && store.enabled && !notifPosted) {
                 setSpotifyControllerEnabled(appCtx, true)
             }
-            delay(if (now.isPlaying) 1_500L else 4_000L)
+            // Control tab: only poll actively while playing; idle when paused.
+            delay(if (now.isPlaying) 1_500L else 12_000L)
         }
     }
 
@@ -3605,6 +3665,17 @@ private fun LikeTrackButton(
     }
 }
 
+/** Full local date + time to the second (DJ chat context). */
+private fun formatDjChatTimestamp(ms: Long): String {
+    if (ms <= 0L) return ""
+    return try {
+        java.text.SimpleDateFormat("MMM d, yyyy · HH:mm:ss", java.util.Locale.getDefault())
+            .format(java.util.Date(ms))
+    } catch (_: Exception) {
+        ""
+    }
+}
+
 @Composable
 private fun DjChatBubble(
     msg: DjChatMessage,
@@ -3617,6 +3688,7 @@ private fun DjChatBubble(
     onPlayTrack: (DjChatMessage) -> Unit = {},
     onMoreLikeThis: (DjChatMessage) -> Unit = {},
 ) {
+    val tsLabel = formatDjChatTimestamp(msg.ts)
     when (msg.role) {
         DjChatRole.User -> {
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
@@ -3628,7 +3700,18 @@ private fun DjChatBubble(
                         .border(1.dp, GrokifyColors.GlowBlue.copy(alpha = 0.25f), RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp))
                         .padding(12.dp),
                 ) {
-                    Text("YOU", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowBlue)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("YOU", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowBlue)
+                        if (tsLabel.isNotBlank()) {
+                            Spacer(Modifier.weight(1f))
+                            Text(
+                                tsLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = GrokifyColors.TextDim,
+                                fontSize = 10.sp,
+                            )
+                        }
+                    }
                     Spacer(Modifier.height(4.dp))
                     Text(msg.text, color = GrokifyColors.TextPrimary, fontSize = 14.sp, lineHeight = 20.sp)
                 }
@@ -3648,6 +3731,15 @@ private fun DjChatBubble(
                     if (msg.streaming) {
                         Spacer(Modifier.width(8.dp))
                         Text("…", color = GrokifyColors.TextMuted, fontSize = 12.sp)
+                    }
+                    if (tsLabel.isNotBlank()) {
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            tsLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                        )
                     }
                 }
                 Spacer(Modifier.height(4.dp))
@@ -3755,15 +3847,26 @@ private fun DjChatBubble(
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(
-                                if (msg.isNowPlaying) {
-                                    if (msg.isPlaying) "NOW PLAYING" else "PAUSED"
-                                } else {
-                                    "PLAYED"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (msg.isNowPlaying) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
-                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    if (msg.isNowPlaying) {
+                                        if (msg.isPlaying) "NOW PLAYING" else "PAUSED"
+                                    } else {
+                                        "PLAYED"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (msg.isNowPlaying) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
+                                )
+                                if (tsLabel.isNotBlank()) {
+                                    Spacer(Modifier.weight(1f))
+                                    Text(
+                                        tsLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = GrokifyColors.TextDim,
+                                        fontSize = 10.sp,
+                                    )
+                                }
+                            }
                             Spacer(Modifier.height(2.dp))
                             Text(
                                 trackTitle,
@@ -3967,16 +4070,29 @@ private fun DjChatBubble(
         }
         DjChatRole.System -> {
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Text(
-                    msg.text,
-                    color = GrokifyColors.TextDim,
-                    fontSize = 11.sp,
-                    textAlign = TextAlign.Center,
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
                         .background(GrokifyColors.PanelSoft)
                         .padding(horizontal = 10.dp, vertical = 4.dp),
-                )
+                ) {
+                    if (tsLabel.isNotBlank()) {
+                        Text(
+                            tsLabel,
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                            textAlign = TextAlign.Center,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                    }
+                    Text(
+                        msg.text,
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
         }
     }

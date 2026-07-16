@@ -1798,13 +1798,31 @@
   function formatTimestamp(ts) {
     if (!ts) return '';
     try {
-      const d = new Date(ts);
+      // Full date + time to the second for conversation context.
+      let d;
+      if (typeof ts === 'number') {
+        d = new Date(ts < 1e12 ? ts * 1000 : ts);
+      } else {
+        const s = String(ts).trim();
+        d = new Date(s.includes('T') ? s : s.replace(' ', 'T'));
+        if (isNaN(d.getTime())) d = new Date(s);
+      }
       if (isNaN(d.getTime())) return '';
-      const h = d.getHours();
-      const m = String(d.getMinutes()).padStart(2, '0');
-      const ampm = h >= 12 ? 'PM' : 'AM';
-      const h12 = h % 12 || 12;
-      return h12 + ':' + m + ' ' + ampm;
+      const pad = (n) => String(n).padStart(2, '0');
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      return (
+        months[d.getMonth()] +
+        ' ' +
+        d.getDate() +
+        ', ' +
+        d.getFullYear() +
+        ' · ' +
+        pad(d.getHours()) +
+        ':' +
+        pad(d.getMinutes()) +
+        ':' +
+        pad(d.getSeconds())
+      );
     } catch {
       return '';
     }

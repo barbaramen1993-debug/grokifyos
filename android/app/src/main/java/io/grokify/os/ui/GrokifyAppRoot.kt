@@ -3545,6 +3545,17 @@ private fun PermissionRequestCard(
 
 // ─── Message bubbles ──────────────────────────────────────────────────
 
+/** Full local date + time to the second for chat context (e.g. `Jul 16, 2026 · 14:32:05`). */
+private fun formatFullChatTimestamp(ms: Long): String {
+    if (ms <= 0L) return ""
+    return try {
+        java.text.SimpleDateFormat("MMM d, yyyy · HH:mm:ss", java.util.Locale.getDefault())
+            .format(java.util.Date(ms))
+    } catch (_: Exception) {
+        ""
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun UserBubble(
@@ -3583,6 +3594,17 @@ private fun UserBubble(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("YOU", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowBlue)
+                    Spacer(Modifier.weight(1f))
+                    val ts = formatFullChatTimestamp(msg.createdAtMs)
+                    if (ts.isNotBlank()) {
+                        Text(
+                            ts,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
                     if (msg.excludedFromContext) {
                         Spacer(Modifier.width(6.dp))
                         Text(
@@ -3654,6 +3676,17 @@ private fun AssistantBubble(
                         color = GrokifyColors.GlowMint,
                     )
                 }
+                Spacer(Modifier.weight(1f))
+                val ts = formatFullChatTimestamp(msg.createdAtMs)
+                if (ts.isNotBlank()) {
+                    Text(
+                        ts,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = GrokifyColors.TextDim,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
                 if (msg.excludedFromContext) {
                     Spacer(Modifier.width(6.dp))
                     Text(
@@ -3704,6 +3737,16 @@ private fun ThinkingCard(msg: ChatLine, onToggle: () -> Unit) {
                 fontWeight = FontWeight.Medium,
                 modifier = Modifier.weight(1f),
             )
+            val ts = formatFullChatTimestamp(msg.createdAtMs)
+            if (ts.isNotBlank()) {
+                Text(
+                    ts,
+                    color = GrokifyColors.TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.padding(end = 6.dp),
+                )
+            }
             if (msg.streaming) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(12.dp),
@@ -3879,6 +3922,16 @@ private fun ToolCard(msg: ChatLine, onToggle: () -> Unit) {
             } else {
                 Spacer(Modifier.weight(1f))
             }
+            val toolTs = formatFullChatTimestamp(msg.createdAtMs)
+            if (toolTs.isNotBlank()) {
+                Text(
+                    toolTs,
+                    color = GrokifyColors.TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.padding(end = 6.dp),
+                )
+            }
             if (msg.toolSuccess == null) {
                 CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = accent)
             } else if (hasBody) {
@@ -3939,12 +3992,8 @@ private fun SystemLine(
     actions: @Composable (() -> Unit)? = null,
 ) {
     Column(Modifier.fillMaxWidth()) {
-        Text(
-            msg.text,
-            color = GrokifyColors.TextDim,
-            fontSize = 12.sp,
-            fontFamily = FontFamily.Monospace,
-            modifier = Modifier
+        Column(
+            Modifier
                 .fillMaxWidth()
                 .alpha(if (msg.excludedFromContext) 0.55f else 1f)
                 .clip(RoundedCornerShape(8.dp))
@@ -3957,7 +4006,24 @@ private fun SystemLine(
                 )
                 .clickable(onClick = onTap, role = Role.Button)
                 .padding(8.dp),
-        )
+        ) {
+            val ts = formatFullChatTimestamp(msg.createdAtMs)
+            if (ts.isNotBlank()) {
+                Text(
+                    ts,
+                    color = GrokifyColors.TextDim,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+            Text(
+                msg.text,
+                color = GrokifyColors.TextDim,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+            )
+        }
         if (actions != null) {
             AnimatedVisibility(
                 visible = selected,

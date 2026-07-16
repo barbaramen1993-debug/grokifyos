@@ -28,6 +28,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Locale
 import java.util.UUID
 
 enum class ChatRole { User, Assistant, System, Tool, Thinking, Media, PermissionRequest }
@@ -57,6 +59,8 @@ data class ChatLine(
     /** Logical permission id for [ChatRole.PermissionRequest] (e.g. camera). */
     val permissionId: String = "",
     val permissionStatus: PermissionRequestStatus = PermissionRequestStatus.Pending,
+    /** Epoch ms when the message was created (server [created_at] or local clock). */
+    val createdAtMs: Long = System.currentTimeMillis(),
 )
 
 data class SessionItem(
@@ -1426,6 +1430,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         val content = m.optString("content")
         val serverId = m.optInt("id", 0)
         val excluded = m.optInt("excluded_from_context", 0) != 0
+        val createdAtMs = parseServerCreatedAtMs(m.optString("created_at"))
         val meta = m.optJSONObject("metadata")
         // Never leave historical rows in a "live streaming" spinner state.
         // Active turns are driven by WebSocket events after agent_resume / send.
@@ -1438,6 +1443,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     text = content,
                     serverMsgId = serverId,
                     excludedFromContext = excluded,
+                    createdAtMs = createdAtMs,
                 ),
             )
             "system" -> return listOf(
@@ -1446,6 +1452,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     text = content,
                     serverMsgId = serverId,
                     excludedFromContext = excluded,
+                    createdAtMs = createdAtMs,
                 ),
             )
             "assistant" -> {
@@ -1464,6 +1471,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                                         expanded = false,
                                         serverMsgId = serverId,
                                         excludedFromContext = excluded,
+                                        createdAtMs = createdAtMs,
                                     )
                                 }
                             }
@@ -1484,6 +1492,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                                     expanded = false,
                                     serverMsgId = serverId,
                                     excludedFromContext = excluded,
+                                    createdAtMs = createdAtMs,
                                 )
                             }
                             "media" -> {
@@ -1497,6 +1506,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                                         mediaKind = if (seg.optString("kind") == "video") "video" else "image",
                                         serverMsgId = serverId,
                                         excludedFromContext = excluded,
+                                        createdAtMs = createdAtMs,
                                     )
                                 }
                             }
@@ -1509,13 +1519,14 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                                         serverMsgId = serverId,
                                         streaming = streaming && i == timeline.length() - 1,
                                         excludedFromContext = excluded,
+                                        createdAtMs = createdAtMs,
                                     )
                                 }
                             }
                         }
                     }
                     // Attach metadata.media if timeline omitted some
-                    appendMediaFromMeta(out, meta, serverId, excluded)
+                    appendMediaFromMeta(out, meta, serverId, excluded, createdAtMs)
                     if (out.none { it.role == ChatRole.Assistant } && content.isNotBlank()) {
                         out += ChatLine(
                             role = ChatRole.Assistant,
@@ -1523,6 +1534,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                             serverMsgId = serverId,
                             streaming = streaming,
                             excludedFromContext = excluded,
+                            createdAtMs = createdAtMs,
                         )
                     }
                     if (out.isNotEmpty()) return out
@@ -1536,6 +1548,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                         expanded = false,
                         serverMsgId = serverId,
                         excludedFromContext = excluded,
+                        createdAtMs = createdAtMs,
                     )
                 }
                 val tools = meta?.optJSONArray("tools")
@@ -1564,10 +1577,11 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                             expanded = false,
                             serverMsgId = serverId,
                             excludedFromContext = excluded,
+                            createdAtMs = createdAtMs,
                         )
                     }
                 }
-                appendMediaFromMeta(out, meta, serverId, excluded)
+                appendMediaFromMeta(out, meta, serverId, excluded, createdAtMs)
                 val body = content.ifBlank {
                     expandAssistantContent(content, meta ?: JSONObject())
                 }
@@ -1578,6 +1592,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                         serverMsgId = serverId,
                         streaming = streaming,
                         excludedFromContext = excluded,
+                        createdAtMs = createdAtMs,
                     )
                 }
                 return out
@@ -1588,9 +1603,39 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     text = content,
                     serverMsgId = serverId,
                     excludedFromContext = excluded,
+                    createdAtMs = createdAtMs,
                 ),
             )
         }
+    }
+
+    /**
+     * Parse server `created_at` (MySQL DATETIME / ISO-8601) to epoch ms.
+     * Falls back to now when missing or unparsable.
+     */
+    private fun parseServerCreatedAtMs(raw: String?): Long {
+        val s = raw?.trim().orEmpty()
+        if (s.isEmpty()) return System.currentTimeMillis()
+        // Epoch seconds / millis
+        s.toLongOrNull()?.let { n ->
+            return if (n < 1_000_000_000_000L) n * 1000L else n
+        }
+        val normalized = s.replace('T', ' ').removeSuffix("Z")
+        val patterns = arrayOf(
+            "yyyy-MM-dd HH:mm:ss.SSS",
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm",
+        )
+        for (p in patterns) {
+            val ms = runCatching {
+                val fmt = SimpleDateFormat(p, Locale.US)
+                // Server timestamps are typically UTC-ish wall clock; display uses local TZ.
+                fmt.isLenient = true
+                fmt.parse(normalized.substringBefore('+').trim())?.time
+            }.getOrNull()
+            if (ms != null && ms > 0L) return ms
+        }
+        return System.currentTimeMillis()
     }
 
     private fun resolveMediaUrl(raw: String): String {
@@ -1606,6 +1651,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         meta: JSONObject?,
         serverId: Int,
         excluded: Boolean,
+        createdAtMs: Long = System.currentTimeMillis(),
     ) {
         val media = meta?.optJSONArray("media") ?: return
         val existing = out.filter { it.role == ChatRole.Media }.map { it.mediaUrl }.toSet()
@@ -1617,6 +1663,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 role = ChatRole.Media,
                 text = m.optString("name"),
                 toolName = m.optString("tool"),
+                createdAtMs = createdAtMs,
                 mediaUrl = url,
                 mediaKind = if (m.optString("kind") == "video") "video" else "image",
                 serverMsgId = serverId,

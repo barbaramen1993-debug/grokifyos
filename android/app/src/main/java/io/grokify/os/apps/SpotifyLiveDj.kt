@@ -2039,10 +2039,11 @@ class SpotifyLiveDjService : Service() {
             val delayMs = when {
                 rateWait > 0L -> rateWait.coerceIn(2_000L, 180_000L)
                 transitioning.get() || nearEndArmed -> 800L
-                // Paused / empty / held: do not poll currently-playing every second.
-                autoHandoffHeld -> 20_000L
-                idlePolls >= 3 -> 12_000L
-                idlePolls > 0 -> 4_000L
+                // Real pause / empty booth: almost idle — only watch for the user
+                // pressing play again (session changes still wake us via status).
+                autoHandoffHeld -> 60_000L
+                idlePolls >= 3 -> 20_000L
+                idlePolls > 0 -> 8_000L
                 remain in 0L..8_000L -> 900L
                 remain in 0L..20_000L -> 1_500L
                 remain in 0L..45_000L -> 2_500L
@@ -2062,6 +2063,10 @@ class SpotifyLiveDjService : Service() {
         stuckEndPolls = 0
         midPauseSinceMs = 0L
         nearEndArmed = false
+        // Drop in-flight auto handoff bookkeeping so a long pause cannot
+        // "finish" a stale near-end arm hours later.
+        handoffLaunchedForUri = null
+        wasPlaying = false
         // Do not clear pendingPlayVerify here — a verify retry may still recover.
     }
 
@@ -2084,10 +2089,14 @@ class SpotifyLiveDjService : Service() {
      * as a user pause (empty player or lagging transport).
      */
     private fun recentlyOwnedPlayback(now: Long = System.currentTimeMillis()): Boolean {
+        // While auto-handoff is held (user pause / empty booth), never claim ownership
+        // of playback — that was re-arming stuck_end hours after a pause.
+        if (autoHandoffHeld) return false
         return inInterTrackGrace(now) ||
             (pendingPlayVerifyUri != null && now <= pendingPlayVerifyUntilMs + 8_000L) ||
             (expectedPlayUri != null && now <= expectedPlayUntilMs) ||
-            handoffLaunchedForUri != null ||
+            // Handoff arm is only "ours" for a short window, not forever.
+            (handoffLaunchedForUri != null && nearEndArmed) ||
             nearEndArmed ||
             // Only treat low remain as "ours" while we still believe the set was playing —
             // avoids re-starting after a real mid-track pause once wasPlaying cleared.
@@ -2211,6 +2220,24 @@ class SpotifyLiveDjService : Service() {
             val remainBeforeEmpty = lastRemainMs
             // Between cuts Spotify often returns 204/empty for several seconds —
             // never freeze the booth during inter-track grace or right after our play.
+            // Already paused / empty booth: never invent a next track.
+            if (autoHandoffHeld) {
+                wasPlaying = false
+                idlePolls = 0
+                lastRemainMs = 0L
+                val banterHint = " · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
+                store.songsSinceBanter = songsSinceBanter
+                publish(
+                    nowLine = "Nothing playing — Live DJ idle…",
+                    status = if (queue.isEmpty()) {
+                        "Idle · queue empty$banterHint"
+                    } else {
+                        "Idle · ${queue.size} queued$banterHint"
+                    },
+                    persist = false,
+                )
+                return
+            }
             if (inInterTrackGrace(now) || recentlyOwnedPlayback(now)) {
                 idlePolls++
                 // Keep a low remain so later empty polls still look like a natural end
@@ -2224,26 +2251,38 @@ class SpotifyLiveDjService : Service() {
                 )
                 // If empty persists and we still have a queue, nudge the next cut
                 // (play may have failed silently or Spotify never started the URI).
-                val shouldNudge = queue.isNotEmpty() &&
+                // Bound the grace window — never nudge forever after a failed handoff.
+                val graceStillLive = inInterTrackGrace(now) ||
+                    (expectedPlayUri != null && now <= expectedPlayUntilMs + 5_000L) ||
+                    (pendingPlayVerifyUri != null && now <= pendingPlayVerifyUntilMs + 5_000L)
+                val shouldNudge = graceStillLive &&
+                    queue.isNotEmpty() &&
                     !transitioning.get() &&
                     idlePolls >= 4 &&
+                    idlePolls <= 12 &&
                     (now > expectedPlayUntilMs || idlePolls >= 8)
                 if (shouldNudge) {
                     idlePolls = 0
-                    releaseAutoHandoff("empty_grace_nudge")
                     armInterTrackGrace(12_000L)
                     scope.launch { runTransition("stuck_end") }
+                } else if (!graceStillLive && idlePolls >= 6) {
+                    // Grace expired with empty player — freeze, do not keep advancing.
+                    holdAutoHandoff("empty_after_grace remainWas=${remainBeforeEmpty}ms")
+                    publish(
+                        nowLine = "Nothing playing — Live DJ idle…",
+                        status = "Idle · ${queue.size} queued",
+                    )
                 }
                 return
             }
-            val likelyNaturalEnd = !autoHandoffHeld && (
-                (wasPlaying && remainBeforeEmpty <= 20_000L) ||
-                    nearEndArmed ||
-                    handoffLaunchedForUri != null ||
-                    pendingPlayVerifyUri != null ||
-                    (remainBeforeEmpty <= 8_000L && wasPlaying) ||
-                    (remainBeforeEmpty <= 5_000L && queue.isNotEmpty() && wasPlaying)
-                )
+            val likelyNaturalEnd = !autoHandoffHeld &&
+                wasPlaying &&
+                (
+                    (remainBeforeEmpty <= 12_000L) ||
+                        nearEndArmed ||
+                        (handoffLaunchedForUri != null && nearEndArmed) ||
+                        pendingPlayVerifyUri != null
+                    )
             if (!likelyNaturalEnd) {
                 // Require a few empty polls before treating as a real session pause —
                 // single empty flashes mid-set used to freeze auto-handoff.
@@ -2256,19 +2295,10 @@ class SpotifyLiveDjService : Service() {
                     )
                     return
                 }
-                // Mid-set with a queue: advance instead of freezing as "Paused"
-                // (common after a failed play + wiped remain).
-                if (queue.isNotEmpty() && wasPlaying && !transitioning.get()) {
-                    Log.i(TAG, "empty after wasPlaying — force next (remainWas=${remainBeforeEmpty}ms)")
-                    idlePolls = 0
-                    lastRemainMs = 0L
-                    armInterTrackGrace(12_000L)
-                    scope.launch { runTransition("stuck_end") }
-                    return
-                }
+                // Real pause / session drop mid-cut: freeze. Never force-next just
+                // because wasPlaying was sticky — that fired hours after pause.
                 holdAutoHandoff(
-                    if (autoHandoffHeld) "empty_while_held"
-                    else "empty_not_near_end remainWas=${remainBeforeEmpty}ms",
+                    "empty_not_near_end remainWas=${remainBeforeEmpty}ms wasPlaying=$wasPlaying",
                 )
                 wasPlaying = false
                 idlePolls = 0
@@ -2590,19 +2620,23 @@ class SpotifyLiveDjService : Service() {
             return
         }
         // Stuck at end: same URI paused near 0 — start next ourselves.
-        // Never while auto-handoff is held (user pause / empty session) — except when
-        // we already launched a handoff for this URI and it failed (retry path).
-        if (!playing && duration > 0 && remain <= 5_000L && queue.isNotEmpty()) {
+        // Hard stop while auto-handoff is held (user pause / empty session).
+        // Do not use sticky wasPlaying to override the hold — that resumed sets hours later.
+        if (
+            !autoHandoffHeld &&
+            !playing &&
+            duration > 0 &&
+            remain <= 5_000L &&
+            queue.isNotEmpty()
+        ) {
             stuckEndPolls++
             val priorHandoff = handoffLaunchedForUri == uri
             val canNudge = !transitioning.get() &&
-                (!autoHandoffHeld || priorHandoff || wasPlaying) &&
                 (handoffLaunchedForUri != uri || stuckEndPolls >= 4)
             if (canNudge && !banterDue && (wasPlaying || stuckEndPolls >= 2 || priorHandoff)) {
                 stuckEndPolls = 0
                 handoffLaunchedForUri = uri
                 nearEndArmed = true
-                releaseAutoHandoff("stuck_end_retry")
                 armInterTrackGrace(18_000L)
                 scope.launch { runTransition("stuck_end") }
                 return
@@ -2611,23 +2645,24 @@ class SpotifyLiveDjService : Service() {
                 stuckEndPolls = 0
                 handoffLaunchedForUri = uri
                 nearEndArmed = true
-                releaseAutoHandoff("stopped_at_end_retry")
                 armInterTrackGrace(20_000L)
                 scope.launch { runTransition("stopped_at_end") }
                 return
             }
-        } else if (playing || remain > 5_000L) {
+        } else if (playing || remain > 5_000L || autoHandoffHeld) {
             stuckEndPolls = 0
         }
 
         // Sticky wasPlaying: brief not-playing flickers near the end / after our play
         // must not clear the flag or the next empty poll freezes the booth.
+        // Held pause always clears it — never stay "wasPlaying" for hours at 0 remain.
         wasPlaying = when {
+            autoHandoffHeld -> false
             playing -> true
             inInterTrackGrace(nowMs) -> true
-            remain <= 12_000L && wasPlaying -> true
             midPauseSinceMs > 0L && nowMs - midPauseSinceMs >= 4_500L -> false
-            autoHandoffHeld -> false
+            // Only stick near-end while we still saw play recently (not a long pause).
+            remain <= 12_000L && wasPlaying && midPauseSinceMs == 0L -> true
             else -> wasPlaying // keep last known while debounce runs
         }
         if (queue.size < 3 && !filling.get()) {
@@ -3452,24 +3487,24 @@ class SpotifyLiveDjService : Service() {
     private suspend fun runTransition(reason: String) {
         // Works in booth mode (Live DJ auto-handoff off) for skip/chat; auto poll only when enabled.
         if (!transitioning.compareAndSet(false, true)) return
-        // Manual user actions always run; automatic idle kicks respect pause hold.
+        // Manual user actions always run; automatic handoffs respect pause hold.
         val isSkipReason = reason == "skip" || reason == "chat_skip"
         val isIdleKick = reason == "kick_idle" || reason == "idle_advance" || reason == "poll_error_advance"
-        val isRecovery = reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended" ||
-            reason == "near_end" || reason == "near_end_direct" ||
-            reason == "session_near_end" || reason == "session_stuck_end"
         val isUserForced = isSkipReason ||
             reason.startsWith("chat_") ||
             reason == "play_from_queue" ||
             reason == "play_uri"
-        if (autoHandoffHeld && isIdleKick && !isUserForced) {
-            Log.i(TAG, "skip transition $reason — auto-handoff held (paused / no now playing)")
+        // Any automatic advance while held must stop — stuck_end used to be treated as
+        // "recovery" and released the hold, so a long pause still bantered + played next.
+        if (autoHandoffHeld && !isUserForced) {
+            Log.i(TAG, "skip transition $reason — auto-handoff held (paused / idle booth)")
             transitioning.set(false)
             handoffLaunchedForUri = null
+            nearEndArmed = false
             return
         }
-        if (isUserForced || isRecovery) {
-            // User skipped/played or natural handoff — leave pause-hold.
+        if (isUserForced) {
+            // User skipped/played — leave pause-hold so the set can run again.
             releaseAutoHandoff("transition:$reason")
         }
         // Capture before clear — Skip + talk sets this; plain skip / natural end do not.
@@ -7284,6 +7319,13 @@ class SpotifyLiveDjService : Service() {
             midPauseSinceMs = 0L
             releaseAutoHandoff(if (rateLimited) "session_playing_rate_limit" else "session_playing")
             idlePolls = 0
+        } else if (duration > 0L && remain > 8_000L && !inInterTrackGrace()) {
+            // Sustained mid-track pause from session — freeze auto handoff.
+            if (midPauseSinceMs == 0L) midPauseSinceMs = System.currentTimeMillis()
+            val pausedFor = System.currentTimeMillis() - midPauseSinceMs
+            if (pausedFor >= 4_500L) {
+                holdAutoHandoff("session_mid_pause remain=${remain}ms")
+            }
         }
         val label = buildString {
             append(if (playing) "▶ " else "⏸ ")
@@ -7306,6 +7348,7 @@ class SpotifyLiveDjService : Service() {
             persist = false,
         )
         // Near-end / stuck-end via session so handoffs still fire under 429.
+        // Never while held — a long pause must not "finish" the cut hours later.
         if (!transitioning.get() && !autoHandoffHeld && queue.isNotEmpty()) {
             if (playing && remain in 0L..3_500L && handoffLaunchedForUri != uri) {
                 nearEndArmed = true
@@ -7313,7 +7356,7 @@ class SpotifyLiveDjService : Service() {
                     handoffLaunchedForUri = uri
                     scope.launch { runTransition("near_end") }
                 }
-            } else if (!playing && remain <= 2_500L && wasPlaying) {
+            } else if (!playing && remain <= 2_500L && wasPlaying && midPauseSinceMs == 0L) {
                 stuckEndPolls++
                 if (stuckEndPolls >= 2) {
                     stuckEndPolls = 0
@@ -7323,6 +7366,8 @@ class SpotifyLiveDjService : Service() {
             } else if (playing) {
                 stuckEndPolls = 0
             }
+        } else if (autoHandoffHeld) {
+            stuckEndPolls = 0
         }
         if (uri.isNotBlank()) {
             lastUri = uri
