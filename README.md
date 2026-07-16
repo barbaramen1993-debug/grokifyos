@@ -314,6 +314,19 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.125 — Live DJ pause freeze, idle lockscreen ticks, full chat timestamps
+
+- **Live DJ pause-hold**: while paused, no auto next / banter / stuck-end recovery — hold stays until you press play (or skip/play still works). Empty player mid-pause freezes instead of force-next; held booth polls ~every 60s.
+- **Spotify lockscreen / FGS**: progress bar ticks only while playing (~1s); paused idles (~30s) and wakes on play/pause/session change.
+- **Chat timestamps**: full date + time to the second (e.g. `Jul 16, 2026 · 14:32:05`) in main chat, Live DJ chat, and web system chat.
+
+### 0.1.124 — Place Notes background FGS, Spotify 429 gate, home widgets
+
+- **Place Notes monitoring**: location **foreground service** keeps area monitoring alive when the app is closed so enter alerts (notify / open app / image) actually fire. Ongoing “Place Notes monitoring” notification; re-arms after reboot and OTA.
+- **Home-screen widgets**: Spotify (1×4 + controls), Place Notes (compact + full), Wi‑Fi / BT scanners, SpaceXAI usage — tap opens GrokifyOS into the matching inner app; Spotify transport actions work from the widget.
+- **Spotify API 429 gate**: process-wide cool-down so Control / widget / Live DJ stop hammering the Web API after rate limits.
+- Media-cache endpoint + album-art mirror helpers for widgets and lockscreen art.
+
 ### 0.1.110 — Live DJ: More like this mix (similar-first)
 
 - **More like this** no longer dumps mostly same-artist tops. Batch is mixed (~¼ same-artist deep cuts, ~½ related artists, rest genre / playlist-radio / your liked+tops blend).
