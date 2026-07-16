@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ImageView
+        android:id="@+id/spotify_album_bg"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@null"
+        android:scaleType="centerCrop"
+        android:src="@drawable/widget_bg_panel" />
+
+    <ImageView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@null"
+        android:src="@drawable/widget_bg_scrim" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingTop="6dp"
+        android:paddingEnd="4dp"
+        android:paddingBottom="6dp">
+
+        <ImageView
+            android:id="@+id/spotify_artist_thumb"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:background="@drawable/widget_thumb_ring"
+            android:contentDescription="Artist"
+            android:padding="2dp"
+            android:scaleType="centerCrop"
+            android:src="@drawable/widget_ic_music" />
+
+        <!-- Tap art / track meta → open GrokifyOS Spotify controller -->
+        <LinearLayout
+            android:id="@+id/spotify_meta"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/spotify_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="Nothing playing"
+                android:textColor="#E8EDF7"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/spotify_artist"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="Spotify · Live DJ controls"
+                android:textColor="#8B95A8"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <ImageButton
+            android:id="@+id/spotify_btn_prev"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:background="@drawable/widget_btn_circle"
+            android:contentDescription="Previous"
+            android:padding="6dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/widget_ic_prev" />
+
+        <ImageButton
+            android:id="@+id/spotify_btn_play"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:layout_marginStart="2dp"
+            android:background="@drawable/widget_btn_circle"
+            android:contentDescription="Play or pause"
+            android:padding="6dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/widget_ic_play" />
+
+        <ImageButton
+            android:id="@+id/spotify_btn_next"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_marginStart="2dp"
+            android:background="@drawable/widget_btn_circle"
+            android:contentDescription="Next"
+            android:padding="6dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/widget_ic_next" />
+
+        <ImageButton
+            android:id="@+id/spotify_btn_like"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_marginStart="2dp"
+            android:background="@drawable/widget_btn_circle"
+            android:contentDescription="Like"
+            android:padding="6dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/widget_ic_heart" />
+
+        <ImageButton
+            android:id="@+id/spotify_btn_more"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_marginStart="2dp"
+            android:layout_marginEnd="2dp"
+            android:background="@drawable/widget_btn_circle"
+            android:contentDescription="More like this"
+            android:padding="6dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/widget_ic_more" />
+    </LinearLayout>
+</FrameLayout>

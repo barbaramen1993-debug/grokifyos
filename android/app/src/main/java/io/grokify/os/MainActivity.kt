@@ -56,6 +56,8 @@ class MainActivity : ComponentActivity() {
         startAssistantService()
         // Spotify OAuth deep link (cold start after browser redirect).
         io.grokify.os.apps.plugin.SpotifyOAuth.handleRedirect(this, intent)
+        // Home-screen widgets → open inner app / Live DJ tab.
+        io.grokify.os.widgets.WidgetNav.handleIntent(intent)
 
         setContent {
             GrokifyTheme {
@@ -173,6 +175,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         io.grokify.os.apps.plugin.SpotifyOAuth.handleRedirect(this, intent)
+        io.grokify.os.widgets.WidgetNav.handleIntent(intent)
     }
 
     /**

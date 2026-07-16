@@ -264,6 +264,41 @@ class GrokifyApi(
         return executeJson(req)
     }
 
+    /**
+     * Ask the host to download [sourceUrl] once and store it content-addressed.
+     * Returns durable `/api/media-cache.php?id=…` URL under the `url` field.
+     */
+    fun cacheMediaFromUrl(sourceUrl: String): JSONObject {
+        val body = JSONObject().put("url", sourceUrl)
+        val req = authRequest("/media-cache.php")
+            .post(jsonBody(body))
+            .build()
+        return executeJson(req)
+    }
+
+    /**
+     * Upload raw image bytes (e.g. media-session album art without a public CDN URL).
+     * @param sourceKey optional stable key for de-dupe (track uri / synthetic source)
+     */
+    fun cacheMediaBytes(
+        bytes: ByteArray,
+        contentType: String = "image/jpeg",
+        sourceKey: String? = null,
+    ): JSONObject {
+        val path = buildString {
+            append("/media-cache.php")
+            if (!sourceKey.isNullOrBlank()) {
+                append("?source=")
+                append(java.net.URLEncoder.encode(sourceKey, "UTF-8"))
+            }
+        }
+        val media = contentType.toMediaType()
+        val req = authRequest(path)
+            .post(bytes.toRequestBody(media))
+            .build()
+        return executeJson(req)
+    }
+
     private fun executeJson(req: Request): JSONObject {
         client.newCall(req).execute().use { resp ->
             val text = resp.body?.string().orEmpty()

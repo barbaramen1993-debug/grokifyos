@@ -10,6 +10,11 @@
     <string name="notification_channel_nearby_bt_desc">Alerts for strong nearby, first-seen, or watched Bluetooth name/MAC devices</string>
     <string name="notification_channel_place_notes">Place notes</string>
     <string name="notification_channel_place_notes_desc">Alerts when you enter a GPS place note area</string>
+    <string name="notification_channel_place_monitor">Place notes monitor</string>
+    <string name="notification_channel_place_monitor_desc">Ongoing notification while Place Notes watches GPS areas in the background</string>
+    <string name="place_monitor_title">Place Notes monitoring</string>
+    <string name="place_monitor_text">Watching place notes in the background</string>
+    <string name="place_monitor_stop">Stop</string>
     <string name="notification_channel_spotify_ctrl">Spotify controller</string>
     <string name="notification_channel_spotify_ctrl_desc">Lockscreen media controls: previous, play/pause, next</string>
     <string name="notification_channel_spotify_dj">Live AI DJ</string>
@@ -19,4 +24,18 @@
     <string name="fg_title">GrokifyOS</string>
     <string name="fg_text">Background bridge (can be ignored)</string>
     <string name="notification_listener_label">GrokifyOS notification access</string>
+
+    <!-- Home screen widgets -->
+    <string name="widget_wifi_desc">1×4 shortcut to Wi‑Fi Scanner</string>
+    <string name="widget_bt_desc">1×4 shortcut to Bluetooth Tracker</string>
+    <string name="widget_place_notes_desc">1×4 Place Notes — tap opens app; badge toggles monitor</string>
+    <string name="widget_usage_desc">1×4 shortcut to SpaceXAI Usage Analyzer</string>
+    <string name="widget_spotify_small_desc">Spotify strip: tap art/title to open app; transport stays on-widget</string>
+    <string name="widget_place_notes_full_desc">Place Notes control panel: monitor, pin, arm places, maps — in-widget</string>
+    <string name="widget_wifi_label">Wi‑Fi Scanner</string>
+    <string name="widget_bt_label">Bluetooth Tracker</string>
+    <string name="widget_place_notes_label">Place Notes</string>
+    <string name="widget_usage_label">SpaceXAI Usage</string>
+    <string name="widget_spotify_small_label">Spotify</string>
+    <string name="widget_place_notes_full_label">Place Notes (full)</string>
 </resources>

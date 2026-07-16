@@ -73,6 +73,20 @@ class GrokifyApp : Application() {
                 description = getString(R.string.notification_channel_place_notes_desc)
             }
         )
+        // Quiet ongoing FGS while area monitoring is on (enter alerts use CHANNEL_PLACE_NOTES).
+        nm.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_PLACE_MONITOR,
+                getString(R.string.notification_channel_place_monitor),
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = getString(R.string.notification_channel_place_monitor_desc)
+                setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
+        )
         // Delete the old LOW channel so devices that already installed 0.1.33
         // pick up DEFAULT importance (LOW often stays off the lockscreen).
         runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl") }
@@ -134,6 +148,7 @@ class GrokifyApp : Application() {
         const val CHANNEL_NEARBY_WIFI = "grokify_nearby_wifi"
         const val CHANNEL_NEARBY_BT = "grokify_nearby_bt"
         const val CHANNEL_PLACE_NOTES = "grokify_place_notes"
+        const val CHANNEL_PLACE_MONITOR = "grokify_place_monitor"
         // v2 id: forces a fresh channel on upgrade (importance is immutable once created)
         const val CHANNEL_SPOTIFY_CTRL = "grokify_spotify_ctrl_v2"
         const val CHANNEL_SPOTIFY_DJ = "grokify_spotify_dj"
@@ -141,5 +156,8 @@ class GrokifyApp : Application() {
 
         lateinit var instance: GrokifyApp
             private set
+
+        fun instanceOrNull(): GrokifyApp? =
+            if (::instance.isInitialized) instance else null
     }
 }

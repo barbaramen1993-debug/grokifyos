@@ -47,6 +47,88 @@ object SpotifyOAuth {
     /** PKCE login must complete within this window. */
     private const val PENDING_TTL_MS = 15 * 60 * 1000L
 
+    /**
+     * Process-wide Web API cool-down shared by Live DJ, widgets, Control UI, and
+     * library calls. Without this, each caller backed off independently while the
+     * others kept hammering player endpoints — 429 never cleared for hours.
+     */
+    @Volatile private var rateLimitedUntilMs: Long = 0L
+    @Volatile private var rateLimitBackoffMs: Long = 0L
+    private const val RATE_BACKOFF_MIN_MS = 15_000L
+    private const val RATE_BACKOFF_MAX_MS = 300_000L // 5 min ceiling
+
+    /** True while any recent Spotify Web API 429 cool-down is active. */
+    fun isRateLimited(now: Long = System.currentTimeMillis()): Boolean =
+        now < rateLimitedUntilMs
+
+    /** Milliseconds left on the global cool-down (0 if clear). */
+    fun rateLimitRemainingMs(now: Long = System.currentTimeMillis()): Long =
+        (rateLimitedUntilMs - now).coerceAtLeast(0L)
+
+    /**
+     * Record a 429 / rate-limit response. Prefer Spotify's Retry-After when present.
+     * Exponential backoff grows to [RATE_BACKOFF_MAX_MS] so deep holes recover.
+     */
+    fun noteHttpRateLimit(retryAfterSec: Int? = null) {
+        val fromHeader = retryAfterSec?.takeIf { it > 0 }?.times(1000L)
+        val next = when {
+            fromHeader != null -> fromHeader.coerceIn(5_000L, RATE_BACKOFF_MAX_MS)
+            rateLimitBackoffMs <= 0L -> RATE_BACKOFF_MIN_MS
+            else -> (rateLimitBackoffMs * 2).coerceAtMost(RATE_BACKOFF_MAX_MS)
+        }
+        rateLimitBackoffMs = next
+        rateLimitedUntilMs = System.currentTimeMillis() + next
+        Log.w(TAG, "global Spotify rate-limit cooldown ${next}ms (retryAfter=$retryAfterSec)")
+    }
+
+    /**
+     * Soft clear after a successful API call once the window has elapsed.
+     * Decays rather than zero so a second 429 still backs off harder.
+     */
+    fun clearRateLimitSoft() {
+        if (rateLimitedUntilMs <= 0L && rateLimitBackoffMs <= 0L) return
+        val now = System.currentTimeMillis()
+        if (now >= rateLimitedUntilMs) {
+            rateLimitedUntilMs = 0L
+            rateLimitBackoffMs = (rateLimitBackoffMs / 2).coerceAtMost(RATE_BACKOFF_MIN_MS)
+            if (rateLimitBackoffMs < 5_000L) rateLimitBackoffMs = 0L
+        }
+    }
+
+    private fun rateLimitedEnvelope(): String {
+        val waitSec = (rateLimitRemainingMs() / 1000L).toInt().coerceAtLeast(1)
+        return JSONObject()
+            .put("ok", false)
+            .put("status", 429)
+            .put("error", "rate_limited")
+            .put("body", "")
+            .put("retryAfter", waitSec)
+            .toString()
+    }
+
+    private fun noteRateLimitFromEnvelope(raw: String) {
+        try {
+            val o = JSONObject(raw)
+            val status = o.optInt("status", 0)
+            val err = if (o.isNull("error")) "" else o.optString("error", "")
+            val is429 = status == 429 ||
+                err.contains("429") ||
+                err.contains("rate limit", ignoreCase = true) ||
+                err.contains("too many requests", ignoreCase = true)
+            if (!is429) {
+                if (o.optBoolean("ok", false) || status in listOf(200, 201, 202, 204)) {
+                    clearRateLimitSoft()
+                }
+                return
+            }
+            val retry = if (o.isNull("retryAfter")) null
+            else o.optInt("retryAfter", 0).takeIf { it > 0 }
+            noteHttpRateLimit(retry)
+        } catch (_: Exception) {
+            // ignore parse failures
+        }
+    }
+
     private val SCOPES = listOf(
         "user-read-email",
         "user-read-private",
@@ -302,8 +384,16 @@ object SpotifyOAuth {
     /**
      * Authenticated Spotify Web API call.
      * @param path e.g. "/v1/me/player/recently-played?limit=20"
+     *
+     * Honors the process-wide rate-limit cool-down: while cooling, returns a
+     * synthetic 429 without hitting the network so UI/widget/DJ stop digging.
      */
     fun api(ctx: Context, method: String, path: String, body: String?): String {
+        val m = method.trim().uppercase().ifBlank { "GET" }
+        // Block everything during cool-down — play/pause retries also burn the quota.
+        if (isRateLimited()) {
+            return rateLimitedEnvelope()
+        }
         val token = ensureAccessToken(ctx)
         if (token.isNullOrBlank()) {
             return JSONObject()
@@ -326,7 +416,6 @@ object SpotifyOAuth {
                 .toString()
         }
         val headers = JSONObject().put("Authorization", "Bearer $token")
-        val m = method.trim().uppercase().ifBlank { "GET" }
         // Spotify player endpoints (pause/play/next) often need an empty JSON object body
         // for PUT/POST so Content-Type is application/json, not a raw empty entity.
         val effectiveBody = when {
@@ -337,7 +426,9 @@ object SpotifyOAuth {
         if (!effectiveBody.isNullOrBlank()) {
             headers.put("Content-Type", "application/json")
         }
-        return HostHttpProxy.request(m, p, headers.toString(), effectiveBody)
+        val raw = HostHttpProxy.request(m, p, headers.toString(), effectiveBody)
+        noteRateLimitFromEnvelope(raw)
+        return raw
     }
 
     /** @return pair(success, errorMessage?) */

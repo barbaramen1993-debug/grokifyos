@@ -5,10 +5,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
+import android.media.session.PlaybackState
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -510,7 +514,8 @@ data class SpotifyDjUiState(
  * Service is the source of runtime state; queue + chat survive leave/return & restarts.
  */
 class SpotifyDjStore(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private val appCtx = context.applicationContext
+    private val prefs = appCtx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     var enabled: Boolean
         get() = prefs.getBoolean(KEY_ENABLED, false)
@@ -813,9 +818,22 @@ class SpotifyDjStore(context: Context) {
 
     fun saveMessages(msgs: List<DjChatMessage>) {
         runCatching {
+            // Persist durable host URLs when we already mirrored covers.
+            val rewritten = SpotifyArtMirror.rewriteMessages(appCtx, msgs)
             val arr = JSONArray()
-            msgs.takeLast(MAX_DJ_CHAT_MESSAGES).forEach { arr.put(it.toJson()) }
+            rewritten.takeLast(MAX_DJ_CHAT_MESSAGES).forEach { arr.put(it.toJson()) }
             prefs.edit().putString(KEY_CHAT, arr.toString()).apply()
+            // Background: push any remaining Spotify CDN URLs to our media-cache.
+            val urls = rewritten.asSequence()
+                .filter { it.role == DjChatRole.Track }
+                .flatMap { sequenceOf(it.albumArtUrl, it.artistArtUrl) }
+                .filterNotNull()
+                .filter { SpotifyArtMirror.isSpotifyCdn(it) }
+                .distinct()
+                .toList()
+            if (urls.isNotEmpty()) {
+                SpotifyArtMirror.mirrorAllAsync(appCtx, urls)
+            }
         }.onFailure { Log.w(TAG, "save chat: ${it.message}") }
     }
 
@@ -1130,9 +1148,20 @@ fun applyDjBanterSettings(context: Context) {
  * Always restores banter countdown counters so leave/return keeps “talk in N tracks” honest.
  */
 fun ensureDjChatHydrated(context: Context) {
-    val store = SpotifyDjStore(context.applicationContext)
+    val appCtx = context.applicationContext
+    val store = SpotifyDjStore(appCtx)
     val bus = SpotifyDjBus.state.value
-    val msgs = if (bus.messages.isEmpty()) store.loadMessages() else bus.messages
+    val loaded = if (bus.messages.isEmpty()) store.loadMessages() else bus.messages
+    val msgs = SpotifyArtMirror.rewriteMessages(appCtx, loaded)
+    // Fire-and-forget: cache any leftover Spotify CDN covers on our host.
+    SpotifyArtMirror.mirrorAllAsync(
+        appCtx,
+        msgs.asSequence()
+            .filter { it.role == DjChatRole.Track }
+            .flatMap { sequenceOf(it.albumArtUrl, it.artistArtUrl) }
+            .filterNotNull()
+            .toList(),
+    )
     val q = if (bus.queue.isEmpty()) store.loadQueue() else bus.queue
     val songsSince = store.songsSinceBanter
     val every = store.banterEvery
@@ -1156,7 +1185,7 @@ fun ensureDjChatHydrated(context: Context) {
     }
     SpotifyDjBus.patch {
         it.copy(
-            messages = if (it.messages.isEmpty()) msgs else it.messages,
+            messages = if (it.messages.isEmpty()) msgs else SpotifyArtMirror.rewriteMessages(appCtx, it.messages),
             queue = if (it.queue.isEmpty()) q else it.queue,
             enabled = store.enabled || it.enabled,
             voiceId = store.voiceId,
@@ -1288,10 +1317,17 @@ object SpotifyDjBus {
 
     fun publish(s: SpotifyDjUiState) {
         _state.value = s
+        notifyWidgets()
     }
 
     fun patch(block: (SpotifyDjUiState) -> SpotifyDjUiState) {
         _state.value = block(_state.value)
+        notifyWidgets()
+    }
+
+    private fun notifyWidgets() {
+        val app = GrokifyApp.instanceOrNull() ?: return
+        io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(app)
     }
 }
 
@@ -1446,8 +1482,8 @@ fun spotifyLiveDjPlayUri(
 }
 
 /**
- * Seed more of this artist + related artists / similar cuts, and **prepend** them
- * to the Live DJ UP NEXT list (next after the current track). Works in booth mode too.
+ * Seed a mixed "more like this" batch (same-artist deep cuts + related / genre-adjacent
+ * similars), and **prepend** them to UP NEXT. Works in booth mode too.
  */
 fun spotifyLiveDjMoreLikeThis(
     context: Context,
@@ -1569,8 +1605,22 @@ class SpotifyLiveDjService : Service() {
      * freeze auto-handoff and leave the booth dead between songs.
      */
     private var interTrackGraceUntilMs = 0L
+    /**
+     * After we commanded a play, verify Spotify actually started. API 204 often lies
+     * (no active device / lag) and then mid-pause hold freezes the booth forever.
+     */
+    private var pendingPlayVerifyUri: String? = null
+    private var pendingPlayVerifyUntilMs = 0L
+    private var pendingPlayRetries = 0
     /** Avoid thrashing play API when device is missing. */
     private var lastPlayAttemptMs = 0L
+    /**
+     * Spotify Web API rate-limit cool-down. While active we skip most API polls
+     * and lean on the media session so we stop spamming `http_429` in status.
+     */
+    private var rateLimitedUntilMs = 0L
+    /** Last backoff length (grows on repeated 429s, resets after a clean poll). */
+    private var rateLimitBackoffMs = 0L
     /**
      * Last known ms remaining on the current cut — used to speed the poll loop
      * before [nearEndArmed] so background handoffs are not missed.
@@ -1980,14 +2030,23 @@ class SpotifyLiveDjService : Service() {
             // Poll faster as the cut ends so background / Doze doesn't skip handoffs.
             // Silent near-end used to be only ~1.2s with a 2.5s tick — that missed almost
             // every natural end when the UI was not open, so the talk counter never moved.
+            // Mid-track / idle we stay much slower to avoid Spotify 429 storms that
+            // used to last for hours when Control UI + widgets also polled.
+            val now = System.currentTimeMillis()
+            val rateWait = SpotifyOAuth.rateLimitRemainingMs(now)
+                .coerceAtLeast((rateLimitedUntilMs - now).coerceAtLeast(0L))
             val remain = lastRemainMs
             val delayMs = when {
-                transitioning.get() || nearEndArmed -> 700L
-                idlePolls > 0 -> 1_000L
-                remain in 0L..8_000L -> 700L
-                remain in 0L..20_000L -> 1_000L
-                remain in 0L..45_000L -> 1_500L
-                else -> 2_200L
+                rateWait > 0L -> rateWait.coerceIn(2_000L, 180_000L)
+                transitioning.get() || nearEndArmed -> 800L
+                // Paused / empty / held: do not poll currently-playing every second.
+                autoHandoffHeld -> 20_000L
+                idlePolls >= 3 -> 12_000L
+                idlePolls > 0 -> 4_000L
+                remain in 0L..8_000L -> 900L
+                remain in 0L..20_000L -> 1_500L
+                remain in 0L..45_000L -> 2_500L
+                else -> 5_000L
             }
             delay(delayMs)
         }
@@ -2003,6 +2062,7 @@ class SpotifyLiveDjService : Service() {
         stuckEndPolls = 0
         midPauseSinceMs = 0L
         nearEndArmed = false
+        // Do not clear pendingPlayVerify here — a verify retry may still recover.
     }
 
     private fun releaseAutoHandoff(reason: String) {
@@ -2011,6 +2071,27 @@ class SpotifyLiveDjService : Service() {
         }
         autoHandoffHeld = false
         midPauseSinceMs = 0L
+    }
+
+    private fun clearPendingPlayVerify() {
+        pendingPlayVerifyUri = null
+        pendingPlayVerifyUntilMs = 0L
+        pendingPlayRetries = 0
+    }
+
+    /**
+     * True when we recently owned a handoff / play and should not freeze the booth
+     * as a user pause (empty player or lagging transport).
+     */
+    private fun recentlyOwnedPlayback(now: Long = System.currentTimeMillis()): Boolean {
+        return inInterTrackGrace(now) ||
+            (pendingPlayVerifyUri != null && now <= pendingPlayVerifyUntilMs + 8_000L) ||
+            (expectedPlayUri != null && now <= expectedPlayUntilMs) ||
+            handoffLaunchedForUri != null ||
+            nearEndArmed ||
+            // Only treat low remain as "ours" while we still believe the set was playing —
+            // avoids re-starting after a real mid-track pause once wasPlaying cleared.
+            (wasPlaying && lastRemainMs <= 12_000L)
     }
 
     /** True during the fragile window after a cut ends / we commanded play. */
@@ -2068,11 +2149,39 @@ class SpotifyLiveDjService : Service() {
             )
             return
         }
+        // Cool down after 429 — use media session so we keep handoffs without API spam.
+        if (isRateLimited()) {
+            if (pollFromMediaSession(rateLimited = true)) return
+            val waitSec = ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000L)
+                .coerceAtLeast(1L)
+            publish(
+                status = "Spotify rate limit — cooling ${waitSec}s · session fallback",
+                error = "rate_limited",
+                persist = false,
+            )
+            return
+        }
         val res = spotifyGet("/v1/me/player/currently-playing")
         // 204 = nothing playing
         if (!res.ok && res.status != 204) {
+            val friendly = friendlySpotifyError(res.status, res.error)
+            val rateHit = isRateLimitResult(res)
+            if (rateHit) {
+                // Prefer session immediately so the booth doesn't look broken.
+                if (pollFromMediaSession(rateLimited = true)) return
+                val waitSec = ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000L)
+                    .coerceAtLeast(1L)
+                publish(
+                    status = "Spotify rate limit — cooling ${waitSec}s",
+                    error = "rate_limited",
+                    persist = false,
+                )
+                return
+            }
             // 401/403 etc. — never auto-play through API errors while held / paused.
-            publish(status = res.error ?: "Player poll failed", error = res.error)
+            // Try session before treating as a hard poll failure.
+            if (pollFromMediaSession(rateLimited = false)) return
+            publish(status = friendly, error = res.error)
             idlePolls++
             // During inter-track grace, API blips are normal — don't freeze, and
             // allow a slightly more patient advance if we were at the outro.
@@ -2091,6 +2200,8 @@ class SpotifyLiveDjService : Service() {
             }
             return
         }
+        // Clean poll clears sticky rate-limit backoff growth.
+        clearRateLimitSoft()
         val data = res.json
         if (data == null || !data.has("item") || data.isNull("item")) {
             // Natural end: we were playing and remaining time was already low.
@@ -2100,33 +2211,38 @@ class SpotifyLiveDjService : Service() {
             val remainBeforeEmpty = lastRemainMs
             // Between cuts Spotify often returns 204/empty for several seconds —
             // never freeze the booth during inter-track grace or right after our play.
-            if (inInterTrackGrace(now)) {
+            if (inInterTrackGrace(now) || recentlyOwnedPlayback(now)) {
                 idlePolls++
-                lastRemainMs = 0L
+                // Keep a low remain so later empty polls still look like a natural end
+                // (wiping to 999999 after transitions used to freeze the booth as "Paused").
+                if (remainBeforeEmpty > 15_000L) lastRemainMs = 0L
+                else lastRemainMs = remainBeforeEmpty.coerceAtMost(3_000L)
                 publish(
                     nowLine = "Between tracks — keeping the set moving…",
                     status = "Handoff buffer · ${queue.size} queued",
                     persist = false,
                 )
-                // If empty persists through the full grace window and we still have a
-                // queue, nudge the next cut (play may have failed silently).
+                // If empty persists and we still have a queue, nudge the next cut
+                // (play may have failed silently or Spotify never started the URI).
                 val shouldNudge = queue.isNotEmpty() &&
                     !transitioning.get() &&
-                    !autoHandoffHeld &&
-                    idlePolls >= 5 &&
-                    now > expectedPlayUntilMs
+                    idlePolls >= 4 &&
+                    (now > expectedPlayUntilMs || idlePolls >= 8)
                 if (shouldNudge) {
                     idlePolls = 0
-                    armInterTrackGrace(10_000L)
+                    releaseAutoHandoff("empty_grace_nudge")
+                    armInterTrackGrace(12_000L)
                     scope.launch { runTransition("stuck_end") }
                 }
                 return
             }
             val likelyNaturalEnd = !autoHandoffHeld && (
-                (wasPlaying && remainBeforeEmpty <= 15_000L) ||
+                (wasPlaying && remainBeforeEmpty <= 20_000L) ||
                     nearEndArmed ||
                     handoffLaunchedForUri != null ||
-                    remainBeforeEmpty <= 5_000L && wasPlaying
+                    pendingPlayVerifyUri != null ||
+                    (remainBeforeEmpty <= 8_000L && wasPlaying) ||
+                    (remainBeforeEmpty <= 5_000L && queue.isNotEmpty() && wasPlaying)
                 )
             if (!likelyNaturalEnd) {
                 // Require a few empty polls before treating as a real session pause —
@@ -2138,6 +2254,16 @@ class SpotifyLiveDjService : Service() {
                         status = "Buffer · empty player ($idlePolls/4)",
                         persist = false,
                     )
+                    return
+                }
+                // Mid-set with a queue: advance instead of freezing as "Paused"
+                // (common after a failed play + wiped remain).
+                if (queue.isNotEmpty() && wasPlaying && !transitioning.get()) {
+                    Log.i(TAG, "empty after wasPlaying — force next (remainWas=${remainBeforeEmpty}ms)")
+                    idlePolls = 0
+                    lastRemainMs = 0L
+                    armInterTrackGrace(12_000L)
+                    scope.launch { runTransition("stuck_end") }
                     return
                 }
                 holdAutoHandoff(
@@ -2239,25 +2365,39 @@ class SpotifyLiveDjService : Service() {
         if (playing) {
             midPauseSinceMs = 0L
             releaseAutoHandoff("playing")
+            if (pendingPlayVerifyUri != null &&
+                (uri == pendingPlayVerifyUri || expectedPlayUri == null || uri == expectedPlayUri)
+            ) {
+                clearPendingPlayVerify()
+            }
         } else if (duration > 0 && remain > 8_000L) {
             val inGrace = inInterTrackGrace(nowMs) ||
                 handoffLaunchedForUri == uri ||
+                recentlyOwnedPlayback(nowMs) ||
                 (expectedPlayUri != null && nowMs <= expectedPlayUntilMs)
             if (inGrace) {
                 midPauseSinceMs = 0L
-                // Soft UI only — do not hold.
+                // Soft UI only — do not hold. If our play never actually started, retry.
+                maybeRetryPendingPlay(uri, playing, remain)
             } else {
                 if (midPauseSinceMs == 0L) midPauseSinceMs = nowMs
                 val pausedFor = nowMs - midPauseSinceMs
-                if (pausedFor >= 4_500L) {
-                    // User (or Spotify) paused mid-cut for real — freeze auto handoff.
-                    holdAutoHandoff(
-                        "mid_track_pause remain=${remain}ms for=${pausedFor}ms",
-                    )
+                // Give Spotify more time after our own play before freezing as "Paused".
+                val holdAfterMs = if (pendingPlayVerifyUri != null) 9_000L else 4_500L
+                if (pausedFor >= holdAfterMs) {
+                    // If we still owe a play verify, retry instead of freezing the set.
+                    if (maybeRetryPendingPlay(uri, playing, remain)) {
+                        midPauseSinceMs = 0L
+                    } else {
+                        // User (or Spotify) paused mid-cut for real — freeze auto handoff.
+                        holdAutoHandoff(
+                            "mid_track_pause remain=${remain}ms for=${pausedFor}ms",
+                        )
+                    }
                 } else {
                     Log.d(
                         TAG,
-                        "mid-pause debounce ${pausedFor}ms remain=${remain}ms (need 4500)",
+                        "mid-pause debounce ${pausedFor}ms remain=${remain}ms (need $holdAfterMs)",
                     )
                 }
             }
@@ -2430,36 +2570,40 @@ class SpotifyLiveDjService : Service() {
             scope.launch { runTransition("near_end") }
             return
         }
-        // Silent: direct-play the next cut in the last second (Spotify has no queue from us).
+        // Silent: direct-play before the last second so background polls don't miss the
+        // 1.2s window (that miss left the cut paused at end with DJ status "Paused").
         if (
             !autoHandoffHeld &&
             !banterDue &&
             playing &&
             duration > 15_000L &&
-            remain <= 1_200L &&
+            remain <= 3_500L &&
             queue.isNotEmpty() &&
             handoffLaunchedForUri != uri &&
             !transitioning.get()
         ) {
             handoffLaunchedForUri = uri
             nearEndArmed = true
-            armInterTrackGrace(15_000L)
+            armInterTrackGrace(18_000L)
             Log.i(TAG, "silent near_end direct-play remain=${remain}ms")
             scope.launch { runTransition("near_end_direct") }
             return
         }
         // Stuck at end: same URI paused near 0 — start next ourselves.
-        // Never while auto-handoff is held (user pause / empty session).
-        // Slightly wider than 2.5s so brief pause-at-outro doesn't sit in the
-        // dead zone between mid-pause debounce and stuck detection.
-        if (!autoHandoffHeld && !playing && duration > 0 && remain <= 5_000L && queue.isNotEmpty()) {
+        // Never while auto-handoff is held (user pause / empty session) — except when
+        // we already launched a handoff for this URI and it failed (retry path).
+        if (!playing && duration > 0 && remain <= 5_000L && queue.isNotEmpty()) {
             stuckEndPolls++
-            val canNudge = handoffLaunchedForUri != uri && !transitioning.get()
-            if (canNudge && !banterDue && (wasPlaying || stuckEndPolls >= 2)) {
+            val priorHandoff = handoffLaunchedForUri == uri
+            val canNudge = !transitioning.get() &&
+                (!autoHandoffHeld || priorHandoff || wasPlaying) &&
+                (handoffLaunchedForUri != uri || stuckEndPolls >= 4)
+            if (canNudge && !banterDue && (wasPlaying || stuckEndPolls >= 2 || priorHandoff)) {
                 stuckEndPolls = 0
                 handoffLaunchedForUri = uri
                 nearEndArmed = true
-                armInterTrackGrace(15_000L)
+                releaseAutoHandoff("stuck_end_retry")
+                armInterTrackGrace(18_000L)
                 scope.launch { runTransition("stuck_end") }
                 return
             }
@@ -2467,6 +2611,7 @@ class SpotifyLiveDjService : Service() {
                 stuckEndPolls = 0
                 handoffLaunchedForUri = uri
                 nearEndArmed = true
+                releaseAutoHandoff("stopped_at_end_retry")
                 armInterTrackGrace(20_000L)
                 scope.launch { runTransition("stopped_at_end") }
                 return
@@ -2525,11 +2670,62 @@ class SpotifyLiveDjService : Service() {
         publish(
             status = when {
                 playing -> "Watching playback$banterHint"
+                remain <= 5_000L && duration > 0L ->
+                    "Track ended — starting next$banterHint · ${queue.size} queued"
+                pendingPlayVerifyUri != null ->
+                    "Starting next track…$banterHint · ${queue.size} queued"
                 autoHandoffHeld -> "Paused · waiting for play$banterHint · ${queue.size} queued"
+                inInterTrackGrace(nowMs) ->
+                    "Between tracks$banterHint · ${queue.size} queued"
                 else -> "Paused$banterHint · ${queue.size} queued"
             },
         )
         updateNotif(line)
+    }
+
+    /**
+     * If [playTrack] claimed success but Spotify never left pause / empty, re-fire once
+     * (or twice) instead of freezing as mid-track pause.
+     * @return true if a retry was launched.
+     */
+    private fun maybeRetryPendingPlay(uri: String, playing: Boolean, remain: Long): Boolean {
+        if (playing || transitioning.get()) return false
+        val pending = pendingPlayVerifyUri ?: return false
+        val now = System.currentTimeMillis()
+        // Still early in the verify window — wait for Spotify to catch up.
+        if (now < pendingPlayVerifyUntilMs - 6_000L) return false
+        // Only retry when we're still on the commanded cut (or empty was handled elsewhere)
+        // or transport is stuck not-playing with lots of remain.
+        val onPending = uri.isBlank() || uri == pending
+        if (!onPending && remain > 20_000L) {
+            // Foreign track mid-song — abandon verify.
+            clearPendingPlayVerify()
+            return false
+        }
+        if (pendingPlayRetries >= 2) {
+            Log.w(TAG, "play verify exhausted for ${pending.takeLast(22)}")
+            clearPendingPlayVerify()
+            return false
+        }
+        pendingPlayRetries++
+        val track = current?.takeIf { it.uri == pending }
+            ?: synchronized(queue) { queue.firstOrNull { it.uri == pending } }
+            ?: DjQueueTrack(uri = pending)
+        Log.i(
+            TAG,
+            "play verify retry #$pendingPlayRetries uri=${pending.takeLast(22)} " +
+                "remain=${remain}ms",
+        )
+        armInterTrackGrace(16_000L)
+        pendingPlayVerifyUntilMs = now + 14_000L
+        releaseAutoHandoff("play_verify_retry")
+        scope.launch(Dispatchers.IO) {
+            val ok = playTrack(track)
+            if (!ok) {
+                Log.w(TAG, "play verify retry failed")
+            }
+        }
+        return true
     }
 
     /** Drop prefetched / pending banter when it no longer matches the queue head. */
@@ -2851,7 +3047,13 @@ class SpotifyLiveDjService : Service() {
 
         val taken = takeNextFromQueue(next)
         val play = taken ?: next
-        return playTrack(play)
+        val ok = playTrack(play)
+        if (!ok) {
+            // Keep the cut at the head so stuck-end / empty recovery can retry.
+            requeueFront(play)
+            Log.w(TAG, "advanceToNext play failed — requeued ${play.uri.takeLast(22)}")
+        }
+        return ok
     }
 
     /** No-op — direct-play never writes Spotify Up Next. */
@@ -2904,7 +3106,10 @@ class SpotifyLiveDjService : Service() {
         publish(status = "Syncing to Spotify…", clearError = true, loggedIn = true)
         val res = spotifyGet("/v1/me/player/currently-playing")
         if (!res.ok && res.status != 204) {
-            publish(status = res.error ?: "Sync failed", error = res.error)
+            publish(
+                status = friendlySpotifyError(res.status, res.error),
+                error = res.error,
+            )
             return
         }
         val data = res.json
@@ -3250,6 +3455,9 @@ class SpotifyLiveDjService : Service() {
         // Manual user actions always run; automatic idle kicks respect pause hold.
         val isSkipReason = reason == "skip" || reason == "chat_skip"
         val isIdleKick = reason == "kick_idle" || reason == "idle_advance" || reason == "poll_error_advance"
+        val isRecovery = reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended" ||
+            reason == "near_end" || reason == "near_end_direct" ||
+            reason == "session_near_end" || reason == "session_stuck_end"
         val isUserForced = isSkipReason ||
             reason.startsWith("chat_") ||
             reason == "play_from_queue" ||
@@ -3257,11 +3465,10 @@ class SpotifyLiveDjService : Service() {
         if (autoHandoffHeld && isIdleKick && !isUserForced) {
             Log.i(TAG, "skip transition $reason — auto-handoff held (paused / no now playing)")
             transitioning.set(false)
+            handoffLaunchedForUri = null
             return
         }
-        if (isUserForced || reason == "near_end" || reason == "near_end_direct" ||
-            reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended"
-        ) {
+        if (isUserForced || isRecovery) {
             // User skipped/played or natural handoff — leave pause-hold.
             releaseAutoHandoff("transition:$reason")
         }
@@ -3274,7 +3481,7 @@ class SpotifyLiveDjService : Service() {
         val allowTalk = store.allowTalkOver && store.banterEnabled
         // Manual skip jumps now; natural ends may hold for banter outro then direct-play.
         val isStuckEnd = reason == "stuck_end" || reason == "stopped_at_end" || reason == "ended" ||
-            reason == "near_end_direct"
+            reason == "near_end_direct" || reason == "session_stuck_end" || reason == "session_near_end"
         // Provisional status; refined after we know next + prefetch below.
         val banterDueProvisional = store.banterEnabled &&
             (forcedTalk || songsSinceBanter + 1 >= banterEvery) // countdown or forced
@@ -3716,10 +3923,18 @@ class SpotifyLiveDjService : Service() {
             publish(status = "Transition error: ${e.message}", error = e.message)
         } finally {
             nearEndArmed = false
-            lastRemainMs = 999_999L
+            // Always clear so a failed handoff can re-arm stuck_end on the same URI.
+            handoffLaunchedForUri = null
             midPauseSinceMs = 0L
+            // Do NOT wipe lastRemainMs to 999999 — that made empty-player polls look like
+            // a mid-set pause and froze auto-handoff ("DJ thinks it's paused").
+            if (lastRemainMs > 20_000L && pendingPlayVerifyUri == null) {
+                // Successful playTrack already set a high remain for the new cut.
+            } else if (pendingPlayVerifyUri == null && lastRemainMs > 8_000L) {
+                lastRemainMs = 2_000L
+            }
             // Keep treating empty/paused flickers as between-song buffer, not user pause.
-            armInterTrackGrace(12_000L)
+            armInterTrackGrace(14_000L)
             transitioning.set(false)
             // Always flush countdown after a handoff so UI + leave/return stay honest.
             store.songsSinceBanter = songsSinceBanter
@@ -3728,7 +3943,9 @@ class SpotifyLiveDjService : Service() {
             publish(
                 transitioning = false,
                 status = SpotifyDjBus.state.value.status.let { s ->
-                    if (s.contains("talk in") || s.contains("banter") || s.startsWith("Playing")) {
+                    if (s.contains("talk in") || s.contains("banter") || s.startsWith("Playing") ||
+                        s.contains("Starting next") || s.contains("Track ended")
+                    ) {
                         s
                     } else {
                         "Watching playback · ${banterCountdownLabel(songsSinceBanter, banterEvery)}"
@@ -3960,9 +4177,16 @@ class SpotifyLiveDjService : Service() {
         stuckEndPolls = 0
         midPauseSinceMs = 0L
         // Buffering the new cut often reports paused + full remain — grace covers it.
-        armInterTrackGrace(14_000L)
+        armInterTrackGrace(if (ok) 16_000L else 10_000L)
         if (ok || res.status == 404) {
             releaseAutoHandoff("play_track")
+            // API 204 often lies — verify the transport actually starts, else retry.
+            val samePending = pendingPlayVerifyUri == item.uri
+            if (!samePending) pendingPlayRetries = 0
+            pendingPlayVerifyUri = item.uri
+            pendingPlayVerifyUntilMs = playAt + 14_000L
+        } else {
+            clearPendingPlayVerify()
         }
         if (item.uri != lastChatTrackUri) {
             lastChatTrackUri = item.uri
@@ -3977,7 +4201,7 @@ class SpotifyLiveDjService : Service() {
             status = if (ok) {
                 "Playing · $upcomingCount in app list"
             } else {
-                "Play rejected · ${res.error ?: res.status}"
+                "Play rejected · ${friendlySpotifyError(res.status, res.error)}"
             },
             clearError = ok,
             error = if (ok) null else (res.error ?: "play_${res.status}"),
@@ -3986,29 +4210,155 @@ class SpotifyLiveDjService : Service() {
         return ok
     }
 
-    private fun togglePause() {
-        val curPlaying = wasPlaying
-        val path = if (curPlaying) "/v1/me/player/pause" else "/v1/me/player/play"
-        val res = spotifyPut(path, if (curPlaying) "{}" else "{}")
-        if (res.ok || res.status in listOf(202, 204)) {
-            wasPlaying = !curPlaying
-            if (curPlaying) {
-                // User paused from the booth — freeze auto banter / next-track.
-                holdAutoHandoff("user_pause_toggle")
-            } else {
-                releaseAutoHandoff("user_play_toggle")
+    /**
+     * Local media-session playing state when Notification Listener can see Spotify.
+     * Avoids Web API poll + sticky [wasPlaying] desync (common after long pause).
+     */
+    private fun sessionIsPlaying(): Boolean? {
+        return try {
+            val ctrl = resolveActiveMediaController(this) ?: return null
+            when (ctrl.playbackState?.state) {
+                PlaybackState.STATE_PLAYING,
+                PlaybackState.STATE_BUFFERING,
+                -> true
+                PlaybackState.STATE_PAUSED,
+                PlaybackState.STATE_STOPPED,
+                PlaybackState.STATE_NONE,
+                -> false
+                else -> null
             }
-            current?.uri?.let { updateNowPlayingFlags(it, playing = !curPlaying) }
-            publish(
-                status = if (!curPlaying) "Playing" else "Paused · auto-handoff waiting",
-                nowLine = current?.let { t ->
-                    val mark = if (!curPlaying) "▶ " else "⏸ "
-                    "$mark${t.name.ifBlank { t.uri }}${if (t.artists.isNotBlank()) " — ${t.artists}" else ""}"
-                },
-            )
-        } else {
-            publish(status = "Pause/play failed", error = res.error)
+        } catch (e: Exception) {
+            Log.w(TAG, "sessionIsPlaying: ${e.message}")
+            null
         }
+    }
+
+    /** Pause/play via Spotify's media session — no API quota. */
+    private fun trySessionTransport(wantPlay: Boolean): Boolean {
+        return try {
+            val ctrl = resolveActiveMediaController(this) ?: return false
+            if (wantPlay) ctrl.transportControls.play()
+            else ctrl.transportControls.pause()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "session transport: ${e.message}")
+            false
+        }
+    }
+
+    private fun dispatchMediaKey(keyCode: Int) {
+        try {
+            val am = getSystemService(AudioManager::class.java) ?: return
+            val now = SystemClock.uptimeMillis()
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
+        } catch (e: Exception) {
+            Log.w(TAG, "media key $keyCode: ${e.message}")
+        }
+    }
+
+    /** Best track to resume when empty-body /me/player/play fails. */
+    private fun resumeTrackCandidate(): DjQueueTrack? {
+        current?.takeIf { it.uri.isNotBlank() }?.let { return it }
+        val uri = lastUri?.takeIf { it.isNotBlank() }
+            ?: store.lastCurrentUri.takeIf { it.isNotBlank() }
+            ?: return null
+        return DjQueueTrack(uri = uri)
+    }
+
+    private fun applyPausedUi() {
+        wasPlaying = false
+        holdAutoHandoff("user_pause_toggle")
+        current?.uri?.let { updateNowPlayingFlags(it, playing = false) }
+        publish(
+            status = "Paused · auto-handoff waiting",
+            nowLine = current?.let { t ->
+                "⏸ ${t.name.ifBlank { t.uri }}" +
+                    if (t.artists.isNotBlank()) " — ${t.artists}" else ""
+            },
+            clearError = true,
+        )
+    }
+
+    private fun applyPlayingUi(source: String) {
+        wasPlaying = true
+        releaseAutoHandoff(source)
+        current?.uri?.let { updateNowPlayingFlags(it, playing = true) }
+        publish(
+            status = "Playing",
+            nowLine = current?.let { t ->
+                "▶ ${t.name.ifBlank { t.uri }}" +
+                    if (t.artists.isNotBlank()) " — ${t.artists}" else ""
+            },
+            clearError = true,
+        )
+    }
+
+    /**
+     * Pause / resume.
+     *
+     * Prefer media-session transport (no rate limit). Empty-body Web API resume often
+     * fails after a long pause or under 429 while song-pick (full URI) still works —
+     * so resume falls back to re-playing the current track via [playTrack].
+     */
+    private fun togglePause() {
+        val curPlaying = sessionIsPlaying() ?: wasPlaying
+        if (curPlaying) {
+            if (trySessionTransport(wantPlay = false)) {
+                applyPausedUi()
+                return
+            }
+            val res = spotifyPut("/v1/me/player/pause", "{}")
+            if (res.ok || res.status in listOf(202, 204)) {
+                applyPausedUi()
+                return
+            }
+            // Last resort — system media key (still may land if Spotify holds focus).
+            dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
+            applyPausedUi()
+            if (isRateLimitResult(res)) {
+                publish(
+                    status = "Paused (local) · ${friendlySpotifyError(res.status, res.error)}",
+                    error = "rate_limited",
+                )
+            } else if (!(res.ok || res.status in listOf(202, 204))) {
+                Log.w(TAG, "pause API failed status=${res.status} err=${res.error} — used media key")
+            }
+            return
+        }
+
+        // ── Resume ──────────────────────────────────────────────────────────
+        if (trySessionTransport(wantPlay = true)) {
+            applyPlayingUi("user_play_session")
+            return
+        }
+        val emptyPlay = spotifyPut("/v1/me/player/play", "{}")
+        if (emptyPlay.ok || emptyPlay.status in listOf(202, 204)) {
+            applyPlayingUi("user_play_toggle")
+            return
+        }
+        // Same path as tapping a track — device + full URI + deep-link retries.
+        // This is what still works when empty resume is rate-limited or device-less.
+        val item = resumeTrackCandidate()
+        if (item != null) {
+            Log.i(
+                TAG,
+                "resume empty-play failed status=${emptyPlay.status} err=${emptyPlay.error} " +
+                    "— replaying ${item.uri.takeLast(22)}",
+            )
+            if (playTrack(item)) {
+                // playTrack already published + released handoff
+                return
+            }
+        }
+        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+        // Optimistic UI — media key may still recover without API
+        applyPlayingUi("user_play_media_key")
+        val hint = emptyPlay.error ?: "play_${emptyPlay.status}"
+        publish(
+            status = "Play attempted · if silent, pick the track or open Spotify",
+            error = hint,
+        )
     }
 
     private fun restartOrPrevious() {
@@ -4670,9 +5020,14 @@ class SpotifyLiveDjService : Service() {
     }
 
     /**
-     * "More like this" from a now-playing or past chat cut:
-     * more from the same artist(s) + related-artist radio, **prepended** so they
-     * play next (after the current track finishes / on next skip).
+     * "More like this" from a now-playing or past chat cut.
+     *
+     * Builds a **mixed** batch (not same-artist radio):
+     * - a couple same-artist deep cuts
+     * - majority related-artist / similar cuts
+     * - genre-adjacent + playlist-radio spice
+     *
+     * Prepended so they play next (after current finishes / on skip).
      */
     private fun moreLikeThis(
         seedUri: String,
@@ -4729,19 +5084,28 @@ class SpotifyLiveDjService : Service() {
             return 0
         }
 
+        val target = want.coerceIn(4, 12)
+        // Mix targets — same-artist is the *minority*, similars dominate.
+        val wantSame = (target * 0.25).toInt().coerceIn(1, 3)
+        val wantRelated = (target * 0.50).toInt().coerceIn(2, 6)
+        val wantAdjacent = (target - wantSame - wantRelated).coerceAtLeast(1)
+
         val seen = HashSet<String>()
         seen.add(seedUri)
         cur?.uri?.takeIf { it.isNotBlank() }?.let { seen.add(it) }
         synchronized(queue) { queue.forEach { seen.add(it.uri) } }
 
-        val pool = ArrayList<DjQueueTrack>(48)
-        fun consider(t: JSONObject?, reason: String) {
+        val samePool = ArrayList<DjQueueTrack>(24)
+        val relatedPool = ArrayList<DjQueueTrack>(48)
+        val adjacentPool = ArrayList<DjQueueTrack>(48)
+
+        fun consider(t: JSONObject?, reason: String, into: MutableList<DjQueueTrack>) {
             if (t == null || t.optBoolean("is_local", false)) return
             val uri = t.optString("uri", "")
             if (uri.isBlank() || !seen.add(uri)) return
             if (isPlayed(uri)) return
             val ids = artistIdsOf(t)
-            pool.add(
+            into.add(
                 DjQueueTrack(
                     uri = uri,
                     name = t.optString("name", ""),
@@ -4756,46 +5120,227 @@ class SpotifyLiveDjService : Service() {
             )
         }
 
+        fun isSeedArtist(ids: List<String>): Boolean =
+            ids.any { it in seedArtistIds }
+
         val primaryIds = seedArtistIds.toList().take(3)
-        // Same-artist deep cuts (top tracks, shuffled)
+        val primary = primaryIds.firstOrNull().orEmpty()
+
+        // ── 1) Same-artist deep cuts (capped) — tops + album B-sides ─────────
         for (aid in primaryIds) {
             val tops = spotifyGet(
                 "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/top-tracks?market=US",
             )
             val tracks = tops.json?.optJSONArray("tracks")
             if (tracks != null) {
-                val pick = (0 until tracks.length()).shuffled().take(5)
+                val pick = (0 until tracks.length()).shuffled().take(4)
                 for (j in pick) {
-                    consider(tracks.optJSONObject(j), "more like: same artist")
+                    consider(tracks.optJSONObject(j), "more like: same artist", samePool)
+                }
+            }
+            // Album deep cuts for variety beyond the hits
+            val albs = spotifyGet(
+                "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/albums" +
+                    "?include_groups=album,single&market=US&limit=8",
+            )
+            val albItems = albs.json?.optJSONArray("items")
+            if (albItems != null && albItems.length() > 0) {
+                val aPick = (0 until albItems.length()).shuffled().take(2)
+                for (j in aPick) {
+                    val alb = albItems.optJSONObject(j) ?: continue
+                    val albId = alb.optString("id", "")
+                    if (albId.isBlank()) continue
+                    val tr = spotifyGet(
+                        "/v1/albums/${java.net.URLEncoder.encode(albId, "UTF-8")}/tracks?limit=20&market=US",
+                    )
+                    val aTracks = tr.json?.optJSONArray("items") ?: continue
+                    val k = (0 until aTracks.length()).shuffled().take(2)
+                    for (m in k) {
+                        // Album track objects lack full artist payloads — hydrate via id if needed.
+                        val raw = aTracks.optJSONObject(m) ?: continue
+                        val tid = raw.optString("id", "")
+                        if (tid.isBlank()) {
+                            consider(raw, "more like: same artist album", samePool)
+                            continue
+                        }
+                        val full = spotifyGet(
+                            "/v1/tracks/${java.net.URLEncoder.encode(tid, "UTF-8")}",
+                        )
+                        consider(
+                            full.json ?: raw,
+                            "more like: same artist album",
+                            samePool,
+                        )
+                    }
                 }
             }
         }
-        // Related-artist radio from primary
-        val primary = primaryIds.firstOrNull().orEmpty()
-        if (primary.isNotBlank()) {
+
+        // ── 2) Related artists (majority of the vibe) ────────────────────────
+        val relatedArtistIds = LinkedHashSet<String>()
+        for (aid in primaryIds) {
             val rel = spotifyGet(
+                "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/related-artists",
+            )
+            val related = rel.json?.optJSONArray("artists") ?: continue
+            val rPick = (0 until related.length()).shuffled().take(8)
+            for (j in rPick) {
+                val ra = related.optJSONObject(j) ?: continue
+                val rid = ra.optString("id", "")
+                if (rid.isNotBlank() && rid !in seedArtistIds) relatedArtistIds.add(rid)
+            }
+        }
+        // Shuffle related artists so each press explores a different neighborhood.
+        for (rid in relatedArtistIds.shuffled().take(10)) {
+            val rt = spotifyGet(
+                "/v1/artists/${java.net.URLEncoder.encode(rid, "UTF-8")}/top-tracks?market=US",
+            )
+            val rTracks = rt.json?.optJSONArray("tracks") ?: continue
+            // 1–3 tracks per related artist, randomized depth
+            val depth = (1..3).random()
+            val k = (0 until rTracks.length()).shuffled().take(depth)
+            for (m in k) {
+                consider(rTracks.optJSONObject(m), "more like: related artist", relatedPool)
+            }
+        }
+
+        // ── 3) Genre-adjacent + playlist radio + listener taste spice ───────
+        val seedGenres = LinkedHashSet<String>()
+        if (primary.isNotBlank()) {
+            val aRes = spotifyGet("/v1/artists/${java.net.URLEncoder.encode(primary, "UTF-8")}")
+            val gArr = aRes.json?.optJSONArray("genres")
+            if (gArr != null) {
+                for (i in 0 until gArr.length()) {
+                    val g = gArr.optString(i, "").trim()
+                    if (g.isNotBlank()) seedGenres.add(g)
+                }
+            }
+        }
+        // Also pull genres from a couple related artists for broader vibe.
+        for (rid in relatedArtistIds.shuffled().take(2)) {
+            val aRes = spotifyGet("/v1/artists/${java.net.URLEncoder.encode(rid, "UTF-8")}")
+            val gArr = aRes.json?.optJSONArray("genres") ?: continue
+            for (i in 0 until gArr.length()) {
+                val g = gArr.optString(i, "").trim()
+                if (g.isNotBlank()) seedGenres.add(g)
+            }
+        }
+        for (g in seedGenres.shuffled().take(3)) {
+            val q = java.net.URLEncoder.encode("genre:\"$g\"", "UTF-8")
+            val search = spotifyGet("/v1/search?type=track&limit=15&q=$q")
+            val items = search.json?.optJSONObject("tracks")?.optJSONArray("items")
+            if (items != null && items.length() > 0) {
+                val pick = (0 until items.length()).shuffled().take(6)
+                for (j in pick) {
+                    val t = items.optJSONObject(j) ?: continue
+                    // Prefer non-seed artists so this bucket stays "similar", not "more of them"
+                    if (isSeedArtist(artistIdsOf(t))) continue
+                    consider(t, "more like: genre · $g", adjacentPool)
+                }
+            } else {
+                val q2 = java.net.URLEncoder.encode(g, "UTF-8")
+                val s2 = spotifyGet("/v1/search?type=track&limit=12&q=$q2")
+                val t2 = s2.json?.optJSONObject("tracks")?.optJSONArray("items")
+                if (t2 != null) {
+                    val pick = (0 until t2.length()).shuffled().take(4)
+                    for (j in pick) {
+                        val t = t2.optJSONObject(j) ?: continue
+                        if (isSeedArtist(artistIdsOf(t))) continue
+                        consider(t, "more like: genre · $g", adjacentPool)
+                    }
+                }
+            }
+        }
+
+        // Playlist radio: search public playlists for the seed artist / track vibe
+        val plQueries = buildList {
+            val pa = primaryArtist(seedArtists)
+            if (pa.isNotBlank()) {
+                add("$pa radio")
+                add("$pa mix")
+            }
+            if (seedName.isNotBlank() && pa.isNotBlank()) add("$seedName $pa")
+            seedGenres.shuffled().take(1).forEach { add("$it playlist") }
+        }.distinct().shuffled().take(2)
+        for (pq in plQueries) {
+            val q = java.net.URLEncoder.encode(pq, "UTF-8")
+            val pls = spotifyGet("/v1/search?type=playlist&limit=4&q=$q")
+            val items = pls.json?.optJSONObject("playlists")?.optJSONArray("items") ?: continue
+            val pPick = (0 until items.length()).shuffled().take(2)
+            for (j in pPick) {
+                val pl = items.optJSONObject(j) ?: continue
+                val pid = pl.optString("id", "")
+                if (pid.isBlank()) continue
+                val plName = pl.optString("name", "mix").take(28)
+                val tr = spotifyGet(
+                    "/v1/playlists/${java.net.URLEncoder.encode(pid, "UTF-8")}/tracks?limit=40",
+                )
+                val trItems = tr.json?.optJSONArray("items") ?: continue
+                val k = (0 until trItems.length()).shuffled().take(6)
+                for (m in k) {
+                    val t = trItems.optJSONObject(m)?.optJSONObject("track") ?: continue
+                    if (isSeedArtist(artistIdsOf(t))) continue
+                    consider(t, "more like: playlist · $plName", adjacentPool)
+                }
+            }
+        }
+
+        // Listener taste blend: liked / short-term top that aren't the seed artist
+        val liked = spotifyGet("/v1/me/tracks?limit=30")
+        if (liked.ok) {
+            val items = liked.json?.optJSONArray("items")
+            if (items != null) {
+                val idx = (0 until items.length()).shuffled().take(12)
+                for (i in idx) {
+                    val t = items.optJSONObject(i)?.optJSONObject("track") ?: continue
+                    if (isSeedArtist(artistIdsOf(t))) continue
+                    // Soft filter: share a genre token or related-artist id when possible
+                    val ids = artistIdsOf(t)
+                    val relatedHit = ids.any { it in relatedArtistIds }
+                    consider(
+                        t,
+                        if (relatedHit) "more like: liked · related" else "more like: liked blend",
+                        if (relatedHit) relatedPool else adjacentPool,
+                    )
+                }
+            }
+        }
+        val top = spotifyGet("/v1/me/top/tracks?time_range=short_term&limit=20")
+        if (top.ok) {
+            val items = top.json?.optJSONArray("items")
+            if (items != null) {
+                val idx = (0 until items.length()).shuffled().take(8)
+                for (i in idx) {
+                    val t = items.optJSONObject(i) ?: continue
+                    if (isSeedArtist(artistIdsOf(t))) continue
+                    consider(t, "more like: your tops blend", adjacentPool)
+                }
+            }
+        }
+
+        // Thin-pool fallbacks: expand related further, then same-artist last resort
+        if (relatedPool.size < wantRelated && primary.isNotBlank()) {
+            val rel2 = spotifyGet(
                 "/v1/artists/${java.net.URLEncoder.encode(primary, "UTF-8")}/related-artists",
             )
-            val related = rel.json?.optJSONArray("artists")
+            val related = rel2.json?.optJSONArray("artists")
             if (related != null) {
-                val rPick = (0 until related.length()).shuffled().take(4)
-                for (j in rPick) {
-                    val ra = related.optJSONObject(j) ?: continue
-                    val rid = ra.optString("id", "")
-                    if (rid.isBlank()) continue
+                for (j in 0 until related.length()) {
+                    if (relatedPool.size >= wantRelated * 3) break
+                    val rid = related.optJSONObject(j)?.optString("id", "").orEmpty()
+                    if (rid.isBlank() || rid in seedArtistIds) continue
                     val rt = spotifyGet(
                         "/v1/artists/${java.net.URLEncoder.encode(rid, "UTF-8")}/top-tracks?market=US",
                     )
                     val rTracks = rt.json?.optJSONArray("tracks") ?: continue
                     val k = (0 until rTracks.length()).shuffled().take(2)
                     for (m in k) {
-                        consider(rTracks.optJSONObject(m), "more like: related artist")
+                        consider(rTracks.optJSONObject(m), "more like: related artist", relatedPool)
                     }
                 }
             }
         }
-        // Name search fallback if pool is thin
-        if (pool.size < want) {
+        if (samePool.size < wantSame) {
             val artistHint = primaryArtist(seedArtists)
             if (artistHint.isNotBlank()) {
                 val q = java.net.URLEncoder.encode("artist:\"$artistHint\"", "UTF-8")
@@ -4803,14 +5348,115 @@ class SpotifyLiveDjService : Service() {
                 val items = s.json?.optJSONObject("tracks")?.optJSONArray("items")
                 if (items != null) {
                     for (i in 0 until items.length()) {
-                        consider(items.optJSONObject(i), "more like: artist search")
+                        consider(items.optJSONObject(i), "more like: same artist search", samePool)
                     }
                 }
             }
         }
 
-        val picked = pool.shuffled().take(want.coerceIn(3, 12))
-        if (picked.isEmpty()) {
+        // ── Compose balanced, artist-diverse, interleaved batch ────────────
+        fun takeDiverse(pool: List<DjQueueTrack>, n: Int, maxPerArtist: Int = 2): List<DjQueueTrack> {
+            if (n <= 0 || pool.isEmpty()) return emptyList()
+            val out = ArrayList<DjQueueTrack>(n)
+            val perArtist = HashMap<String, Int>()
+            for (t in pool.shuffled()) {
+                if (out.size >= n) break
+                val key = primaryArtist(t.artists).lowercase().ifBlank {
+                    t.artistIds.firstOrNull().orEmpty()
+                }
+                val c = perArtist[key] ?: 0
+                if (key.isNotBlank() && c >= maxPerArtist) continue
+                out.add(t)
+                if (key.isNotBlank()) perArtist[key] = c + 1
+            }
+            // Fill if diversity cap was too strict
+            if (out.size < n) {
+                val have = out.map { it.uri }.toHashSet()
+                for (t in pool.shuffled()) {
+                    if (out.size >= n) break
+                    if (have.add(t.uri)) out.add(t)
+                }
+            }
+            return out
+        }
+
+        var samePicks = takeDiverse(samePool, wantSame, maxPerArtist = 2)
+        var relatedPicks = takeDiverse(relatedPool, wantRelated, maxPerArtist = 1)
+        var adjacentPicks = takeDiverse(adjacentPool, wantAdjacent, maxPerArtist = 1)
+
+        // Steal from fuller buckets if one ran short
+        fun topUp(need: Int, vararg sources: List<DjQueueTrack>): List<DjQueueTrack> {
+            if (need <= 0) return emptyList()
+            val have = HashSet<String>()
+            samePicks.forEach { have.add(it.uri) }
+            relatedPicks.forEach { have.add(it.uri) }
+            adjacentPicks.forEach { have.add(it.uri) }
+            val extra = ArrayList<DjQueueTrack>(need)
+            for (src in sources) {
+                for (t in src.shuffled()) {
+                    if (extra.size >= need) break
+                    if (have.add(t.uri)) extra.add(t)
+                }
+                if (extra.size >= need) break
+            }
+            return extra
+        }
+        val shortfall = target - (samePicks.size + relatedPicks.size + adjacentPicks.size)
+        if (shortfall > 0) {
+            val fill = topUp(shortfall, relatedPool, adjacentPool, samePool)
+            // Prefer stuffing similars first
+            relatedPicks = relatedPicks + fill
+        }
+
+        // Interleave buckets so you don't get 3 same-artist in a row.
+        val picked = ArrayList<DjQueueTrack>(target)
+        val buckets = listOf(
+            samePicks.toMutableList(),
+            relatedPicks.toMutableList(),
+            adjacentPicks.toMutableList(),
+        ).shuffled() // randomize which bucket leads each press
+        // Slightly prefer starting with a similar/related cut over same-artist
+        val orderedBuckets = buckets.sortedBy { b ->
+            when {
+                b.firstOrNull()?.reason?.contains("related") == true -> 0
+                b.firstOrNull()?.reason?.contains("genre") == true -> 1
+                b.firstOrNull()?.reason?.contains("playlist") == true -> 1
+                b.firstOrNull()?.reason?.contains("same artist") == true -> 3
+                else -> 2
+            }
+        }
+        var guard = 0
+        while (picked.size < target && guard < 64) {
+            guard++
+            var added = false
+            for (b in orderedBuckets) {
+                if (picked.size >= target) break
+                if (b.isEmpty()) continue
+                val t = b.removeAt(0)
+                if (picked.none { it.uri == t.uri }) {
+                    picked.add(t)
+                    added = true
+                }
+            }
+            if (!added) break
+        }
+        // Final artist-stack soft pass: avoid 3+ consecutive same primary
+        val finalList = ArrayList<DjQueueTrack>(picked.size)
+        val deferred = ArrayList<DjQueueTrack>()
+        for (t in picked) {
+            val p = primaryArtist(t.artists).lowercase()
+            val lastTwo = finalList.takeLast(2).map { primaryArtist(it.artists).lowercase() }
+            if (p.isNotBlank() && lastTwo.size == 2 && lastTwo.all { it == p }) {
+                deferred.add(t)
+            } else {
+                finalList.add(t)
+            }
+        }
+        for (t in deferred) {
+            if (finalList.none { it.uri == t.uri }) finalList.add(t)
+        }
+
+        if (finalList.isEmpty()) {
             publish(status = "More like this · nothing new", clearError = false)
             appendChat(
                 DjChatMessage(
@@ -4825,7 +5471,7 @@ class SpotifyLiveDjService : Service() {
         val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
         // Prepend so the first pick is next up (addFirst in reverse order).
         synchronized(queue) {
-            for (t in picked.asReversed()) {
+            for (t in finalList.asReversed()) {
                 if (queue.none { it.uri == t.uri }) {
                     queue.addFirst(t)
                 }
@@ -4835,11 +5481,25 @@ class SpotifyLiveDjService : Service() {
         val newHead = synchronized(queue) { queue.firstOrNull()?.uri }
         if (prevHead != newHead) invalidateStaleBanterCaches(newHead)
         persistRuntimeState()
-        val n = picked.size
-        val listLines = picked.mapIndexed { i, t ->
-            val title = t.name.ifBlank { "track" }.take(40)
-            val art = t.artists.take(36)
-            if (art.isNotBlank()) "${i + 1}. $title — $art" else "${i + 1}. $title"
+        val n = finalList.size
+        val sameN = finalList.count { it.reason.contains("same artist") }
+        val relN = finalList.count {
+            it.reason.contains("related") || it.reason.contains("genre") ||
+                it.reason.contains("playlist") || it.reason.contains("liked") ||
+                it.reason.contains("tops")
+        }
+        val listLines = finalList.mapIndexed { i, t ->
+            val title = t.name.ifBlank { "track" }.take(36)
+            val art = t.artists.take(28)
+            val tag = when {
+                t.reason.contains("same artist") -> "same"
+                t.reason.contains("related") -> "related"
+                t.reason.contains("genre") -> "genre"
+                t.reason.contains("playlist") -> "mix"
+                t.reason.contains("liked") || t.reason.contains("tops") -> "you"
+                else -> "sim"
+            }
+            if (art.isNotBlank()) "${i + 1}. [$tag] $title — $art" else "${i + 1}. [$tag] $title"
         }.joinToString("\n")
         // Status clears the in-chat "Finding…" indicator (UI watches this).
         publish(
@@ -4850,10 +5510,16 @@ class SpotifyLiveDjService : Service() {
             DjChatMessage(
                 id = "sys-mlt-${System.currentTimeMillis()}",
                 role = DjChatRole.System,
-                text = "More like $label — added $n to UP NEXT (no talk):\n$listLines",
+                text = "More like $label — added $n to UP NEXT " +
+                    "($sameN same-artist · $relN similar, no talk):\n$listLines",
             ),
         )
-        Log.i(TAG, "moreLikeThis n=$n seed=$seedUri artists=${seedArtistIds.joinToString()}")
+        Log.i(
+            TAG,
+            "moreLikeThis n=$n same=$sameN similar=$relN " +
+                "pools=${samePool.size}/${relatedPool.size}/${adjacentPool.size} " +
+                "seed=$seedUri artists=${seedArtistIds.joinToString()} genres=${seedGenres.take(4)}",
+        )
         return n
     }
 
@@ -4911,8 +5577,10 @@ class SpotifyLiveDjService : Service() {
                     trackUri = track.uri,
                     trackName = title,
                     trackArtists = track.artists,
-                    albumArtUrl = track.albumArtUrl.ifBlank { null },
-                    artistArtUrl = track.artistArtUrl.ifBlank { null },
+                    albumArtUrl = SpotifyArtMirror.preferredUrl(this@SpotifyLiveDjService, track.albumArtUrl)
+                        .ifBlank { track.albumArtUrl }.ifBlank { null },
+                    artistArtUrl = SpotifyArtMirror.preferredUrl(this@SpotifyLiveDjService, track.artistArtUrl)
+                        .ifBlank { track.artistArtUrl }.ifBlank { null },
                     albumUri = track.albumUri.ifBlank { null },
                     artistUri = track.artistUri.ifBlank { null },
                     progressMs = progressMs,
@@ -4923,6 +5591,11 @@ class SpotifyLiveDjService : Service() {
             )
             trimChatLocked()
         }
+        // Cache covers on our host so widgets/UI never re-hit Spotify CDN.
+        SpotifyArtMirror.mirrorAllAsync(
+            this,
+            listOf(track.albumArtUrl, track.artistArtUrl),
+        )
         publish(persist = true)
     }
 
@@ -5034,6 +5707,15 @@ class SpotifyLiveDjService : Service() {
      */
     private fun fillQueue(useAi: Boolean, force: Boolean = false, replace: Boolean = false) {
         if (!store.enabled && !force) return
+        if (isRateLimited()) {
+            val waitSec = ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000L)
+                .coerceAtLeast(1L)
+            publish(
+                status = "Queue fill paused — Spotify rate limit (${waitSec}s)",
+                error = "rate_limited",
+            )
+            return
+        }
         if (!filling.compareAndSet(false, true)) return
         val statusStart = if (replace) {
             "New queue — clearing upcoming, rebuilding from liked · top · recent…"
@@ -5063,16 +5745,23 @@ class SpotifyLiveDjService : Service() {
             // Drop any UP NEXT rows already heard (recently played / skipped past)
             pruneQueueOfPlayed()
             var pool = gatherRadioPool(curForPool)
+            // Stop mid-fill if Spotify started rate-limiting the pool crawl.
+            if (isRateLimited() && pool.size < 4) {
+                publish(
+                    status = "Queue fill cooled off — Spotify rate limit (using ${pool.size} seeds)",
+                    error = "rate_limited",
+                )
+            }
             // If replace still yields nothing (everything marked played), forget more —
             // but keep the freshest recently-played exclusions (re-fetch will re-mark).
-            if (replace && pool.size < 8 && playedUris.isNotEmpty()) {
+            if (replace && pool.size < 8 && playedUris.isNotEmpty() && !isRateLimited()) {
                 val keys = playedUris.keys.take(playedUris.size.coerceAtLeast(1) / 2)
                 keys.forEach { playedUris.remove(it) }
                 store.savePlayedUris(playedUris.toMap())
                 pool = gatherRadioPool(curForPool)
             }
             // City set → optional local-show discovery injects a few artist cuts
-            if (store.listenerCity.isNotBlank()) {
+            if (store.listenerCity.isNotBlank() && !isRateLimited()) {
                 publish(status = "Checking shows near ${store.listenerCity}…")
                 pool = injectLocalShowTracks(pool, curForPool)
             }
@@ -5255,6 +5944,8 @@ class SpotifyLiveDjService : Service() {
         val seen = HashSet<String>()
         val seedTracks = ArrayList<DjQueueTrack>(40)
         val seedArtistIds = LinkedHashSet<String>()
+        // Abort expansion once Spotify 429s so we don't dig a deeper rate-limit hole.
+        fun rateLimitedOut(): Boolean = isRateLimited()
 
         fun add(
             uri: String,
@@ -5308,6 +5999,7 @@ class SpotifyLiveDjService : Service() {
 
         // 1) Recently played — EXCLUDE from the radio queue (already listened), but still
         // harvest artists / seed tracks for radio expansion so the set stays in the vibe.
+        if (rateLimitedOut()) return pool
         val recent = spotifyGet("/v1/me/player/recently-played?limit=50")
         if (recent.ok) {
             val items = recent.json?.optJSONArray("items")
@@ -5346,6 +6038,7 @@ class SpotifyLiveDjService : Service() {
 
         // 2) Top tracks (short + medium term — what Spotify DJ leans on)
         for (range in listOf("short_term", "medium_term")) {
+            if (rateLimitedOut()) return pool
             val top = spotifyGet("/v1/me/top/tracks?time_range=$range&limit=20")
             if (top.ok) {
                 val items = top.json?.optJSONArray("items")
@@ -5359,6 +6052,7 @@ class SpotifyLiveDjService : Service() {
 
         // 3) Top artists → later expand as artist radio
         for (range in listOf("short_term", "medium_term")) {
+            if (rateLimitedOut()) return pool
             val topA = spotifyGet("/v1/me/top/artists?time_range=$range&limit=15")
             if (topA.ok) {
                 val items = topA.json?.optJSONArray("items")
@@ -5373,20 +6067,22 @@ class SpotifyLiveDjService : Service() {
         }
 
         // 4) Liked / saved tracks
-        val liked = spotifyGet("/v1/me/tracks?limit=40")
-        if (liked.ok) {
-            val items = liked.json?.optJSONArray("items")
-            if (items != null) {
-                for (i in 0 until items.length()) {
-                    val it = items.optJSONObject(i) ?: continue
-                    addFromTrackObj(it.optJSONObject("track"), "liked songs", asSeed = true)
+        if (!rateLimitedOut()) {
+            val liked = spotifyGet("/v1/me/tracks?limit=40")
+            if (liked.ok) {
+                val items = liked.json?.optJSONArray("items")
+                if (items != null) {
+                    for (i in 0 until items.length()) {
+                        val it = items.optJSONObject(i) ?: continue
+                        addFromTrackObj(it.optJSONObject("track"), "liked songs", asSeed = true)
+                    }
                 }
             }
         }
 
         // Current track's artists are strong radio seeds
         current?.artistIds?.forEach { if (it.isNotBlank()) seedArtistIds.add(it) }
-        if (current != null && current.artistIds.isEmpty()) {
+        if (current != null && current.artistIds.isEmpty() && !rateLimitedOut()) {
             val hint = primaryArtist(current.artists)
             if (hint.isNotBlank()) {
                 val q = java.net.URLEncoder.encode(hint, "UTF-8")
@@ -5398,6 +6094,8 @@ class SpotifyLiveDjService : Service() {
                 if (!id.isNullOrBlank()) seedArtistIds.add(id)
             }
         }
+
+        if (rateLimitedOut()) return pool
 
         // Rotate radio modes like Spotify's DJ (artist radio vs song-adjacent vs liked)
         val modes = listOf("artist_radio", "song_radio", "liked_blend", "top_blend")
@@ -5413,6 +6111,7 @@ class SpotifyLiveDjService : Service() {
             },
         )
         for (aid in artistPick) {
+            if (rateLimitedOut()) return pool
             val tops = spotifyGet(
                 "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/top-tracks?market=US",
             )
@@ -5424,6 +6123,7 @@ class SpotifyLiveDjService : Service() {
                 }
             }
             if (mode == "artist_radio" || mode == "liked_blend") {
+                if (rateLimitedOut()) return pool
                 val rel = spotifyGet(
                     "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/related-artists",
                 )
@@ -5431,6 +6131,7 @@ class SpotifyLiveDjService : Service() {
                 if (related != null) {
                     val rPick = (0 until related.length()).shuffled().take(2)
                     for (j in rPick) {
+                        if (rateLimitedOut()) return pool
                         val ra = related.optJSONObject(j) ?: continue
                         val rid = ra.optString("id", "")
                         if (rid.isBlank()) continue
@@ -5451,6 +6152,7 @@ class SpotifyLiveDjService : Service() {
         if (mode == "song_radio" || mode == "top_blend") {
             val seeds = seedTracks.shuffled().take(5)
             for (s in seeds) {
+                if (rateLimitedOut()) return pool
                 val aid = s.artistIds.firstOrNull().orEmpty()
                 if (aid.isBlank()) continue
                 val tops = spotifyGet(
@@ -6482,6 +7184,7 @@ class SpotifyLiveDjService : Service() {
         val status: Int,
         val json: JSONObject?,
         val error: String?,
+        val retryAfterSec: Int? = null,
     )
 
     private fun spotifyGet(path: String): ApiResult = spotifyCall("GET", path, null)
@@ -6489,6 +7192,144 @@ class SpotifyLiveDjService : Service() {
     private fun spotifyPut(path: String, body: String?): ApiResult = spotifyCall("PUT", path, body)
 
     private fun spotifyPost(path: String, body: String?): ApiResult = spotifyCall("POST", path, body)
+
+    /** Process-wide cool-down (also blocks Control UI / widgets via SpotifyOAuth). */
+    private fun isRateLimited(now: Long = System.currentTimeMillis()): Boolean =
+        SpotifyOAuth.isRateLimited(now) || now < rateLimitedUntilMs
+
+    private fun isRateLimitResult(res: ApiResult): Boolean =
+        res.status == 429 ||
+            res.error?.contains("429") == true ||
+            res.error?.contains("rate limit", ignoreCase = true) == true ||
+            res.error?.contains("too many requests", ignoreCase = true) == true
+
+    /**
+     * Human status/error for UI — never surface raw `http_429` etc.
+     */
+    private fun friendlySpotifyError(status: Int, error: String?): String {
+        val err = error.orEmpty()
+        return when {
+            status == 429 || err.contains("429") ||
+                err.contains("rate limit", ignoreCase = true) ||
+                err.contains("too many requests", ignoreCase = true) -> {
+                val wait = (SpotifyOAuth.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                "Spotify rate limit — cooling ${wait}s"
+            }
+            status == 401 || err == "not_logged_in" ->
+                "Spotify session expired — re-authorize in Account"
+            status == 403 || err.contains("insufficient", ignoreCase = true) ||
+                err.contains("scope", ignoreCase = true) ->
+                "Spotify permission missing — re-authorize"
+            status == 404 || err.contains("NO_ACTIVE_DEVICE", ignoreCase = true) ||
+                err.contains("no active device", ignoreCase = true) ->
+                "No active Spotify device — open Spotify once"
+            status == 502 || status == 503 ->
+                "Spotify is briefly unavailable"
+            err.startsWith("http_") -> {
+                val code = err.removePrefix("http_").toIntOrNull() ?: status
+                "Spotify error (HTTP $code)"
+            }
+            err.isNotBlank() -> err.take(120)
+            status > 0 -> "Spotify error (HTTP $status)"
+            else -> "Spotify request failed"
+        }
+    }
+
+    private fun noteRateLimit(res: ApiResult) {
+        if (!isRateLimitResult(res)) return
+        // Single process-wide gate so widgets/UI stop calling while Live DJ cools.
+        SpotifyOAuth.noteHttpRateLimit(res.retryAfterSec)
+        rateLimitedUntilMs = System.currentTimeMillis() + SpotifyOAuth.rateLimitRemainingMs()
+        rateLimitBackoffMs = SpotifyOAuth.rateLimitRemainingMs().coerceAtLeast(15_000L)
+        Log.w(
+            TAG,
+            "Spotify rate-limited status=${res.status} err=${res.error} " +
+                "retryAfter=${res.retryAfterSec} backoffMs=$rateLimitBackoffMs",
+        )
+    }
+
+    /** Soft clear: keep a floor so a single success doesn't instantly re-spam. */
+    private fun clearRateLimitSoft() {
+        SpotifyOAuth.clearRateLimitSoft()
+        if (rateLimitedUntilMs <= 0L && rateLimitBackoffMs <= 0L) return
+        val now = System.currentTimeMillis()
+        if (now >= rateLimitedUntilMs) {
+            rateLimitedUntilMs = 0L
+            rateLimitBackoffMs = (rateLimitBackoffMs / 2).coerceAtMost(15_000L)
+            if (rateLimitBackoffMs < 5_000L) rateLimitBackoffMs = 0L
+        }
+    }
+
+    /**
+     * Drive remain / near-end / now-line from the local media session (no Web API).
+     * @return true if session data was usable.
+     */
+    private fun pollFromMediaSession(rateLimited: Boolean): Boolean {
+        val np = try {
+            readNowPlaying(this)
+        } catch (e: Exception) {
+            Log.w(TAG, "session poll: ${e.message}")
+            return false
+        }
+        if (!np.hasSession || np.packageName !in SPOTIFY_PACKAGES) return false
+        val uri = np.trackUri.ifBlank { lastUri.orEmpty() }
+        if (uri.isBlank() && np.title.isBlank()) return false
+        val duration = np.durationMs
+        val progress = np.positionMs
+        val playing = np.isPlaying
+        val remain = if (duration > 0L) (duration - progress).coerceAtLeast(0L) else lastRemainMs
+        lastRemainMs = remain
+        if (playing) {
+            wasPlaying = true
+            midPauseSinceMs = 0L
+            releaseAutoHandoff(if (rateLimited) "session_playing_rate_limit" else "session_playing")
+            idlePolls = 0
+        }
+        val label = buildString {
+            append(if (playing) "▶ " else "⏸ ")
+            append(np.title.ifBlank { uri })
+            if (np.artist.isNotBlank()) append(" — ").append(np.artist)
+        }
+        val coolHint = if (rateLimited) {
+            val waitSec = ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000L)
+                .coerceAtLeast(0L)
+            if (waitSec > 0L) " · API cool ${waitSec}s" else " · session"
+        } else {
+            " · session"
+        }
+        publish(
+            nowLine = label,
+            status = (if (playing) "Playing" else "Paused") +
+                " · ${queue.size} queued$coolHint",
+            clearError = !rateLimited,
+            error = if (rateLimited) "rate_limited" else null,
+            persist = false,
+        )
+        // Near-end / stuck-end via session so handoffs still fire under 429.
+        if (!transitioning.get() && !autoHandoffHeld && queue.isNotEmpty()) {
+            if (playing && remain in 0L..3_500L && handoffLaunchedForUri != uri) {
+                nearEndArmed = true
+                if (handoffLaunchedForUri == null) {
+                    handoffLaunchedForUri = uri
+                    scope.launch { runTransition("near_end") }
+                }
+            } else if (!playing && remain <= 2_500L && wasPlaying) {
+                stuckEndPolls++
+                if (stuckEndPolls >= 2) {
+                    stuckEndPolls = 0
+                    armInterTrackGrace(12_000L)
+                    scope.launch { runTransition("stuck_end") }
+                }
+            } else if (playing) {
+                stuckEndPolls = 0
+            }
+        }
+        if (uri.isNotBlank()) {
+            lastUri = uri
+            store.lastCurrentUri = uri
+        }
+        return true
+    }
 
     /**
      * Legacy “Mirror to Spotify” — direct-play mode never writes Spotify Up Next.
@@ -6510,6 +7351,17 @@ class SpotifyLiveDjService : Service() {
     }
 
     private fun spotifyCall(method: String, path: String, body: String?): ApiResult {
+        // Hard gate while cooling down — except play/pause which already prefer session.
+        if (isRateLimited() && method.equals("GET", ignoreCase = true)) {
+            return ApiResult(
+                ok = false,
+                status = 429,
+                json = null,
+                error = "rate_limited",
+                retryAfterSec = ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000L)
+                    .toInt().coerceAtLeast(1),
+            )
+        }
         val raw = SpotifyOAuth.api(this, method, path, body)
         return try {
             val o = JSONObject(raw)
@@ -6520,7 +7372,16 @@ class SpotifyLiveDjService : Service() {
                 runCatching { JSONObject(bodyStr) }.getOrNull()
             } else null
             val err = if (o.isNull("error")) null else o.optString("error").ifBlank { null }
-            ApiResult(ok = ok, status = status, json = json, error = err)
+            val retry = if (o.isNull("retryAfter")) null else o.optInt("retryAfter", 0).takeIf { it > 0 }
+            val result = ApiResult(
+                ok = ok,
+                status = status,
+                json = json,
+                error = err,
+                retryAfterSec = retry,
+            )
+            if (!ok) noteRateLimit(result)
+            result
         } catch (e: Exception) {
             ApiResult(false, 0, null, e.message)
         }
@@ -6719,7 +7580,7 @@ class SpotifyLiveDjService : Service() {
         const val ACTION_DJ_PLAY_FROM_QUEUE = "io.grokify.os.SPOTIFY_DJ_PLAY_FROM_QUEUE"
         /** Direct-play a URI from chat history (no queue membership required). */
         const val ACTION_DJ_PLAY_URI = "io.grokify.os.SPOTIFY_DJ_PLAY_URI"
-        /** Prepend same-artist + related cuts seeded from a chat / now-playing track. */
+        /** Prepend mixed same-artist + similar cuts seeded from a chat / now-playing track. */
         const val ACTION_DJ_MORE_LIKE_THIS = "io.grokify.os.SPOTIFY_DJ_MORE_LIKE_THIS"
         const val ACTION_DJ_PAUSE_TOGGLE = "io.grokify.os.SPOTIFY_DJ_PAUSE_TOGGLE"
         const val ACTION_DJ_PREVIOUS = "io.grokify.os.SPOTIFY_DJ_PREVIOUS"

@@ -125,6 +125,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -254,6 +255,16 @@ fun GrokifyAppRoot(
     var tab by remember { mutableIntStateOf(1) } // default Chat
     /** null = Apps hub; else built-in mini-app id (kept while on other tabs). */
     var appsScreen by remember { mutableStateOf<String?>(null) }
+    // Home-screen widgets can request an inner app (and Spotify tab).
+    val widgetNav by io.grokify.os.widgets.WidgetNav.pending.collectAsState()
+    LaunchedEffect(widgetNav) {
+        val req = widgetNav ?: return@LaunchedEffect
+        onCloseSettings()
+        onSetPanel(ChatPanel.None)
+        tab = 2
+        appsScreen = req.pluginId
+        io.grokify.os.widgets.WidgetNav.consume()
+    }
     var tokenDraft by remember { mutableStateOf(state.token) }
     var chatDraft by remember { mutableStateOf("") }
     var renameOpen by remember { mutableStateOf(false) }

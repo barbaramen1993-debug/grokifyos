@@ -140,12 +140,34 @@ private const val KEY_ENABLED = "enabled"
 private const val KEY_PREFERRED_DEVICE = "preferred_device_id"
 const val SPOTIFY_CTRL_NOTIF_ID = 47001
 
-private const val ACTION_PREV = "io.grokify.os.SPOTIFY_PREV"
-private const val ACTION_PLAY_PAUSE = "io.grokify.os.SPOTIFY_PLAY_PAUSE"
-private const val ACTION_NEXT = "io.grokify.os.SPOTIFY_NEXT"
-private const val ACTION_STOP = "io.grokify.os.SPOTIFY_STOP"
+const val ACTION_PREV = "io.grokify.os.SPOTIFY_PREV"
+const val ACTION_PLAY_PAUSE = "io.grokify.os.SPOTIFY_PLAY_PAUSE"
+const val ACTION_NEXT = "io.grokify.os.SPOTIFY_NEXT"
+const val ACTION_STOP = "io.grokify.os.SPOTIFY_STOP"
+/** Home-screen widget: toggle Liked Songs for current track. */
+const val ACTION_LIKE_TOGGLE = "io.grokify.os.SPOTIFY_LIKE_TOGGLE"
+/** Home-screen widget: queue more-like-this via Live DJ. */
+const val ACTION_MORE_LIKE = "io.grokify.os.SPOTIFY_MORE_LIKE"
+/** Widget: play a specific track URI (history bubble). */
+const val ACTION_PLAY_URI = "io.grokify.os.SPOTIFY_PLAY_URI"
+/** Widget: like/unlike a specific track URI. */
+const val ACTION_LIKE_URI = "io.grokify.os.SPOTIFY_LIKE_URI"
+/** Widget: more-like-this for a specific track URI. */
+const val ACTION_MORE_LIKE_URI = "io.grokify.os.SPOTIFY_MORE_LIKE_URI"
+/** Widget: toggle Live AI DJ booth on/off. */
+const val ACTION_DJ_TOGGLE = "io.grokify.os.SPOTIFY_DJ_TOGGLE"
+/** Widget: force refresh Spotify / DJ widgets. */
+const val ACTION_WIDGET_REFRESH = "io.grokify.os.SPOTIFY_WIDGET_REFRESH"
 
-private val SPOTIFY_PACKAGES = listOf(
+const val EXTRA_TRACK_URI = "track_uri"
+const val EXTRA_TRACK_NAME = "track_name"
+const val EXTRA_TRACK_ARTISTS = "track_artists"
+const val EXTRA_ARTIST_URI = "artist_uri"
+const val EXTRA_ALBUM_ART = "album_art"
+const val EXTRA_ARTIST_ART = "artist_art"
+const val EXTRA_ALBUM_URI = "album_uri"
+
+internal val SPOTIFY_PACKAGES = listOf(
     "com.spotify.music",
     "com.spotify.lite",
 )
@@ -474,15 +496,42 @@ fun readNowPlaying(context: Context): SpotifyNowPlaying {
     )
 }
 
+/**
+ * Album art embedded in the active media session (many players only ship a
+ * Bitmap, not a URI). Scaled for widgets / RemoteViews parcel size.
+ */
+fun readSessionAlbumArtBitmap(context: Context, maxEdge: Int = 512): android.graphics.Bitmap? {
+    val ctrl = resolveActiveMediaController(context) ?: return null
+    val md = ctrl.metadata ?: return null
+    val raw = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+        ?: md.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        ?: md.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        ?: return null
+    val edge = maxEdge.coerceAtLeast(64)
+    if (raw.width <= edge && raw.height <= edge) return raw
+    val scale = edge.toFloat() / maxOf(raw.width, raw.height).toFloat()
+    val w = (raw.width * scale).toInt().coerceAtLeast(1)
+    val h = (raw.height * scale).toInt().coerceAtLeast(1)
+    return try {
+        android.graphics.Bitmap.createScaledBitmap(raw, w, h, true)
+    } catch (_: Exception) {
+        raw
+    }
+}
+
 /** In-process artist id → portrait URL cache for Control tab enrichment. */
 private val controlArtistImageCache = HashMap<String, String>(48)
 
 /**
  * Enrich a media-session snapshot with Spotify Web API art + deep-link URIs
  * (album background, artist thumbnail, clickable track/artist/album).
+ *
+ * Skips the network while the global Spotify cool-down is active so Control UI
+ * / widgets do not dig a deeper 429 hole than Live DJ already has.
  */
 fun enrichNowPlayingFromApi(context: Context, base: SpotifyNowPlaying): SpotifyNowPlaying {
     if (!SpotifyOAuth.isLoggedIn(context)) return base
+    if (SpotifyOAuth.isRateLimited()) return base
     return try {
         val raw = SpotifyOAuth.api(context, "GET", "/v1/me/player/currently-playing", null)
         val o = JSONObject(raw)
@@ -606,6 +655,31 @@ fun spotifyTrackIdFromUri(uri: String?): String {
     }.trim()
 }
 
+/** Canonical `spotify:track:{id}` for library endpoints (Feb 2026+ Dev Mode). */
+fun spotifyTrackUriCanonical(trackUri: String?): String {
+    val id = spotifyTrackIdFromUri(trackUri)
+    return if (id.isBlank()) "" else "spotify:track:$id"
+}
+
+/** trackId → (liked, fetchedAtMs). Widget + Control used to re-hit library every paint. */
+private val likedSongsCache =
+    object : LinkedHashMap<String, Pair<Boolean, Long>>(64, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, Pair<Boolean, Long>>?,
+        ): Boolean = size > 100
+    }
+private val likedCacheLock = Any()
+private const val LIKED_CACHE_TTL_MS = 120_000L
+
+/** Update in-process liked cache (optimistic heart toggles). */
+fun rememberSpotifyTrackLiked(trackUri: String?, liked: Boolean) {
+    val id = spotifyTrackIdFromUri(trackUri)
+    if (id.isBlank()) return
+    synchronized(likedCacheLock) {
+        likedSongsCache[id] = liked to System.currentTimeMillis()
+    }
+}
+
 /**
  * Whether [trackUri] is in the user's Liked Songs.
  * @return true/false when known, null on auth/network errors.
@@ -618,32 +692,92 @@ fun checkSpotifyTrackLiked(context: Context, trackUri: String?): Boolean? {
 }
 
 /**
- * Batch Liked Songs lookup for many track URIs (Spotify allows ≤50 ids/request).
+ * Batch Liked Songs lookup for many track URIs.
+ * Prefer [GET /v1/me/library/contains] (≤40 URIs); fall back to legacy
+ * [GET /v1/me/tracks/contains] (≤50 ids) for Extended Quota apps.
  * Keys in the result are Spotify track ids.
+ *
+ * Fresh results are cached ~2 minutes so controller ticks / widgets do not
+ * burn library quota every second.
  */
 fun checkSpotifyTracksLiked(context: Context, trackUris: List<String>): Map<String, Boolean> {
     if (!SpotifyOAuth.isLoggedIn(context)) return emptyMap()
     val ids = trackUris.map { spotifyTrackIdFromUri(it) }.filter { it.isNotBlank() }.distinct()
     if (ids.isEmpty()) return emptyMap()
+    val now = System.currentTimeMillis()
     val out = LinkedHashMap<String, Boolean>(ids.size)
-    // Spotify hard-caps contains queries at 50 ids.
-    for (chunk in ids.chunked(50)) {
+    val missing = ArrayList<String>()
+    synchronized(likedCacheLock) {
+        for (id in ids) {
+            val hit = likedSongsCache[id]
+            if (hit != null && now - hit.second < LIKED_CACHE_TTL_MS) {
+                out[id] = hit.first
+            } else {
+                missing.add(id)
+            }
+        }
+    }
+    if (missing.isEmpty()) return out
+    // During global cool-down return only what we already know — do not dig deeper.
+    if (SpotifyOAuth.isRateLimited()) return out
+    // New library endpoint hard-caps at 40 URIs.
+    for (chunk in missing.chunked(40)) {
         try {
+            val uris = chunk.map { "spotify:track:$it" }
+            val encoded = uris.joinToString(",") {
+                java.net.URLEncoder.encode(it, Charsets.UTF_8.name())
+            }
             val raw = SpotifyOAuth.api(
                 context,
                 "GET",
-                "/v1/me/tracks/contains?ids=${chunk.joinToString(",")}",
+                "/v1/me/library/contains?uris=$encoded",
                 null,
             )
             val o = JSONObject(raw)
             val status = o.optInt("status", 0)
-            if (status == 401 || status == 403) continue
-            if (!o.optBoolean("ok", false) && status !in listOf(200, 201)) continue
+            if (status == 401 || status == 403 || status == 429) continue
             val body = o.optString("body", "").trim()
-            if (!body.startsWith("[")) continue
-            val arr = JSONArray(body)
-            for (i in chunk.indices) {
-                if (i < arr.length()) out[chunk[i]] = arr.optBoolean(i)
+            if (o.optBoolean("ok", false) || status in listOf(200, 201)) {
+                if (body.startsWith("[")) {
+                    val arr = JSONArray(body)
+                    val fetchedAt = System.currentTimeMillis()
+                    synchronized(likedCacheLock) {
+                        for (i in chunk.indices) {
+                            if (i < arr.length()) {
+                                val liked = arr.optBoolean(i)
+                                out[chunk[i]] = liked
+                                likedSongsCache[chunk[i]] = liked to fetchedAt
+                            }
+                        }
+                    }
+                    continue
+                }
+            }
+            // Legacy fallback (Extended Quota still serves the old path).
+            if (status in listOf(0, 404, 405, 410, 425) || !body.startsWith("[")) {
+                val legacy = SpotifyOAuth.api(
+                    context,
+                    "GET",
+                    "/v1/me/tracks/contains?ids=${chunk.joinToString(",")}",
+                    null,
+                )
+                val lo = JSONObject(legacy)
+                val lStatus = lo.optInt("status", 0)
+                if (lStatus == 401 || lStatus == 403 || lStatus == 429) continue
+                if (!lo.optBoolean("ok", false) && lStatus !in listOf(200, 201)) continue
+                val lBody = lo.optString("body", "").trim()
+                if (!lBody.startsWith("[")) continue
+                val arr = JSONArray(lBody)
+                val fetchedAt = System.currentTimeMillis()
+                synchronized(likedCacheLock) {
+                    for (i in chunk.indices) {
+                        if (i < arr.length()) {
+                            val liked = arr.optBoolean(i)
+                            out[chunk[i]] = liked
+                            likedSongsCache[chunk[i]] = liked to fetchedAt
+                        }
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "check liked batch: ${e.message}")
@@ -671,33 +805,71 @@ fun spotifyMsgNeedsReauth(msg: String?): Boolean {
         m.contains("scope")
 }
 
+/**
+ * Parse SpotifyOAuth.api JSON envelope into a short UI error, or null on success.
+ */
+private fun spotifyLibraryResultError(raw: String, liked: Boolean): String? {
+    val o = JSONObject(raw)
+    val status = o.optInt("status", 0)
+    val ok = o.optBoolean("ok", false) || status in listOf(200, 201, 204)
+    if (ok) return null
+    val err = o.optString("error", "").ifBlank { "HTTP $status" }
+    return when {
+        status == 403 || err.contains("scope", ignoreCase = true) ||
+            err.contains("insufficient", ignoreCase = true) ->
+            "Need library permission — tap Re-authorize Spotify"
+        status == 401 -> "Spotify session expired — tap Re-authorize Spotify"
+        status == 425 || err.contains("http_425", ignoreCase = true) ->
+            "Spotify library API updated — retry after update, or Re-authorize Spotify"
+        status == 429 -> "Spotify rate limit — try again in a moment"
+        else -> err
+    }
+}
+
 fun setSpotifyTrackLiked(context: Context, trackUri: String?, liked: Boolean): String? {
     val id = spotifyTrackIdFromUri(trackUri)
     if (id.isBlank()) return "No track to like"
     if (!SpotifyOAuth.isLoggedIn(context)) return "Connect Spotify first"
+    val canonical = "spotify:track:$id"
+    val encoded = java.net.URLEncoder.encode(canonical, Charsets.UTF_8.name())
+    val method = if (liked) "PUT" else "DELETE"
     return try {
-        val method = if (liked) "PUT" else "DELETE"
+        // Feb 2026 Dev Mode: type-specific /me/tracks save/remove is gone.
+        // Use generic library endpoints with full Spotify URIs (query `uris=`).
+        // PUT may include a body for clients that prefer JSON; DELETE is query-only.
+        val putBody = JSONObject().put("uris", JSONArray().put(canonical)).toString()
         val raw = SpotifyOAuth.api(
             context,
             method,
-            "/v1/me/tracks?ids=$id",
-            if (liked) "{}" else null,
+            "/v1/me/library?uris=$encoded",
+            if (liked) putBody else null,
         )
-        val o = JSONObject(raw)
-        val status = o.optInt("status", 0)
-        val ok = o.optBoolean("ok", false) || status in listOf(200, 201, 204)
-        if (ok) {
-            null
-        } else {
-            val err = o.optString("error", "").ifBlank { "HTTP $status" }
-            when {
-                status == 403 || err.contains("scope", ignoreCase = true) ||
-                    err.contains("insufficient", ignoreCase = true) ->
-                    "Need library permission — tap Re-authorize Spotify"
-                status == 401 -> "Spotify session expired — tap Re-authorize Spotify"
-                else -> err
-            }
+        val first = spotifyLibraryResultError(raw, liked)
+        if (first == null) {
+            rememberSpotifyTrackLiked(canonical, liked)
+            return null
         }
+
+        val status = JSONObject(raw).optInt("status", 0)
+        // Fall back for Extended Quota apps that still only accept the legacy path,
+        // or if the new endpoint rejects the body shape.
+        if (status in listOf(0, 400, 404, 405, 410, 415, 425)) {
+            val legacyBody =
+                if (liked) JSONObject().put("ids", JSONArray().put(id)).toString() else null
+            val legacy = SpotifyOAuth.api(
+                context,
+                method,
+                "/v1/me/tracks?ids=$id",
+                legacyBody,
+            )
+            val second = spotifyLibraryResultError(legacy, liked)
+            if (second == null) {
+                rememberSpotifyTrackLiked(canonical, liked)
+                return null
+            }
+            return second
+        }
+        first
     } catch (e: Exception) {
         Log.w(TAG, "set liked: ${e.message}")
         e.message ?: "like_failed"
@@ -724,6 +896,9 @@ fun dispatchMediaCommand(context: Context, action: String) {
                 return
             }
             ACTION_PLAY_PAUSE -> {
+                // Booth owns pause/resume so auto-handoff freezes/resumes correctly.
+                // Implementation prefers media session, then empty Web API, then
+                // re-plays the current track URI (same path as song pick).
                 spotifyLiveDjPauseToggle(appCtx)
                 return
             }
@@ -733,8 +908,14 @@ fun dispatchMediaCommand(context: Context, action: String) {
     if (ctrl != null) {
         try {
             when (action) {
-                ACTION_PREV -> ctrl.transportControls.skipToPrevious()
-                ACTION_NEXT -> ctrl.transportControls.skipToNext()
+                ACTION_PREV -> {
+                    ctrl.transportControls.skipToPrevious()
+                    return
+                }
+                ACTION_NEXT -> {
+                    ctrl.transportControls.skipToNext()
+                    return
+                }
                 ACTION_PLAY_PAUSE -> {
                     val st = ctrl.playbackState?.state
                     if (st == PlaybackState.STATE_PLAYING || st == PlaybackState.STATE_BUFFERING) {
@@ -742,12 +923,24 @@ fun dispatchMediaCommand(context: Context, action: String) {
                     } else {
                         ctrl.transportControls.play()
                     }
+                    return
                 }
             }
-            return
         } catch (e: Exception) {
             Log.w(TAG, "transportControls failed: ${e.message}")
         }
+    }
+    // No active session (common after a long pause): try Web API resume/pause so
+    // Play still works when media keys have nothing to target.
+    if (action == ACTION_PLAY_PAUSE && SpotifyOAuth.isLoggedIn(appCtx)) {
+        Thread {
+            try {
+                resumeOrPauseViaWebApi(appCtx)
+            } catch (e: Exception) {
+                Log.w(TAG, "web play/pause fallback: ${e.message}")
+            }
+        }.start()
+        return
     }
     // System-wide media keys — works when Spotify (or other player) holds audio focus
     val key = when (action) {
@@ -763,6 +956,76 @@ fun dispatchMediaCommand(context: Context, action: String) {
 }
 
 /**
+ * When media session is gone, empty-body play/pause often still works; if not,
+ * re-issue the last known track URI (same approach as Live DJ song pick).
+ */
+private fun resumeOrPauseViaWebApi(context: Context) {
+    val appCtx = context.applicationContext
+    // Prefer currently-playing snapshot for real is_playing
+    var isPlaying = false
+    var trackUri = ""
+    try {
+        val raw = SpotifyOAuth.api(appCtx, "GET", "/v1/me/player/currently-playing", null)
+        val o = JSONObject(raw)
+        val status = o.optInt("status", 0)
+        val bodyStr = o.optString("body", "")
+        if (status == 204 || bodyStr.isBlank()) {
+            isPlaying = false
+        } else if (o.optBoolean("ok", false) || status in listOf(200, 202)) {
+            val data = runCatching { JSONObject(bodyStr) }.getOrNull()
+            isPlaying = data?.optBoolean("is_playing", false) == true
+            trackUri = data?.optJSONObject("item")?.optString("uri", "").orEmpty()
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "currently-playing for resume: ${e.message}")
+    }
+    if (trackUri.isBlank()) {
+        trackUri = SpotifyDjStore(appCtx).lastCurrentUri
+    }
+    if (isPlaying) {
+        val res = SpotifyOAuth.api(appCtx, "PUT", "/v1/me/player/pause", "{}")
+        Log.i(TAG, "web pause: $res")
+        return
+    }
+    // Resume empty body first
+    var res = SpotifyOAuth.api(appCtx, "PUT", "/v1/me/player/play", "{}")
+    val o = runCatching { JSONObject(res) }.getOrNull()
+    val status = o?.optInt("status", 0) ?: 0
+    val ok = o?.optBoolean("ok", false) == true || status in listOf(200, 201, 202, 204)
+    if (ok) {
+        Log.i(TAG, "web empty resume ok")
+        return
+    }
+    // Full URI play — works when empty resume fails (device idle / 429 recovery path)
+    if (trackUri.isNotBlank()) {
+        val body = JSONObject()
+            .put("uris", JSONArray().put(trackUri))
+            .put("offset", JSONObject().put("position", 0))
+            .toString()
+        val preferred = SpotifyControllerStore(appCtx).preferredDeviceId.trim()
+        val path = if (preferred.isNotBlank()) {
+            "/v1/me/player/play?device_id=${java.net.URLEncoder.encode(preferred, "UTF-8")}"
+        } else {
+            "/v1/me/player/play"
+        }
+        res = SpotifyOAuth.api(appCtx, "PUT", path, body)
+        val o2 = runCatching { JSONObject(res) }.getOrNull()
+        val st2 = o2?.optInt("status", 0) ?: 0
+        val ok2 = o2?.optBoolean("ok", false) == true || st2 in listOf(200, 201, 202, 204)
+        Log.i(TAG, "web uri resume ok=$ok2 status=$st2 uri=${trackUri.takeLast(22)}")
+        if (!ok2 && st2 == 404) {
+            SpotifyOAuth.openContentUri(appCtx, trackUri)
+        }
+        return
+    }
+    // Absolute last resort
+    val am = appCtx.getSystemService(AudioManager::class.java) ?: return
+    val now = SystemClock.uptimeMillis()
+    am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY, 0))
+    am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY, 0))
+}
+
+/**
  * Foreground service that pins a shade/lockscreen notification with
  * Previous / Play-Pause / Next always visible (MediaStyle compact actions).
  * Does NOT attach a MediaSession token — that fights Spotify for the system
@@ -772,12 +1035,14 @@ fun dispatchMediaCommand(context: Context, action: String) {
  */
 class SpotifyControllerService : Service() {
     private val handler = Handler(Looper.getMainLooper())
+    /** Only push home widgets when track / play state actually changes. */
+    @Volatile private var lastWidgetSig: String = ""
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
             val now = refreshNotification()
             // Tick progress bar smoothly while playing; idle slower to save battery
-            val delayMs = if (now?.isPlaying == true) 1_000L else 2_500L
+            val delayMs = if (now?.isPlaying == true) 1_000L else 4_000L
             handler.postDelayed(this, delayMs)
         }
     }
@@ -854,6 +1119,19 @@ class SpotifyControllerService : Service() {
         val now = readNowPlaying(this)
         val nm = getSystemService(NotificationManager::class.java) ?: return now
         nm.notify(SPOTIFY_CTRL_NOTIF_ID, buildNotification(now))
+        // Progress ticks must NOT re-enrich Spotify every second (that was the 429 hole).
+        // Only repaint home widgets when the track or play/pause state changes.
+        val sig = listOf(
+            now.trackUri,
+            now.title,
+            now.artist,
+            now.isPlaying,
+            now.hasSession,
+        ).joinToString("|")
+        if (sig != lastWidgetSig) {
+            lastWidgetSig = sig
+            io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(this)
+        }
         return now
     }
 
@@ -956,6 +1234,112 @@ class SpotifyControllerReceiver : BroadcastReceiver() {
                         Intent(context, SpotifyControllerService::class.java),
                     )
                 }
+                io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(context)
+            }
+            ACTION_LIKE_TOGGLE -> {
+                val pending = goAsync()
+                Thread {
+                    try {
+                        val appCtx = context.applicationContext
+                        var now = readNowPlaying(appCtx)
+                        if (SpotifyOAuth.isLoggedIn(appCtx)) {
+                            now = enrichNowPlayingFromApi(appCtx, now)
+                        }
+                        val uri = now.trackUri
+                        if (uri.isNotBlank()) {
+                            val currently = checkSpotifyTrackLiked(appCtx, uri) == true
+                            setSpotifyTrackLiked(appCtx, uri, !currently)
+                        }
+                        io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(appCtx)
+                    } finally {
+                        pending.finish()
+                    }
+                }.start()
+            }
+            ACTION_MORE_LIKE -> {
+                val appCtx = context.applicationContext
+                var now = readNowPlaying(appCtx)
+                if (SpotifyOAuth.isLoggedIn(appCtx)) {
+                    now = enrichNowPlayingFromApi(appCtx, now)
+                }
+                if (now.trackUri.isNotBlank() || now.title.isNotBlank()) {
+                    spotifyLiveDjMoreLikeThis(
+                        appCtx,
+                        trackUri = now.trackUri,
+                        name = now.title,
+                        artists = now.artist,
+                        artistUri = now.artistUri,
+                        albumArtUrl = now.albumArtUrl,
+                    )
+                }
+                io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(appCtx)
+            }
+            ACTION_PLAY_URI -> {
+                val appCtx = context.applicationContext
+                val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty()
+                if (uri.isNotBlank()) {
+                    spotifyLiveDjPlayUri(
+                        appCtx,
+                        trackUri = uri,
+                        name = intent.getStringExtra(EXTRA_TRACK_NAME).orEmpty(),
+                        artists = intent.getStringExtra(EXTRA_TRACK_ARTISTS).orEmpty(),
+                        albumArtUrl = intent.getStringExtra(EXTRA_ALBUM_ART).orEmpty(),
+                        artistArtUrl = intent.getStringExtra(EXTRA_ARTIST_ART).orEmpty(),
+                        albumUri = intent.getStringExtra(EXTRA_ALBUM_URI).orEmpty(),
+                        artistUri = intent.getStringExtra(EXTRA_ARTIST_URI).orEmpty(),
+                    )
+                }
+                io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(appCtx)
+            }
+            ACTION_LIKE_URI -> {
+                val pending = goAsync()
+                Thread {
+                    try {
+                        val appCtx = context.applicationContext
+                        val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty()
+                        if (uri.isNotBlank()) {
+                            val currently = checkSpotifyTrackLiked(appCtx, uri) == true
+                            setSpotifyTrackLiked(appCtx, uri, !currently)
+                        }
+                        io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(appCtx)
+                    } finally {
+                        pending.finish()
+                    }
+                }.start()
+            }
+            ACTION_MORE_LIKE_URI -> {
+                val appCtx = context.applicationContext
+                val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty()
+                val name = intent.getStringExtra(EXTRA_TRACK_NAME).orEmpty()
+                val artists = intent.getStringExtra(EXTRA_TRACK_ARTISTS).orEmpty()
+                if (uri.isNotBlank() || name.isNotBlank() || artists.isNotBlank()) {
+                    spotifyLiveDjMoreLikeThis(
+                        appCtx,
+                        trackUri = uri,
+                        name = name,
+                        artists = artists,
+                        artistUri = intent.getStringExtra(EXTRA_ARTIST_URI).orEmpty(),
+                        albumArtUrl = intent.getStringExtra(EXTRA_ALBUM_ART).orEmpty(),
+                    )
+                }
+                io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(appCtx)
+            }
+            ACTION_DJ_TOGGLE -> {
+                val appCtx = context.applicationContext
+                val store = SpotifyDjStore(appCtx)
+                val next = !store.enabled
+                if (next && !SpotifyOAuth.isLoggedIn(appCtx)) {
+                    // Can't start booth without Spotify account — leave off.
+                    SpotifyDjBus.patch {
+                        it.copy(status = "Connect Spotify first (Account)", error = "not_logged_in")
+                    }
+                } else {
+                    setSpotifyLiveDjEnabled(appCtx, next)
+                }
+                io.grokify.os.widgets.GrokifyWidgets.refreshSpotify(appCtx)
+            }
+            ACTION_WIDGET_REFRESH -> {
+                io.grokify.os.widgets.GrokifyWidgets.forceRefreshSpotify(context)
             }
             ACTION_STOP -> setSpotifyControllerEnabled(context, false)
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
@@ -965,6 +1349,7 @@ class SpotifyControllerReceiver : BroadcastReceiver() {
                         Intent(context, SpotifyControllerService::class.java),
                     )
                 }
+                io.grokify.os.widgets.GrokifyWidgets.refreshAll(context)
             }
         }
     }
@@ -981,7 +1366,9 @@ fun SpotifyControllerPane(
     val djStore = remember { SpotifyDjStore(appCtx) }
     val scope = rememberCoroutineScope()
 
-    var tab by remember { mutableStateOf(0) } // 0 control, 1 live dj, 2 build, 3 account
+    var tab by remember {
+        mutableStateOf(io.grokify.os.widgets.WidgetNav.consumeSpotifyTab() ?: 0)
+    } // 0 control, 1 live dj, 2 build, 3 account
 
     var enabled by remember { mutableStateOf(store.enabled) }
     var now by remember { mutableStateOf(readNowPlaying(appCtx)) }
@@ -1068,10 +1455,43 @@ fun SpotifyControllerPane(
     }
 
     LaunchedEffect(enabled) {
+        // Media session is free; Web API enrich only on track change or every 45s.
+        // The old every-1.5s currently-playing poll alone could exhaust Spotify quota.
+        var lastApiUri = ""
+        var lastApiAt = 0L
+        var cachedApi: SpotifyNowPlaying? = null
         while (true) {
             val snap = readNowPlaying(appCtx)
             now = if (SpotifyOAuth.isLoggedIn(appCtx) && (snap.hasSession || loggedIn)) {
-                withContext(Dispatchers.IO) { enrichNowPlayingFromApi(appCtx, snap) }
+                val age = System.currentTimeMillis() - lastApiAt
+                val wantApi = !SpotifyOAuth.isRateLimited() &&
+                    (
+                        snap.trackUri != lastApiUri ||
+                            (snap.trackUri.isNotBlank() && age > 45_000L) ||
+                            (lastApiAt == 0L && snap.hasSession)
+                        )
+                if (wantApi) {
+                    withContext(Dispatchers.IO) { enrichNowPlayingFromApi(appCtx, snap) }.also {
+                        lastApiUri = it.trackUri.ifBlank { snap.trackUri }
+                        lastApiAt = System.currentTimeMillis()
+                        cachedApi = it
+                    }
+                } else {
+                    val c = cachedApi
+                    if (c != null &&
+                        (c.trackUri == snap.trackUri || snap.trackUri.isBlank())
+                    ) {
+                        snap.copy(
+                            albumArtUrl = snap.albumArtUrl.ifBlank { c.albumArtUrl },
+                            artistArtUrl = snap.artistArtUrl.ifBlank { c.artistArtUrl },
+                            trackUri = snap.trackUri.ifBlank { c.trackUri },
+                            albumUri = snap.albumUri.ifBlank { c.albumUri },
+                            artistUri = snap.artistUri.ifBlank { c.artistUri },
+                        )
+                    } else {
+                        snap
+                    }
+                }
             } else {
                 snap
             }
@@ -1081,7 +1501,7 @@ fun SpotifyControllerPane(
             if (enabled && store.enabled && !notifPosted) {
                 setSpotifyControllerEnabled(appCtx, true)
             }
-            delay(1_500L)
+            delay(if (now.isPlaying) 1_500L else 4_000L)
         }
     }
 
@@ -1147,23 +1567,27 @@ fun SpotifyControllerPane(
         }
     }
 
-    // Refresh device list on Control tab (and when login becomes available)
+    // Refresh device list on Control tab (and when login becomes available).
+    // 5s was burning /v1/me/player/devices forever while the tab sat open.
     LaunchedEffect(tab, loggedIn) {
         if (tab != 0) return@LaunchedEffect
         while (true) {
-            if (SpotifyOAuth.isLoggedIn(appCtx)) {
+            if (SpotifyOAuth.isLoggedIn(appCtx) && !SpotifyOAuth.isRateLimited()) {
                 devicesLoading = devices.isEmpty()
                 val (list, err) = withContext(Dispatchers.IO) { fetchSpotifyDevices(appCtx) }
                 devices = list
                 devicesMsg = err
                 preferredDeviceId = store.preferredDeviceId
                 devicesLoading = false
-            } else {
+            } else if (!SpotifyOAuth.isLoggedIn(appCtx)) {
                 devices = emptyList()
                 devicesMsg = "Connect Spotify in the Account tab"
                 devicesLoading = false
+            } else if (SpotifyOAuth.isRateLimited()) {
+                val wait = (SpotifyOAuth.rateLimitRemainingMs() / 1000L).coerceAtLeast(1L)
+                devicesMsg = "Spotify rate limit — cooling ${wait}s"
             }
-            delay(5_000L)
+            delay(30_000L)
         }
     }
 
@@ -1570,7 +1994,7 @@ fun SpotifyControllerPane(
                                     }
                                 },
                             )
-                            // More like this → prepend same-artist + related to DJ UP NEXT
+                            // More like this → prepend mixed same-artist + similar cuts to DJ UP NEXT
                             TransportButton(
                                 icon = Icons.Default.PlaylistAdd,
                                 label = "More",
@@ -2113,7 +2537,7 @@ fun SpotifyControllerPane(
                                         Text(
                                             "Chat, queue, and play work even when Live DJ auto-handoff is off. " +
                                                 "Tracks & banter show here. Heart any cut (now or past) to Liked Songs. " +
-                                                "More like this prepends same-artist + related cuts to UP NEXT. " +
+                                                "More like this prepends a mixed batch (some same-artist + mostly similar) to UP NEXT. " +
                                                 "Ask for a new queue, top-up, drop songs, or song/artist info. " +
                                                 "Tap ▶ on past songs to replay. Queue tab is the app radio set " +
                                                 "(not Spotify’s Up Next).",

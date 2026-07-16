@@ -84,11 +84,17 @@ object HostHttpProxy {
                 } else {
                     extractApiError(respBody) ?: "http_${resp.code}"
                 }
+                // Spotify (and others) send Retry-After as seconds or an HTTP-date.
+                val retryAfterSec = parseRetryAfterSeconds(resp.header("Retry-After"))
                 JSONObject()
                     .put("ok", resp.isSuccessful)
                     .put("status", resp.code)
                     .put("body", respBody)
                     .put("error", errMsg ?: JSONObject.NULL)
+                    .put(
+                        "retryAfter",
+                        if (retryAfterSec != null) retryAfterSec else JSONObject.NULL,
+                    )
                     .toString()
             }
         } catch (e: Exception) {
@@ -98,6 +104,29 @@ object HostHttpProxy {
                 .put("body", "")
                 .put("error", e.message ?: "request_failed")
                 .toString()
+        }
+    }
+
+    /**
+     * Parse Retry-After into whole seconds, or null if missing/unparseable.
+     * Accepts integer seconds (Spotify's usual form) or HTTP-date.
+     */
+    private fun parseRetryAfterSeconds(raw: String?): Int? {
+        if (raw.isNullOrBlank()) return null
+        val t = raw.trim()
+        t.toIntOrNull()?.let { return it.coerceIn(1, 600) }
+        return try {
+            val date = java.time.ZonedDateTime.parse(
+                t,
+                java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME,
+            )
+            val sec = java.time.Duration.between(
+                java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC),
+                date,
+            ).seconds
+            sec.toInt().coerceIn(1, 600)
+        } catch (_: Exception) {
+            null
         }
     }
 

@@ -158,6 +158,11 @@
         </service>
 
         <service
+            android:name=".apps.LocationNoteMonitorService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+
+        <service
             android:name=".service.GrokifyNotificationListener"
             android:exported="true"
             android:label="@string/notification_listener_label"
@@ -185,7 +190,14 @@
                 <action android:name="io.grokify.os.PLACE_NOTE_OPEN" />
                 <action android:name="io.grokify.os.PLACE_NOTE_OPEN_APP" />
                 <action android:name="io.grokify.os.PLACE_NOTE_OPEN_IMAGE" />
+                <action android:name="io.grokify.os.PLACE_NOTE_TOGGLE_MONITOR" />
+                <action android:name="io.grokify.os.PLACE_NOTE_TOGGLE_NOTE" />
+                <action android:name="io.grokify.os.PLACE_NOTE_REFRESH" />
+                <action android:name="io.grokify.os.PLACE_NOTE_PIN_HERE" />
+                <action android:name="io.grokify.os.PLACE_NOTE_OPEN_MAPS" />
+                <action android:name="io.grokify.os.PLACE_NOTE_STOP_MONITOR" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
@@ -197,9 +209,84 @@
                 <action android:name="io.grokify.os.SPOTIFY_PLAY_PAUSE" />
                 <action android:name="io.grokify.os.SPOTIFY_NEXT" />
                 <action android:name="io.grokify.os.SPOTIFY_STOP" />
+                <action android:name="io.grokify.os.SPOTIFY_LIKE_TOGGLE" />
+                <action android:name="io.grokify.os.SPOTIFY_MORE_LIKE" />
+                <action android:name="io.grokify.os.SPOTIFY_PLAY_URI" />
+                <action android:name="io.grokify.os.SPOTIFY_LIKE_URI" />
+                <action android:name="io.grokify.os.SPOTIFY_MORE_LIKE_URI" />
+                <action android:name="io.grokify.os.SPOTIFY_DJ_TOGGLE" />
+                <action android:name="io.grokify.os.SPOTIFY_WIDGET_REFRESH" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
+        </receiver>
+
+        <!-- Home-screen widgets (inner apps) -->
+        <receiver
+            android:name=".widgets.WifiScannerWidget"
+            android:exported="true"
+            android:label="@string/widget_wifi_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_wifi_scanner" />
+        </receiver>
+        <receiver
+            android:name=".widgets.BtScannerWidget"
+            android:exported="true"
+            android:label="@string/widget_bt_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_bt_scanner" />
+        </receiver>
+        <receiver
+            android:name=".widgets.PlaceNotesSmallWidget"
+            android:exported="true"
+            android:label="@string/widget_place_notes_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_place_notes" />
+        </receiver>
+        <receiver
+            android:name=".widgets.SpaceXaiUsageWidget"
+            android:exported="true"
+            android:label="@string/widget_usage_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_spacexai_usage" />
+        </receiver>
+        <receiver
+            android:name=".widgets.SpotifySmallWidget"
+            android:exported="true"
+            android:label="@string/widget_spotify_small_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_spotify_small" />
+        </receiver>
+        <receiver
+            android:name=".widgets.PlaceNotesFullWidget"
+            android:exported="true"
+            android:label="@string/widget_place_notes_full_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_place_notes_full" />
         </receiver>
 
         <receiver

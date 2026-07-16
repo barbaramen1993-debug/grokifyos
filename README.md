@@ -314,6 +314,12 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.110 — Live DJ: More like this mix (similar-first)
+
+- **More like this** no longer dumps mostly same-artist tops. Batch is mixed (~¼ same-artist deep cuts, ~½ related artists, rest genre / playlist-radio / your liked+tops blend).
+- Related artists expanded (more seeds, random depth), album B-sides for same-artist variety, genre tags from the seed, public playlist radio searches.
+- Artist-diverse pick + interleaved order so you don’t get the same name three times in a row; chat lists `[same]` / `[related]` / `[genre]` / `[mix]` tags.
+
 ### 0.1.109 — Apps tab: last-app icon & name
 
 - When you’re on **Home / Chat / Update** and a mini-app was last open, the **Apps** tab shows that app’s **icon + short name** (resume on tap).

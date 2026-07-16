@@ -2,7 +2,6 @@ package io.grokify.os.apps.plugin
 
 import android.content.Context
 import android.util.Log
-import io.grokify.os.apps.LocationNoteStore
 import io.grokify.os.apps.setSpotifyControllerEnabled
 import io.grokify.os.apps.setSpotifyLiveDjEnabled
 
@@ -39,7 +38,7 @@ object PluginLifecycle {
             }
             BuiltinPluginCatalog.PLACE_NOTES -> {
                 try {
-                    LocationNoteStore(appCtx).setMonitoringEnabled(false)
+                    io.grokify.os.apps.LocationNoteWatcher.setEnabled(appCtx, false)
                 } catch (e: Exception) {
                     Log.w(TAG, "stop place-notes monitoring: ${e.message}")
                 }

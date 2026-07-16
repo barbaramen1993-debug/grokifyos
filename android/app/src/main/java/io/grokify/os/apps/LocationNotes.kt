@@ -1,12 +1,15 @@
 package io.grokify.os.apps
 
 import android.annotation.SuppressLint
+import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -14,10 +17,14 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -91,6 +98,7 @@ import androidx.core.content.FileProvider
 import coil.compose.AsyncImage
 import io.grokify.os.GrokifyApp
 import io.grokify.os.MainActivity
+import io.grokify.os.R
 import io.grokify.os.permission.AppPermissionId
 import io.grokify.os.permission.PermissionHelper
 import io.grokify.os.ui.theme.GrokifyColors
@@ -112,8 +120,22 @@ private const val ACTION_LOCATION = "io.grokify.os.PLACE_NOTE_LOCATION"
 private const val ACTION_OPEN_NOTE = "io.grokify.os.PLACE_NOTE_OPEN"
 private const val ACTION_OPEN_APP = "io.grokify.os.PLACE_NOTE_OPEN_APP"
 private const val ACTION_OPEN_IMAGE = "io.grokify.os.PLACE_NOTE_OPEN_IMAGE"
-private const val EXTRA_NOTE_ID = "note_id"
+/** Widget: toggle global place monitor. */
+const val ACTION_PLACE_TOGGLE_MONITOR = "io.grokify.os.PLACE_NOTE_TOGGLE_MONITOR"
+/** Widget: arm/disarm a single place note. */
+const val ACTION_PLACE_TOGGLE_NOTE = "io.grokify.os.PLACE_NOTE_TOGGLE_NOTE"
+/** Widget: re-read GPS + distances. */
+const val ACTION_PLACE_REFRESH = "io.grokify.os.PLACE_NOTE_REFRESH"
+/** Widget: pin a new note at current GPS. */
+const val ACTION_PLACE_PIN_HERE = "io.grokify.os.PLACE_NOTE_PIN_HERE"
+/** Widget: open note location in maps. */
+const val ACTION_PLACE_OPEN_MAPS = "io.grokify.os.PLACE_NOTE_OPEN_MAPS"
+/** Notification action: stop area monitoring FGS. */
+const val ACTION_PLACE_STOP_MONITOR = "io.grokify.os.PLACE_NOTE_STOP_MONITOR"
+const val EXTRA_NOTE_ID = "note_id"
 private const val MIN_RETRIGGER_MS = 90_000L
+const val PLACE_MONITOR_NOTIF_ID = 4610
+private const val TAG_PLACE = "PlaceNotes"
 
 /** A GPS-pinned note with optional enter-area actions. */
 data class LocationNote(
@@ -169,6 +191,7 @@ class LocationNoteStore(context: Context) {
     fun upsert(note: LocationNote) {
         val next = list().filterNot { it.id == note.id } + note
         saveAll(next)
+        io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(appCtx)
     }
 
     fun delete(id: String) {
@@ -178,12 +201,14 @@ class LocationNoteStore(context: Context) {
         }
         saveAll(list().filterNot { it.id == id })
         clearInside(id)
+        io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(appCtx)
     }
 
     fun monitoringEnabled(): Boolean = prefs.getBoolean(KEY_MONITOR, false)
 
     fun setMonitoringEnabled(on: Boolean) {
         prefs.edit().putBoolean(KEY_MONITOR, on).apply()
+        io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(appCtx)
     }
 
     fun isInside(id: String): Boolean =
@@ -358,25 +383,51 @@ fun openNoteImage(context: Context, path: String): Boolean {
     }.getOrDefault(false)
 }
 
-/** Start / stop PendingIntent location updates for place-note geofences. */
+/**
+ * Start / stop place-note area monitoring.
+ *
+ * Uses a location foreground service so GPS keeps running when the UI is closed.
+ * PendingIntent location updates alone are throttled / dropped in the background
+ * on modern Android, which is why enter alerts never fired after leaving the app.
+ */
 object LocationNoteWatcher {
     @SuppressLint("MissingPermission")
     fun sync(context: Context) {
         val appCtx = context.applicationContext
         val store = LocationNoteStore(appCtx)
-        val lm = appCtx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
+        val lm = appCtx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
         val pi = locationPendingIntent(appCtx)
-        runCatching { lm.removeUpdates(pi) }
-        if (!store.monitoringEnabled()) return
-        if (!locationPermsOk(appCtx)) return
+        // Always clear stale PI registrations first.
+        if (lm != null) runCatching { lm.removeUpdates(pi) }
+
+        if (!store.monitoringEnabled()) {
+            stopService(appCtx)
+            return
+        }
+        if (!locationPermsOk(appCtx)) {
+            Log.w(TAG_PLACE, "monitor on but location permission missing")
+            stopService(appCtx)
+            return
+        }
         val active = store.list().any { it.enabled }
-        if (!active) return
-        val minTime = 20_000L
-        val minDist = 12f
+        if (!active) {
+            // Keep the preference on, but no work until a note is armed.
+            stopService(appCtx)
+            return
+        }
+
+        // Primary path: location FGS (survives app background / process limits).
+        startService(appCtx)
+
+        // Backup path: LocationManager → BroadcastReceiver (boot / OEM quirks).
+        val minTime = 15_000L
+        val minDist = 8f
         listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER).forEach { p ->
-            if (!lm.isProviderEnabled(p)) return@forEach
+            if (lm == null || !lm.isProviderEnabled(p)) return@forEach
             runCatching {
                 lm.requestLocationUpdates(p, minTime, minDist, pi)
+            }.onFailure { e ->
+                Log.w(TAG_PLACE, "requestLocationUpdates($p) failed: ${e.message}")
             }
         }
         // Immediate evaluation from last fix
@@ -385,8 +436,19 @@ object LocationNoteWatcher {
 
     fun stop(context: Context) {
         val appCtx = context.applicationContext
-        val lm = appCtx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
-        runCatching { lm.removeUpdates(locationPendingIntent(appCtx)) }
+        val lm = appCtx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        if (lm != null) {
+            runCatching { lm.removeUpdates(locationPendingIntent(appCtx)) }
+        }
+        stopService(appCtx)
+    }
+
+    /** Persist + start/stop monitoring (used by UI, widgets, plugin uninstall). */
+    fun setEnabled(context: Context, enabled: Boolean) {
+        val appCtx = context.applicationContext
+        LocationNoteStore(appCtx).setMonitoringEnabled(enabled)
+        if (enabled) sync(appCtx) else stop(appCtx)
+        io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(appCtx)
     }
 
     fun evaluate(context: Context, gps: GpsFix) {
@@ -394,6 +456,7 @@ object LocationNoteWatcher {
         val store = LocationNoteStore(appCtx)
         if (!store.monitoringEnabled()) return
         val now = System.currentTimeMillis()
+        var changed = false
         for (note in store.list()) {
             if (!note.enabled) continue
             val dist = distanceMeters(gps.lat, gps.lon, note.lat, note.lon)
@@ -403,6 +466,7 @@ object LocationNoteWatcher {
             val inside = if (wasInside) dist <= exitR else dist <= enterR
             if (inside && !wasInside) {
                 store.setInside(note.id, true)
+                changed = true
                 val cool = note.lastTriggeredMs > 0L && now - note.lastTriggeredMs < MIN_RETRIGGER_MS
                 if (!cool) {
                     store.markTriggered(note.id, now)
@@ -410,9 +474,16 @@ object LocationNoteWatcher {
                 }
             } else if (!inside && wasInside) {
                 store.setInside(note.id, false)
+                changed = true
             } else if (inside != wasInside) {
                 store.setInside(note.id, inside)
+                changed = true
             }
+        }
+        if (changed) {
+            io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(appCtx)
+            // Refresh FGS text (armed / nearest) when enter/exit state flips.
+            LocationNoteMonitorService.refreshNotification(appCtx)
         }
     }
 
@@ -429,6 +500,25 @@ object LocationNoteWatcher {
         }
     }
 
+    private fun startService(context: Context) {
+        val intent = Intent(context, LocationNoteMonitorService::class.java)
+        try {
+            ContextCompat.startForegroundService(context, intent)
+        } catch (e: Exception) {
+            Log.e(TAG_PLACE, "startForegroundService failed: ${e.message}", e)
+        }
+    }
+
+    private fun stopService(context: Context) {
+        runCatching {
+            context.stopService(Intent(context, LocationNoteMonitorService::class.java))
+        }
+        runCatching {
+            context.getSystemService(NotificationManager::class.java)
+                ?.cancel(PLACE_MONITOR_NOTIF_ID)
+        }
+    }
+
     private fun locationPendingIntent(context: Context): PendingIntent {
         val intent = Intent(context, LocationNoteReceiver::class.java).setAction(ACTION_LOCATION)
         return PendingIntent.getBroadcast(
@@ -437,6 +527,200 @@ object LocationNoteWatcher {
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+    }
+}
+
+/**
+ * Location-type foreground service that keeps GPS hot while Place Notes monitoring is on.
+ * This is what produces the system “running in background” / ongoing notification.
+ */
+class LocationNoteMonitorService : Service() {
+    private val handler = Handler(Looper.getMainLooper())
+    private var listener: LocationListener? = null
+    private val tick = object : Runnable {
+        override fun run() {
+            if (!LocationNoteStore(this@LocationNoteMonitorService).monitoringEnabled()) {
+                stopSelf()
+                return
+            }
+            // Re-check last fix even if providers are quiet (indoor / fused stall).
+            readPlaceGps(this@LocationNoteMonitorService)?.let {
+                LocationNoteWatcher.evaluate(this@LocationNoteMonitorService, it)
+            }
+            refreshNotificationInternal()
+            handler.postDelayed(this, TICK_MS)
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val store = LocationNoteStore(this)
+        if (!store.monitoringEnabled() || !store.list().any { it.enabled }) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (!locationPermsOk(this)) {
+            Log.w(TAG_PLACE, "FGS start without location permission")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val n = buildMonitorNotification(this)
+        val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        } else {
+            0
+        }
+        try {
+            ServiceCompat.startForeground(this, PLACE_MONITOR_NOTIF_ID, n, fgsType)
+            Log.i(TAG_PLACE, "monitor FGS started")
+        } catch (e: Exception) {
+            Log.e(TAG_PLACE, "startForeground failed: ${e.message}", e)
+            try {
+                startForeground(PLACE_MONITOR_NOTIF_ID, n)
+            } catch (e2: Exception) {
+                Log.e(TAG_PLACE, "plain startForeground failed: ${e2.message}", e2)
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        }
+        attachLocationListener()
+        handler.removeCallbacks(tick)
+        handler.post(tick)
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        handler.removeCallbacks(tick)
+        detachLocationListener()
+        super.onDestroy()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun attachLocationListener() {
+        detachLocationListener()
+        if (!locationPermsOk(this)) return
+        val lm = getSystemService(LOCATION_SERVICE) as? LocationManager ?: return
+        val locListener = object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                LocationNoteWatcher.evaluate(
+                    this@LocationNoteMonitorService,
+                    GpsFix(
+                        lat = location.latitude,
+                        lon = location.longitude,
+                        accuracyM = if (location.hasAccuracy()) location.accuracy else -1f,
+                        atMs = location.time.takeIf { it > 0L } ?: System.currentTimeMillis(),
+                    ),
+                )
+                refreshNotificationInternal()
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            override fun onProviderEnabled(provider: String) {}
+            override fun onProviderDisabled(provider: String) {}
+        }
+        listener = locListener
+        listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER).forEach { p ->
+            if (!lm.isProviderEnabled(p)) return@forEach
+            runCatching {
+                lm.requestLocationUpdates(p, 12_000L, 6f, locListener, Looper.getMainLooper())
+            }.onFailure { e ->
+                Log.w(TAG_PLACE, "FGS requestLocationUpdates($p): ${e.message}")
+            }
+        }
+        readPlaceGps(this)?.let { LocationNoteWatcher.evaluate(this, it) }
+    }
+
+    private fun detachLocationListener() {
+        val l = listener ?: return
+        listener = null
+        val lm = getSystemService(LOCATION_SERVICE) as? LocationManager ?: return
+        runCatching { lm.removeUpdates(l) }
+    }
+
+    private fun refreshNotificationInternal() {
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        if (!LocationNoteStore(this).monitoringEnabled()) return
+        nm.notify(PLACE_MONITOR_NOTIF_ID, buildMonitorNotification(this))
+    }
+
+    companion object {
+        private const val TICK_MS = 25_000L
+
+        fun refreshNotification(context: Context) {
+            val appCtx = context.applicationContext
+            if (!LocationNoteStore(appCtx).monitoringEnabled()) return
+            val nm = appCtx.getSystemService(NotificationManager::class.java) ?: return
+            // Only update if FGS notif is expected; avoid re-posting after stop.
+            nm.notify(PLACE_MONITOR_NOTIF_ID, buildMonitorNotification(appCtx))
+        }
+
+        fun buildMonitorNotification(context: Context): Notification {
+            val store = LocationNoteStore(context)
+            val notes = store.list().filter { it.enabled }
+            val gps = readPlaceGps(context)
+            val nearest = if (gps != null && notes.isNotEmpty()) {
+                notes.minByOrNull { distanceMeters(gps.lat, gps.lon, it.lat, it.lon) }
+            } else {
+                null
+            }
+            val nearestLine = when {
+                nearest == null -> null
+                gps == null -> null
+                else -> {
+                    val d = distanceMeters(gps.lat, gps.lon, nearest.lat, nearest.lon)
+                    val inside = d <= nearest.radiusM
+                    if (inside) "Inside “${nearest.title}”"
+                    else String.format(Locale.US, "Nearest: %s · %.0f m", nearest.title, d)
+                }
+            }
+            val text = buildString {
+                append(
+                    when (notes.size) {
+                        0 -> context.getString(R.string.place_monitor_text)
+                        1 -> "Watching 1 place in the background"
+                        else -> "Watching ${notes.size} places in the background"
+                    },
+                )
+                if (nearestLine != null) {
+                    append(" · ")
+                    append(nearestLine)
+                }
+            }
+            val openMain = PendingIntent.getActivity(
+                context,
+                4710,
+                Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    putExtra("open_app", "place_notes")
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val stopPi = PendingIntent.getBroadcast(
+                context,
+                4711,
+                Intent(context, LocationNoteReceiver::class.java)
+                    .setAction(ACTION_PLACE_STOP_MONITOR),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            return NotificationCompat.Builder(context, GrokifyApp.CHANNEL_PLACE_MONITOR)
+                .setSmallIcon(android.R.drawable.ic_dialog_map)
+                .setContentTitle(context.getString(R.string.place_monitor_title))
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setContentIntent(openMain)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setSilent(true)
+                .setShowWhen(false)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+                .addAction(0, context.getString(R.string.place_monitor_stop), stopPi)
+                .build()
+        }
     }
 }
 
@@ -524,8 +808,13 @@ class LocationNoteReceiver : BroadcastReceiver() {
                     )
                 }
             }
-            Intent.ACTION_BOOT_COMPLETED -> {
+            Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_MY_PACKAGE_REPLACED,
+            -> {
                 if (store.monitoringEnabled()) LocationNoteWatcher.sync(context)
+            }
+            ACTION_PLACE_STOP_MONITOR -> {
+                LocationNoteWatcher.setEnabled(context, false)
             }
             ACTION_OPEN_APP -> {
                 val id = intent.getStringExtra(EXTRA_NOTE_ID) ?: return
@@ -540,8 +829,62 @@ class LocationNoteReceiver : BroadcastReceiver() {
             ACTION_OPEN_NOTE -> {
                 // reserved — main activity handles open_app
             }
+            ACTION_PLACE_TOGGLE_MONITOR -> {
+                LocationNoteWatcher.setEnabled(context, !store.monitoringEnabled())
+            }
+            ACTION_PLACE_TOGGLE_NOTE -> {
+                val id = intent.getStringExtra(EXTRA_NOTE_ID) ?: return
+                val note = store.get(id) ?: return
+                store.upsert(note.copy(enabled = !note.enabled))
+                if (store.monitoringEnabled()) LocationNoteWatcher.sync(context)
+                io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(context)
+            }
+            ACTION_PLACE_REFRESH -> {
+                if (store.monitoringEnabled()) {
+                    LocationNoteWatcher.sync(context)
+                    readPlaceGps(context)?.let { LocationNoteWatcher.evaluate(context, it) }
+                }
+                io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(context)
+            }
+            ACTION_PLACE_PIN_HERE -> {
+                val gps = readPlaceGps(context)
+                if (gps != null) {
+                    val stamp = SimpleDateFormat("MMM d · HH:mm", Locale.getDefault())
+                        .format(Date())
+                    store.upsert(
+                        LocationNote(
+                            id = UUID.randomUUID().toString(),
+                            title = "Pinned · $stamp",
+                            body = "",
+                            lat = gps.lat,
+                            lon = gps.lon,
+                            radiusM = 60f,
+                            enabled = true,
+                            notifyOnEnter = true,
+                        ),
+                    )
+                    if (store.monitoringEnabled()) LocationNoteWatcher.sync(context)
+                }
+                io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(context)
+            }
+            ACTION_PLACE_OPEN_MAPS -> {
+                val id = intent.getStringExtra(EXTRA_NOTE_ID) ?: return
+                val note = store.get(id) ?: return
+                openPlaceMaps(context, note)
+            }
         }
     }
+}
+
+/** Open a place pin in the device maps app (no Grokify activity). */
+fun openPlaceMaps(context: Context, note: LocationNote): Boolean {
+    val label = Uri.encode(note.title.ifBlank { "Place" })
+    val geo = Uri.parse("geo:${note.lat},${note.lon}?q=${note.lat},${note.lon}($label)")
+    val intent = Intent(Intent.ACTION_VIEW, geo).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    return runCatching {
+        context.startActivity(intent)
+        true
+    }.getOrDefault(false)
 }
 
 @Composable
@@ -1083,7 +1426,7 @@ fun LocationNotesPane(
                             )
                             Text(
                                 if (monitoring) {
-                                    "On — enter radius → notify / open app / image"
+                                    "On — runs in background · enter radius → notify / app / image"
                                 } else {
                                     "Off — enable to watch places in the background"
                                 },
@@ -1104,13 +1447,17 @@ fun LocationNotesPane(
                                     }
                                 }
                                 monitoring = on
-                                store.setMonitoringEnabled(on)
-                                if (on) {
-                                    LocationNoteWatcher.sync(appCtx)
-                                    status = "Area monitoring on"
+                                LocationNoteWatcher.setEnabled(appCtx, on)
+                                status = if (on) {
+                                    if (!locationPermsOk(appCtx)) {
+                                        "Need Location permission for background watch"
+                                    } else if (notes.none { it.enabled }) {
+                                        "Monitoring on — arm a place note to start watching"
+                                    } else {
+                                        "Area monitoring on · keep the Place Notes notification"
+                                    }
                                 } else {
-                                    LocationNoteWatcher.stop(appCtx)
-                                    status = "Area monitoring off"
+                                    "Area monitoring off"
                                 }
                             },
                             colors = SwitchDefaults.colors(
