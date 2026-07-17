@@ -3,10 +3,10 @@
     android:description="@string/widget_spotify_small_desc"
     android:initialLayout="@layout/widget_spotify_1x4"
     android:minWidth="250dp"
-    android:minHeight="70dp"
+    android:minHeight="100dp"
     android:previewLayout="@layout/widget_spotify_1x4"
     android:resizeMode="horizontal|vertical"
     android:targetCellWidth="4"
-    android:targetCellHeight="1"
+    android:targetCellHeight="2"
     android:updatePeriodMillis="0"
     android:widgetCategory="home_screen" />

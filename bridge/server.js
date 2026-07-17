@@ -24,6 +24,8 @@ const PORT = parseInt(envFirst('GROKIFY_BRIDGE_PORT', 'GROKPOT_BRIDGE_PORT') || 
 const INSTANCE_ID = envFirst('GROKIFY_BRIDGE_INSTANCE', 'GROKPOT_BRIDGE_INSTANCE') || 'a';
 const GROK_BIN = envFirst('GROKIFY_GROK_BIN', 'GROKPOT_GROK_BIN') || '/root/.grok/bin/grok';
 const DEFAULT_GROK_MODEL = envFirst('GROKIFY_GROK_DEFAULT_MODEL', 'GROKPOT_GROK_DEFAULT_MODEL') || 'grok-4.5';
+/** Headless CLI reasoning effort for all chats (override with GROKIFY_REASONING_EFFORT). */
+const REASONING_EFFORT = envFirst('GROKIFY_REASONING_EFFORT', 'GROKPOT_REASONING_EFFORT') || 'high';
 const LOG_FILE = path.join(WORKSPACE, 'storage', 'logs', 'bridge.log');
 const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_PROMPT_BYTES = 120000;
@@ -1791,6 +1793,7 @@ function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId
     log('info', 'agent', 'Spawning Grok Build', {
         session_id: sessionId,
         model: realModel,
+        reasoning_effort: REASONING_EFFORT,
         user_id: userId,
         prompt_bytes: Buffer.byteLength(fullPrompt),
         detach: DETACH_AGENTS,
@@ -1800,6 +1803,7 @@ function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId
     const args = [
         '--output-format', 'streaming-json',
         '--always-approve',
+        '--reasoning-effort', REASONING_EFFORT,
         '-m', realModel,
         '-p', fullPrompt,
     ];

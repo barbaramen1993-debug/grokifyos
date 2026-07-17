@@ -21,6 +21,9 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import android.view.KeyEvent
 import androidx.compose.foundation.BorderStroke
@@ -70,9 +73,13 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.material.icons.filled.Tablet
+import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -138,7 +145,17 @@ private const val TAG = "SpotifyCtrl"
 private const val PREFS = "spotify_controller"
 private const val KEY_ENABLED = "enabled"
 private const val KEY_PREFERRED_DEVICE = "preferred_device_id"
+private const val KEY_LAST_STATUS = "last_status"
+private const val KEY_LAST_ERROR = "last_error"
 const val SPOTIFY_CTRL_NOTIF_ID = 47001
+
+/** Process-lifetime: true while [SpotifyControllerService] is created. */
+@Volatile
+private var ctrlServiceAlive: Boolean = false
+
+/** Rate-limit ensure kicks so Control-tab polling cannot thrash FGS. */
+@Volatile
+private var lastCtrlEnsureMs: Long = 0L
 
 const val ACTION_PREV = "io.grokify.os.SPOTIFY_PREV"
 const val ACTION_PLAY_PAUSE = "io.grokify.os.SPOTIFY_PLAY_PAUSE"
@@ -148,6 +165,17 @@ const val ACTION_STOP = "io.grokify.os.SPOTIFY_STOP"
 const val ACTION_LIKE_TOGGLE = "io.grokify.os.SPOTIFY_LIKE_TOGGLE"
 /** Home-screen widget: queue more-like-this via Live DJ. */
 const val ACTION_MORE_LIKE = "io.grokify.os.SPOTIFY_MORE_LIKE"
+
+/** Target for the Dislike multi-select modal (Control + chat bubbles). */
+private data class DislikeTarget(
+    val trackUri: String,
+    val name: String,
+    val artists: String,
+    val artistUri: String = "",
+    val artistIds: List<String> = emptyList(),
+    /** When true, apply will skip if this cut is currently playing. */
+    val skipIfPlaying: Boolean = true,
+)
 /** Widget: play a specific track URI (history bubble). */
 const val ACTION_PLAY_URI = "io.grokify.os.SPOTIFY_PLAY_URI"
 /** Widget: like/unlike a specific track URI. */
@@ -171,6 +199,35 @@ internal val SPOTIFY_PACKAGES = listOf(
     "com.spotify.music",
     "com.spotify.lite",
 )
+
+/**
+ * Coil model for Control-tab art.
+ *
+ * Prefer **on-disk** bytes, then the **original** CDN / session URI. Do **not**
+ * switch Coil to a host media-cache URL until that file is on disk — otherwise
+ * the first successful CDN paint is replaced by a 404 host URL and the card
+ * goes blank (the flash-then-empty bug).
+ */
+private fun controlArtModel(context: Context, sourceUrl: String?, trackUri: String = ""): Any? {
+    val src = sourceUrl?.trim().orEmpty()
+    if (src.isNotBlank()) {
+        SpotifyArtMirror.localFile(context, src)?.let { return it }
+        val preferred = SpotifyArtMirror.preferredUrl(context, src)
+        if (preferred.isNotBlank() && preferred != src) {
+            SpotifyArtMirror.localFile(context, preferred)?.let { return it }
+        }
+        // Kick mirror in background; keep loading the original until disk is ready.
+        if (SpotifyArtMirror.isSpotifyCdn(src) || src.startsWith("http", ignoreCase = true)) {
+            SpotifyArtMirror.mirrorAsync(context, src, onDone = null)
+        }
+        return src
+    }
+    if (trackUri.isNotBlank()) {
+        val sessionKey = "session:$trackUri"
+        SpotifyArtMirror.localFile(context, sessionKey)?.let { return it }
+    }
+    return null
+}
 
 /** Snapshot of whatever media session we can drive. */
 data class SpotifyNowPlaying(
@@ -205,6 +262,67 @@ class SpotifyControllerStore(context: Context) {
     var preferredDeviceId: String
         get() = prefs.getString(KEY_PREFERRED_DEVICE, "").orEmpty()
         set(value) = prefs.edit().putString(KEY_PREFERRED_DEVICE, value).apply()
+
+    /** Short human status for Control tab diagnostics. */
+    var lastStatus: String
+        get() = prefs.getString(KEY_LAST_STATUS, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_LAST_STATUS, value).apply()
+
+    var lastError: String
+        get() = prefs.getString(KEY_LAST_ERROR, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_LAST_ERROR, value).apply()
+
+    fun recordStatus(status: String, error: String = "") {
+        prefs.edit()
+            .putString(KEY_LAST_STATUS, status)
+            .putString(KEY_LAST_ERROR, error)
+            .apply()
+    }
+}
+
+/** Human-readable why the shade card may be missing (channel / app notifs / service). */
+fun spotifyControllerDiag(context: Context): String {
+    val appCtx = context.applicationContext
+    val store = SpotifyControllerStore(appCtx)
+    val nm = appCtx.getSystemService(NotificationManager::class.java)
+    val nmc = NotificationManagerCompat.from(appCtx)
+    val appOk = nmc.areNotificationsEnabled()
+    val ch = nm?.getNotificationChannel(GrokifyApp.CHANNEL_SPOTIFY_CTRL)
+    val chImp = ch?.importance ?: -1
+    val chBlocked = ch == null || chImp == NotificationManager.IMPORTANCE_NONE
+    val posted = isSpotifyControllerNotificationPosted(appCtx)
+    val parts = mutableListOf<String>()
+    parts += if (store.enabled) "enabled" else "disabled"
+    parts += if (ctrlServiceAlive) "service=up" else "service=down"
+    parts += if (posted) "notif=live" else "notif=missing"
+    parts += if (appOk) "appNotif=ok" else "appNotif=BLOCKED"
+    parts += when {
+        ch == null -> "channel=missing"
+        chBlocked -> "channel=BLOCKED(imp=$chImp)"
+        else -> "channel=ok(imp=$chImp)"
+    }
+    if (store.lastStatus.isNotBlank()) parts += "last=${store.lastStatus}"
+    if (store.lastError.isNotBlank()) parts += "err=${store.lastError}"
+    return parts.joinToString(" · ")
+}
+
+/** Ensure channel exists (Application may not have run yet on some OEM paths). */
+fun ensureSpotifyCtrlChannel(context: Context) {
+    val nm = context.getSystemService(NotificationManager::class.java) ?: return
+    if (nm.getNotificationChannel(GrokifyApp.CHANNEL_SPOTIFY_CTRL) != null) return
+    nm.createNotificationChannel(
+        android.app.NotificationChannel(
+            GrokifyApp.CHANNEL_SPOTIFY_CTRL,
+            context.getString(io.grokify.os.R.string.notification_channel_spotify_ctrl),
+            NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            description = context.getString(io.grokify.os.R.string.notification_channel_spotify_ctrl_desc)
+            setShowBadge(false)
+            setSound(null, null)
+            enableVibration(false)
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        },
+    )
 }
 
 /** Spotify Connect / app playback target from Web API. */
@@ -374,6 +492,63 @@ fun isSpotifyControllerNotificationPosted(context: Context): Boolean {
     }
 }
 
+/**
+ * Seed a MediaStyle card via [NotificationManager] so the shade shows something
+ * even before FGS binds. Same id as the service — startForeground upgrades it.
+ */
+private fun seedControllerNotification(context: Context) {
+    ensureSpotifyCtrlChannel(context)
+    val appCtx = context.applicationContext
+    val now = runCatching { nowPlayingForNotification(appCtx) }.getOrNull()
+        ?: SpotifyNowPlaying(title = "Spotify Controller", artist = "Prev · Play · Next")
+    val n = SpotifyMediaNotif.buildMinimal(appCtx, now, subText = "GrokifyOS")
+    runCatching {
+        appCtx.getSystemService(NotificationManager::class.java)
+            ?.notify(SPOTIFY_CTRL_NOTIF_ID, n)
+        Log.i(TAG, "seed notify id=$SPOTIFY_CTRL_NOTIF_ID")
+    }.onFailure {
+        Log.e(TAG, "seed notify failed: ${it.message}", it)
+        SpotifyControllerStore(appCtx).recordStatus("seed_fail", it.message ?: "notify")
+    }
+}
+
+/**
+ * Start (or re-assert) the controller FGS **without** stopService.
+ *
+ * Critical: Control-tab polling used to call [setSpotifyControllerEnabled] every
+ * ~1.5s when the notif looked missing; that path previously did stopService first
+ * and permanently thrash-killed the FGS on Samsung / Android 14+.
+ */
+fun ensureSpotifyControllerRunning(context: Context, force: Boolean = false) {
+    val appCtx = context.applicationContext
+    val store = SpotifyControllerStore(appCtx)
+    if (!store.enabled) return
+    val now = SystemClock.elapsedRealtime()
+    if (!force && ctrlServiceAlive && isSpotifyControllerNotificationPosted(appCtx)) {
+        return
+    }
+    // Rate-limit kicks unless forced (user Repost / toggle).
+    if (!force && now - lastCtrlEnsureMs < 8_000L) return
+    lastCtrlEnsureMs = now
+    ensureSpotifyCtrlChannel(appCtx)
+    if (!isSpotifyControllerNotificationPosted(appCtx)) {
+        seedControllerNotification(appCtx)
+    }
+    try {
+        ContextCompat.startForegroundService(
+            appCtx,
+            Intent(appCtx, SpotifyControllerService::class.java),
+        )
+        store.recordStatus("start_requested")
+        Log.i(TAG, "controller FGS ensure requested force=$force alive=$ctrlServiceAlive")
+    } catch (e: Exception) {
+        Log.e(TAG, "startForegroundService failed: ${e.message}", e)
+        store.recordStatus("start_denied", e.javaClass.simpleName + ": " + (e.message ?: ""))
+        // Last resort: keep the seed shade notification even without FGS.
+        seedControllerNotification(appCtx)
+    }
+}
+
 /** Start or stop the lockscreen media control notification. */
 fun setSpotifyControllerEnabled(context: Context, enabled: Boolean) {
     val appCtx = context.applicationContext
@@ -381,22 +556,31 @@ fun setSpotifyControllerEnabled(context: Context, enabled: Boolean) {
     store.enabled = enabled
     val intent = Intent(appCtx, SpotifyControllerService::class.java)
     if (enabled) {
-        // One shared shade entry with Live DJ — drop the legacy DJ-only id.
-        runCatching {
-            appCtx.getSystemService(NotificationManager::class.java)
-                ?.cancel(SPOTIFY_DJ_NOTIF_ID)
-        }
-        try {
-            ContextCompat.startForegroundService(appCtx, intent)
-        } catch (e: Exception) {
-            Log.e(TAG, "startForegroundService failed: ${e.message}", e)
-        }
+        // NEVER stopService here — that was a death spiral with Control-tab auto-retry.
+        // Seed shade card immediately so status flips to live even before onStartCommand.
+        seedControllerNotification(appCtx)
+        lastCtrlEnsureMs = 0L
+        ensureSpotifyControllerRunning(appCtx, force = true)
+        // Soft re-assert once (OEM delay) — still no stop.
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (SpotifyControllerStore(appCtx).enabled) {
+                ensureSpotifyControllerRunning(appCtx, force = true)
+            }
+        }, 750L)
     } else {
-        appCtx.stopService(intent)
-        // Keep the shared notification if Live DJ still needs a FGS slot.
-        if (!SpotifyDjStore(appCtx).enabled) {
-            val nm = appCtx.getSystemService(NotificationManager::class.java)
-            nm?.cancel(SPOTIFY_CTRL_NOTIF_ID)
+        store.recordStatus("disabled")
+        runCatching { appCtx.stopService(intent) }
+        val nm = appCtx.getSystemService(NotificationManager::class.java)
+        nm?.cancel(SPOTIFY_CTRL_NOTIF_ID)
+        // If Live DJ is still armed, poke it so it reclaims a visible media card.
+        if (SpotifyDjStore(appCtx).enabled) {
+            runCatching {
+                ContextCompat.startForegroundService(
+                    appCtx,
+                    Intent(appCtx, SpotifyLiveDjService::class.java)
+                        .setAction(SpotifyLiveDjService.ACTION_DJ_RELOAD_SETTINGS),
+                )
+            }
         }
     }
 }
@@ -416,12 +600,16 @@ fun resolveActiveMediaController(context: Context): MediaController? {
         emptyList()
     }
     if (sessions.isEmpty()) return null
-    return sessions.firstOrNull { it.packageName in SPOTIFY_PACKAGES }
-        ?: sessions.firstOrNull { ctrl ->
+    // Never target our own Live DJ MediaSession (would loop pause/play keys into ourselves).
+    val selfPkg = context.packageName
+    val foreign = sessions.filter { it.packageName != selfPkg }
+    if (foreign.isEmpty()) return null
+    return foreign.firstOrNull { it.packageName in SPOTIFY_PACKAGES }
+        ?: foreign.firstOrNull { ctrl ->
             val st = ctrl.playbackState?.state
             st == PlaybackState.STATE_PLAYING || st == PlaybackState.STATE_BUFFERING
         }
-        ?: sessions.firstOrNull()
+        ?: foreign.firstOrNull()
 }
 
 /** Extrapolate live position from last PlaybackState update while playing. */
@@ -1026,17 +1214,31 @@ private fun resumeOrPauseViaWebApi(context: Context) {
 }
 
 /**
- * Foreground service that pins a shade/lockscreen notification with
- * Previous / Play-Pause / Next always visible (MediaStyle compact actions).
- * Does NOT attach a MediaSession token — that fights Spotify for the system
- * media player and usually makes our notif disappear. Progress uses the
- * standard notification progress bar + time text from Spotify's session.
+ * Foreground service that pins a **live notification** with Previous / Play-Pause /
+ * Next action buttons, album art, and progress.
+ *
+ * Samsung One UI forces traditional MediaStyle players into Now bar / AI boards, so
+ * this card is deliberately a normal ongoing BigText notification (Live Update
+ * promotion requested) that paints on the lock screen with transport buttons.
+ *
+ * **Always** owns the visible controls card while enabled — including when Live DJ
+ * is armed. Live DJ keeps a quiet FGS on its own id. MediaSession is kept for
+ * transport routing but is **not** attached to the notification.
+ *
  * specialUse FGS: we control other apps' media, we are not a player.
  */
 class SpotifyControllerService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     /** Only push home widgets when track / play state actually changes. */
     @Volatile private var lastWidgetSig: String = ""
+    /** Skip nm.notify when shell+progress bucket unchanged (stops shade thrash). */
+    @Volatile private var lastPostedSig: String = ""
+    /** Last time we re-asserted startForeground (OEM demotion fight). */
+    @Volatile private var lastPromoteMs: Long = 0L
+    @Volatile private var lastArtTrackKey: String = ""
+    @Volatile private var lastArt: SpotifyMediaNotif.ArtPair? = null
+    @Volatile private var lastCtrlSessionSig: String = ""
+    private var ctrlMediaSession: MediaSessionCompat? = null
     private var trackedController: MediaController? = null
     private val playbackCallback = object : MediaController.Callback() {
         override fun onPlaybackStateChanged(state: PlaybackState?) {
@@ -1044,6 +1246,10 @@ class SpotifyControllerService : Service() {
         }
 
         override fun onMetadataChanged(metadata: android.media.MediaMetadata?) {
+            // Metadata changes = new track details; force a full notif rebuild.
+            lastArt = null
+            lastArtTrackKey = ""
+            lastPostedSig = ""
             wakeRefresh()
         }
     }
@@ -1051,11 +1257,9 @@ class SpotifyControllerService : Service() {
     private val refreshRunnable = object : Runnable {
         override fun run() {
             val now = refreshNotification()
-            // Only actively tick while audio is playing. Paused / no session: go nearly
-            // idle and rely on playback callbacks + control intents to wake us.
-            // (Previously 4s forever while paused — kept the FGS "working" for hours.)
+            // Progress text only needs ~2s resolution; faster ticks spazz the shade.
             val delayMs = when {
-                now?.isPlaying == true -> 1_000L
+                now?.isPlaying == true -> 2_000L
                 now?.hasSession == true -> 30_000L
                 else -> 90_000L
             }
@@ -1067,9 +1271,21 @@ class SpotifyControllerService : Service() {
         wakeRefresh()
     }
 
+    private val artReadyListener: (Context) -> Unit = { ctx ->
+        if (ctx.packageName == packageName && SpotifyControllerStore(this).enabled) {
+            // Art just landed — rebuild shade card + re-push MediaSession bitmaps
+            // so lockscreen background updates (sig used to skip art-only changes).
+            lastArt = null
+            lastPostedSig = ""
+            lastCtrlSessionSig = ""
+            handler.post { refreshNotification() }
+        }
+    }
+
     /** Immediate notif refresh + reschedule tick (play just started, button tap, etc.). */
     private fun wakeRefresh() {
         handler.removeCallbacks(refreshRunnable)
+        lastPostedSig = ""
         refreshNotification()
         handler.post(refreshRunnable)
     }
@@ -1078,6 +1294,8 @@ class SpotifyControllerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        ctrlServiceAlive = true
+        SpotifyMediaNotif.setArtReadyListener(artReadyListener)
         try {
             val msm = getSystemService(MediaSessionManager::class.java)
             if (msm != null && isNotificationListenerEnabled(this)) {
@@ -1093,44 +1311,115 @@ class SpotifyControllerService : Service() {
         handler.post(refreshRunnable)
     }
 
+    /**
+     * Promote to foreground with the first type that the OEM accepts.
+     *
+     * Order: **specialUse first** (we are a remote control, not an audio player) →
+     * both → mediaPlayback alone → bare.
+     *
+     * mediaPlayback-first was killing the FGS on Android 14+: the system expects a
+     * real playing MediaSession on *this* service, but Spotify holds audio focus and
+     * Live DJ owns the session token — so the controller was demoted/killed and the
+     * shade card vanished (“lost it again”).
+     */
+    private fun promoteForeground(notification: Notification): Boolean {
+        ensureSpotifyCtrlChannel(this)
+        val store = SpotifyControllerStore(this)
+        if (Build.VERSION.SDK_INT < 29) {
+            return try {
+                startForeground(SPOTIFY_CTRL_NOTIF_ID, notification)
+                store.recordStatus("fg_ok_legacy")
+                true
+            } catch (e: Exception) {
+                store.recordStatus("fg_fail_legacy", e.message ?: "")
+                false
+            }
+        }
+        val types = mutableListOf<Int>()
+        if (Build.VERSION.SDK_INT >= 34) {
+            types += ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            types += (
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                )
+            types += ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        } else {
+            // API 29–33: type is optional; 0 = use manifest default.
+            types += 0
+            types += ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        }
+        var lastErr: String = ""
+        for (t in types) {
+            try {
+                if (t == 0) {
+                    startForeground(SPOTIFY_CTRL_NOTIF_ID, notification)
+                } else {
+                    ServiceCompat.startForeground(this, SPOTIFY_CTRL_NOTIF_ID, notification, t)
+                }
+                store.recordStatus("fg_ok_type=$t")
+                Log.i(TAG, "startForeground ok type=$t id=$SPOTIFY_CTRL_NOTIF_ID")
+                return true
+            } catch (e: Exception) {
+                lastErr = "type=$t ${e.javaClass.simpleName}:${e.message}"
+                Log.e(TAG, "startForeground failed $lastErr", e)
+            }
+        }
+        // Non-FGS shade post — better than nothing; may be less sticky.
+        return try {
+            getSystemService(NotificationManager::class.java)
+                ?.notify(SPOTIFY_CTRL_NOTIF_ID, notification)
+            store.recordStatus("fg_fail_notify_only", lastErr)
+            true
+        } catch (e: Exception) {
+            store.recordStatus("fg_fail_all", lastErr + " / " + (e.message ?: ""))
+            false
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!SpotifyControllerStore(this).enabled) {
             stopSelf()
             return START_NOT_STICKY
         }
-        // Button taps re-enter here — wake the tick so play resumes 1s progress updates.
-        val now = readNowPlaying(this)
-        val n = buildNotification(now)
-        // specialUse: we control other apps' media — we are not a player.
-        // mediaPlayback FGS is killed on Android 14+ when not actually playing.
-        val fgsType = when {
-            Build.VERSION.SDK_INT >= 34 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            Build.VERSION.SDK_INT >= 29 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            else -> 0
+        // 1) startForeground FIRST with a bare card — no session / art work before this.
+        //    Violating the ~5s FGS contract kills us with no notification on Samsung.
+        val bootstrap = SpotifyMediaNotif.buildMinimal(
+            this,
+            SpotifyNowPlaying(title = "Spotify Controller", artist = "Prev · Play · Next"),
+        )
+        val promoted = promoteForeground(bootstrap)
+        if (!promoted) {
+            Log.e(TAG, "could not promote foreground at all")
         }
-        try {
-            ServiceCompat.startForeground(this, SPOTIFY_CTRL_NOTIF_ID, n, fgsType)
-            Log.i(TAG, "foreground started, notif posted id=$SPOTIFY_CTRL_NOTIF_ID")
-        } catch (e: Exception) {
-            Log.e(TAG, "startForeground failed, falling back: ${e.message}", e)
-            // Last resort: post as plain notification so controls still appear
-            try {
-                startForeground(SPOTIFY_CTRL_NOTIF_ID, n)
-            } catch (e2: Exception) {
-                Log.e(TAG, "plain startForeground failed: ${e2.message}", e2)
-                getSystemService(NotificationManager::class.java)
-                    ?.notify(SPOTIFY_CTRL_NOTIF_ID, n)
+
+        // 2) Now safe to resolve session / art and upgrade the card.
+        val now = runCatching { nowPlayingForNotification(this) }.getOrNull()
+            ?: SpotifyNowPlaying(title = "Spotify Controller", artist = "Prev · Play · Next")
+        val token = runCatching { resolveSessionToken(now) }.getOrNull()
+        val (n, postSig) = runCatching { buildNotificationWithSig(now) }
+            .getOrElse {
+                Log.e(TAG, "buildNotification failed: ${it.message}", it)
+                SpotifyMediaNotif.buildMinimal(this, now, sessionToken = token) to "minimal"
             }
+        lastPostedSig = postSig
+        // Upgrade FGS notification (same id) + re-assert via NM for OEMs that
+        // hide FGS-only media cards from the expanded shade.
+        promoteForeground(n)
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                ?.notify(SPOTIFY_CTRL_NOTIF_ID, n)
         }
         handler.removeCallbacks(refreshRunnable)
-        // After a control action, poll a few times quickly then settle into idle/play rate.
         handler.postDelayed(refreshRunnable, 400L)
         return START_STICKY
     }
 
     override fun onDestroy() {
+        ctrlServiceAlive = false
         handler.removeCallbacks(refreshRunnable)
+        SpotifyMediaNotif.setArtReadyListener(null)
         untrackController()
+        releaseCtrlMediaSession()
         try {
             getSystemService(MediaSessionManager::class.java)
                 ?.removeOnActiveSessionsChangedListener(sessionListener)
@@ -1168,6 +1457,167 @@ class SpotifyControllerService : Service() {
         }
     }
 
+    /**
+     * Always own a MediaSession on **this** service for MediaStyle + lockscreen.
+     * Transport routes through [dispatchMediaCommand] (Live DJ when booth is on,
+     * else Spotify session / media keys). Do **not** borrow Live DJ’s token —
+     * a foreign service token + mediaPlayback FGS is how the card kept vanishing.
+     */
+    private fun resolveSessionToken(now: SpotifyNowPlaying): MediaSessionCompat.Token? {
+        ensureCtrlMediaSession()
+        syncCtrlMediaSession(now)
+        return try {
+            ctrlMediaSession?.sessionToken
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun ensureCtrlMediaSession() {
+        if (ctrlMediaSession != null) return
+        val session = MediaSessionCompat(this, "GrokifySpotifyCtrl").apply {
+            setFlags(
+                MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
+                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
+            )
+            setCallback(
+                object : MediaSessionCompat.Callback() {
+                    override fun onPlay() {
+                        dispatchMediaCommand(this@SpotifyControllerService, ACTION_PLAY_PAUSE)
+                        wakeRefresh()
+                    }
+
+                    override fun onPause() {
+                        dispatchMediaCommand(this@SpotifyControllerService, ACTION_PLAY_PAUSE)
+                        wakeRefresh()
+                    }
+
+                    override fun onSkipToNext() {
+                        dispatchMediaCommand(this@SpotifyControllerService, ACTION_NEXT)
+                        wakeRefresh()
+                    }
+
+                    override fun onSkipToPrevious() {
+                        dispatchMediaCommand(this@SpotifyControllerService, ACTION_PREV)
+                        wakeRefresh()
+                    }
+
+                    override fun onStop() {
+                        dispatchMediaCommand(this@SpotifyControllerService, ACTION_PLAY_PAUSE)
+                        wakeRefresh()
+                    }
+                },
+                handler,
+            )
+            val openApp = PendingIntent.getActivity(
+                this@SpotifyControllerService,
+                47020,
+                Intent(this@SpotifyControllerService, MainActivity::class.java).apply {
+                    putExtra("open_app", "spotify_controller")
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            setSessionActivity(openApp)
+            // Cold-start media buttons → receiver → re-start service.
+            val mbr = PendingIntent.getBroadcast(
+                this@SpotifyControllerService,
+                47021,
+                Intent(Intent.ACTION_MEDIA_BUTTON).setClass(
+                    this@SpotifyControllerService,
+                    SpotifyControllerReceiver::class.java,
+                ),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            setMediaButtonReceiver(mbr)
+        }
+        ctrlMediaSession = session
+        Log.i(TAG, "ctrl MediaSession created")
+    }
+
+    private fun syncCtrlMediaSession(now: SpotifyNowPlaying) {
+        val session = ctrlMediaSession ?: return
+        val title = now.title.ifBlank { "Spotify Controller" }
+        val artist = now.artist.ifBlank { "Prev · Play · Next" }
+        val playing = now.isPlaying
+        val pos = now.positionMs.coerceAtLeast(0L)
+        val dur = now.durationMs.coerceAtLeast(0L)
+        val artBmp = SpotifyMediaNotif.bestSessionArt(lastArt)
+        val artSig = when {
+            artBmp != null -> "art${artBmp.width}x${artBmp.height}"
+            now.albumArtUrl.isNotBlank() -> "url"
+            else -> "noart"
+        }
+        val sig = "${now.trackUri}|$playing|${pos / 2_000L}|$title|$artist|$dur|$artSig"
+        if (sig == lastCtrlSessionSig && session.isActive) return
+        lastCtrlSessionSig = sig
+        try {
+            val meta = MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ARTIST, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_TITLE, title)
+                .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_DESCRIPTION, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, now.trackUri)
+                .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_URI, now.trackUri)
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, dur)
+            if (now.albumArtUrl.isNotBlank()) {
+                meta.putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, now.albumArtUrl)
+                meta.putString(MediaMetadataCompat.METADATA_KEY_ART_URI, now.albumArtUrl)
+                meta.putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON_URI, now.albumArtUrl)
+            }
+            // Embed large cover — SystemUI lockscreen media uses these bitmaps as background.
+            artBmp?.let {
+                meta.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, it)
+                meta.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, it)
+                meta.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, it)
+            }
+            session.setMetadata(meta.build())
+            val actions =
+                PlaybackStateCompat.ACTION_PLAY or
+                    PlaybackStateCompat.ACTION_PAUSE or
+                    PlaybackStateCompat.ACTION_PLAY_PAUSE or
+                    PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                    PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                    PlaybackStateCompat.ACTION_STOP
+            val state = when {
+                playing -> PlaybackStateCompat.STATE_PLAYING
+                now.hasSession || now.title.isNotBlank() -> PlaybackStateCompat.STATE_PAUSED
+                else -> PlaybackStateCompat.STATE_STOPPED
+            }
+            session.setPlaybackState(
+                PlaybackStateCompat.Builder()
+                    .setActions(actions)
+                    .setState(
+                        state,
+                        pos,
+                        if (playing) 1.0f else 0f,
+                        SystemClock.elapsedRealtime(),
+                    )
+                    .build(),
+            )
+            if (!session.isActive) {
+                session.isActive = true
+                Log.i(TAG, "ctrl MediaSession active")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "syncCtrlMediaSession: ${e.message}")
+        }
+    }
+
+    private fun releaseCtrlMediaSession() {
+        runCatching {
+            ctrlMediaSession?.apply {
+                isActive = false
+                setCallback(null)
+                release()
+            }
+        }
+        ctrlMediaSession = null
+        lastCtrlSessionSig = ""
+    }
+
     /** @return latest snapshot (for refresh scheduling), or null if stopped. */
     private fun refreshNotification(): SpotifyNowPlaying? {
         if (!SpotifyControllerStore(this).enabled) {
@@ -1175,11 +1625,46 @@ class SpotifyControllerService : Service() {
             return null
         }
         trackActiveController()
-        val now = readNowPlaying(this)
+        val now = nowPlayingForNotification(this)
+        resolveSessionToken(now)
         val nm = getSystemService(NotificationManager::class.java) ?: return now
-        nm.notify(SPOTIFY_CTRL_NOTIF_ID, buildNotification(now))
-        // Progress ticks must NOT re-enrich Spotify every second (that was the 429 hole).
-        // Only repaint home widgets when the track or play/pause state changes.
+        val (n, postSig) = runCatching { buildNotificationWithSig(now) }
+            .getOrElse {
+                Log.e(TAG, "refresh build failed: ${it.message}", it)
+                val token = resolveSessionToken(now)
+                SpotifyMediaNotif.buildMinimal(this, now, sessionToken = token) to "minimal-refresh"
+            }
+        val missing = !isSpotifyControllerNotificationPosted(this)
+        val nowElapsed = SystemClock.elapsedRealtime()
+        // Re-assert FGS periodically — Samsung demotes mediaPlayback/specialUse cards
+        // and clears them without killing the process; sig-only skip left us silent.
+        val duePromote = missing ||
+            postSig != lastPostedSig ||
+            (nowElapsed - lastPromoteMs) > 45_000L
+        if (duePromote) {
+            lastPostedSig = postSig
+            lastPromoteMs = nowElapsed
+            val ok = promoteForeground(n)
+            if (!ok) {
+                runCatching { nm.notify(SPOTIFY_CTRL_NOTIF_ID, n) }
+                    .onFailure {
+                        Log.e(TAG, "notify failed, minimal: ${it.message}")
+                        val token = resolveSessionToken(now)
+                        nm.notify(
+                            SPOTIFY_CTRL_NOTIF_ID,
+                            SpotifyMediaNotif.buildMinimal(this, now, sessionToken = token),
+                        )
+                    }
+            } else {
+                // Also NM-notify so shade shows even when FGS is deprioritized.
+                runCatching { nm.notify(SPOTIFY_CTRL_NOTIF_ID, n) }
+            }
+            if (missing) {
+                Log.w(TAG, "controller notif was missing — re-promoted")
+                SpotifyControllerStore(this).recordStatus("reposted_missing")
+            }
+        }
+        // Progress ticks must NOT re-enrich Spotify. Widgets only on track/play change.
         val sig = listOf(
             now.trackUri,
             now.title,
@@ -1194,89 +1679,90 @@ class SpotifyControllerService : Service() {
         return now
     }
 
-    private fun pi(action: String, req: Int): PendingIntent {
-        val i = Intent(this, SpotifyControllerReceiver::class.java).setAction(action)
-        return PendingIntent.getBroadcast(
-            this,
-            req,
-            i,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    private fun buildNotificationWithSig(now: SpotifyNowPlaying): Pair<Notification, String> {
+        // Always post MediaStyle transport. Live DJ keeps a separate quiet FGS and
+        // does not steal this card.
+        val djBus = SpotifyDjBus.state.value
+        val onAir = now.isPlaying
+        val queue = if (SpotifyDjStore(this).enabled) djBus.queue else emptyList()
+        val queueSig = queue.take(5).joinToString(",") { it.uri }
+
+        // Prefer real track metadata whenever we have a title — lockscreen + shade both
+        // read title/artist from the notification (and MediaSession mirror).
+        val hasRealTrack = now.title.isNotBlank() && now.title != "Unknown track"
+        val display = when {
+            onAir && hasRealTrack -> now.copy(isPlaying = true)
+            onAir && !hasRealTrack -> now.copy(
+                isPlaying = true,
+                title = now.title.ifBlank { "Playing" },
+                artist = now.artist.ifBlank { now.appLabel.ifBlank { "Spotify" } },
+            )
+            hasRealTrack -> now.copy(isPlaying = now.isPlaying)
+            now.hasSession -> now.copy(
+                isPlaying = false,
+                title = now.title.ifBlank { "Spotify" },
+                artist = now.artist.ifBlank { "Controls ready" },
+            )
+            else -> SpotifyNowPlaying(
+                title = "Spotify Controller",
+                artist = "Controls ready · prev / play / next",
+                appLabel = now.appLabel,
+                packageName = now.packageName,
+                isPlaying = false,
+                hasSession = now.hasSession,
+            )
+        }
+
+        val trackKey = listOf(
+            display.trackUri,
+            display.title,
+            display.artist,
+            display.albumArtUrl,
+            queueSig,
+            display.isPlaying,
+            onAir,
+        ).joinToString("|")
+        if (trackKey != lastArtTrackKey) {
+            lastArt = null
+            lastArtTrackKey = trackKey
+        }
+        // Bucket progress to 2s so we don't rebuild every second for a 1s clock.
+        val progressBucket = display.positionMs / 2_000L
+        val art = when {
+            !onAir && !display.hasSession -> null
+            lastArt == null ->
+                SpotifyMediaNotif.resolveArt(this, display, kickNetwork = onAir || display.hasSession)
+                    .also { lastArt = it }
+            lastArt?.album == null &&
+                (display.albumArtUrl.isNotBlank() || display.trackUri.isNotBlank()) ->
+                SpotifyMediaNotif.resolveArt(this, display, kickNetwork = onAir || display.hasSession)
+                    .also { lastArt = it }
+            else -> lastArt
+        }
+        val sub = when {
+            SpotifyDjStore(this).enabled && onAir -> "Live DJ"
+            display.appLabel.isNotBlank() -> display.appLabel
+            else -> "GrokifyOS"
+        }
+        val token = resolveSessionToken(display)
+        // Keep mirror session metadata (title/artist/art) in lockstep with the card.
+        runCatching { syncCtrlMediaSession(display) }
+        val n = SpotifyMediaNotif.buildPlaying(
+            context = this,
+            now = display,
+            queue = queue,
+            subText = sub,
+            art = art,
+            sessionToken = token,
         )
-    }
-
-    private fun buildNotification(now: SpotifyNowPlaying): Notification {
-        val openApp = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).apply {
-                putExtra("open_app", "spotify_controller")
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val title = when {
-            now.hasSession && now.title.isNotBlank() -> now.title
-            else -> "Spotify Controller"
-        }
-        val timePart = when {
-            now.hasSession && now.durationMs > 0L ->
-                "${formatTrackTime(now.positionMs)} / ${formatTrackTime(now.durationMs)}"
-            now.hasSession && now.positionMs > 0L ->
-                formatTrackTime(now.positionMs)
-            else -> null
-        }
-        val text = when {
-            now.hasSession && now.artist.isNotBlank() && timePart != null ->
-                "${now.artist} · $timePart"
-            now.hasSession && now.artist.isNotBlank() ->
-                "${now.artist} · ${now.appLabel.ifBlank { "media" }}"
-            now.hasSession && timePart != null -> timePart
-            now.hasSession -> now.appLabel.ifBlank { "Media session active" }
-            else -> "Prev · Play/Pause · Next — start Spotify"
-        }
-        val playIcon = if (now.isPlaying) {
-            android.R.drawable.ic_media_pause
-        } else {
-            android.R.drawable.ic_media_play
-        }
-        val playLabel = if (now.isPlaying) "Pause" else "Play"
-
-        // MediaStyle compact actions = buttons visible without expanding.
-        // No MediaSession token — attaching one steals/loses the lockscreen
-        // media slot to Spotify and our controls vanish.
-        val mediaStyle = androidx.media.app.NotificationCompat.MediaStyle()
-            .setShowActionsInCompactView(0, 1, 2)
-
-        val builder = NotificationCompat.Builder(this, GrokifyApp.CHANNEL_SPOTIFY_CTRL)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setStyle(mediaStyle)
-            .setSubText(if (now.hasSession) now.appLabel.ifBlank { "GrokifyOS" } else "GrokifyOS")
-            .setContentIntent(openApp)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setSilent(true)
-            .setShowWhen(false)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .addAction(android.R.drawable.ic_media_previous, "Previous", pi(ACTION_PREV, 1))
-            .addAction(playIcon, playLabel, pi(ACTION_PLAY_PAUSE, 2))
-            .addAction(android.R.drawable.ic_media_next, "Next", pi(ACTION_NEXT, 3))
-
-        // Determinate progress bar under the text (works without MediaSession).
-        if (now.hasSession && now.durationMs > 0L) {
-            val max = now.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-            val prog = now.positionMs.coerceIn(0L, now.durationMs)
-                .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-            builder.setProgress(max, prog, false)
-        } else {
-            builder.setProgress(0, 0, false)
-        }
-
-        return builder.build()
+        val finalSig = listOf(
+            trackKey,
+            progressBucket.toString(),
+            (display.durationMs / 1000L).toString(),
+            if (art?.sessionArt != null || art?.album != null) "art" else "noart",
+            if (token != null) "tok" else "notok",
+        ).joinToString("|")
+        return n to finalSig
     }
 }
 
@@ -1401,6 +1887,37 @@ class SpotifyControllerReceiver : BroadcastReceiver() {
                 io.grokify.os.widgets.GrokifyWidgets.forceRefreshSpotify(context)
             }
             ACTION_STOP -> setSpotifyControllerEnabled(context, false)
+            Intent.ACTION_MEDIA_BUTTON -> {
+                val ke = if (Build.VERSION.SDK_INT >= 33) {
+                    intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                } ?: return
+                if (ke.action != KeyEvent.ACTION_DOWN || ke.repeatCount != 0) return
+                val mapped = when (ke.keyCode) {
+                    KeyEvent.KEYCODE_MEDIA_NEXT,
+                    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
+                    -> ACTION_NEXT
+                    KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+                    KeyEvent.KEYCODE_MEDIA_REWIND,
+                    -> ACTION_PREV
+                    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                    KeyEvent.KEYCODE_HEADSETHOOK,
+                    KeyEvent.KEYCODE_MEDIA_PLAY,
+                    KeyEvent.KEYCODE_MEDIA_PAUSE,
+                    KeyEvent.KEYCODE_MEDIA_STOP,
+                    -> ACTION_PLAY_PAUSE
+                    else -> return
+                }
+                dispatchMediaCommand(context, mapped)
+                if (SpotifyControllerStore(context).enabled) {
+                    ContextCompat.startForegroundService(
+                        context,
+                        Intent(context, SpotifyControllerService::class.java),
+                    )
+                }
+            }
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
                 if (SpotifyControllerStore(context).enabled) {
                     ContextCompat.startForegroundService(
@@ -1484,18 +2001,30 @@ fun SpotifyControllerPane(
     var trackLikedBusy by remember { mutableStateOf(false) }
     var trackLikedMsg by remember { mutableStateOf<String?>(null) }
 
-    // Clear sticky "Finding more like this…" once the service finishes (status / chat).
+    /** Pending multi-select dislike modal target (Control transport or chat bubble). */
+    var dislikeTarget by remember { mutableStateOf<DislikeTarget?>(null) }
+
+    // Clear sticky "Finding more like this…" / dislike pending once the service finishes.
     LaunchedEffect(djState.status, djState.messages.lastOrNull()?.id) {
-        val pending = trackLikedMsg?.startsWith("Finding more") == true
-        if (!pending) return@LaunchedEffect
+        val pendingMore = trackLikedMsg?.startsWith("Finding more") == true
+        val pendingDislike = trackLikedMsg?.startsWith("Saving dislike") == true
+        if (!pendingMore && !pendingDislike) return@LaunchedEffect
         val st = djState.status
         val lastSys = djState.messages.lastOrNull { it.role == DjChatRole.System }?.text.orEmpty()
-        val done = st.startsWith("More like") ||
+        val doneMore = st.startsWith("More like") ||
             st.contains("More like this failed", ignoreCase = true) ||
             lastSys.startsWith("More like") ||
             lastSys.contains("More like this", ignoreCase = true)
-        if (done) {
-            trackLikedMsg = null
+        val doneDislike = st.startsWith("Disliked") ||
+            lastSys.contains("Disliked") ||
+            lastSys.startsWith("👎")
+        if ((pendingMore && doneMore) || (pendingDislike && doneDislike)) {
+            trackLikedMsg = when {
+                pendingDislike && doneDislike ->
+                    st.takeIf { it.startsWith("Disliked") }
+                        ?: lastSys.removePrefix("👎 ").trim().ifBlank { "Dislike saved" }
+                else -> null
+            }
         }
     }
     var likedCheckUri by remember { mutableStateOf("") }
@@ -1515,19 +2044,21 @@ fun SpotifyControllerPane(
 
     LaunchedEffect(enabled) {
         // Media session is free; Web API enrich only on track change or every 45s.
-        // The old every-1.5s currently-playing poll alone could exhaust Spotify quota.
+        // Sticky merge (nowPlayingForNotification) keeps art across blank session polls.
         var lastApiUri = ""
         var lastApiAt = 0L
         var cachedApi: SpotifyNowPlaying? = null
         while (true) {
-            val snap = readNowPlaying(appCtx)
-            now = if (SpotifyOAuth.isLoggedIn(appCtx) && (snap.hasSession || loggedIn)) {
+            // DJ-aware + sticky art/title (session alone often drops albumArtUrl after 1 tick).
+            val snap = nowPlayingForNotification(appCtx)
+            val enriched = if (SpotifyOAuth.isLoggedIn(appCtx) && (snap.hasSession || loggedIn)) {
                 val age = System.currentTimeMillis() - lastApiAt
                 val wantApi = !SpotifyOAuth.isRateLimited() &&
                     (
                         snap.trackUri != lastApiUri ||
                             (snap.trackUri.isNotBlank() && age > 45_000L) ||
-                            (lastApiAt == 0L && snap.hasSession)
+                            (lastApiAt == 0L && snap.hasSession) ||
+                            (snap.albumArtUrl.isBlank() && snap.hasSession && age > 8_000L)
                         )
                 if (wantApi) {
                     withContext(Dispatchers.IO) { enrichNowPlayingFromApi(appCtx, snap) }.also {
@@ -1554,11 +2085,14 @@ fun SpotifyControllerPane(
             } else {
                 snap
             }
+            // Never let a blank poll wipe last-good art for the same cut.
+            now = SpotifyNowPlayingSticky.remember(enriched)
             listenerOk = isNotificationListenerEnabled(appCtx)
             spotifyOk = isSpotifyInstalled(appCtx)
             notifPosted = isSpotifyControllerNotificationPosted(appCtx)
+            // Soft ensure only — never stopService (that was thrashing the FGS).
             if (enabled && store.enabled && !notifPosted) {
-                setSpotifyControllerEnabled(appCtx, true)
+                ensureSpotifyControllerRunning(appCtx, force = false)
             }
             // Control tab: only poll actively while playing; idle when paused.
             delay(if (now.isPlaying) 1_500L else 12_000L)
@@ -1790,7 +2324,7 @@ fun SpotifyControllerPane(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(
-                                "Lockscreen widget",
+                                "Live lockscreen controls",
                                 color = GrokifyColors.TextPrimary,
                                 fontWeight = FontWeight.SemiBold,
                                 fontSize = 15.sp,
@@ -1798,11 +2332,11 @@ fun SpotifyControllerPane(
                             Text(
                                 when {
                                     enabled && notifPosted ->
-                                        "On — look for “Spotify Controller” in shade / lockscreen"
+                                        "On — live notification with Prev · Play · Next (Samsung lockscreen; bypasses Now bar)"
                                     enabled && !notifPosted ->
-                                        "On — starting notification…"
+                                        "On — notification missing. Tap Repost, or Notifications → Spotify live controls"
                                     else ->
-                                        "Off — enable to pin Prev · Play · Next on lockscreen"
+                                        "Off — pin a live notification with Prev · Play · Next on the lock screen"
                                 },
                                 color = GrokifyColors.TextDim,
                                 fontSize = 12.sp,
@@ -1820,6 +2354,12 @@ fun SpotifyControllerPane(
                                     enabled = false
                                 }
                                 notifPosted = isSpotifyControllerNotificationPosted(appCtx)
+                                scope.launch {
+                                    delay(400)
+                                    notifPosted = isSpotifyControllerNotificationPosted(appCtx)
+                                    delay(900)
+                                    notifPosted = isSpotifyControllerNotificationPosted(appCtx)
+                                }
                             },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = GrokifyColors.Void,
@@ -1833,6 +2373,41 @@ fun SpotifyControllerPane(
 
                 Spacer(Modifier.height(12.dp))
 
+                // Sticky art models: keep last good cover for the same track so a
+                // blank poll / failed host URL cannot wipe the card after a flash.
+                var stickyAlbumArt by remember { mutableStateOf<Any?>(null) }
+                var stickyArtistArt by remember { mutableStateOf<Any?>(null) }
+                var stickyArtTrackKey by remember { mutableStateOf("") }
+                val trackArtKey = now.trackUri.ifBlank { "${now.title}|${now.artist}" }
+                LaunchedEffect(now.albumArtUrl, now.artistArtUrl, trackArtKey) {
+                    val albumModel = controlArtModel(appCtx, now.albumArtUrl, now.trackUri)
+                    val artistModel = controlArtModel(
+                        appCtx,
+                        now.artistArtUrl.ifBlank { now.albumArtUrl },
+                        now.trackUri,
+                    )
+                    if (trackArtKey != stickyArtTrackKey) {
+                        stickyArtTrackKey = trackArtKey
+                        stickyAlbumArt = albumModel
+                        stickyArtistArt = artistModel
+                    } else {
+                        if (albumModel != null) stickyAlbumArt = albumModel
+                        if (artistModel != null) stickyArtistArt = artistModel
+                    }
+                    // Session-only bitmap (no URL): mirror once so later polls have a File.
+                    if (albumModel == null && now.trackUri.isNotBlank() && now.hasSession) {
+                        withContext(Dispatchers.IO) {
+                            readSessionAlbumArtBitmap(appCtx, maxEdge = 512)?.let { bmp ->
+                                SpotifyArtMirror.mirrorBitmap(appCtx, "session:${now.trackUri}", bmp)
+                            }
+                        }
+                        controlArtModel(appCtx, now.albumArtUrl, now.trackUri)?.let {
+                            stickyAlbumArt = it
+                        }
+                    }
+                }
+                val albumArtModel = stickyAlbumArt
+                val artistArtModel = stickyArtistArt
                 Box(
                     Modifier
                         .fillMaxWidth()
@@ -1840,9 +2415,9 @@ fun SpotifyControllerPane(
                         .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp)),
                 ) {
                     // Album art as full-card background
-                    if (now.albumArtUrl.isNotBlank()) {
+                    if (albumArtModel != null) {
                         AsyncImage(
-                            model = now.albumArtUrl,
+                            model = albumArtModel,
                             contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.matchParentSize(),
@@ -1852,7 +2427,7 @@ fun SpotifyControllerPane(
                         Modifier
                             .matchParentSize()
                             .background(
-                                if (now.albumArtUrl.isNotBlank()) {
+                                if (albumArtModel != null) {
                                     GrokifyColors.Void.copy(alpha = 0.72f)
                                 } else {
                                     GrokifyColors.Panel
@@ -1888,10 +2463,9 @@ fun SpotifyControllerPane(
                                 },
                             contentAlignment = Alignment.Center,
                         ) {
-                            val thumb = now.artistArtUrl.ifBlank { now.albumArtUrl }
-                            if (thumb.isNotBlank()) {
+                            if (artistArtModel != null) {
                                 AsyncImage(
-                                    model = thumb,
+                                    model = artistArtModel,
                                     contentDescription = "Artist",
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier.fillMaxSize(),
@@ -2072,6 +2646,22 @@ fun SpotifyControllerPane(
                                     )
                                 },
                             )
+                            // Dislike → multi-select reasons; keeps cut/artist out of Live DJ queue
+                            TransportButton(
+                                icon = Icons.Default.ThumbDown,
+                                label = "Dislike",
+                                onClick = {
+                                    val uri = now.trackUri
+                                    if (uri.isBlank() && now.title.isBlank()) return@TransportButton
+                                    dislikeTarget = DislikeTarget(
+                                        trackUri = uri,
+                                        name = now.title,
+                                        artists = now.artist,
+                                        artistUri = now.artistUri,
+                                        skipIfPlaying = true,
+                                    )
+                                },
+                            )
                         }
                         if (!trackLikedMsg.isNullOrBlank() && tab == 0) {
                             Spacer(Modifier.height(6.dp))
@@ -2081,7 +2671,9 @@ fun SpotifyControllerPane(
                                     trackLikedMsg!!.startsWith("Saved") ||
                                     trackLikedMsg!!.startsWith("Removed") ||
                                     trackLikedMsg!!.startsWith("Finding more") ||
-                                    trackLikedMsg!!.startsWith("More like")
+                                    trackLikedMsg!!.startsWith("More like") ||
+                                    trackLikedMsg!!.startsWith("Disliked") ||
+                                    trackLikedMsg!!.startsWith("Saving dislike")
                                 ) {
                                     GrokifyColors.GlowMint
                                 } else {
@@ -2352,12 +2944,12 @@ fun SpotifyControllerPane(
                     StatusLine(
                         ok = notifOk,
                         okText = "Notifications allowed",
-                        badText = "Notifications blocked — required for lockscreen widget",
+                        badText = "Notifications blocked — required for live lockscreen controls",
                     )
                     StatusLine(
                         ok = !enabled || notifPosted,
                         okText = if (enabled) "Controller notification is live" else "Widget idle",
-                        badText = "Controller notification missing — toggle off/on",
+                        badText = "Controller notification missing — tap Repost",
                     )
                     StatusLine(
                         ok = listenerOk,
@@ -2369,6 +2961,15 @@ fun SpotifyControllerPane(
                         okText = "Spotify installed",
                         badText = "Spotify not found — install Spotify Music",
                     )
+                    if (enabled) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            spotifyControllerDiag(appCtx),
+                            color = GrokifyColors.TextMuted,
+                            fontSize = 10.sp,
+                            lineHeight = 13.sp,
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     if (!listenerOk) {
                         TextButton(onClick = { openNotificationListenerSettings(context) }) {
@@ -2384,8 +2985,14 @@ fun SpotifyControllerPane(
                         TextButton(onClick = {
                             setSpotifyControllerEnabled(appCtx, true)
                             notifPosted = isSpotifyControllerNotificationPosted(appCtx)
+                            scope.launch {
+                                delay(500)
+                                notifPosted = isSpotifyControllerNotificationPosted(appCtx)
+                                delay(1000)
+                                notifPosted = isSpotifyControllerNotificationPosted(appCtx)
+                            }
                         }) {
-                            Text("Repost lockscreen widget", color = GrokifyColors.GlowMint, fontSize = 13.sp)
+                            Text("Repost live controls", color = GrokifyColors.GlowMint, fontSize = 13.sp)
                         }
                     }
                     TextButton(onClick = { openSpotifyApp(context) }) {
@@ -2598,6 +3205,8 @@ fun SpotifyControllerPane(
                                             "Chat, queue, and play work even when Live DJ auto-handoff is off. " +
                                                 "Tracks & banter show here. Heart any cut (now or past) to Liked Songs. " +
                                                 "More like this prepends a mixed batch (some same-artist + mostly similar) to UP NEXT. " +
+                                                "Dislike opens reasons (artist / song / lyrics / tired for now) so the " +
+                                                "radio set won’t re-queue those picks. " +
                                                 "Ask for a new queue, top-up, drop songs, or song/artist info. " +
                                                 "Tap ▶ on past songs to replay. Queue tab is the app radio set " +
                                                 "(not Spotify’s Up Next).",
@@ -2707,6 +3316,26 @@ fun SpotifyControllerPane(
                                             albumArtUrl = m.albumArtUrl.orEmpty(),
                                         )
                                     },
+                                    onDislike = { m ->
+                                        val uri = m.trackUri.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.trackUri else "" }
+                                        val name = m.trackName.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.title else "" }
+                                        val artists = m.trackArtists.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.artist else "" }
+                                        val aUri = m.artistUri.orEmpty()
+                                            .ifBlank { if (m.isNowPlaying) now.artistUri else "" }
+                                        if (uri.isBlank() && name.isBlank() && artists.isBlank()) {
+                                            return@DjChatBubble
+                                        }
+                                        dislikeTarget = DislikeTarget(
+                                            trackUri = uri,
+                                            name = name,
+                                            artists = artists,
+                                            artistUri = aUri,
+                                            skipIfPlaying = m.isNowPlaying || uri == now.trackUri,
+                                        )
+                                    },
                                 )
                             }
                         }
@@ -2717,7 +3346,9 @@ fun SpotifyControllerPane(
                                     trackLikedMsg!!.startsWith("Saved") ||
                                     trackLikedMsg!!.startsWith("Removed") ||
                                     trackLikedMsg!!.startsWith("Finding more") ||
-                                    trackLikedMsg!!.startsWith("More like")
+                                    trackLikedMsg!!.startsWith("More like") ||
+                                    trackLikedMsg!!.startsWith("Disliked") ||
+                                    trackLikedMsg!!.startsWith("Saving dislike")
                                 ) {
                                     GrokifyColors.GlowMint
                                 } else {
@@ -3590,6 +4221,150 @@ fun SpotifyControllerPane(
             }
         }
     }
+
+    val pendingDislike = dislikeTarget
+    if (pendingDislike != null) {
+        DislikeReasonsDialog(
+            trackTitle = pendingDislike.name.ifBlank { "This track" },
+            artists = pendingDislike.artists,
+            onDismiss = { dislikeTarget = null },
+            onConfirm = { reasons ->
+                dislikeTarget = null
+                trackLikedMsg = "Saving dislike…"
+                spotifyLiveDjDislike(
+                    appCtx,
+                    trackUri = pendingDislike.trackUri,
+                    name = pendingDislike.name,
+                    artists = pendingDislike.artists,
+                    artistUri = pendingDislike.artistUri,
+                    artistIds = pendingDislike.artistIds,
+                    reasons = reasons,
+                    skipIfPlaying = pendingDislike.skipIfPlaying,
+                )
+            },
+        )
+    }
+}
+
+/** Multi-select reasons when the user dislikes a cut (Control + chat bubbles). */
+@Composable
+private fun DislikeReasonsDialog(
+    trackTitle: String,
+    artists: String,
+    onDismiss: () -> Unit,
+    onConfirm: (Set<String>) -> Unit,
+) {
+    var pickArtist by remember { mutableStateOf(false) }
+    var pickSong by remember { mutableStateOf(false) }
+    var pickLyrics by remember { mutableStateOf(false) }
+    var pickTired by remember { mutableStateOf(false) }
+    val any = pickArtist || pickSong || pickLyrics || pickTired
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = GrokifyColors.Panel,
+        title = {
+            Text("Not feeling this?", color = GrokifyColors.TextPrimary)
+        },
+        text = {
+            Column {
+                Text(
+                    buildString {
+                        append("“${trackTitle.take(60)}”")
+                        if (artists.isNotBlank()) append(" — ${artists.take(48)}")
+                    },
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 13.sp,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Why? Pick any that apply — Live DJ won’t put matching cuts back in UP NEXT.",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 12.sp,
+                )
+                Spacer(Modifier.height(10.dp))
+                DislikeReasonRow(
+                    checked = pickArtist,
+                    onCheckedChange = { pickArtist = it },
+                    title = "The artist",
+                    subtitle = "Never queue this artist again",
+                )
+                DislikeReasonRow(
+                    checked = pickSong,
+                    onCheckedChange = { pickSong = it },
+                    title = "This song",
+                    subtitle = "Block this track permanently",
+                )
+                DislikeReasonRow(
+                    checked = pickLyrics,
+                    onCheckedChange = { pickLyrics = it },
+                    title = "The lyrics",
+                    subtitle = "Keep this track out of the set",
+                )
+                DislikeReasonRow(
+                    checked = pickTired,
+                    onCheckedChange = { pickTired = it },
+                    title = "Tired of hearing it for now",
+                    subtitle = "Cool-down ~14 days, then it can return",
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = any,
+                onClick = {
+                    val reasons = buildSet {
+                        if (pickArtist) add(DjDislikeReason.ARTIST)
+                        if (pickSong) add(DjDislikeReason.SONG)
+                        if (pickLyrics) add(DjDislikeReason.LYRICS)
+                        if (pickTired) add(DjDislikeReason.TIRED)
+                    }
+                    onConfirm(reasons)
+                },
+            ) {
+                Text(
+                    "Keep out of queue",
+                    color = if (any) GrokifyColors.GlowAmber else GrokifyColors.TextDim,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = GrokifyColors.TextMuted)
+            }
+        },
+    )
+}
+
+@Composable
+private fun DislikeReasonRow(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    title: String,
+    subtitle: String,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = CheckboxDefaults.colors(
+                checkedColor = GrokifyColors.GlowAmber,
+                uncheckedColor = GrokifyColors.TextDim,
+                checkmarkColor = GrokifyColors.Void,
+            ),
+        )
+        Column(Modifier.weight(1f)) {
+            Text(title, color = GrokifyColors.TextPrimary, fontSize = 14.sp)
+            Text(subtitle, color = GrokifyColors.TextDim, fontSize = 11.sp)
+        }
+    }
 }
 
 /** Scroll a LazyColumn so the last item’s bottom is fully visible (tall track cards). */
@@ -3687,6 +4462,7 @@ private fun DjChatBubble(
     onLikeToggle: (() -> Unit)? = null,
     onPlayTrack: (DjChatMessage) -> Unit = {},
     onMoreLikeThis: (DjChatMessage) -> Unit = {},
+    onDislike: (DjChatMessage) -> Unit = {},
 ) {
     val tsLabel = formatDjChatTimestamp(msg.ts)
     when (msg.role) {
@@ -4005,9 +4781,22 @@ private fun DjChatBubble(
                                     tint = GrokifyColors.GlowCyan,
                                 )
                             }
+                            // Dislike — multi-select reasons; keeps cut/artist out of queue
+                            IconButton(
+                                onClick = { onDislike(msg) },
+                                enabled = !msg.trackUri.isNullOrBlank() ||
+                                    !msg.trackName.isNullOrBlank() ||
+                                    !msg.trackArtists.isNullOrBlank(),
+                            ) {
+                                Icon(
+                                    Icons.Default.ThumbDown,
+                                    contentDescription = "Dislike — keep out of Live DJ queue",
+                                    tint = GrokifyColors.GlowAmber,
+                                )
+                            }
                         }
                     } else if (!msg.trackUri.isNullOrBlank()) {
-                        // Replay past songs + heart + more-like-this from chat history
+                        // Replay past songs + heart + more-like-this + dislike from chat history
                         Spacer(Modifier.height(8.dp))
                         Row(
                             Modifier.fillMaxWidth(),
@@ -4042,6 +4831,14 @@ private fun DjChatBubble(
                                         )
                                     }
                                 }
+                            }
+                            IconButton(onClick = { onDislike(msg) }) {
+                                Icon(
+                                    Icons.Default.ThumbDown,
+                                    contentDescription = "Dislike — keep out of Live DJ queue",
+                                    tint = GrokifyColors.GlowAmber,
+                                    modifier = Modifier.size(18.dp),
+                                )
                             }
                             TextButton(onClick = { onMoreLikeThis(msg) }) {
                                 Icon(

@@ -15,8 +15,8 @@
     <string name="place_monitor_title">Place Notes monitoring</string>
     <string name="place_monitor_text">Watching place notes in the background</string>
     <string name="place_monitor_stop">Stop</string>
-    <string name="notification_channel_spotify_ctrl">Spotify controller</string>
-    <string name="notification_channel_spotify_ctrl_desc">Lockscreen media controls: previous, play/pause, next</string>
+    <string name="notification_channel_spotify_ctrl">Spotify live controls</string>
+    <string name="notification_channel_spotify_ctrl_desc">Live lockscreen notification with previous, play/pause, next (bypasses Samsung media player / Now bar)</string>
     <string name="notification_channel_spotify_dj">Live AI DJ</string>
     <string name="notification_channel_spotify_dj_desc">Native Live AI DJ: library queue and banter between tracks</string>
     <string name="notification_channel_spacexai_usage">SpaceXAI usage alerts</string>
@@ -30,7 +30,7 @@
     <string name="widget_bt_desc">1×4 shortcut to Bluetooth Tracker</string>
     <string name="widget_place_notes_desc">1×4 Place Notes — tap opens app; badge toggles monitor</string>
     <string name="widget_usage_desc">1×4 shortcut to SpaceXAI Usage Analyzer</string>
-    <string name="widget_spotify_small_desc">Spotify strip: tap art/title to open app; transport stays on-widget</string>
+    <string name="widget_spotify_small_desc">Spotify: prev / play / next on-widget; tap art or title to open</string>
     <string name="widget_place_notes_full_desc">Place Notes control panel: monitor, pin, arm places, maps — in-widget</string>
     <string name="widget_wifi_label">Wi‑Fi Scanner</string>
     <string name="widget_bt_label">Bluetooth Tracker</string>

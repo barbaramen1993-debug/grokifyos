@@ -159,28 +159,34 @@ object GrokifyWidgets {
         WidgetArt.bindContext(context)
         val mgr = AppWidgetManager.getInstance(context)
         val smallIds = mgr.getAppWidgetIds(ComponentName(context, SpotifySmallWidget::class.java))
-        // No Spotify strip placed → no enrich/liked API work.
+        // No Spotify strip placed → zero Web API / CDN work.
         if (smallIds.isEmpty()) return
 
         var now = readNowPlaying(context)
-        // Blank artist art used to force enrich on every paint → infinite currently-playing
-        // + /artists spam (and 429 that never recovered). Cap: track change or 60s TTL.
-        val age = System.currentTimeMillis() - lastEnrichedAt
+        // Enrich only when the track changes or album art is still missing.
+        // Never periodic re-hit currently-playing while art is already known (429 hole).
+        val trackChanged = now.trackUri.isNotBlank() && now.trackUri != lastEnrichedUri
+        val missingArt = now.albumArtUrl.isBlank()
         val needEnrich = SpotifyOAuth.isLoggedIn(context) &&
             !SpotifyOAuth.isRateLimited() &&
             (now.hasSession || now.trackUri.isNotBlank()) &&
-            (
-                now.trackUri != lastEnrichedUri ||
-                    lastEnrichedAt == 0L ||
-                    age > 60_000L
-                )
+            (trackChanged || (missingArt && now.trackUri != lastEnrichedUri) ||
+                (missingArt && lastEnrichedAt == 0L) ||
+                (missingArt && System.currentTimeMillis() - lastEnrichedAt > 90_000L))
         if (needEnrich) {
             now = runCatching { enrichNowPlayingFromApi(context, now) }.getOrDefault(now)
             lastEnrichedUri = now.trackUri
             lastEnrichedAt = System.currentTimeMillis()
+        } else if (trackChanged) {
+            // Remember URI even when we skipped enrich (rate-limited / logged out).
+            lastEnrichedUri = now.trackUri
         }
-        // Liked lookup is cached in-process (~2 min); safe even when URI is sticky.
-        val liked = if (now.trackUri.isNotBlank() && SpotifyOAuth.isLoggedIn(context)) {
+        // Liked: in-process cache (~2 min). Skip the call path entirely when not logged in.
+        // checkSpotifyTrackLiked itself no-ops network while rate-limited.
+        val liked = if (
+            now.trackUri.isNotBlank() &&
+            SpotifyOAuth.isLoggedIn(context)
+        ) {
             checkSpotifyTrackLiked(context, now.trackUri) == true
         } else {
             false
@@ -209,15 +215,28 @@ object GrokifyWidgets {
         if (!force && shellSig == lastShellSig) return
 
         val mirrorUrls = listOf(now.albumArtUrl, now.artistArtUrl, albumUrl, artistUrl)
-        SpotifyArtMirror.mirrorAllAsync(context, mirrorUrls, onAny = null)
+            .filter { it.isNotBlank() }
+        if (mirrorUrls.isNotEmpty()) {
+            SpotifyArtMirror.mirrorAllAsync(context, mirrorUrls, onAny = null)
+        }
 
+        // Cache-first paint; only hit network once per missing cover (not every force).
         val sessionBmp = readSessionAlbumArtBitmap(context, maxEdge = 640)
-        val albumBmp = WidgetArt.loadSync(albumUrl.ifBlank { now.albumArtUrl }, maxEdge = 640)
+        val albumSrc = albumUrl.ifBlank { now.albumArtUrl }
+        var albumBmp = WidgetArt.loadCachedOnly(albumSrc, maxEdge = 640) ?: sessionBmp
+        if (albumBmp == null && albumSrc.isNotBlank()) {
+            albumBmp = WidgetArt.loadSync(albumSrc, maxEdge = 640)
+        }
+        val artistSrc = artistUrl.ifBlank { albumUrl }
+        var artistRaw = WidgetArt.loadCachedOnly(artistSrc, maxEdge = 256)
+            ?: if (artistSrc.isNotBlank() && artistSrc != albumSrc) {
+                WidgetArt.loadSync(artistSrc, maxEdge = 256)
+            } else {
+                null
+            }
+            ?: albumBmp
             ?: sessionBmp
-        val artistBmp = (
-            WidgetArt.loadSync(artistUrl.ifBlank { albumUrl }, maxEdge = 256)
-                ?: sessionBmp
-            )?.let { WidgetArt.circleCrop(it, 160) }
+        val artistBmp = artistRaw?.let { WidgetArt.circleCrop(it, 160) }
         if (now.albumArtUrl.isBlank() && sessionBmp != null && now.trackUri.isNotBlank()) {
             SpotifyArtMirror.mirrorBitmapAsync(
                 context,

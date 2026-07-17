@@ -87,14 +87,25 @@ class GrokifyApp : Application() {
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
         )
-        // Delete the old LOW channel so devices that already installed 0.1.33
-        // pick up DEFAULT importance (LOW often stays off the lockscreen).
+        // Delete prior channel ids so upgrades pick up HIGH importance +
+        // PUBLIC lockscreen (importance is immutable once a channel exists).
         runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v2") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v3") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v4") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v5") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v6") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v7") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v8") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v9") }
+        runCatching { nm.deleteNotificationChannel("grokify_spotify_ctrl_v10") }
         nm.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_SPOTIFY_CTRL,
                 getString(R.string.notification_channel_spotify_ctrl),
-                NotificationManager.IMPORTANCE_DEFAULT
+                // HIGH + PUBLIC: lockscreen Live Notification with prev/play/next.
+                // Must not be MIN (disqualifies Android 16 Live Update promotion).
+                NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = getString(R.string.notification_channel_spotify_ctrl_desc)
                 setShowBadge(false)
@@ -149,8 +160,8 @@ class GrokifyApp : Application() {
         const val CHANNEL_NEARBY_BT = "grokify_nearby_bt"
         const val CHANNEL_PLACE_NOTES = "grokify_place_notes"
         const val CHANNEL_PLACE_MONITOR = "grokify_place_monitor"
-        // v2 id: forces a fresh channel on upgrade (importance is immutable once created)
-        const val CHANNEL_SPOTIFY_CTRL = "grokify_spotify_ctrl_v2"
+        // v11: Live Notification (BigText + actions, no MediaStyle) for Samsung lockscreen
+        const val CHANNEL_SPOTIFY_CTRL = "grokify_spotify_ctrl_v11"
         const val CHANNEL_SPOTIFY_DJ = "grokify_spotify_dj"
         const val CHANNEL_SPACEXAI_USAGE = "grokify_spacexai_usage"
 

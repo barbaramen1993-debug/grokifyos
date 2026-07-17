@@ -8,9 +8,14 @@ import android.content.Intent
 import android.media.AudioManager
 import android.media.session.PlaybackState
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.support.v4.media.MediaMetadataCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
@@ -40,6 +45,32 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "SpotifyLiveDj"
 const val SPOTIFY_DJ_NOTIF_ID = 47002
+
+/**
+ * Exposes the Live DJ [MediaSessionCompat] token so the lockscreen / shade
+ * MediaStyle card can attach it (SystemUI media carousel requires a session token).
+ */
+object LiveDjMediaSessionHolder {
+    @Volatile private var session: MediaSessionCompat? = null
+
+    fun publish(s: MediaSessionCompat?) {
+        session = s
+    }
+
+    fun token(): MediaSessionCompat.Token? {
+        return try {
+            session?.sessionToken
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun isActive(): Boolean = try {
+        session?.isActive == true
+    } catch (_: Exception) {
+        false
+    }
+}
 
 /** Process-talk openers the model sometimes leaks into banter TTS. */
 private val META_NARRATION_OPENER = Regex(
@@ -71,6 +102,14 @@ private const val KEY_USE_AI = "use_ai_rank"
 private const val KEY_CHAT = "chat_messages_v1"
 private const val KEY_QUEUE = "queue_v1"
 private const val KEY_PLAYED = "played_uris_v1"
+/** Permanent track URI blocks from dislike (song / lyrics). */
+private const val KEY_DISLIKE_TRACKS = "dislike_tracks_v1"
+/** Permanent artist id blocks from dislike. */
+private const val KEY_DISLIKE_ARTISTS = "dislike_artists_v1"
+/** Temporary "tired of hearing it" cooldowns: uri → untilMs. */
+private const val KEY_DISLIKE_TIRED = "dislike_tired_v1"
+/** How long "tired for now" keeps a cut out of the radio set. */
+const val DJ_TIRED_COOLDOWN_MS = 14L * 24 * 60 * 60 * 1000
 private const val KEY_VIBE = "vibe_hint_v1"
 private const val KEY_BANTER_EVERY = "banter_every_v1"
 private const val KEY_SONGS_SINCE_BANTER = "songs_since_banter_v1"
@@ -102,6 +141,26 @@ private const val KEY_ACTIVE_BEHAVIOR_ID = "active_behavior_prompt_id_v1"
 /** Inclusive bounds for “talk every N songs” settings. */
 const val BANTER_EVERY_MIN = 1
 const val BANTER_EVERY_MAX = 20
+
+/**
+ * Multi-select reasons for the Dislike control / chat-bubble modal.
+ * Stored as string tags so prefs stay forward-compatible.
+ */
+object DjDislikeReason {
+    const val ARTIST = "artist"
+    const val SONG = "song"
+    const val LYRICS = "lyrics"
+    /** Temporary cool-down — not permanent. */
+    const val TIRED = "tired"
+
+    fun label(reason: String): String = when (reason) {
+        ARTIST -> "The artist"
+        SONG -> "This song"
+        LYRICS -> "The lyrics"
+        TIRED -> "Tired of hearing it for now"
+        else -> reason
+    }
+}
 
 /** How often the Live DJ speaks between tracks. */
 enum class BanterFrequencyMode {
@@ -892,6 +951,268 @@ class SpotifyDjStore(context: Context) {
             prefs.edit().putString(KEY_PLAYED, arr.toString()).apply()
         }.onFailure { Log.w(TAG, "save played: ${it.message}") }
     }
+
+    // ── Dislike filters (durable; not cleared by “new queue” played soft-forget) ──
+
+    /** uri → reasons (song / lyrics). */
+    private val blockedTracksCache = LinkedHashMap<String, MutableSet<String>>()
+    /** artistId or `name:<lower>` → display name. */
+    private val blockedArtistsCache = LinkedHashMap<String, String>()
+    /** uri → until epoch ms. */
+    private val tiredTracksCache = LinkedHashMap<String, Long>()
+    private var dislikesLoaded = false
+
+    private fun ensureDislikesLoaded() {
+        if (dislikesLoaded) return
+        synchronized(this) {
+            if (dislikesLoaded) return
+            blockedTracksCache.clear()
+            blockedArtistsCache.clear()
+            tiredTracksCache.clear()
+            // Tracks
+            runCatching {
+                val raw = prefs.getString(KEY_DISLIKE_TRACKS, null)
+                if (raw != null) {
+                    val arr = JSONArray(raw)
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val uri = o.optString("uri", "")
+                        if (uri.isBlank()) continue
+                        val reasons = LinkedHashSet<String>()
+                        val r = o.optJSONArray("reasons")
+                        if (r != null) {
+                            for (j in 0 until r.length()) {
+                                val s = r.optString(j, "")
+                                if (s.isNotBlank()) reasons.add(s)
+                            }
+                        }
+                        if (reasons.isEmpty()) reasons.add(DjDislikeReason.SONG)
+                        blockedTracksCache[uri] = reasons
+                    }
+                }
+            }.onFailure { Log.w(TAG, "load dislike tracks: ${it.message}") }
+            // Artists
+            runCatching {
+                val raw = prefs.getString(KEY_DISLIKE_ARTISTS, null)
+                if (raw != null) {
+                    val arr = JSONArray(raw)
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val id = o.optString("id", "")
+                        val name = o.optString("name", "")
+                        val key = id.ifBlank {
+                            name.trim().lowercase().takeIf { it.isNotBlank() }
+                                ?.let { "name:$it" }.orEmpty()
+                        }
+                        if (key.isBlank()) continue
+                        blockedArtistsCache[key] = name.ifBlank { id }
+                    }
+                }
+            }.onFailure { Log.w(TAG, "load dislike artists: ${it.message}") }
+            // Tired (drop expired)
+            runCatching {
+                val raw = prefs.getString(KEY_DISLIKE_TIRED, null)
+                val now = System.currentTimeMillis()
+                if (raw != null) {
+                    val arr = JSONArray(raw)
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val uri = o.optString("uri", "")
+                        val until = o.optLong("until", 0L)
+                        if (uri.isBlank() || until <= now) continue
+                        tiredTracksCache[uri] = until
+                    }
+                }
+            }.onFailure { Log.w(TAG, "load dislike tired: ${it.message}") }
+            dislikesLoaded = true
+        }
+    }
+
+    private fun persistBlockedTracks() {
+        runCatching {
+            val arr = JSONArray()
+            blockedTracksCache.entries.toList().takeLast(400).forEach { e ->
+                val uri = e.key
+                val reasons = e.value
+                if (uri.isBlank()) return@forEach
+                val r = JSONArray()
+                reasons.forEach { reason -> r.put(reason) }
+                arr.put(
+                    JSONObject()
+                        .put("uri", uri)
+                        .put("reasons", r)
+                        .put("ts", System.currentTimeMillis()),
+                )
+            }
+            prefs.edit().putString(KEY_DISLIKE_TRACKS, arr.toString()).apply()
+        }.onFailure { Log.w(TAG, "save dislike tracks: ${it.message}") }
+    }
+
+    private fun persistBlockedArtists() {
+        runCatching {
+            val arr = JSONArray()
+            blockedArtistsCache.entries.toList().takeLast(200).forEach { e ->
+                val key = e.key
+                val name = e.value
+                if (key.isBlank()) return@forEach
+                val id = if (key.startsWith("name:")) "" else key
+                val n = name.ifBlank {
+                    if (key.startsWith("name:")) key.removePrefix("name:") else key
+                }
+                arr.put(JSONObject().put("id", id).put("name", n))
+            }
+            prefs.edit().putString(KEY_DISLIKE_ARTISTS, arr.toString()).apply()
+        }.onFailure { Log.w(TAG, "save dislike artists: ${it.message}") }
+    }
+
+    private fun persistTiredTracks() {
+        runCatching {
+            val now = System.currentTimeMillis()
+            val arr = JSONArray()
+            tiredTracksCache.entries.toList()
+                .filter { it.key.isNotBlank() && it.value > now }
+                .takeLast(300)
+                .forEach { e ->
+                    arr.put(JSONObject().put("uri", e.key).put("until", e.value))
+                }
+            prefs.edit().putString(KEY_DISLIKE_TIRED, arr.toString()).apply()
+        }.onFailure { Log.w(TAG, "save dislike tired: ${it.message}") }
+    }
+
+    fun isArtistIdBlocked(artistId: String): Boolean {
+        ensureDislikesLoaded()
+        val id = artistId.trim()
+        return id.isNotBlank() && blockedArtistsCache.containsKey(id)
+    }
+
+    fun isArtistNameBlocked(artists: String): Boolean {
+        ensureDislikesLoaded()
+        if (blockedArtistsCache.isEmpty()) return false
+        val parts = artists.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        if (parts.isEmpty()) return false
+        return parts.any { blockedArtistsCache.containsKey("name:$it") }
+    }
+
+    fun isTrackBlocked(uri: String): Boolean {
+        ensureDislikesLoaded()
+        val u = uri.trim()
+        return u.isNotBlank() && blockedTracksCache.containsKey(u)
+    }
+
+    fun isTired(uri: String): Boolean {
+        ensureDislikesLoaded()
+        val u = uri.trim()
+        if (u.isBlank()) return false
+        val until = tiredTracksCache[u] ?: return false
+        if (until <= System.currentTimeMillis()) {
+            tiredTracksCache.remove(u)
+            return false
+        }
+        return true
+    }
+
+    /**
+     * True when this cut (or its artists) should not enter / stay in the Live DJ queue.
+     */
+    fun isDisliked(
+        uri: String,
+        artistIds: List<String> = emptyList(),
+        artists: String = "",
+        artistUri: String = "",
+    ): Boolean {
+        ensureDislikesLoaded()
+        val u = uri.trim()
+        if (u.isNotBlank() && (isTrackBlocked(u) || isTired(u))) return true
+        val idFromUri = artistUri.trim().let { raw ->
+            when {
+                raw.startsWith("spotify:artist:") -> raw.removePrefix("spotify:artist:")
+                raw.contains("/artist/") -> raw.substringAfterLast('/').substringBefore('?')
+                else -> raw
+            }.trim().takeIf { it.isNotBlank() && !it.contains(':') && !it.contains('/') }
+        }
+        if (!idFromUri.isNullOrBlank() && isArtistIdBlocked(idFromUri)) return true
+        if (artistIds.any { isArtistIdBlocked(it) }) return true
+        if (isArtistNameBlocked(artists)) return true
+        return false
+    }
+
+    /**
+     * Apply multi-select dislike reasons for a track. Returns a short human summary.
+     */
+    fun applyDislike(
+        trackUri: String,
+        trackName: String = "",
+        artists: String = "",
+        artistUri: String = "",
+        artistIds: List<String> = emptyList(),
+        reasons: Set<String>,
+    ): String {
+        ensureDislikesLoaded()
+        val uri = trackUri.trim()
+        val picked = reasons.map { it.trim().lowercase() }.filter { it.isNotBlank() }.toSet()
+        if (picked.isEmpty()) return "Pick at least one reason"
+
+        val permanentTrack = DjDislikeReason.SONG in picked || DjDislikeReason.LYRICS in picked
+        val blockArtist = DjDislikeReason.ARTIST in picked
+        val tired = DjDislikeReason.TIRED in picked
+
+        if (permanentTrack && uri.isNotBlank()) {
+            val set = blockedTracksCache.getOrPut(uri) { LinkedHashSet() }
+            if (DjDislikeReason.SONG in picked) set.add(DjDislikeReason.SONG)
+            if (DjDislikeReason.LYRICS in picked) set.add(DjDislikeReason.LYRICS)
+            persistBlockedTracks()
+        }
+        if (blockArtist) {
+            val primaryName = artists.split(",").map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
+            val ids = LinkedHashSet<String>()
+            artistIds.forEach { if (it.isNotBlank()) ids.add(it.trim()) }
+            artistUri.trim().let { raw ->
+                val id = when {
+                    raw.startsWith("spotify:artist:") -> raw.removePrefix("spotify:artist:")
+                    raw.contains("/artist/") -> raw.substringAfterLast('/').substringBefore('?')
+                    else -> ""
+                }.trim()
+                if (id.isNotBlank() && !id.contains(':') && !id.contains('/')) ids.add(id)
+            }
+            if (ids.isEmpty() && primaryName.isNotBlank()) {
+                blockedArtistsCache["name:${primaryName.lowercase()}"] = primaryName
+            } else {
+                ids.forEach { id ->
+                    blockedArtistsCache[id] = primaryName.ifBlank { id }
+                }
+                // Also name-key so seeds without ids still match.
+                if (primaryName.isNotBlank()) {
+                    blockedArtistsCache["name:${primaryName.lowercase()}"] = primaryName
+                }
+            }
+            persistBlockedArtists()
+        }
+        if (tired && uri.isNotBlank()) {
+            tiredTracksCache[uri] = System.currentTimeMillis() + DJ_TIRED_COOLDOWN_MS
+            // Cap map size
+            while (tiredTracksCache.size > 300) {
+                val first = tiredTracksCache.keys.firstOrNull() ?: break
+                tiredTracksCache.remove(first)
+            }
+            persistTiredTracks()
+        }
+
+        val bits = ArrayList<String>(4)
+        if (blockArtist) {
+            val who = artists.split(",").map { it.trim() }.firstOrNull { it.isNotEmpty() }
+                ?: "artist"
+            bits.add("artist “${who.take(40)}” blocked")
+        }
+        if (DjDislikeReason.SONG in picked) bits.add("song blocked")
+        if (DjDislikeReason.LYRICS in picked) bits.add("lyrics blocked")
+        if (tired) bits.add("cooled ~14 days")
+        val title = trackName.ifBlank { uri.takeLast(18) }.take(48)
+        return if (bits.isEmpty()) {
+            "Disliked “$title”"
+        } else {
+            "Disliked “$title” · ${bits.joinToString(" · ")}"
+        }
+    }
 }
 
 /** Human-readable banter countdown from persisted counters. */
@@ -1266,6 +1587,9 @@ fun maybeResumeLiveDj(context: Context) {
 /**
  * Start the Live DJ foreground service without flipping [SpotifyDjStore.enabled] to false
  * on transient FGS failures (common right after OTA / boot).
+ *
+ * Transient start blocks (background restriction right after OTA) are silent — no
+ * "Start deferred" status/error in the UI or notification; we retry shortly.
  */
 private fun startLiveDjService(context: Context, fromResume: Boolean = false) {
     val appCtx = context.applicationContext
@@ -1278,7 +1602,11 @@ private fun startLiveDjService(context: Context, fromResume: Boolean = false) {
             SpotifyDjBus.patch {
                 it.copy(
                     enabled = true,
-                    status = if (it.status.isBlank() || it.status == "Off") {
+                    status = if (
+                        it.status.isBlank() ||
+                        it.status == "Off" ||
+                        it.status.startsWith("Start deferred", ignoreCase = true)
+                    ) {
                         "Resuming after restart…"
                     } else {
                         it.status
@@ -1287,25 +1615,55 @@ private fun startLiveDjService(context: Context, fromResume: Boolean = false) {
                     error = null,
                 )
             }
+        } else {
+            // Clear any stale deferred noise from a previous failed start.
+            SpotifyDjBus.patch {
+                if (
+                    it.error.isNullOrBlank() &&
+                    !it.status.startsWith("Start deferred", ignoreCase = true)
+                ) {
+                    it
+                } else {
+                    it.copy(
+                        error = null,
+                        status = if (it.status.startsWith("Start deferred", ignoreCase = true)) {
+                            "Starting…"
+                        } else {
+                            it.status
+                        },
+                    )
+                }
+            }
         }
     } catch (e: Exception) {
-        Log.e(TAG, "start Live DJ failed: ${e.message}", e)
+        Log.e(TAG, "start Live DJ failed (silent retry): ${e.message}", e)
         // Keep [enabled] when user wants resume — next process/activity open can retry.
         // Only wipe when they opted out of resume (session mode).
         if (!store.resumeAfterRestart) {
             store.enabled = false
         }
+        // Do not surface "Start deferred" in status/error — it clears when the app
+        // opens / service attaches, and just looks like a broken notification.
         SpotifyDjBus.patch {
             it.copy(
                 enabled = store.enabled,
-                status = if (store.enabled) {
-                    "Start deferred: ${e.message?.take(80) ?: "blocked"} — will retry"
-                } else {
-                    "Failed to start: ${e.message}"
+                status = when {
+                    !store.enabled -> "Off"
+                    it.status.isBlank() ||
+                        it.status.startsWith("Start deferred", ignoreCase = true) ||
+                        it.status == "Off" -> "Starting…"
+                    else -> it.status
                 },
-                error = e.message,
+                error = null,
                 resumeAfterRestart = store.resumeAfterRestart,
             )
+        }
+        if (store.enabled) {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (SpotifyDjStore(appCtx).enabled) {
+                    runCatching { startLiveDjService(appCtx, fromResume = true) }
+                }
+            }, 2_500L)
         }
     }
 }
@@ -1506,6 +1864,38 @@ fun spotifyLiveDjMoreLikeThis(
     startDjServiceAction(appCtx, i, "moreLikeThis")
 }
 
+/**
+ * Apply dislike reasons for a cut so Live DJ won’t re-queue it (and optionally skips
+ * if it’s playing now). Reasons: [DjDislikeReason.ARTIST], [DjDislikeReason.SONG],
+ * [DjDislikeReason.LYRICS], [DjDislikeReason.TIRED].
+ */
+fun spotifyLiveDjDislike(
+    context: Context,
+    trackUri: String,
+    name: String = "",
+    artists: String = "",
+    artistUri: String = "",
+    artistIds: List<String> = emptyList(),
+    reasons: Collection<String>,
+    skipIfPlaying: Boolean = true,
+) {
+    val appCtx = context.applicationContext
+    val uri = trackUri.trim()
+    val reasonArr = reasons.map { it.trim() }.filter { it.isNotBlank() }.distinct().toTypedArray()
+    if (reasonArr.isEmpty()) return
+    if (uri.isBlank() && name.isBlank() && artists.isBlank() && artistUri.isBlank()) return
+    val i = Intent(appCtx, SpotifyLiveDjService::class.java)
+        .setAction(SpotifyLiveDjService.ACTION_DJ_DISLIKE)
+        .putExtra(SpotifyLiveDjService.EXTRA_TRACK_URI, uri)
+        .putExtra(SpotifyLiveDjService.EXTRA_TRACK_NAME, name)
+        .putExtra(SpotifyLiveDjService.EXTRA_TRACK_ARTISTS, artists)
+        .putExtra(SpotifyLiveDjService.EXTRA_ARTIST_URI, artistUri)
+        .putExtra(SpotifyLiveDjService.EXTRA_ARTIST_IDS, artistIds.toTypedArray())
+        .putExtra(SpotifyLiveDjService.EXTRA_DISLIKE_REASONS, reasonArr)
+        .putExtra(SpotifyLiveDjService.EXTRA_SKIP_IF_PLAYING, skipIfPlaying)
+    startDjServiceAction(appCtx, i, "dislike")
+}
+
 fun spotifyLiveDjPauseToggle(context: Context) {
     val appCtx = context.applicationContext
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
@@ -1564,6 +1954,19 @@ class SpotifyLiveDjService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var loopJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * Claims Bluetooth / headset media buttons while Live DJ is armed so Next/Prev/Play-Pause
+     * hit our radio queue instead of Spotify’s empty Up Next. Does not take audio focus —
+     * Spotify keeps playing; we only own transport.
+     */
+    private var mediaSession: MediaSessionCompat? = null
+    /** Dedup metadata/playback-state pushes (position bucketed). */
+    @Volatile private var lastMediaSessionSig: String = ""
+    /** Ignore echoed system media keys we ourselves dispatched as a pause/play fallback. */
+    @Volatile private var ignoreMediaButtonsUntilMs: Long = 0L
+    /** Serialize BT/session transport so double-taps / key down+up don’t double-skip. */
+    private val mediaSessionBusy = AtomicBoolean(false)
 
     private val transitioning = AtomicBoolean(false)
     private val filling = AtomicBoolean(false)
@@ -1723,10 +2126,12 @@ class SpotifyLiveDjService : Service() {
         }
         publish(persist = false)
         acquireWakeLock()
+        ensureMediaSession()
         startAsForeground(
             if (queue.isNotEmpty()) "Resuming · ${queue.size} in queue…"
             else "Starting Live DJ…",
         )
+        syncMediaSession(force = true)
         Log.i(TAG, "service created · chat=${chatLog.size} queue=${queue.size} played=${playedUris.size}")
     }
 
@@ -1879,6 +2284,43 @@ class SpotifyLiveDjService : Service() {
                     }
                 }
             }
+            ACTION_DJ_DISLIKE -> {
+                val uri = intent.getStringExtra(EXTRA_TRACK_URI).orEmpty().trim()
+                val name = intent.getStringExtra(EXTRA_TRACK_NAME).orEmpty()
+                val artists = intent.getStringExtra(EXTRA_TRACK_ARTISTS).orEmpty()
+                val artistUri = intent.getStringExtra(EXTRA_ARTIST_URI).orEmpty()
+                val artistIds = intent.getStringArrayExtra(EXTRA_ARTIST_IDS)
+                    ?.map { it.trim() }?.filter { it.isNotBlank() }.orEmpty()
+                val reasons = intent.getStringArrayExtra(EXTRA_DISLIKE_REASONS)
+                    ?.map { it.trim() }?.filter { it.isNotBlank() }.orEmpty()
+                val skipIfPlaying = intent.getBooleanExtra(EXTRA_SKIP_IF_PLAYING, true)
+                if (reasons.isNotEmpty() &&
+                    (uri.isNotBlank() || name.isNotBlank() || artists.isNotBlank() || artistUri.isNotBlank())
+                ) {
+                    sessionWork = true
+                    scope.launch {
+                        try {
+                            val shouldSkip = withContext(Dispatchers.IO) {
+                                applyDislike(
+                                    trackUri = uri,
+                                    trackName = name,
+                                    artists = artists,
+                                    artistUri = artistUri,
+                                    artistIds = artistIds,
+                                    reasons = reasons.toSet(),
+                                    skipIfPlaying = skipIfPlaying,
+                                )
+                            }
+                            if (shouldSkip) {
+                                forceBanter = false
+                                runTransition("skip")
+                            }
+                        } finally {
+                            finishSessionIfNeeded()
+                        }
+                    }
+                }
+            }
             ACTION_DJ_PAUSE_TOGGLE -> {
                 sessionWork = true
                 scope.launch(Dispatchers.IO) {
@@ -1934,6 +2376,8 @@ class SpotifyLiveDjService : Service() {
             }
         }
         if (store.enabled) {
+            ensureMediaSession()
+            syncMediaSession(force = false)
             startAsForeground(SpotifyDjBus.state.value.status.ifBlank { "Watching playback…" })
             if (loopJob?.isActive != true) {
                 loopJob = scope.launch { runLoop() }
@@ -1974,6 +2418,7 @@ class SpotifyLiveDjService : Service() {
         persistRuntimeState()
         loopJob?.cancel()
         scope.cancel()
+        releaseMediaSession()
         releaseWakeLock()
         runCatching {
             val nm = getSystemService(android.app.NotificationManager::class.java)
@@ -4283,6 +4728,8 @@ class SpotifyLiveDjService : Service() {
 
     private fun dispatchMediaKey(keyCode: Int) {
         try {
+            // Our session may own media buttons — swallow the echo so we don't recurse.
+            ignoreMediaButtonsUntilMs = SystemClock.elapsedRealtime() + 900L
             val am = getSystemService(AudioManager::class.java) ?: return
             val now = SystemClock.uptimeMillis()
             am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
@@ -4313,6 +4760,7 @@ class SpotifyLiveDjService : Service() {
             },
             clearError = true,
         )
+        syncMediaSession(force = true)
     }
 
     private fun applyPlayingUi(source: String) {
@@ -4327,6 +4775,7 @@ class SpotifyLiveDjService : Service() {
             },
             clearError = true,
         )
+        syncMediaSession(force = true)
     }
 
     /**
@@ -5026,19 +5475,25 @@ class SpotifyLiveDjService : Service() {
             for (i in 0 until items.length()) {
                 val t = items.optJSONObject(i) ?: continue
                 val uri = t.optString("uri", "")
-                if (uri.isBlank() || isPlayed(uri) || queue.any { it.uri == uri }) continue
                 val ids = artistIdsOf(t)
+                val arts = artistsOf(t)
+                val aUri = artistUriOf(t)
+                if (uri.isBlank() || isPlayed(uri) || isDisliked(uri, ids, arts, aUri) ||
+                    queue.any { it.uri == uri }
+                ) {
+                    continue
+                }
                 queue.addLast(
                     DjQueueTrack(
                         uri = uri,
                         name = t.optString("name", ""),
-                        artists = artistsOf(t),
+                        artists = arts,
                         reason = "chat: $q",
                         artistIds = ids,
                         albumArtUrl = albumArtUrlOf(t),
                         artistArtUrl = artistArtUrlOf(ids.firstOrNull().orEmpty()),
                         albumUri = albumUriOf(t),
-                        artistUri = artistUriOf(t),
+                        artistUri = aUri,
                     ),
                 )
                 added++
@@ -5140,17 +5595,20 @@ class SpotifyLiveDjService : Service() {
             if (uri.isBlank() || !seen.add(uri)) return
             if (isPlayed(uri)) return
             val ids = artistIdsOf(t)
+            val arts = artistsOf(t)
+            val aUri = artistUriOf(t)
+            if (isDisliked(uri, ids, arts, aUri)) return
             into.add(
                 DjQueueTrack(
                     uri = uri,
                     name = t.optString("name", ""),
-                    artists = artistsOf(t),
+                    artists = arts,
                     reason = reason,
                     artistIds = ids,
                     albumArtUrl = albumArtUrlOf(t),
                     artistArtUrl = "",
                     albumUri = albumUriOf(t),
-                    artistUri = artistUriOf(t),
+                    artistUri = aUri,
                 ),
             )
         }
@@ -5507,6 +5965,7 @@ class SpotifyLiveDjService : Service() {
         // Prepend so the first pick is next up (addFirst in reverse order).
         synchronized(queue) {
             for (t in finalList.asReversed()) {
+                if (isDisliked(t) || isPlayed(t.uri)) continue
                 if (queue.none { it.uri == t.uri }) {
                     queue.addFirst(t)
                 }
@@ -5816,12 +6275,19 @@ class SpotifyLiveDjService : Service() {
                 batch = pickFromPool(pool, curForPool, (if (replace) 8 else 6) + (0..3).random())
                 aiBanterLine = null
             }
-            // Never re-add recently played / already heard
-            batch = batch.filter { !isPlayed(it.uri) && it.uri != curForPool?.uri }
+            // Never re-add recently played / already heard / disliked
+            batch = batch.filter {
+                !isPlayed(it.uri) && !isDisliked(it) && it.uri != curForPool?.uri
+            }
             val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
             synchronized(queue) {
                 batch.forEach { t ->
-                    if (queue.none { it.uri == t.uri } && !isPlayed(t.uri)) queue.addLast(t)
+                    if (queue.none { it.uri == t.uri } &&
+                        !isPlayed(t.uri) &&
+                        !isDisliked(t)
+                    ) {
+                        queue.addLast(t)
+                    }
                 }
                 while (queue.size > MAX_DJ_QUEUE) queue.removeLast()
             }
@@ -5938,6 +6404,10 @@ class SpotifyLiveDjService : Service() {
                 val uri = t.optString("uri", "")
                 if (uri.isBlank() || !seen.add(uri)) continue
                 if (isPlayed(uri) || current?.uri == uri) continue
+                val ids = artistIdsOf(t)
+                val arts = artistsOf(t)
+                val aUri = artistUriOf(t)
+                if (isDisliked(uri, ids, arts, aUri) || store.isArtistIdBlocked(aid)) continue
                 val reason = if (show.isNotBlank()) {
                     "in town near $city · $show"
                 } else {
@@ -5947,12 +6417,12 @@ class SpotifyLiveDjService : Service() {
                     DjQueueTrack(
                         uri = uri,
                         name = t.optString("name", ""),
-                        artists = artistsOf(t),
+                        artists = arts,
                         reason = reason,
-                        artistIds = artistIdsOf(t),
+                        artistIds = ids,
                         albumArtUrl = albumArtUrlOf(t),
                         albumUri = albumUriOf(t),
-                        artistUri = artistUriOf(t),
+                        artistUri = aUri,
                     ),
                 )
             }
@@ -5997,7 +6467,9 @@ class SpotifyLiveDjService : Service() {
             if (uri.isBlank() || uri.contains("local:")) return
             if (!seen.add(uri)) return
             if (isPlayed(uri)) return
+            if (isDisliked(uri, artistIds, artists, artistUri)) return
             if (current?.uri == uri) return
+            // Still allow as seed-only when artist is blocked? No — skip entirely.
             val t = DjQueueTrack(
                 uri = uri,
                 name = name,
@@ -6011,7 +6483,9 @@ class SpotifyLiveDjService : Service() {
             )
             pool.add(t)
             if (asSeed) seedTracks.add(t)
-            artistIds.forEach { if (it.isNotBlank()) seedArtistIds.add(it) }
+            artistIds.forEach { id ->
+                if (id.isNotBlank() && !store.isArtistIdBlocked(id)) seedArtistIds.add(id)
+            }
         }
 
         fun addFromTrackObj(t: JSONObject?, reason: String, asSeed: Boolean = false) {
@@ -6050,19 +6524,24 @@ class SpotifyLiveDjService : Service() {
                         seen.add(uri) // keep out of pool even if mark is flushed later mid-fill
                     }
                     val ids = artistIdsOf(t)
-                    ids.forEach { if (it.isNotBlank()) seedArtistIds.add(it) }
+                    ids.forEach { id ->
+                        if (id.isNotBlank() && !store.isArtistIdBlocked(id)) seedArtistIds.add(id)
+                    }
                     // Seed for song_radio expansion only — not a queue candidate
-                    if (uri.isNotBlank()) {
+                    // (skip seeds for permanently blocked artists)
+                    val arts = artistsOf(t)
+                    val aUri = artistUriOf(t)
+                    if (uri.isNotBlank() && !isDisliked(uri, ids, arts, aUri)) {
                         seedTracks.add(
                             DjQueueTrack(
                                 uri = uri,
                                 name = t.optString("name", ""),
-                                artists = artistsOf(t),
+                                artists = arts,
                                 reason = "recently played (exclude)",
                                 artistIds = ids,
                                 albumArtUrl = albumArtUrlOf(t),
                                 albumUri = albumUriOf(t),
-                                artistUri = artistUriOf(t),
+                                artistUri = aUri,
                             ),
                         )
                     }
@@ -6137,6 +6616,9 @@ class SpotifyLiveDjService : Service() {
         val mode = modes[radioModeIdx % modes.size]
         radioModeIdx++
 
+        // Drop any artist seeds the user permanently blocked via Dislike.
+        seedArtistIds.removeAll { store.isArtistIdBlocked(it) }
+
         // 5) Artist radio: top tracks + related artists for a handful of seeds
         val artistPick = seedArtistIds.shuffled().take(
             when (mode) {
@@ -6146,6 +6628,7 @@ class SpotifyLiveDjService : Service() {
             },
         )
         for (aid in artistPick) {
+            if (store.isArtistIdBlocked(aid)) continue
             if (rateLimitedOut()) return pool
             val tops = spotifyGet(
                 "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/top-tracks?market=US",
@@ -6169,7 +6652,7 @@ class SpotifyLiveDjService : Service() {
                         if (rateLimitedOut()) return pool
                         val ra = related.optJSONObject(j) ?: continue
                         val rid = ra.optString("id", "")
-                        if (rid.isBlank()) continue
+                        if (rid.isBlank() || store.isArtistIdBlocked(rid)) continue
                         val rt = spotifyGet(
                             "/v1/artists/${java.net.URLEncoder.encode(rid, "UTF-8")}/top-tracks?market=US",
                         )
@@ -6188,7 +6671,7 @@ class SpotifyLiveDjService : Service() {
             val seeds = seedTracks.shuffled().take(5)
             for (s in seeds) {
                 if (rateLimitedOut()) return pool
-                val aid = s.artistIds.firstOrNull().orEmpty()
+                val aid = s.artistIds.firstOrNull { !store.isArtistIdBlocked(it) }.orEmpty()
                 if (aid.isBlank()) continue
                 val tops = spotifyGet(
                     "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/top-tracks?market=US",
@@ -6406,7 +6889,7 @@ class SpotifyLiveDjService : Service() {
             val p = picks.optJSONObject(i) ?: continue
             val uri = p.optString("uri", "")
             val hit = byUri[uri] ?: continue
-            if (isPlayed(hit.uri)) continue
+            if (isPlayed(hit.uri) || isDisliked(hit)) continue
             // Keep original pool reason (liked / top / artist radio / chat:…) for attribution.
             // Never let AI banter_note overwrite source — that made the DJ claim "you queued" DJ picks.
             out.add(hit)
@@ -7049,15 +7532,120 @@ class SpotifyLiveDjService : Service() {
 
     private fun isPlayed(uri: String): Boolean = playedUris.containsKey(uri)
 
+    private fun isDisliked(t: DjQueueTrack): Boolean =
+        store.isDisliked(t.uri, t.artistIds, t.artists, t.artistUri)
+
+    private fun isDisliked(
+        uri: String,
+        artistIds: List<String> = emptyList(),
+        artists: String = "",
+        artistUri: String = "",
+    ): Boolean = store.isDisliked(uri, artistIds, artists, artistUri)
+
+    /**
+     * Persist dislike reasons, purge matching UP NEXT rows, mark the cut heard.
+     * @return true when the caller should skip (current track was disliked).
+     */
+    private fun applyDislike(
+        trackUri: String,
+        trackName: String,
+        artists: String,
+        artistUri: String,
+        artistIds: List<String>,
+        reasons: Set<String>,
+        skipIfPlaying: Boolean,
+    ): Boolean {
+        val uri = trackUri.trim()
+        // Prefer live current metadata when the URI matches (richer artist ids).
+        val cur = current
+        val ids = LinkedHashSet<String>()
+        artistIds.forEach { if (it.isNotBlank()) ids.add(it) }
+        if (uri.isNotBlank() && cur?.uri == uri) {
+            cur.artistIds.forEach { if (it.isNotBlank()) ids.add(it) }
+            artistIdFromUri(cur.artistUri)?.let { ids.add(it) }
+        }
+        artistIdFromUri(artistUri)?.let { ids.add(it) }
+        val name = trackName.ifBlank { if (cur?.uri == uri) cur.name else "" }
+        val arts = artists.ifBlank { if (cur?.uri == uri) cur.artists else "" }
+        val aUri = artistUri.ifBlank { if (cur?.uri == uri) cur.artistUri else "" }
+
+        val summary = store.applyDislike(
+            trackUri = uri,
+            trackName = name,
+            artists = arts,
+            artistUri = aUri,
+            artistIds = ids.toList(),
+            reasons = reasons,
+        )
+        // Always treat as heard so soft played-set + refill won't re-pick soon.
+        if (uri.isNotBlank()) markPlayed(uri)
+
+        // Drop matching rows from UP NEXT (this cut, and whole artist if blocked).
+        val reasonKeys = reasons.map { it.lowercase() }.toSet()
+        val blockArtist = DjDislikeReason.ARTIST in reasonKeys
+        var removed = 0
+        val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
+        synchronized(queue) {
+            val kept = queue.filterNot { t ->
+                val hit = when {
+                    uri.isNotBlank() && t.uri == uri -> true
+                    isDisliked(t) -> true
+                    blockArtist && ids.isNotEmpty() && t.artistIds.any { it in ids } -> true
+                    blockArtist && arts.isNotBlank() &&
+                        t.artists.split(",").map { it.trim().lowercase() }
+                            .any { a ->
+                                a.isNotEmpty() &&
+                                    arts.split(",").map { it.trim().lowercase() }.contains(a)
+                            } -> true
+                    else -> false
+                }
+                if (hit) removed++
+                hit
+            }
+            if (removed > 0) {
+                queue.clear()
+                kept.forEach { queue.addLast(it) }
+            }
+        }
+        if (removed > 0) {
+            val newHead = synchronized(queue) { queue.firstOrNull()?.uri }
+            if (prevHead != newHead) invalidateStaleBanterCaches(newHead)
+        }
+        persistRuntimeState()
+
+        val status = if (removed > 0) {
+            "$summary · removed $removed from UP NEXT"
+        } else {
+            summary
+        }
+        publish(status = status, clearError = true)
+        appendChat(
+            DjChatMessage(
+                id = "sys-dislike-${System.currentTimeMillis()}",
+                role = DjChatRole.System,
+                text = "👎 $status",
+            ),
+        )
+        Log.i(TAG, "dislike uri=$uri reasons=$reasons removed=$removed")
+
+        val playingThis = uri.isNotBlank() && (
+            cur?.uri == uri || lastUri == uri || store.lastCurrentUri == uri
+            )
+        return skipIfPlaying && playingThis
+    }
+
     /**
      * Remove UP NEXT rows that are already in the played / recently-heard set so the
      * Live DJ list cannot stay “ahead” of songs Spotify already finished or skipped.
+     * Also drops durable / temporary dislikes (artist, song, lyrics, tired).
      */
     private fun pruneQueueOfPlayed() {
         val before = synchronized(queue) { queue.size }
         val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
         synchronized(queue) {
-            val keep = queue.filterNot { isPlayed(it.uri) || it.uri == current?.uri }
+            val keep = queue.filterNot {
+                isPlayed(it.uri) || isDisliked(it) || it.uri == current?.uri
+            }
             if (keep.size == queue.size) return
             queue.clear()
             keep.forEach { queue.addLast(it) }
@@ -7491,87 +8079,476 @@ class SpotifyLiveDjService : Service() {
         )
     }
 
+    /** Last quiet/media FGS signature — skip identical posts (stops shade thrash). */
+    @Volatile private var lastDjNotifSig: String = ""
+
     /**
-     * One shade entry only: share [SPOTIFY_CTRL_NOTIF_ID] with the lockscreen controller.
-     * When the controller is on it owns the visible MediaStyle notif; Live DJ only
-     * needs startForeground and will not keep a second “Live AI DJ” card.
+     * Live DJ FGS notification.
+     *
+     * When the **lockscreen controller** is enabled, it owns the visible MediaStyle
+     * card (prev / play / next). We only need a quiet keep-alive on
+     * [SPOTIFY_DJ_NOTIF_ID] so the DJ service stays in the foreground without
+     * fighting the controller (this is the model that worked through ~0.1.125).
+     *
+     * When the controller is off, we post MediaStyle transport ourselves and
+     * attach our MediaSession token so SystemUI can promote the card into the
+     * lockscreen media carousel.
      */
     private fun startAsForeground(text: String) {
-        // Drop the legacy separate Live DJ notification if it still exists.
-        runCatching {
-            getSystemService(android.app.NotificationManager::class.java)
-                ?.cancel(SPOTIFY_DJ_NOTIF_ID)
-        }
-        val n = buildNotification(text)
+        val n = buildDjForegroundNotification(text)
+        lastDjNotifSig = ""
         try {
             if (Build.VERSION.SDK_INT >= 34) {
                 ServiceCompat.startForeground(
                     this,
-                    SPOTIFY_CTRL_NOTIF_ID,
+                    SPOTIFY_DJ_NOTIF_ID,
                     n,
                     android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
                 )
             } else {
-                startForeground(SPOTIFY_CTRL_NOTIF_ID, n)
+                startForeground(SPOTIFY_DJ_NOTIF_ID, n)
             }
         } catch (e: Exception) {
             Log.e(TAG, "startForeground failed", e)
             runCatching {
                 getSystemService(android.app.NotificationManager::class.java)
-                    ?.notify(SPOTIFY_CTRL_NOTIF_ID, n)
+                    ?.notify(SPOTIFY_DJ_NOTIF_ID, n)
             }
         }
+        // Never cancel or overwrite SPOTIFY_CTRL_NOTIF_ID — controller owns that card.
     }
 
     private fun updateNotif(text: String) {
-        // Controller service refreshes the shared media notification; don't fight it.
-        if (SpotifyControllerStore(this).enabled) return
-        runCatching {
-            getSystemService(android.app.NotificationManager::class.java)
-                ?.notify(SPOTIFY_CTRL_NOTIF_ID, buildNotification(text))
+        // Keep BT / headset media buttons claimed while Live DJ is armed.
+        syncMediaSession(force = false)
+        // Controller refreshes the visible media card; don't fight it.
+        if (SpotifyControllerStore(this).enabled) {
+            // Watchdog: if the controller card vanished (OEM demotion / FGS kill),
+            // kick it back without thrashing stopService.
+            if (!isSpotifyControllerNotificationPosted(this)) {
+                Log.w(TAG, "controller notif missing while Live DJ on — ensure")
+                runCatching { ensureSpotifyControllerRunning(this, force = true) }
+            }
+            // Still re-assert quiet FGS status occasionally so the channel stays valid.
+            val quietSig = "quiet|${current?.uri.orEmpty()}|${wasPlaying}"
+            if (quietSig == lastDjNotifSig) return
+            lastDjNotifSig = quietSig
+            val nm = getSystemService(android.app.NotificationManager::class.java) ?: return
+            runCatching {
+                nm.notify(
+                    SPOTIFY_DJ_NOTIF_ID,
+                    SpotifyMediaNotif.buildHidden(
+                        this,
+                        title = "Live DJ",
+                        status = if (wasPlaying) "On air" else text.take(48).ifBlank { "Standby" },
+                    ),
+                )
+            }
+            return
+        }
+        val nm = getSystemService(android.app.NotificationManager::class.java) ?: return
+        val n = buildDjForegroundNotification(text)
+        // Bucket by track + play bit so progress ticks don't spam shade rebuilds.
+        val curUri = current?.uri.orEmpty()
+        val curName = current?.name.orEmpty()
+        val qSize = synchronized(queue) { queue.size }
+        val sig = "media|$curUri|$curName|${wasPlaying}|$qSize|${text.take(40)}"
+        if (sig == lastDjNotifSig) return
+        lastDjNotifSig = sig
+        runCatching { nm.notify(SPOTIFY_DJ_NOTIF_ID, n) }
+    }
+
+    /**
+     * Active MediaSession so Bluetooth AVRCP / headset keys route here (Next = DJ skip,
+     * Prev = restart, Play/Pause = booth toggle). Metadata mirrors Spotify/now-playing
+     * for OEM media UIs that read the active session.
+     *
+     * Also attached to the Live DJ MediaStyle notification so SystemUI promotes the
+     * card into the lockscreen media carousel (actions alone are not enough on many OEMs).
+     */
+    private fun ensureMediaSession() {
+        if (mediaSession != null) return
+        val session = MediaSessionCompat(this, "GrokifyLiveDj").apply {
+            setFlags(
+                MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
+                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS,
+            )
+            setCallback(
+                object : MediaSessionCompat.Callback() {
+                    override fun onPlay() {
+                        handleMediaSessionCommand("play")
+                    }
+
+                    override fun onPause() {
+                        handleMediaSessionCommand("pause")
+                    }
+
+                    override fun onSkipToNext() {
+                        handleMediaSessionCommand("next")
+                    }
+
+                    override fun onSkipToPrevious() {
+                        handleMediaSessionCommand("prev")
+                    }
+
+                    override fun onStop() {
+                        handleMediaSessionCommand("pause")
+                    }
+
+                    override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
+                        if (SystemClock.elapsedRealtime() < ignoreMediaButtonsUntilMs) {
+                            return true
+                        }
+                        val ke = mediaButtonKeyEvent(mediaButtonEvent)
+                            ?: return super.onMediaButtonEvent(mediaButtonEvent)
+                        if (ke.action != KeyEvent.ACTION_DOWN || ke.repeatCount != 0) {
+                            return true
+                        }
+                        val kind = when (ke.keyCode) {
+                            KeyEvent.KEYCODE_MEDIA_NEXT,
+                            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
+                            -> "next"
+                            KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+                            KeyEvent.KEYCODE_MEDIA_REWIND,
+                            -> "prev"
+                            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                            KeyEvent.KEYCODE_HEADSETHOOK,
+                            -> "play_pause"
+                            KeyEvent.KEYCODE_MEDIA_PLAY -> "play"
+                            KeyEvent.KEYCODE_MEDIA_PAUSE,
+                            KeyEvent.KEYCODE_MEDIA_STOP,
+                            -> "pause"
+                            else -> return super.onMediaButtonEvent(mediaButtonEvent)
+                        }
+                        handleMediaSessionCommand(kind)
+                        return true
+                    }
+                },
+                Handler(Looper.getMainLooper()),
+            )
+            val openApp = PendingIntent.getActivity(
+                this@SpotifyLiveDjService,
+                47200,
+                Intent(this@SpotifyLiveDjService, MainActivity::class.java).apply {
+                    putExtra("open_app", "spotify_controller")
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            setSessionActivity(openApp)
+            // Cold-start path: process dead → MEDIA_BUTTON lands on receiver → restarts service.
+            val mbr = PendingIntent.getBroadcast(
+                this@SpotifyLiveDjService,
+                47201,
+                Intent(Intent.ACTION_MEDIA_BUTTON).setClass(
+                    this@SpotifyLiveDjService,
+                    SpotifyLiveDjReceiver::class.java,
+                ),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            setMediaButtonReceiver(mbr)
+        }
+        mediaSession = session
+        LiveDjMediaSessionHolder.publish(session)
+        Log.i(TAG, "mediaSession created (BT transport)")
+    }
+
+    private fun mediaButtonKeyEvent(intent: Intent?): KeyEvent? {
+        if (intent == null) return null
+        return if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        val open = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).apply {
-                putExtra("open_app", "spotify_controller")
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val stop = PendingIntent.getBroadcast(
-            this,
-            1,
-            Intent(this, SpotifyLiveDjReceiver::class.java).setAction(ACTION_DJ_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        // Same channel + ID as controller so only one Spotify notification appears.
-        val title = current?.name?.takeIf { it.isNotBlank() } ?: "Spotify Controller"
-        val body = buildString {
-            val arts = current?.artists.orEmpty()
-            if (arts.isNotBlank()) append(arts).append(" · ")
-            append(text.take(72))
+    private fun handleMediaSessionCommand(kind: String) {
+        if (SystemClock.elapsedRealtime() < ignoreMediaButtonsUntilMs) return
+        if (!mediaSessionBusy.compareAndSet(false, true)) {
+            Log.d(TAG, "mediaSession busy, drop $kind")
+            return
         }
-        return NotificationCompat.Builder(this, GrokifyApp.CHANNEL_SPOTIFY_CTRL)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setSubText("Live DJ")
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-            .setContentIntent(open)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setSilent(true)
-            .setShowWhen(false)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .addAction(0, "Stop DJ", stop)
-            .build()
+        Log.i(TAG, "mediaSession command=$kind")
+        when (kind) {
+            "next" -> {
+                forceBanter = false
+                scope.launch {
+                    try {
+                        runTransition("skip")
+                    } finally {
+                        mediaSessionBusy.set(false)
+                        syncMediaSession(force = true)
+                    }
+                }
+            }
+            "prev" -> {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        restartOrPrevious()
+                    } finally {
+                        mediaSessionBusy.set(false)
+                        syncMediaSession(force = true)
+                    }
+                }
+            }
+            "play_pause" -> {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        togglePause()
+                    } finally {
+                        mediaSessionBusy.set(false)
+                        syncMediaSession(force = true)
+                    }
+                }
+            }
+            "play" -> {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val playing = sessionIsPlaying() ?: wasPlaying
+                        if (!playing) togglePause()
+                    } finally {
+                        mediaSessionBusy.set(false)
+                        syncMediaSession(force = true)
+                    }
+                }
+            }
+            "pause" -> {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val playing = sessionIsPlaying() ?: wasPlaying
+                        if (playing) togglePause()
+                    } finally {
+                        mediaSessionBusy.set(false)
+                        syncMediaSession(force = true)
+                    }
+                }
+            }
+            else -> mediaSessionBusy.set(false)
+        }
+    }
+
+    private fun syncMediaSession(force: Boolean) {
+        if (!store.enabled) {
+            mediaSession?.isActive = false
+            lastMediaSessionSig = ""
+            return
+        }
+        // Controller owns the shade/lockscreen MediaSession + media buttons when
+        // its widget is on. Two active sessions from the same package made OEMs
+        // drop our card and keep only native Spotify. DJ transport still runs
+        // via dispatchMediaCommand → spotifyLiveDjSkip/Previous/togglePause.
+        if (SpotifyControllerStore(this).enabled) {
+            mediaSession?.let { s ->
+                if (s.isActive) s.isActive = false
+            }
+            lastMediaSessionSig = ""
+            return
+        }
+        ensureMediaSession()
+        val session = mediaSession ?: return
+        val now = runCatching { nowPlayingForNotification(this) }.getOrNull()
+        val cur = current
+        val title = when {
+            now != null && now.title.isNotBlank() && now.title != "Unknown track" -> now.title
+            cur != null && cur.name.isNotBlank() -> cur.name
+            else -> "Live DJ"
+        }
+        val artist = when {
+            now != null && now.artist.isNotBlank() -> now.artist
+            cur != null -> cur.artists
+            else -> ""
+        }
+        val uri = when {
+            now != null && now.trackUri.isNotBlank() -> now.trackUri
+            cur != null -> cur.uri
+            else -> ""
+        }
+        val playing = now?.isPlaying ?: wasPlaying
+        val pos = (now?.positionMs ?: 0L).coerceAtLeast(0L)
+        val dur = (now?.durationMs ?: 0L).coerceAtLeast(0L)
+        val artUrl = when {
+            now != null && now.albumArtUrl.isNotBlank() -> now.albumArtUrl
+            cur != null && cur.albumArtUrl.isNotBlank() -> cur.albumArtUrl
+            else -> ""
+        }
+        val artPair = runCatching {
+            SpotifyMediaNotif.resolveArt(
+                this,
+                now ?: SpotifyNowPlaying(
+                    title = title,
+                    artist = artist,
+                    trackUri = uri,
+                    albumArtUrl = artUrl,
+                    isPlaying = playing,
+                ),
+                kickNetwork = false,
+            )
+        }.getOrNull()
+        val sessionBmp = SpotifyMediaNotif.bestSessionArt(artPair)
+        // Bitmap size in sig so we re-push when cover finishes decoding (not just URL).
+        val artPresence = when {
+            sessionBmp != null -> "bmp${sessionBmp.width}x${sessionBmp.height}"
+            artUrl.isNotBlank() -> "url"
+            else -> "noart"
+        }
+        // Bucket position so we re-assert PLAYING every ~2s without thrashing every poll.
+        val sig = "$uri|$playing|${pos / 2_000L}|$title|$artist|$dur|$artPresence"
+        if (!force && sig == lastMediaSessionSig && session.isActive) return
+        lastMediaSessionSig = sig
+        try {
+            val metaBuilder = MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title.ifBlank { "Live DJ" })
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ARTIST, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_TITLE, title.ifBlank { "Live DJ" })
+                .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_DESCRIPTION, artist)
+                .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, uri)
+                .putString(MediaMetadataCompat.METADATA_KEY_MEDIA_URI, uri)
+                .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, dur)
+            if (artUrl.isNotBlank()) {
+                metaBuilder.putString(MediaMetadataCompat.METADATA_KEY_ALBUM_ART_URI, artUrl)
+                metaBuilder.putString(MediaMetadataCompat.METADATA_KEY_ART_URI, artUrl)
+                metaBuilder.putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON_URI, artUrl)
+            }
+            // Large cover for lockscreen background (not just 128px shade icon).
+            sessionBmp?.let {
+                metaBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, it)
+                metaBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_ART, it)
+                metaBuilder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, it)
+            }
+            session.setMetadata(metaBuilder.build())
+            val actions =
+                PlaybackStateCompat.ACTION_PLAY or
+                    PlaybackStateCompat.ACTION_PAUSE or
+                    PlaybackStateCompat.ACTION_PLAY_PAUSE or
+                    PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+                    PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+                    PlaybackStateCompat.ACTION_STOP
+            val state = if (playing) {
+                PlaybackStateCompat.STATE_PLAYING
+            } else {
+                PlaybackStateCompat.STATE_PAUSED
+            }
+            val pb = PlaybackStateCompat.Builder()
+                .setActions(actions)
+                .setState(
+                    state,
+                    pos,
+                    if (playing) 1.0f else 0f,
+                    SystemClock.elapsedRealtime(),
+                )
+                .build()
+            session.setPlaybackState(pb)
+            if (!session.isActive) {
+                session.isActive = true
+                Log.i(TAG, "mediaSession active (BT transport)")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "syncMediaSession: ${e.message}")
+        }
+    }
+
+    private fun releaseMediaSession() {
+        runCatching {
+            mediaSession?.apply {
+                isActive = false
+                setCallback(null)
+                release()
+            }
+        }
+        mediaSession = null
+        LiveDjMediaSessionHolder.publish(null)
+        lastMediaSessionSig = ""
+        mediaSessionBusy.set(false)
+        Log.i(TAG, "mediaSession released")
+    }
+
+    private fun buildDjForegroundNotification(text: String): Notification {
+        // Controller owns the MediaStyle card — quiet keep-alive only.
+        if (SpotifyControllerStore(this).enabled) {
+            ensureMediaSession()
+            syncMediaSession(force = false)
+            return SpotifyMediaNotif.buildHidden(
+                this,
+                title = "Live DJ",
+                status = when {
+                    wasPlaying || current != null ->
+                        current?.name?.takeIf { it.isNotBlank() }?.let { "On air · $it" }
+                            ?: "On air"
+                    else -> text.take(48).ifBlank { "Standby" }
+                },
+            )
+        }
+
+        // Prefer Live DJ + session merge so we never stick on the previous cut.
+        val now = runCatching { nowPlayingForNotification(this) }.getOrNull()
+            ?: SpotifyNowPlaying()
+        val cur = current
+        val merged = when {
+            cur == null -> now
+            // Session blank / same cut — fill gaps from service current.
+            now.trackUri.isBlank() || now.trackUri == cur.uri -> now.copy(
+                title = when {
+                    now.title.isNotBlank() && now.title != "Unknown track" -> now.title
+                    else -> cur.name.ifBlank { now.title }
+                },
+                artist = now.artist.ifBlank { cur.artists },
+                albumArtUrl = now.albumArtUrl.ifBlank { cur.albumArtUrl },
+                artistArtUrl = now.artistArtUrl.ifBlank { cur.artistArtUrl },
+                trackUri = now.trackUri.ifBlank { cur.uri },
+                // Trust wasPlaying/current during session lag so we don't flip to Standby.
+                isPlaying = now.isPlaying || wasPlaying,
+                hasSession = now.hasSession || cur.uri.isNotBlank(),
+            )
+            // Session still on previous cut after a handoff — service current wins.
+            else -> now.copy(
+                title = cur.name.ifBlank { now.title },
+                artist = cur.artists.ifBlank { now.artist },
+                albumArtUrl = cur.albumArtUrl.ifBlank { now.albumArtUrl },
+                artistArtUrl = cur.artistArtUrl.ifBlank { now.artistArtUrl },
+                trackUri = cur.uri.ifBlank { now.trackUri },
+                isPlaying = true,
+                hasSession = true,
+            )
+        }
+        val onAir = merged.isPlaying || (cur != null && wasPlaying) ||
+            SpotifyDjBus.state.value.messages.any {
+                it.role == DjChatRole.Track && it.isNowPlaying && it.isPlaying
+            }
+        // BT/headset + lockscreen carousel — attach token when we own the card.
+        ensureMediaSession()
+        syncMediaSession(force = false)
+        val q = synchronized(queue) { queue.toList() }
+        val display = if (onAir) {
+            merged.copy(
+                isPlaying = true,
+                title = merged.title.ifBlank { cur?.name.orEmpty().ifBlank { "Live DJ" } },
+                artist = merged.artist.ifBlank {
+                    cur?.artists.orEmpty().ifBlank { "On air" }
+                },
+            )
+        } else {
+            SpotifyNowPlaying(
+                title = merged.title.ifBlank { "Live DJ" },
+                artist = merged.artist.ifBlank { "Standby · prev / play / next" },
+                albumArtUrl = merged.albumArtUrl,
+                trackUri = merged.trackUri,
+                isPlaying = false,
+                hasSession = true,
+                positionMs = merged.positionMs,
+                durationMs = merged.durationMs,
+                appLabel = "Live DJ",
+            )
+        }
+        return SpotifyMediaNotif.buildPlaying(
+            context = this,
+            now = display,
+            queue = q,
+            subText = "Live DJ",
+            sessionToken = LiveDjMediaSessionHolder.token(),
+        )
     }
 
     private fun acquireWakeLock() {
@@ -7627,6 +8604,8 @@ class SpotifyLiveDjService : Service() {
         const val ACTION_DJ_PLAY_URI = "io.grokify.os.SPOTIFY_DJ_PLAY_URI"
         /** Prepend mixed same-artist + similar cuts seeded from a chat / now-playing track. */
         const val ACTION_DJ_MORE_LIKE_THIS = "io.grokify.os.SPOTIFY_DJ_MORE_LIKE_THIS"
+        /** Apply multi-select dislike reasons so the cut (or artist) stays out of UP NEXT. */
+        const val ACTION_DJ_DISLIKE = "io.grokify.os.SPOTIFY_DJ_DISLIKE"
         const val ACTION_DJ_PAUSE_TOGGLE = "io.grokify.os.SPOTIFY_DJ_PAUSE_TOGGLE"
         const val ACTION_DJ_PREVIOUS = "io.grokify.os.SPOTIFY_DJ_PREVIOUS"
         const val ACTION_DJ_SYNC_SPOTIFY = "io.grokify.os.SPOTIFY_DJ_SYNC_SPOTIFY"
@@ -7642,6 +8621,9 @@ class SpotifyLiveDjService : Service() {
         const val EXTRA_ARTIST_ART = "artist_art"
         const val EXTRA_ALBUM_URI = "album_uri"
         const val EXTRA_ARTIST_URI = "artist_uri"
+        const val EXTRA_ARTIST_IDS = "artist_ids"
+        const val EXTRA_DISLIKE_REASONS = "dislike_reasons"
+        const val EXTRA_SKIP_IF_PLAYING = "skip_if_playing"
     }
 }
 
@@ -7652,6 +8634,38 @@ class SpotifyLiveDjReceiver : android.content.BroadcastReceiver() {
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
                 // OTA / reboot: honor resume-after-restart (keeps queue + settings)
                 maybeResumeLiveDj(context)
+            }
+            Intent.ACTION_MEDIA_BUTTON -> {
+                // Cold-start: MediaSession media-button receiver when process was dead.
+                if (!SpotifyDjStore(context).enabled) return
+                val ke = if (Build.VERSION.SDK_INT >= 33) {
+                    intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                } ?: return
+                if (ke.action != KeyEvent.ACTION_DOWN || ke.repeatCount != 0) return
+                val action = when (ke.keyCode) {
+                    KeyEvent.KEYCODE_MEDIA_NEXT,
+                    KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
+                    -> SpotifyLiveDjService.ACTION_DJ_SKIP
+                    KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+                    KeyEvent.KEYCODE_MEDIA_REWIND,
+                    -> SpotifyLiveDjService.ACTION_DJ_PREVIOUS
+                    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+                    KeyEvent.KEYCODE_HEADSETHOOK,
+                    KeyEvent.KEYCODE_MEDIA_PLAY,
+                    KeyEvent.KEYCODE_MEDIA_PAUSE,
+                    -> SpotifyLiveDjService.ACTION_DJ_PAUSE_TOGGLE
+                    else -> return
+                }
+                Log.i(TAG, "MEDIA_BUTTON cold-start → $action key=${ke.keyCode}")
+                val i = Intent(context, SpotifyLiveDjService::class.java).setAction(action)
+                try {
+                    ContextCompat.startForegroundService(context.applicationContext, i)
+                } catch (e: Exception) {
+                    Log.w(TAG, "MEDIA_BUTTON start service: ${e.message}")
+                }
             }
         }
     }

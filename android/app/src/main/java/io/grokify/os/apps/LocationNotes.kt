@@ -32,11 +32,16 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -45,6 +50,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
@@ -54,6 +61,8 @@ import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Image
@@ -85,11 +94,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -133,9 +146,20 @@ const val ACTION_PLACE_OPEN_MAPS = "io.grokify.os.PLACE_NOTE_OPEN_MAPS"
 /** Notification action: stop area monitoring FGS. */
 const val ACTION_PLACE_STOP_MONITOR = "io.grokify.os.PLACE_NOTE_STOP_MONITOR"
 const val EXTRA_NOTE_ID = "note_id"
-private const val MIN_RETRIGGER_MS = 90_000L
+/** Min gap between enter fires for the same note (process restart / race backup). */
+private const val MIN_RETRIGGER_MS = 120_000L
 const val PLACE_MONITOR_NOTIF_ID = 4610
 private const val TAG_PLACE = "PlaceNotes"
+private const val EXTRA_APP_PACKAGE = "app_package"
+private const val EXTRA_IMAGE_PATH = "image_path"
+private const val MAX_OPEN_APPS = 8
+private const val MAX_OPEN_IMAGES = 8
+
+/** App to launch when entering a place note's radius. */
+data class PlaceOpenApp(
+    val packageName: String,
+    val label: String = "",
+)
 
 /** A GPS-pinned note with optional enter-area actions. */
 data class LocationNote(
@@ -147,18 +171,34 @@ data class LocationNote(
     val radiusM: Float = 60f,
     val enabled: Boolean = true,
     val notifyOnEnter: Boolean = true,
-    val openAppPackage: String = "",
-    val openAppLabel: String = "",
-    val imagePath: String = "",
+    /** Apps to open (or offer) on enter — order is priority. */
+    val openApps: List<PlaceOpenApp> = emptyList(),
+    /** Image file paths to open (or offer) on enter. */
+    val imagePaths: List<String> = emptyList(),
     val createdAtMs: Long = System.currentTimeMillis(),
     val lastTriggeredMs: Long = 0L,
+    /** Lifetime enter-fire count (does not reset while still inside). */
+    val triggerCount: Int = 0,
 ) {
-    fun hasAppAction(): Boolean = openAppPackage.isNotBlank()
-    fun hasImageAction(): Boolean = imagePath.isNotBlank()
+    /** First app package — widget / legacy helpers. */
+    val openAppPackage: String get() = openApps.firstOrNull()?.packageName.orEmpty()
+    val openAppLabel: String get() = openApps.firstOrNull()?.label.orEmpty()
+    val imagePath: String get() = imagePaths.firstOrNull().orEmpty()
+
+    fun hasAppAction(): Boolean = openApps.isNotEmpty()
+    fun hasImageAction(): Boolean = imagePaths.isNotEmpty()
     fun actionSummary(): String = buildList {
         if (notifyOnEnter) add("notify")
-        if (hasAppAction()) add("app")
-        if (hasImageAction()) add("image")
+        when (openApps.size) {
+            0 -> Unit
+            1 -> add("app")
+            else -> add("${openApps.size} apps")
+        }
+        when (imagePaths.size) {
+            0 -> Unit
+            1 -> add("image")
+            else -> add("${imagePaths.size} images")
+        }
         if (isEmpty()) add("note only")
     }.joinToString(" · ")
 }
@@ -196,8 +236,8 @@ class LocationNoteStore(context: Context) {
 
     fun delete(id: String) {
         val note = get(id)
-        if (note != null && note.imagePath.isNotBlank()) {
-            runCatching { File(note.imagePath).takeIf { it.exists() }?.delete() }
+        note?.imagePaths?.forEach { path ->
+            if (path.isNotBlank()) runCatching { File(path).takeIf { it.exists() }?.delete() }
         }
         saveAll(list().filterNot { it.id == id })
         clearInside(id)
@@ -224,7 +264,12 @@ class LocationNoteStore(context: Context) {
 
     fun markTriggered(id: String, atMs: Long = System.currentTimeMillis()) {
         val n = get(id) ?: return
-        upsert(n.copy(lastTriggeredMs = atMs))
+        upsert(
+            n.copy(
+                lastTriggeredMs = atMs,
+                triggerCount = (n.triggerCount + 1).coerceAtLeast(1),
+            ),
+        )
     }
 
     private fun saveAll(notes: List<LocationNote>) {
@@ -233,36 +278,85 @@ class LocationNoteStore(context: Context) {
         prefs.edit().putString(KEY_NOTES, arr.toString()).apply()
     }
 
-    private fun LocationNote.toJson(): JSONObject = JSONObject()
-        .put("id", id)
-        .put("title", title)
-        .put("body", body)
-        .put("lat", lat)
-        .put("lon", lon)
-        .put("radiusM", radiusM.toDouble())
-        .put("enabled", enabled)
-        .put("notifyOnEnter", notifyOnEnter)
-        .put("openAppPackage", openAppPackage)
-        .put("openAppLabel", openAppLabel)
-        .put("imagePath", imagePath)
-        .put("createdAtMs", createdAtMs)
-        .put("lastTriggeredMs", lastTriggeredMs)
+    private fun LocationNote.toJson(): JSONObject {
+        val appsArr = JSONArray()
+        openApps.forEach { app ->
+            appsArr.put(
+                JSONObject()
+                    .put("packageName", app.packageName)
+                    .put("label", app.label),
+            )
+        }
+        val imgsArr = JSONArray()
+        imagePaths.forEach { imgsArr.put(it) }
+        return JSONObject()
+            .put("id", id)
+            .put("title", title)
+            .put("body", body)
+            .put("lat", lat)
+            .put("lon", lon)
+            .put("radiusM", radiusM.toDouble())
+            .put("enabled", enabled)
+            .put("notifyOnEnter", notifyOnEnter)
+            .put("openApps", appsArr)
+            // Legacy single fields kept for older readers / widgets mid-update.
+            .put("openAppPackage", openAppPackage)
+            .put("openAppLabel", openAppLabel)
+            .put("imagePaths", imgsArr)
+            .put("imagePath", imagePath)
+            .put("createdAtMs", createdAtMs)
+            .put("lastTriggeredMs", lastTriggeredMs)
+            .put("triggerCount", triggerCount)
+    }
 
-    private fun JSONObject.toNote(): LocationNote = LocationNote(
-        id = optString("id", UUID.randomUUID().toString()),
-        title = optString("title", "Place"),
-        body = optString("body", ""),
-        lat = optDouble("lat", 0.0),
-        lon = optDouble("lon", 0.0),
-        radiusM = optDouble("radiusM", 60.0).toFloat().coerceIn(15f, 2000f),
-        enabled = optBoolean("enabled", true),
-        notifyOnEnter = optBoolean("notifyOnEnter", true),
-        openAppPackage = optString("openAppPackage", ""),
-        openAppLabel = optString("openAppLabel", ""),
-        imagePath = optString("imagePath", ""),
-        createdAtMs = optLong("createdAtMs", System.currentTimeMillis()),
-        lastTriggeredMs = optLong("lastTriggeredMs", 0L),
-    )
+    private fun JSONObject.toNote(): LocationNote {
+        val apps = mutableListOf<PlaceOpenApp>()
+        val appsJson = optJSONArray("openApps")
+        if (appsJson != null) {
+            for (i in 0 until appsJson.length()) {
+                val o = appsJson.optJSONObject(i) ?: continue
+                val pkg = o.optString("packageName", "").trim()
+                if (pkg.isBlank()) continue
+                apps.add(PlaceOpenApp(pkg, o.optString("label", "")))
+            }
+        }
+        // Migrate legacy single-app fields.
+        if (apps.isEmpty()) {
+            val legacyPkg = optString("openAppPackage", "").trim()
+            if (legacyPkg.isNotBlank()) {
+                apps.add(PlaceOpenApp(legacyPkg, optString("openAppLabel", "")))
+            }
+        }
+
+        val images = mutableListOf<String>()
+        val imgsJson = optJSONArray("imagePaths")
+        if (imgsJson != null) {
+            for (i in 0 until imgsJson.length()) {
+                val p = imgsJson.optString(i, "").trim()
+                if (p.isNotBlank()) images.add(p)
+            }
+        }
+        if (images.isEmpty()) {
+            val legacyImg = optString("imagePath", "").trim()
+            if (legacyImg.isNotBlank()) images.add(legacyImg)
+        }
+
+        return LocationNote(
+            id = optString("id", UUID.randomUUID().toString()),
+            title = optString("title", "Place"),
+            body = optString("body", ""),
+            lat = optDouble("lat", 0.0),
+            lon = optDouble("lon", 0.0),
+            radiusM = optDouble("radiusM", 60.0).toFloat().coerceIn(15f, 2000f),
+            enabled = optBoolean("enabled", true),
+            notifyOnEnter = optBoolean("notifyOnEnter", true),
+            openApps = apps.distinctBy { it.packageName }.take(MAX_OPEN_APPS),
+            imagePaths = images.distinct().take(MAX_OPEN_IMAGES),
+            createdAtMs = optLong("createdAtMs", System.currentTimeMillis()),
+            lastTriggeredMs = optLong("lastTriggeredMs", 0L),
+            triggerCount = optInt("triggerCount", 0).coerceAtLeast(0),
+        )
+    }
 
     companion object {
         private const val PREFS = "location_notes"
@@ -451,6 +545,13 @@ object LocationNoteWatcher {
         io.grokify.os.widgets.GrokifyWidgets.refreshPlaceNotes(appCtx)
     }
 
+    /**
+     * Evaluate geofences. Synchronized so concurrent GPS sources (FGS, UI, broadcast)
+     * cannot double-fire enter for the same note. While still inside, enter actions
+     * do not re-run; exit is required before the next trigger. [triggerCount] increments
+     * only when actions actually fire.
+     */
+    @Synchronized
     fun evaluate(context: Context, gps: GpsFix) {
         val appCtx = context.applicationContext
         val store = LocationNoteStore(appCtx)
@@ -458,26 +559,40 @@ object LocationNoteWatcher {
         val now = System.currentTimeMillis()
         var changed = false
         for (note in store.list()) {
-            if (!note.enabled) continue
+            if (!note.enabled) {
+                // Disarmed while inside — clear so re-arming requires a fresh enter.
+                if (store.isInside(note.id)) {
+                    store.setInside(note.id, false)
+                    changed = true
+                }
+                continue
+            }
             val dist = distanceMeters(gps.lat, gps.lon, note.lat, note.lon)
             val wasInside = store.isInside(note.id)
             val enterR = note.radiusM.toDouble()
-            val exitR = note.radiusM * 1.25
+            // Hysteresis: larger exit radius avoids GPS jitter re-enter spam.
+            val exitR = note.radiusM * 1.35
             val inside = if (wasInside) dist <= exitR else dist <= enterR
             if (inside && !wasInside) {
+                // Mark inside FIRST so any nested evaluate sees presence.
                 store.setInside(note.id, true)
                 changed = true
-                val cool = note.lastTriggeredMs > 0L && now - note.lastTriggeredMs < MIN_RETRIGGER_MS
+                val cool = note.lastTriggeredMs > 0L &&
+                    now - note.lastTriggeredMs < MIN_RETRIGGER_MS
                 if (!cool) {
                     store.markTriggered(note.id, now)
                     onEnterArea(appCtx, note, dist)
+                    Log.i(
+                        TAG_PLACE,
+                        "enter “${note.title}” d=${dist.toInt()}m triggers=${note.triggerCount + 1}",
+                    )
+                } else {
+                    Log.d(TAG_PLACE, "enter suppressed (cooldown) “${note.title}”")
                 }
             } else if (!inside && wasInside) {
                 store.setInside(note.id, false)
                 changed = true
-            } else if (inside != wasInside) {
-                store.setInside(note.id, inside)
-                changed = true
+                Log.d(TAG_PLACE, "exit “${note.title}” d=${dist.toInt()}m")
             }
         }
         if (changed) {
@@ -492,11 +607,12 @@ object LocationNoteWatcher {
             notifyPlaceEnter(context, note, distM)
         }
         // Best-effort auto-open (may be blocked when backgrounded — notification actions remain).
-        if (note.hasAppAction()) {
-            openAppPackage(context, note.openAppPackage)
-        }
-        if (note.hasImageAction() && !note.hasAppAction()) {
-            openNoteImage(context, note.imagePath)
+        // Open the first app; if none, open the first image. Extra targets stay on the notif.
+        val firstApp = note.openApps.firstOrNull()
+        if (firstApp != null) {
+            openAppPackage(context, firstApp.packageName)
+        } else {
+            note.imagePaths.firstOrNull()?.let { openNoteImage(context, it) }
         }
     }
 
@@ -741,11 +857,24 @@ fun notifyPlaceEnter(context: Context, note: LocationNote, distM: Double) {
         if (note.body.isNotBlank()) append(note.body.trim())
         if (isNotEmpty()) append("\n")
         append(String.format(Locale.US, "≈ %.0f m from pin · r %.0f m", distM, note.radiusM))
-        if (note.hasAppAction()) {
-            append("\nApp: ")
-            append(note.openAppLabel.ifBlank { note.openAppPackage })
+        if (note.openApps.isNotEmpty()) {
+            append("\nApps: ")
+            append(
+                note.openApps.joinToString(", ") {
+                    it.label.ifBlank { it.packageName }.take(24)
+                },
+            )
         }
-        if (note.hasImageAction()) append("\nImage attached")
+        if (note.imagePaths.isNotEmpty()) {
+            append("\n")
+            append(
+                if (note.imagePaths.size == 1) "1 image attached"
+                else "${note.imagePaths.size} images attached",
+            )
+        }
+        if (note.triggerCount > 0) {
+            append("\nEnter #${note.triggerCount + 1}")
+        }
     }
     val builder = NotificationCompat.Builder(context, GrokifyApp.CHANNEL_PLACE_NOTES)
         .setSmallIcon(android.R.drawable.ic_dialog_map)
@@ -757,24 +886,30 @@ fun notifyPlaceEnter(context: Context, note: LocationNote, distM: Double) {
         .setContentIntent(mainPi)
         .setCategory(NotificationCompat.CATEGORY_REMINDER)
 
-    if (note.hasAppAction()) {
+    // Android surfaces ~3 actions; prefer first app + first image.
+    var actionSeed = 11
+    note.openApps.firstOrNull()?.let { app ->
+        val label = app.label.ifBlank { "Open app" }.take(18)
         val appPi = PendingIntent.getBroadcast(
             context,
-            (note.id.hashCode() + 11) and 0xFFFF,
+            (note.id.hashCode() + actionSeed) and 0xFFFF,
             Intent(context, LocationNoteReceiver::class.java)
                 .setAction(ACTION_OPEN_APP)
-                .putExtra(EXTRA_NOTE_ID, note.id),
+                .putExtra(EXTRA_NOTE_ID, note.id)
+                .putExtra(EXTRA_APP_PACKAGE, app.packageName),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        builder.addAction(0, "Open app", appPi)
+        builder.addAction(0, label, appPi)
+        actionSeed += 3
     }
-    if (note.hasImageAction()) {
+    note.imagePaths.firstOrNull()?.let { path ->
         val imgPi = PendingIntent.getBroadcast(
             context,
-            (note.id.hashCode() + 22) and 0xFFFF,
+            (note.id.hashCode() + actionSeed) and 0xFFFF,
             Intent(context, LocationNoteReceiver::class.java)
                 .setAction(ACTION_OPEN_IMAGE)
-                .putExtra(EXTRA_NOTE_ID, note.id),
+                .putExtra(EXTRA_NOTE_ID, note.id)
+                .putExtra(EXTRA_IMAGE_PATH, path),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         builder.addAction(0, "Open image", imgPi)
@@ -819,12 +954,27 @@ class LocationNoteReceiver : BroadcastReceiver() {
             ACTION_OPEN_APP -> {
                 val id = intent.getStringExtra(EXTRA_NOTE_ID) ?: return
                 val note = store.get(id) ?: return
-                openAppPackage(context, note.openAppPackage)
+                val pkg = intent.getStringExtra(EXTRA_APP_PACKAGE)
+                    ?.takeIf { it.isNotBlank() }
+                    ?: note.openAppPackage
+                if (pkg.isNotBlank()) {
+                    openAppPackage(context, pkg)
+                } else {
+                    // Open every attached app if no specific package was requested.
+                    note.openApps.forEach { openAppPackage(context, it.packageName) }
+                }
             }
             ACTION_OPEN_IMAGE -> {
                 val id = intent.getStringExtra(EXTRA_NOTE_ID) ?: return
                 val note = store.get(id) ?: return
-                openNoteImage(context, note.imagePath)
+                val path = intent.getStringExtra(EXTRA_IMAGE_PATH)
+                    ?.takeIf { it.isNotBlank() }
+                    ?: note.imagePath
+                if (path.isNotBlank()) {
+                    openNoteImage(context, path)
+                } else {
+                    note.imagePaths.forEach { openNoteImage(context, it) }
+                }
             }
             ACTION_OPEN_NOTE -> {
                 // reserved — main activity handles open_app
@@ -920,6 +1070,8 @@ fun LocationNotesPane(
     var status by remember { mutableStateOf("Place notes at GPS spots · auto-actions on enter") }
     var showAppPicker by remember { mutableStateOf(false) }
     var appQuery by remember { mutableStateOf("") }
+    /** Map in editor is collapsible so the note field stays above the keyboard. */
+    var editorMapExpanded by remember { mutableStateOf(true) }
     var draft by remember {
         mutableStateOf(
             LocationNote(
@@ -931,6 +1083,9 @@ fun LocationNotesPane(
             ),
         )
     }
+    val density = LocalDensity.current
+    val imeBottom = WindowInsets.ime.getBottom(density)
+    val keyboardOpen = imeBottom > 0
 
     fun reload() {
         notes = store.list()
@@ -973,8 +1128,12 @@ fun LocationNotesPane(
             title = title,
             body = draft.body.trim(),
             radiusM = draft.radiusM.coerceIn(15f, 2000f),
-            openAppPackage = draft.openAppPackage.trim(),
-            openAppLabel = draft.openAppLabel.trim(),
+            openApps = draft.openApps
+                .map { it.copy(packageName = it.packageName.trim(), label = it.label.trim()) }
+                .filter { it.packageName.isNotBlank() }
+                .distinctBy { it.packageName }
+                .take(MAX_OPEN_APPS),
+            imagePaths = draft.imagePaths.filter { it.isNotBlank() }.distinct().take(MAX_OPEN_IMAGES),
         )
         store.upsert(cleaned)
         reload()
@@ -991,13 +1150,15 @@ fun LocationNotesPane(
         if (uri == null) return@rememberLauncherForActivityResult
         val path = copyImageToNotes(appCtx, uri)
         if (path != null) {
-            // remove previous image if replacing
-            val old = draft.imagePath
-            if (old.isNotBlank() && old != path) {
-                runCatching { File(old).delete() }
+            if (draft.imagePaths.contains(path)) {
+                status = "Image already attached"
+            } else if (draft.imagePaths.size >= MAX_OPEN_IMAGES) {
+                status = "Max $MAX_OPEN_IMAGES images"
+            } else {
+                val next = draft.imagePaths + path
+                draft = draft.copy(imagePaths = next)
+                status = "Image added (${next.size} total)"
             }
-            draft = draft.copy(imagePath = path)
-            status = "Image attached"
         } else {
             status = "Could not copy image"
         }
@@ -1063,6 +1224,13 @@ fun LocationNotesPane(
     }
 
     val formOpen = creating || editing != null
+    // Collapse pin map while the keyboard is open so the note field stays visible.
+    LaunchedEffect(keyboardOpen, formOpen) {
+        if (formOpen && keyboardOpen) editorMapExpanded = false
+    }
+    LaunchedEffect(creating, editing?.id) {
+        if (formOpen) editorMapExpanded = true
+    }
     val sortedNotes = remember(notes, gps) {
         if (gps == null) notes.sortedByDescending { it.createdAtMs }
         else notes.sortedBy {
@@ -1086,7 +1254,17 @@ fun LocationNotesPane(
             )
         }
     }
-    val draftMapMarkers = remember(draft, formOpen, gps, creating) {
+    // Pin geometry only — title/body typing must not re-fit the map (that felt "static").
+    val draftPinKey = "${draft.lat}|${draft.lon}|${draft.radiusM}"
+    var editorLastFitPin by remember { mutableStateOf("") }
+    val editorShouldAutoFit = formOpen && draftPinKey != editorLastFitPin
+    LaunchedEffect(draftPinKey, formOpen) {
+        if (!formOpen) return@LaunchedEffect
+        // Keep autoFit true briefly so the WebView can apply fitBounds, then lock pan free.
+        delay(450)
+        editorLastFitPin = draftPinKey
+    }
+    val draftMapMarkers = remember(draftPinKey, formOpen, gps, creating, draft.title, draft.id, draft.enabled) {
         if (!formOpen || !draft.lat.isFinite() || !draft.lon.isFinite()) emptyList()
         else {
             val dist = gps?.let { distanceMeters(it.lat, it.lon, draft.lat, draft.lon) }
@@ -1109,6 +1287,7 @@ fun LocationNotesPane(
 
     if (showAppPicker) {
         val apps = remember { listLaunchableApps(appCtx) }
+        val selectedPkgs = remember(draft.openApps) { draft.openApps.map { it.packageName }.toSet() }
         val filtered = remember(appQuery, apps) {
             val q = appQuery.trim().lowercase(Locale.US)
             if (q.isEmpty()) apps.take(80)
@@ -1119,9 +1298,15 @@ fun LocationNotesPane(
         }
         AlertDialog(
             onDismissRequest = { showAppPicker = false },
-            title = { Text("Open app on enter", color = GrokifyColors.TextPrimary) },
+            title = { Text("Add apps to open on enter", color = GrokifyColors.TextPrimary) },
             text = {
                 Column {
+                    Text(
+                        "${draft.openApps.size}/$MAX_OPEN_APPS selected · tap to add/remove",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.height(6.dp))
                     OutlinedTextField(
                         value = appQuery,
                         onValueChange = { appQuery = it },
@@ -1137,34 +1322,58 @@ fun LocationNotesPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         filtered.forEach { app ->
-                            Column(
+                            val selected = app.packageName in selectedPkgs
+                            Row(
                                 Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        draft = draft.copy(
-                                            openAppPackage = app.packageName,
-                                            openAppLabel = app.label,
-                                        )
-                                        showAppPicker = false
-                                        appQuery = ""
+                                        if (selected) {
+                                            draft = draft.copy(
+                                                openApps = draft.openApps.filterNot {
+                                                    it.packageName == app.packageName
+                                                },
+                                            )
+                                        } else if (draft.openApps.size >= MAX_OPEN_APPS) {
+                                            status = "Max $MAX_OPEN_APPS apps"
+                                        } else {
+                                            draft = draft.copy(
+                                                openApps = draft.openApps + PlaceOpenApp(
+                                                    packageName = app.packageName,
+                                                    label = app.label,
+                                                ),
+                                            )
+                                        }
                                     }
                                     .padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Text(app.label, color = GrokifyColors.TextPrimary, fontSize = 14.sp)
-                                Text(
-                                    app.packageName,
-                                    color = GrokifyColors.TextDim,
-                                    fontSize = 11.sp,
-                                    fontFamily = FontFamily.Monospace,
-                                )
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        app.label,
+                                        color = if (selected) GrokifyColors.GlowMint else GrokifyColors.TextPrimary,
+                                        fontSize = 14.sp,
+                                    )
+                                    Text(
+                                        app.packageName,
+                                        color = GrokifyColors.TextDim,
+                                        fontSize = 11.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                    )
+                                }
+                                if (selected) {
+                                    Text("✓", color = GrokifyColors.GlowMint, fontSize = 16.sp)
+                                }
                             }
                         }
                     }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { showAppPicker = false }) {
-                    Text("Cancel", color = GrokifyColors.GlowCyan)
+                TextButton(onClick = {
+                    showAppPicker = false
+                    appQuery = ""
+                }) {
+                    Text("Done", color = GrokifyColors.GlowCyan)
                 }
             },
             containerColor = GrokifyColors.Panel,
@@ -1272,35 +1481,99 @@ fun LocationNotesPane(
 
             if (formOpen) {
                 Spacer(Modifier.height(8.dp))
-                // Map outside the editor scroll so WebView keeps a stable size.
-                Column(Modifier.fillMaxSize()) {
-                    Box(
+                // Editor column: collapsible map + scrollable form with IME padding so
+                // the note field is not buried under the keyboard.
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .imePadding(),
+                ) {
+                    Row(
                         Modifier
                             .fillMaxWidth()
-                            .height(200.dp),
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(GrokifyColors.Panel)
+                            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(10.dp))
+                            .clickable {
+                                editorMapExpanded = !editorMapExpanded
+                            }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        WifiMapView(
-                            markers = draftMapMarkers,
-                            userGps = gps,
-                            selectedId = draft.id.ifBlank { "draft" },
-                            emptyHint = "Tap the map to drop a pin",
-                            onMapTapped = { lat, lon ->
-                                draft = draft.copy(lat = lat, lon = lon)
-                                status = "Pin moved · ${String.format(Locale.US, "%.5f, %.5f", lat, lon)}"
-                            },
-                            autoFit = true,
-                            framed = true,
-                            resizeKey = "editor-${draft.id}",
-                            modifier = Modifier.fillMaxSize(),
+                        Icon(
+                            Icons.Default.Map,
+                            contentDescription = null,
+                            tint = GrokifyColors.GlowCyan,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                if (editorMapExpanded) "Pin map" else "Pin map (collapsed)",
+                                color = GrokifyColors.TextPrimary,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                String.format(
+                                    Locale.US,
+                                    "%.5f, %.5f · r %dm · tap to %s",
+                                    draft.lat,
+                                    draft.lon,
+                                    draft.radiusM.toInt(),
+                                    if (editorMapExpanded) "hide" else "show map",
+                                ),
+                                color = GrokifyColors.TextDim,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Icon(
+                            if (editorMapExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = if (editorMapExpanded) "Collapse map" else "Expand map",
+                            tint = GrokifyColors.TextMuted,
                         )
                     }
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Tap map to place pin · ring = enter radius",
-                        color = GrokifyColors.TextDim,
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(bottom = 4.dp),
-                    )
+                    if (editorMapExpanded && !keyboardOpen) {
+                        Spacer(Modifier.height(8.dp))
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(180.dp),
+                        ) {
+                            WifiMapView(
+                                markers = draftMapMarkers,
+                                userGps = gps,
+                                selectedId = draft.id.ifBlank { "draft" },
+                                emptyHint = "Tap the map to drop a pin",
+                                onMapTapped = { lat, lon ->
+                                    draft = draft.copy(lat = lat, lon = lon)
+                                    status = "Pin moved · ${String.format(Locale.US, "%.5f, %.5f", lat, lon)}"
+                                },
+                                // Fit only when pin/radius changes — free pan/zoom while typing.
+                                autoFit = editorShouldAutoFit,
+                                framed = true,
+                                resizeKey = "editor-${draft.id}-${editorMapExpanded}",
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                        Text(
+                            "Tap map to place pin · pan/zoom freely · ring = enter radius",
+                            color = GrokifyColors.TextDim,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 4.dp, bottom = 4.dp),
+                        )
+                    } else if (keyboardOpen) {
+                        Text(
+                            "Map hidden while typing — collapse lifts the note field above the keyboard",
+                            color = GrokifyColors.TextDim,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                        )
+                    }
+                    Spacer(Modifier.height(6.dp))
                     PlaceNoteEditor(
                         draft = draft,
                         onDraft = { draft = it },
@@ -1319,20 +1592,22 @@ fun LocationNotesPane(
                             onRequestPermissions()
                             imagePicker.launch("image/*")
                         },
-                        onClearImage = {
-                            val old = draft.imagePath
-                            if (old.isNotBlank()) runCatching { File(old).delete() }
-                            draft = draft.copy(imagePath = "")
+                        onRemoveImage = { path ->
+                            if (path.isNotBlank()) runCatching { File(path).delete() }
+                            draft = draft.copy(imagePaths = draft.imagePaths.filterNot { it == path })
                         },
                         onPickApp = { showAppPicker = true },
-                        onClearApp = {
-                            draft = draft.copy(openAppPackage = "", openAppLabel = "")
+                        onRemoveApp = { pkg ->
+                            draft = draft.copy(
+                                openApps = draft.openApps.filterNot { it.packageName == pkg },
+                            )
                         },
                         onSave = { saveDraft() },
                         onCancel = {
                             creating = false
                             editing = null
                         },
+                        onFieldFocused = { editorMapExpanded = false },
                         modifier = Modifier.weight(1f),
                     )
                 }
@@ -1564,7 +1839,7 @@ fun LocationNotesPane(
                             )
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                "Tap “Note here” to pin a note at your GPS.\nOn enter: notify, open an app, or show an image.",
+                                "Tap “Note here” to pin a note at your GPS.\nOn enter: notify, open apps, or show images — once per visit.",
                                 color = GrokifyColors.TextMuted,
                                 fontSize = 13.sp,
                                 modifier = Modifier.padding(horizontal = 12.dp),
@@ -1594,10 +1869,16 @@ fun LocationNotesPane(
                                         if (monitoring) LocationNoteWatcher.sync(appCtx)
                                     },
                                     onTestOpen = {
-                                        if (note.hasAppAction()) openAppPackage(appCtx, note.openAppPackage)
-                                        if (note.hasImageAction()) openNoteImage(appCtx, note.imagePath)
-                                        if (!note.hasAppAction() && !note.hasImageAction()) {
-                                            status = note.body.ifBlank { note.title }
+                                        var opened = false
+                                        note.openApps.forEach { app ->
+                                            if (openAppPackage(appCtx, app.packageName)) opened = true
+                                        }
+                                        note.imagePaths.forEach { path ->
+                                            if (openNoteImage(appCtx, path)) opened = true
+                                        }
+                                        status = when {
+                                            opened -> "Opened ${note.actionSummary()}"
+                                            else -> note.body.ifBlank { note.title }
                                         }
                                     },
                                 )
@@ -1611,6 +1892,7 @@ fun LocationNotesPane(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun PlaceNoteEditor(
     draft: LocationNote,
@@ -1618,17 +1900,22 @@ private fun PlaceNoteEditor(
     gps: GpsFix?,
     onUseGps: () -> Unit,
     onPickImage: () -> Unit,
-    onClearImage: () -> Unit,
+    onRemoveImage: (path: String) -> Unit,
     onPickApp: () -> Unit,
-    onClearApp: () -> Unit,
+    onRemoveApp: (packageName: String) -> Unit,
     onSave: () -> Unit,
     onCancel: () -> Unit,
+    onFieldFocused: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    val scroll = rememberScrollState()
+    var manualPkg by remember { mutableStateOf("") }
+    val keyboard = LocalSoftwareKeyboardController.current
+
     Column(
         modifier
             .fillMaxWidth()
-            .verticalScroll(rememberScrollState()),
+            .verticalScroll(scroll),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         OutlinedTextField(
@@ -1637,16 +1924,25 @@ private fun PlaceNoteEditor(
             label = { Text("Title") },
             singleLine = true,
             colors = placeFieldColors(),
-            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+            modifier = Modifier
+                .fillMaxWidth()
+                .onFocusChanged { if (it.isFocused) onFieldFocused() },
         )
         OutlinedTextField(
             value = draft.body,
             onValueChange = { onDraft(draft.copy(body = it)) },
             label = { Text("Note") },
-            minLines = 3,
-            maxLines = 6,
+            minLines = 4,
+            maxLines = 10,
             colors = placeFieldColors(),
-            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
+            keyboardActions = KeyboardActions(
+                onDone = { keyboard?.hide() },
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .onFocusChanged { if (it.isFocused) onFieldFocused() },
         )
 
         Column(
@@ -1681,7 +1977,10 @@ private fun PlaceNoteEditor(
             }
             Spacer(Modifier.height(4.dp))
             Text("Radius: ${draft.radiusM.toInt()} m", color = GrokifyColors.TextPrimary, fontSize = 13.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
                 listOf(30f, 60f, 100f, 200f, 500f).forEach { r ->
                     val sel = draft.radiusM == r
                     Text(
@@ -1732,42 +2031,115 @@ private fun PlaceNoteEditor(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Apps, null, tint = GrokifyColors.GlowCyan, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Open app on enter", color = GrokifyColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-            }
-            Spacer(Modifier.height(6.dp))
-            if (draft.openAppPackage.isNotBlank()) {
-                Text(
-                    draft.openAppLabel.ifBlank { draft.openAppPackage },
-                    color = GrokifyColors.GlowMint,
-                    fontSize = 13.sp,
-                )
-                Text(
-                    draft.openAppPackage,
-                    color = GrokifyColors.TextDim,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                )
-            } else {
-                Text("None selected", color = GrokifyColors.TextDim, fontSize = 12.sp)
-            }
-            Row {
-                TextButton(onClick = onPickApp) {
-                    Text("Pick app", color = GrokifyColors.GlowCyan, fontSize = 13.sp)
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Open apps on enter",
+                        color = GrokifyColors.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        "First app auto-opens · others via notification",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                    )
                 }
-                if (draft.openAppPackage.isNotBlank()) {
-                    TextButton(onClick = onClearApp) {
-                        Text("Clear", color = GrokifyColors.GlowRose, fontSize = 13.sp)
+                Text(
+                    "${draft.openApps.size}/$MAX_OPEN_APPS",
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 11.sp,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            if (draft.openApps.isEmpty()) {
+                Text("No apps yet", color = GrokifyColors.TextDim, fontSize = 12.sp)
+            } else {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    draft.openApps.forEach { app ->
+                        Row(
+                            Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(GrokifyColors.PanelSoft)
+                                .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(8.dp))
+                                .padding(start = 10.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                app.label.ifBlank { app.packageName }.take(22),
+                                color = GrokifyColors.GlowMint,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                            )
+                            IconButton(
+                                onClick = { onRemoveApp(app.packageName) },
+                                modifier = Modifier.size(28.dp),
+                            ) {
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "Remove app",
+                                    tint = GrokifyColors.GlowRose,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                            }
+                        }
                     }
                 }
             }
+            Spacer(Modifier.height(4.dp))
+            TextButton(onClick = onPickApp) {
+                Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = GrokifyColors.GlowCyan)
+                Spacer(Modifier.width(4.dp))
+                Text("Add app", color = GrokifyColors.GlowCyan, fontSize = 13.sp)
+            }
             OutlinedTextField(
-                value = draft.openAppPackage,
-                onValueChange = { onDraft(draft.copy(openAppPackage = it, openAppLabel = draft.openAppLabel)) },
-                label = { Text("Package (optional manual)") },
+                value = manualPkg,
+                onValueChange = { manualPkg = it },
+                label = { Text("Package name (manual add)") },
                 singleLine = true,
                 colors = placeFieldColors(),
-                modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(
+                    onDone = {
+                        val pkg = manualPkg.trim()
+                        if (pkg.isBlank()) return@KeyboardActions
+                        if (draft.openApps.any { it.packageName == pkg }) {
+                            manualPkg = ""
+                            return@KeyboardActions
+                        }
+                        if (draft.openApps.size >= MAX_OPEN_APPS) return@KeyboardActions
+                        onDraft(
+                            draft.copy(
+                                openApps = draft.openApps + PlaceOpenApp(pkg, pkg.substringAfterLast('.')),
+                            ),
+                        )
+                        manualPkg = ""
+                        keyboard?.hide()
+                    },
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { if (it.isFocused) onFieldFocused() },
             )
+            if (manualPkg.isNotBlank()) {
+                TextButton(
+                    onClick = {
+                        val pkg = manualPkg.trim()
+                        if (pkg.isBlank() || draft.openApps.any { it.packageName == pkg }) return@TextButton
+                        if (draft.openApps.size >= MAX_OPEN_APPS) return@TextButton
+                        onDraft(
+                            draft.copy(
+                                openApps = draft.openApps + PlaceOpenApp(pkg, pkg.substringAfterLast('.')),
+                            ),
+                        )
+                        manualPkg = ""
+                    },
+                ) {
+                    Text("Add package", color = GrokifyColors.GlowMint, fontSize = 12.sp)
+                }
+            }
         }
 
         Column(
@@ -1781,32 +2153,85 @@ private fun PlaceNoteEditor(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.Image, null, tint = GrokifyColors.GlowMint, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Open image on enter", color = GrokifyColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-            }
-            Spacer(Modifier.height(6.dp))
-            if (draft.imagePath.isNotBlank() && File(draft.imagePath).exists()) {
-                AsyncImage(
-                    model = File(draft.imagePath),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(140.dp)
-                        .clip(RoundedCornerShape(8.dp)),
-                )
-                Spacer(Modifier.height(6.dp))
-            } else {
-                Text("No image attached", color = GrokifyColors.TextDim, fontSize = 12.sp)
-            }
-            Row {
-                TextButton(onClick = onPickImage) {
-                    Text(if (draft.imagePath.isBlank()) "Pick image" else "Replace", color = GrokifyColors.GlowMint, fontSize = 13.sp)
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Open images on enter",
+                        color = GrokifyColors.TextPrimary,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Text(
+                        "First image opens if no app · more via notification",
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                    )
                 }
-                if (draft.imagePath.isNotBlank()) {
-                    TextButton(onClick = onClearImage) {
-                        Text("Clear", color = GrokifyColors.GlowRose, fontSize = 13.sp)
+                Text(
+                    "${draft.imagePaths.size}/$MAX_OPEN_IMAGES",
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 11.sp,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            if (draft.imagePaths.isEmpty()) {
+                Text("No images yet", color = GrokifyColors.TextDim, fontSize = 12.sp)
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    draft.imagePaths.forEach { path ->
+                        if (File(path).exists()) {
+                            Box {
+                                AsyncImage(
+                                    model = File(path),
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(120.dp)
+                                        .clip(RoundedCornerShape(8.dp)),
+                                )
+                                IconButton(
+                                    onClick = { onRemoveImage(path) },
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(4.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(GrokifyColors.Panel.copy(alpha = 0.9f)),
+                                ) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = "Remove image",
+                                        tint = GrokifyColors.GlowRose,
+                                    )
+                                }
+                            }
+                        } else {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "Missing file",
+                                    color = GrokifyColors.GlowRose,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TextButton(onClick = { onRemoveImage(path) }) {
+                                    Text("Remove", color = GrokifyColors.GlowRose, fontSize = 12.sp)
+                                }
+                            }
+                        }
                     }
                 }
+            }
+            Spacer(Modifier.height(4.dp))
+            TextButton(onClick = onPickImage) {
+                Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = GrokifyColors.GlowMint)
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    if (draft.imagePaths.isEmpty()) "Add image" else "Add another image",
+                    color = GrokifyColors.GlowMint,
+                    fontSize = 13.sp,
+                )
             }
         }
 
@@ -1821,7 +2246,16 @@ private fun PlaceNoteEditor(
         ) {
             Column(Modifier.weight(1f)) {
                 Text("Watch this place", color = GrokifyColors.TextPrimary, fontSize = 13.sp)
-                Text("Included when area monitoring is on", color = GrokifyColors.TextDim, fontSize = 11.sp)
+                Text(
+                    buildString {
+                        append("Included when area monitoring is on")
+                        if (draft.triggerCount > 0) {
+                            append(" · triggered ${draft.triggerCount}×")
+                        }
+                    },
+                    color = GrokifyColors.TextDim,
+                    fontSize = 11.sp,
+                )
             }
             Switch(
                 checked = draft.enabled,
@@ -1849,7 +2283,8 @@ private fun PlaceNoteEditor(
                 Text("Save", fontWeight = FontWeight.SemiBold)
             }
         }
-        Spacer(Modifier.height(24.dp))
+        // Extra space so the last fields clear the IME when scrolled.
+        Spacer(Modifier.height(120.dp))
     }
 }
 
@@ -1932,17 +2367,32 @@ private fun PlaceNoteRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        if (note.imagePath.isNotBlank() && File(note.imagePath).exists()) {
+        val thumbs = note.imagePaths.filter { File(it).exists() }.take(3)
+        if (thumbs.isNotEmpty()) {
             Spacer(Modifier.height(8.dp))
-            AsyncImage(
-                model = File(note.imagePath),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(96.dp)
-                    .clip(RoundedCornerShape(8.dp)),
-            )
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                thumbs.forEach { path ->
+                    AsyncImage(
+                        model = File(path),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(width = 96.dp, height = 72.dp)
+                            .clip(RoundedCornerShape(8.dp)),
+                    )
+                }
+                if (note.imagePaths.size > thumbs.size) {
+                    Text(
+                        "+${note.imagePaths.size - thumbs.size}",
+                        color = GrokifyColors.TextMuted,
+                        fontSize = 12.sp,
+                        modifier = Modifier.align(Alignment.CenterVertically),
+                    )
+                }
+            }
         }
         Spacer(Modifier.height(6.dp))
         Row(
@@ -1965,9 +2415,15 @@ private fun PlaceNoteRow(
                 Spacer(Modifier.width(4.dp))
                 Text("Delete", color = GrokifyColors.GlowRose, fontSize = 12.sp)
             }
-            if (note.lastTriggeredMs > 0L) {
+            if (note.triggerCount > 0 || note.lastTriggeredMs > 0L) {
                 Text(
-                    "Last enter ${formatPlaceTime(note.lastTriggeredMs)}",
+                    buildString {
+                        if (note.triggerCount > 0) append("${note.triggerCount}×")
+                        if (note.lastTriggeredMs > 0L) {
+                            if (isNotEmpty()) append(" · ")
+                            append(formatPlaceTime(note.lastTriggeredMs))
+                        }
+                    },
                     color = GrokifyColors.TextDim,
                     fontSize = 10.sp,
                     modifier = Modifier.padding(start = 4.dp),
