@@ -314,6 +314,15 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.145 — Spotify live lockscreen controls, custom media notif, widgets
+
+- **Custom Spotify media card**: shade + lockscreen use RemoteViews (compact + expanded) with real **title / artist**, **album art** (large art for lockscreen background), and **prev · play/pause · next** always visible (white icons on dark discs; mint play/pause).
+- **Notification durability**: HIGH-importance channel (v9+), MediaSession metadata + art re-sync, FGS re-promote when the controller card vanishes, and Live DJ no longer tears down the controller notif on booth teardown.
+- **MediaSession ownership**: controller keeps its own session token on the card; Live DJ session stays for BT/headset; transport routes to the booth when Live DJ is on air.
+- **Home Spotify widget**: layout/control refresh so 1×4 transport matches the new notif icon set.
+- **Place Notes**: further monitoring / background FGS hardening for enter alerts when the app is closed.
+- **Bridge**: default `--reasoning-effort high` for headless Grok agents (`GROKIFY_REASONING_EFFORT` override).
+
 ### 0.1.125 — Live DJ pause freeze, idle lockscreen ticks, full chat timestamps
 
 - **Live DJ pause-hold**: while paused, no auto next / banter / stuck-end recovery — hold stays until you press play (or skip/play still works). Empty player mid-pause freezes instead of force-next; held booth polls ~every 60s.
