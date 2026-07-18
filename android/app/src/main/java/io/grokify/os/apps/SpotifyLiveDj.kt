@@ -3422,10 +3422,13 @@ class SpotifyLiveDjService : Service() {
      * Wait until the current cut has ≤ [targetRemainMs] left (or already ended / changed).
      *
      * Returns true when it is safe to hand off (near end / track changed / empty at end).
-     * Returns false when the user clearly paused mid-cut — caller must NOT skip forward.
+     * Returns false only for a clear *mid-track* user pause — caller must NOT skip, but
+     * must also NOT freeze the whole booth forever (poll will re-arm when play resumes).
      *
-     * Important: a single empty or is_playing=false poll is common mid-song (API lag /
-     * buffering). Treating that as "ended" used to pause + advance halfway through cuts.
+     * Spotify quirks this absorbs:
+     * - single empty / is_playing=false polls mid-song (API lag / buffering)
+     * - is_playing=false with a few seconds "remain" on the true outro (file silence /
+     *   sticky progress_ms) — 0.1.146 aborted + holdAutoHandoff and left dead air forever
      */
     private suspend fun waitUntilRemainAbout(
         expectedUri: String?,
@@ -3435,17 +3438,26 @@ class SpotifyLiveDjService : Service() {
         val deadline = System.currentTimeMillis() + maxWaitMs
         var emptyStreak = 0
         var pausedStreak = 0
-        val endSlackMs = targetRemainMs.coerceAtLeast(2_500L)
+        // Lowest remain observed while still on this cut (playing or not).
+        var minRemainSeen = lastRemainMs.coerceAtLeast(0L).let {
+            if (it in 1L..600_000L) it else 600_000L
+        }
+        // Immediate handoff when paused/empty inside this window (true outro / silence).
+        val softEndMs = (targetRemainMs + 3_500L).coerceIn(3_500L, 8_000L)
+        // After a sustained pause inside this window, treat as ended (sticky progress).
+        val stuckEndMs = 14_000L
+        val hardMidMs = 25_000L
         while (System.currentTimeMillis() < deadline) {
             val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
             if (snap == null) {
                 emptyStreak++
                 pausedStreak = 0
-                // Only treat empty as natural end once we were already in the outro,
-                // or after a long empty streak (Spotify often 204s between cuts).
-                if (emptyStreak >= 3 && lastRemainMs <= 10_000L) return true
-                if (emptyStreak >= 10) return true
-                delay(450L)
+                // Empty after we already saw the outro → natural end (Spotify 204 between cuts).
+                if (emptyStreak >= 2 && minRemainSeen <= stuckEndMs) return true
+                if (emptyStreak >= 3 && lastRemainMs <= stuckEndMs) return true
+                // Long empty with no live item — treat as ended so we never stall the set.
+                if (emptyStreak >= 8) return true
+                delay(400L)
                 continue
             }
             emptyStreak = 0
@@ -3453,34 +3465,69 @@ class SpotifyLiveDjService : Service() {
                 return true // already moved on
             }
             lastRemainMs = snap.remainMs
+            if (snap.remainMs in 0L..600_000L) {
+                minRemainSeen = minOf(minRemainSeen, snap.remainMs)
+            }
             if (!snap.playing) {
                 pausedStreak++
-                // Paused at/near end → safe to hand off.
-                if (snap.durationMs > 0L && snap.remainMs <= endSlackMs) return true
-                // Brief not-playing flicker mid-cut — keep waiting.
+                val remain = snap.remainMs
+                // True outro (or we already ticked into it) while stopped → hand off now.
+                if (snap.durationMs > 0L &&
+                    (remain <= softEndMs || minRemainSeen <= softEndMs)
+                ) {
+                    return true
+                }
+                // Brief not-playing flicker — keep waiting (do not abort the set).
                 if (pausedStreak < 5) {
-                    delay(450L)
+                    delay(400L)
                     continue
                 }
-                // Sustained mid-track pause — do not skip the rest of the song.
-                Log.i(
-                    TAG,
-                    "waitUntilRemainAbout mid-pause remain=${snap.remainMs}ms " +
-                        "target=${targetRemainMs}ms — abort handoff",
-                )
-                return false
+                // Sustained pause clearly mid-song → abort this wait; poll re-arms later.
+                // Callers must not holdAutoHandoff or songs never advance again.
+                if (remain > hardMidMs && minRemainSeen > hardMidMs) {
+                    Log.i(
+                        TAG,
+                        "waitUntilRemainAbout mid-pause remain=${remain}ms " +
+                            "minSeen=${minRemainSeen}ms target=${targetRemainMs}ms — abort",
+                    )
+                    return false
+                }
+                // Stuck paused in the last ~14s (outro silence / laggy progress) → hand off.
+                if (remain <= stuckEndMs || minRemainSeen <= stuckEndMs) {
+                    if (pausedStreak >= 7) {
+                        Log.i(
+                            TAG,
+                            "waitUntilRemainAbout stuck-paused remain=${remain}ms " +
+                                "minSeen=${minRemainSeen}ms — proceed",
+                        )
+                        return true
+                    }
+                    delay(400L)
+                    continue
+                }
+                // Ambiguous (15–25s remain, paused): keep waiting a bit longer.
+                delay(400L)
+                continue
             }
             pausedStreak = 0
             if (snap.durationMs > 0L && snap.remainMs <= targetRemainMs) return true
-            delay(450L)
+            delay(400L)
         }
-        // Timed out: only proceed if we're actually close to the target.
-        val closeEnough = lastRemainMs <= targetRemainMs + 4_000L
+        // Timed out: proceed in the outro; mid-track timeout re-arms (no freeze).
+        val closeEnough =
+            lastRemainMs <= stuckEndMs ||
+                minRemainSeen <= stuckEndMs ||
+                lastRemainMs <= targetRemainMs + 5_000L
         if (!closeEnough) {
             Log.w(
                 TAG,
                 "waitUntilRemainAbout timeout remain=${lastRemainMs}ms " +
-                    "target=${targetRemainMs}ms — abort (not near end)",
+                    "minSeen=${minRemainSeen}ms target=${targetRemainMs}ms — abort (re-arm later)",
+            )
+        } else {
+            Log.i(
+                TAG,
+                "waitUntilRemainAbout timeout near end remain=${lastRemainMs}ms — proceed",
             )
         }
         return closeEnough
@@ -4234,8 +4281,8 @@ class SpotifyLiveDjService : Service() {
                                 maxWaitMs = 120_000L,
                             )
                             if (!ready) {
-                                Log.i(TAG, "banter talkover wait aborted — mid-track pause")
-                                // Restore bake ownership so a later handoff can reuse it.
+                                Log.i(TAG, "banter talkover wait aborted — re-arm (no freeze)")
+                                // Restore bake so the next near-end arm can reuse it.
                                 if (banterNext != null && !line.isBlank()) {
                                     prefetchedBanter = line
                                     prefetchedForUri = banterNext.uri
@@ -4244,8 +4291,9 @@ class SpotifyLiveDjService : Service() {
                                         prefetchedTtsDurationMs = bakedMs
                                     }
                                 }
-                                holdAutoHandoff("banter_wait_mid_pause")
-                                publish(status = "Paused mid-track — holding set (no skip)")
+                                // Do NOT holdAutoHandoff — that froze the whole set after
+                                // Spotify paused flickers and songs never advanced.
+                                publish(status = "Wait aborted — watching for outro again")
                                 return@withContext
                             }
                         } else {
@@ -4260,7 +4308,7 @@ class SpotifyLiveDjService : Service() {
                                 maxWaitMs = 120_000L,
                             )
                             if (!ready) {
-                                Log.i(TAG, "banter clean-mic wait aborted — mid-track pause")
+                                Log.i(TAG, "banter clean-mic wait aborted — re-arm (no freeze)")
                                 if (banterNext != null && !line.isBlank()) {
                                     prefetchedBanter = line
                                     prefetchedForUri = banterNext.uri
@@ -4269,8 +4317,7 @@ class SpotifyLiveDjService : Service() {
                                         prefetchedTtsDurationMs = bakedMs
                                     }
                                 }
-                                holdAutoHandoff("banter_wait_mid_pause")
-                                publish(status = "Paused mid-track — holding set (no skip)")
+                                publish(status = "Wait aborted — watching for outro again")
                                 return@withContext
                             }
                         }
@@ -4528,10 +4575,10 @@ class SpotifyLiveDjService : Service() {
                             maxWaitMs = 90_000L,
                         )
                         if (!ready) {
-                            Log.i(TAG, "silent handoff wait aborted — mid-track pause")
-                            // Undo the +1 we haven't applied yet (count is below).
-                            holdAutoHandoff("silent_wait_mid_pause")
-                            publish(status = "Paused mid-track — holding set (no skip)")
+                            Log.i(TAG, "silent handoff wait aborted — re-arm (no freeze)")
+                            // Leave songsSinceBanter alone (count is below). finally clears
+                            // handoffLaunchedForUri so near_end can fire again.
+                            publish(status = "Wait aborted — watching for outro again")
                             return@withContext
                         }
                     }

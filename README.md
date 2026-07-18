@@ -314,6 +314,12 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.147 — Live DJ: next song advances again
+
+- **Root cause (0.1.146 regression)**: end-wait abort on Spotify `is_playing=false` called `holdAutoHandoff`, which froze *all* auto handoffs — songs ended into dead air and never started the next cut.
+- **Fix**: wait abort only cancels that handoff and re-arms; it no longer freezes the booth. Outro detect treats empty/paused-near-end as “done” so the set keeps moving.
+- Still avoids mid-song skips: sustained pause only aborts when remain is clearly mid-track (~25s+).
+
 ### 0.1.146 — Live DJ: stop mid-song / early end skips
 
 - **Root cause**: handoff wait treated a single empty / `is_playing=false` API blip as “track ended,” then pause + direct-play next mid-cut. Silent handoffs also hard-cut at ~3.5s remain.
