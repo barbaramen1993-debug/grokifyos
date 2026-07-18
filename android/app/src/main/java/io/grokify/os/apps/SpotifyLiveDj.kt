@@ -1999,6 +1999,14 @@ class SpotifyLiveDjService : Service() {
     /** Track ended but Spotify still reports the item paused at the end. */
     private var stuckEndPolls = 0
     /**
+     * Debounce "external track" reclaim — a single poll with a foreign URI (ad blip,
+     * laggy metadata) used to direct-play the next cut mid-song.
+     */
+    private var externalCandidateUri: String? = null
+    private var externalCandidateSinceMs: Long = 0L
+    /** Consecutive media-session polls with remain in the near-end window. */
+    private var sessionNearEndStreak = 0
+    /**
      * Sustained mid-track pause detection. Spotify often flickers is_playing=false
      * between cuts / while buffering — never hold on a single poll.
      */
@@ -2511,6 +2519,9 @@ class SpotifyLiveDjService : Service() {
         // Drop in-flight auto handoff bookkeeping so a long pause cannot
         // "finish" a stale near-end arm hours later.
         handoffLaunchedForUri = null
+        externalCandidateUri = null
+        externalCandidateSinceMs = 0L
+        sessionNearEndStreak = 0
         wasPlaying = false
         // Do not clear pendingPlayVerify here — a verify retry may still recover.
     }
@@ -2642,9 +2653,12 @@ class SpotifyLiveDjService : Service() {
             if (inInterTrackGrace()) {
                 return
             }
+            // Only force-next on API errors when we were already in the true outro.
+            // A sticky/low lastRemainMs used to advance mid-song after a few 5xx blips.
             val mayAdvanceOnError = !autoHandoffHeld &&
                 wasPlaying &&
-                lastRemainMs <= 12_000L &&
+                nearEndArmed &&
+                lastRemainMs <= 6_000L &&
                 queue.isNotEmpty() &&
                 !transitioning.get()
             if (mayAdvanceOnError && idlePolls >= 4) {
@@ -2720,13 +2734,16 @@ class SpotifyLiveDjService : Service() {
                 }
                 return
             }
+            // Empty player only counts as natural end when we were already near the
+            // outro (or mid-handoff). remain≤12s alone was too loose after sticky
+            // lastRemainMs from a prior near-end arm.
             val likelyNaturalEnd = !autoHandoffHeld &&
                 wasPlaying &&
                 (
-                    (remainBeforeEmpty <= 12_000L) ||
-                        nearEndArmed ||
+                    (nearEndArmed && remainBeforeEmpty <= 10_000L) ||
+                        (remainBeforeEmpty <= 5_000L) ||
                         (handoffLaunchedForUri != null && nearEndArmed) ||
-                        pendingPlayVerifyUri != null
+                        (pendingPlayVerifyUri != null && remainBeforeEmpty <= 15_000L)
                     )
             if (!likelyNaturalEnd) {
                 // Require a few empty polls before treating as a real session pause —
@@ -2945,14 +2962,46 @@ class SpotifyLiveDjService : Service() {
                         expectedPlayUri = null
                         expectedPlayFromUri = null
                     }
+                    // Debounce foreign URI: one flaky poll mid-cut must not reclaim/skip.
+                    // Require the same unexpected URI for ~2.2s (or a clear mid-track
+                    // override on a long cut) before treating it as real drift.
+                    val nowExt = System.currentTimeMillis()
+                    if (externalCandidateUri != uri) {
+                        externalCandidateUri = uri
+                        externalCandidateSinceMs = nowExt
+                        Log.i(
+                            TAG,
+                            "external candidate $lastUri → $uri (prevRemain=${prevRemain}ms) — debounce",
+                        )
+                        // Keep watching the previous cut; don't rewrite lastUri yet.
+                        return
+                    }
+                    val heldMs = nowExt - externalCandidateSinceMs
+                    val solidMidTrack =
+                        progress >= 10_000L && remain > 25_000L && duration > 45_000L
+                    if (heldMs < 2_200L && !solidMidTrack) {
+                        Log.d(
+                            TAG,
+                            "external debounce $uri held=${heldMs}ms — suppress",
+                        )
+                        return
+                    }
+                    externalCandidateUri = null
+                    externalCandidateSinceMs = 0L
                     Log.i(
                         TAG,
-                        "external track change $lastUri → $uri (prevRemain=${prevRemain}ms) — sync/recalibrate",
+                        "external track change $lastUri → $uri (prevRemain=${prevRemain}ms " +
+                            "held=${heldMs}ms) — sync/recalibrate",
                     )
                     handleExternalTrackChange(track, playing, progress, duration, prevRemain)
                     return
                 }
             }
+        }
+        // Same URI as last poll — clear external debounce.
+        if (uri.isNotBlank() && uri == lastUri) {
+            externalCandidateUri = null
+            externalCandidateSinceMs = 0L
         }
         // playTrack already set lastUri; when Spotify catches up uri == lastUri and we
         // never entered the branch above — still clear ownership so it cannot linger.
@@ -3011,25 +3060,28 @@ class SpotifyLiveDjService : Service() {
         if (playing && duration > 15_000L && remain <= 8_000L) {
             nearEndArmed = true
         }
-        // Banter: enter handoff with enough headroom.
-        // Talk-over ON: need speech duration + pad so line lands on the outro.
-        // Talk-over OFF: still enter early enough that wait+pause is seamless; audio should
-        // already be baked so we never block on TTS after the cut ends.
+        // Banter: enter handoff with enough headroom for the wait loop — NOT to skip.
+        // Talk-over ON: speech duration + pad so the line lands on the outro.
+        // Talk-over OFF: enter late; waitUntilRemainAbout holds until the last second.
+        // Caps stay tight so a long/unknown TTS bake never arms "mid song".
         val banterThreshold = when {
             !banterDue -> 0L
             allowTalkSnap && banterAudioReady ->
-                (prefetchedTtsDurationMs + 2_500L).coerceIn(10_000L, 28_000L)
-            allowTalkSnap && banterPrefetched -> 14_000L
-            banterAudioReady -> 8_000L // clean mic: short headroom; audio already baked
-            banterPrefetched -> 12_000L
-            else -> 16_000L // still researching / baking — start early
+                (prefetchedTtsDurationMs + 1_200L).coerceIn(6_000L, 18_000L)
+            allowTalkSnap && banterPrefetched -> 10_000L
+            banterAudioReady -> 5_000L // clean mic: short headroom; audio already baked
+            banterPrefetched -> 7_000L
+            else -> 9_000L // still researching / baking — modest early arm only
         }
+        // Never arm near-end in the first half of a long cut (stale progress_ms glitches).
+        val pastIntro = duration <= 0L || progress >= 12_000L || remain <= duration / 2
         if (
             !autoHandoffHeld &&
             banterDue &&
             banterThreshold > 0L &&
             playing &&
             duration > 15_000L &&
+            pastIntro &&
             remain <= banterThreshold &&
             handoffLaunchedForUri != uri &&
             !transitioning.get()
@@ -3045,14 +3097,15 @@ class SpotifyLiveDjService : Service() {
             scope.launch { runTransition("near_end") }
             return
         }
-        // Silent: direct-play before the last second so background polls don't miss the
-        // 1.2s window (that miss left the cut paused at end with DJ status "Paused").
+        // Silent: arm a few seconds early so background polls don't miss the end, then
+        // waitUntilRemainAbout inside the transition holds until ~0.8s remain.
         if (
             !autoHandoffHeld &&
             !banterDue &&
             playing &&
             duration > 15_000L &&
-            remain <= 3_500L &&
+            pastIntro &&
+            remain <= 4_000L &&
             queue.isNotEmpty() &&
             handoffLaunchedForUri != uri &&
             !transitioning.get()
@@ -3367,26 +3420,70 @@ class SpotifyLiveDjService : Service() {
 
     /**
      * Wait until the current cut has ≤ [targetRemainMs] left (or already ended / changed).
-     * Used so talkover banter lands on the real outro instead of mid-song after fast prep.
+     *
+     * Returns true when it is safe to hand off (near end / track changed / empty at end).
+     * Returns false when the user clearly paused mid-cut — caller must NOT skip forward.
+     *
+     * Important: a single empty or is_playing=false poll is common mid-song (API lag /
+     * buffering). Treating that as "ended" used to pause + advance halfway through cuts.
      */
     private suspend fun waitUntilRemainAbout(
         expectedUri: String?,
         targetRemainMs: Long,
         maxWaitMs: Long,
-    ) {
+    ): Boolean {
         val deadline = System.currentTimeMillis() + maxWaitMs
+        var emptyStreak = 0
+        var pausedStreak = 0
+        val endSlackMs = targetRemainMs.coerceAtLeast(2_500L)
         while (System.currentTimeMillis() < deadline) {
             val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
-            if (snap == null) return // nothing playing — handoff now
-            if (expectedUri != null && snap.uri.isNotBlank() && snap.uri != expectedUri) {
-                return // already moved on
+            if (snap == null) {
+                emptyStreak++
+                pausedStreak = 0
+                // Only treat empty as natural end once we were already in the outro,
+                // or after a long empty streak (Spotify often 204s between cuts).
+                if (emptyStreak >= 3 && lastRemainMs <= 10_000L) return true
+                if (emptyStreak >= 10) return true
+                delay(450L)
+                continue
             }
-            // Paused / stopped (any remain) — do not spin; speech + next track must proceed.
-            if (!snap.playing) return
-            if (snap.durationMs > 0L && snap.remainMs <= targetRemainMs) return
+            emptyStreak = 0
+            if (expectedUri != null && snap.uri.isNotBlank() && snap.uri != expectedUri) {
+                return true // already moved on
+            }
             lastRemainMs = snap.remainMs
+            if (!snap.playing) {
+                pausedStreak++
+                // Paused at/near end → safe to hand off.
+                if (snap.durationMs > 0L && snap.remainMs <= endSlackMs) return true
+                // Brief not-playing flicker mid-cut — keep waiting.
+                if (pausedStreak < 5) {
+                    delay(450L)
+                    continue
+                }
+                // Sustained mid-track pause — do not skip the rest of the song.
+                Log.i(
+                    TAG,
+                    "waitUntilRemainAbout mid-pause remain=${snap.remainMs}ms " +
+                        "target=${targetRemainMs}ms — abort handoff",
+                )
+                return false
+            }
+            pausedStreak = 0
+            if (snap.durationMs > 0L && snap.remainMs <= targetRemainMs) return true
             delay(450L)
         }
+        // Timed out: only proceed if we're actually close to the target.
+        val closeEnough = lastRemainMs <= targetRemainMs + 4_000L
+        if (!closeEnough) {
+            Log.w(
+                TAG,
+                "waitUntilRemainAbout timeout remain=${lastRemainMs}ms " +
+                    "target=${targetRemainMs}ms — abort (not near end)",
+            )
+        }
+        return closeEnough
     }
 
     /**
@@ -4119,6 +4216,66 @@ class SpotifyLiveDjService : Service() {
                     prefetchedBanter = null
                     prefetchedForUri = null
 
+                    val speechMs = speechDurationMs(line, bakedMs)
+
+                    // Natural ends: land speech on the true outro BEFORE posting the bubble.
+                    // Early wait aborts (mid-track pause / API blip) must not leave a
+                    // banter chat line that never got spoken, and must not skip forward.
+                    if (!isSkipReason && !isIdleKick) {
+                        if (talkover) {
+                            publish(
+                                status = "🎙 Holding for outro (${speechMs / 1000}s line)…",
+                                transitioning = true,
+                            )
+                            val ready = waitUntilRemainAbout(
+                                expectedUri = prevUri,
+                                // Cap headroom so a bad TTS duration never starts mid-song.
+                                targetRemainMs = (speechMs + 900L).coerceIn(4_000L, 18_000L),
+                                maxWaitMs = 120_000L,
+                            )
+                            if (!ready) {
+                                Log.i(TAG, "banter talkover wait aborted — mid-track pause")
+                                // Restore bake ownership so a later handoff can reuse it.
+                                if (banterNext != null && !line.isBlank()) {
+                                    prefetchedBanter = line
+                                    prefetchedForUri = banterNext.uri
+                                    if (!bakedPath.isNullOrBlank()) {
+                                        prefetchedTtsPath = bakedPath
+                                        prefetchedTtsDurationMs = bakedMs
+                                    }
+                                }
+                                holdAutoHandoff("banter_wait_mid_pause")
+                                publish(status = "Paused mid-track — holding set (no skip)")
+                                return@withContext
+                            }
+                        } else {
+                            // Clean mic: pause only in the last ~1.2s of the cut.
+                            publish(
+                                status = "🎙 Holding for last second (${speechMs / 1000}s ready)…",
+                                transitioning = true,
+                            )
+                            val ready = waitUntilRemainAbout(
+                                expectedUri = prevUri,
+                                targetRemainMs = 1_200L,
+                                maxWaitMs = 120_000L,
+                            )
+                            if (!ready) {
+                                Log.i(TAG, "banter clean-mic wait aborted — mid-track pause")
+                                if (banterNext != null && !line.isBlank()) {
+                                    prefetchedBanter = line
+                                    prefetchedForUri = banterNext.uri
+                                    if (!bakedPath.isNullOrBlank()) {
+                                        prefetchedTtsPath = bakedPath
+                                        prefetchedTtsDurationMs = bakedMs
+                                    }
+                                }
+                                holdAutoHandoff("banter_wait_mid_pause")
+                                publish(status = "Paused mid-track — holding set (no skip)")
+                                return@withContext
+                            }
+                        }
+                    }
+
                     appendChat(
                         DjChatMessage(
                             id = "banter-${System.currentTimeMillis()}",
@@ -4130,36 +4287,6 @@ class SpotifyLiveDjService : Service() {
                         status = if (talkover) "🎙 Talkover: $line" else "🎙 $line",
                         transitioning = true,
                     )
-
-                    val speechMs = speechDurationMs(line, bakedMs)
-
-                    // Natural ends: land speech on the true outro — never start the next
-                    // cut early via playTrack.
-                    if (!isSkipReason && !isIdleKick) {
-                        if (talkover) {
-                            publish(
-                                status = "🎙 Holding for outro (${speechMs / 1000}s line)…",
-                                transitioning = true,
-                            )
-                            waitUntilRemainAbout(
-                                expectedUri = prevUri,
-                                targetRemainMs = speechMs + 900L,
-                                maxWaitMs = 120_000L,
-                            )
-                        } else {
-                            // Clean mic: pause only in the last ~1.2s of the cut.
-                            // Audio should already be baked so speech starts immediately.
-                            publish(
-                                status = "🎙 Holding for last second (${speechMs / 1000}s ready)…",
-                                transitioning = true,
-                            )
-                            waitUntilRemainAbout(
-                                expectedUri = prevUri,
-                                targetRemainMs = 1_200L,
-                                maxWaitMs = 120_000L,
-                            )
-                        }
-                    }
 
                     // If Spotify already advanced to our next during the wait, adopt and
                     // still speak (line is about that cut) — do not introduce a different song.
@@ -4299,24 +4426,56 @@ class SpotifyLiveDjService : Service() {
                         alreadyOnBanterNext -> true
                         talkover && !isSkipReason && !isIdleKick -> {
                             // Let the cut finish under/after the line, then start next.
+                            // Budget scales with real remaining time — a fixed 12s used to
+                            // force-next while ~15–25s of outro was still playing.
                             publish(
                                 status = "🎙 Waiting for track end$style…",
                                 transitioning = true,
                             )
+                            val endBudget = (lastRemainMs + 10_000L).coerceIn(10_000L, 50_000L)
                             val natural = awaitNativeAdvance(
                                 prevUri,
                                 banterNext ?: next,
-                                maxWaitMs = 12_000L,
+                                maxWaitMs = endBudget,
                             )
                             if (natural) {
                                 true
                             } else {
-                                advanceToNext(
-                                    next = banterNext ?: next,
-                                    prevUri = prevUri,
-                                    preferSkip = false,
-                                    allowPlayFallback = true,
-                                )
+                                // Still only force if we're actually near the end.
+                                val snap = readPlaybackSnap()
+                                val stillMid = snap != null &&
+                                    snap.uri == prevUri &&
+                                    snap.playing &&
+                                    snap.remainMs > 6_000L
+                                if (stillMid) {
+                                    Log.i(
+                                        TAG,
+                                        "talkover end-wait: still mid remain=${snap!!.remainMs}ms — " +
+                                            "keep waiting once more",
+                                    )
+                                    val natural2 = awaitNativeAdvance(
+                                        prevUri,
+                                        banterNext ?: next,
+                                        maxWaitMs = (snap.remainMs + 5_000L).coerceIn(8_000L, 40_000L),
+                                    )
+                                    if (natural2) {
+                                        true
+                                    } else {
+                                        advanceToNext(
+                                            next = banterNext ?: next,
+                                            prevUri = prevUri,
+                                            preferSkip = false,
+                                            allowPlayFallback = true,
+                                        )
+                                    }
+                                } else {
+                                    advanceToNext(
+                                        next = banterNext ?: next,
+                                        prevUri = prevUri,
+                                        preferSkip = false,
+                                        allowPlayFallback = true,
+                                    )
+                                }
                             }
                         }
                         else -> {
@@ -4354,6 +4513,28 @@ class SpotifyLiveDjService : Service() {
                     // Silent handoff — direct-play the next URI (no Spotify queue).
                     // Count toward random/fixed cycle; do not re-roll until banter fires.
                     // Cap so external sync races cannot push us past "due" forever.
+                    //
+                    // near_end_direct used to fire at ~3.5s remain and immediately
+                    // playTrack the next cut — that chopped the last few seconds every
+                    // silent handoff. Wait until the true outro (or natural end).
+                    if (!isSkipReason && !isIdleKick) {
+                        publish(
+                            status = "Holding for track end…",
+                            transitioning = true,
+                        )
+                        val ready = waitUntilRemainAbout(
+                            expectedUri = prevUri,
+                            targetRemainMs = 800L,
+                            maxWaitMs = 90_000L,
+                        )
+                        if (!ready) {
+                            Log.i(TAG, "silent handoff wait aborted — mid-track pause")
+                            // Undo the +1 we haven't applied yet (count is below).
+                            holdAutoHandoff("silent_wait_mid_pause")
+                            publish(status = "Paused mid-track — holding set (no skip)")
+                            return@withContext
+                        }
+                    }
                     songsSinceBanter = (songsSinceBanter + 1).coerceAtMost(banterEvery)
                     store.songsSinceBanter = songsSinceBanter
                     store.banterEvery = banterEvery
@@ -7937,14 +8118,21 @@ class SpotifyLiveDjService : Service() {
         )
         // Near-end / stuck-end via session so handoffs still fire under 429.
         // Never while held — a long pause must not "finish" the cut hours later.
+        // Require consecutive low-remain polls: media-session position can jump once
+        // and falsely look like the outro mid-song.
         if (!transitioning.get() && !autoHandoffHeld && queue.isNotEmpty()) {
-            if (playing && remain in 0L..3_500L && handoffLaunchedForUri != uri) {
+            val pastIntro = duration <= 0L || progress >= 12_000L ||
+                (duration > 0L && remain <= duration / 2)
+            if (playing && remain in 0L..3_500L && pastIntro && handoffLaunchedForUri != uri) {
+                sessionNearEndStreak++
                 nearEndArmed = true
-                if (handoffLaunchedForUri == null) {
+                if (sessionNearEndStreak >= 2 && handoffLaunchedForUri == null) {
                     handoffLaunchedForUri = uri
-                    scope.launch { runTransition("near_end") }
+                    sessionNearEndStreak = 0
+                    scope.launch { runTransition("near_end_direct") }
                 }
             } else if (!playing && remain <= 2_500L && wasPlaying && midPauseSinceMs == 0L) {
+                sessionNearEndStreak = 0
                 stuckEndPolls++
                 if (stuckEndPolls >= 2) {
                     stuckEndPolls = 0
@@ -7952,9 +8140,11 @@ class SpotifyLiveDjService : Service() {
                     scope.launch { runTransition("stuck_end") }
                 }
             } else if (playing) {
+                sessionNearEndStreak = 0
                 stuckEndPolls = 0
             }
         } else if (autoHandoffHeld) {
+            sessionNearEndStreak = 0
             stuckEndPolls = 0
         }
         if (uri.isNotBlank()) {

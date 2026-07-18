@@ -314,6 +314,15 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.146 — Live DJ: stop mid-song / early end skips
+
+- **Root cause**: handoff wait treated a single empty / `is_playing=false` API blip as “track ended,” then pause + direct-play next mid-cut. Silent handoffs also hard-cut at ~3.5s remain.
+- **End wait**: require sustained empty/pause near the true outro; mid-track pause aborts handoff (hold set, no skip).
+- **Near-end arming**: tighter banter thresholds (cap ~18s talkover), no arm in the first half of a long cut; silent path waits until ~0.8s remain before next.
+- **Talkover finish**: wait for natural end scales with remaining time (no fixed 12s force-next).
+- **External reclaim debounce**: foreign URI must stick ~2.2s before reclaiming (ad/metadata blips).
+- **Session fallback**: need two consecutive low-remain polls before near-end.
+
 ### 0.1.145 — Spotify live lockscreen controls, custom media notif, widgets
 
 - **Custom Spotify media card**: shade + lockscreen use RemoteViews (compact + expanded) with real **title / artist**, **album art** (large art for lockscreen background), and **prev · play/pause · next** always visible (white icons on dark discs; mint play/pause).
