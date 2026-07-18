@@ -314,6 +314,14 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.148 — System back navigation
+
+- **Inner app → Apps hub**: Android system back closes the open inner app instead of leaving the activity.
+- **Apps hub → Chat**: from the Apps tab (no open app), back switches to Chat.
+- **Chat double-back → minimize**: first back toasts “Press back again to minimize”; second within 2s calls `moveTaskToBack` so the app runs in the background (does not exit).
+- **Overlays first**: open settings, history/notes panels, rename, and notification-access dialogs close on back before tab navigation.
+- **Home / Update**: back returns to Chat for a consistent stack.
+
 ### 0.1.147 — Live DJ: next song advances again
 
 - **Root cause (0.1.146 regression)**: end-wait abort on Spotify `is_playing=false` called `holdAutoHandoff`, which froze *all* auto handoffs — songs ended into dead air and never started the next cut.

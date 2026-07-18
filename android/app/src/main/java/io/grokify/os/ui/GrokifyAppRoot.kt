@@ -130,6 +130,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -159,9 +160,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import android.widget.VideoView
+import androidx.activity.compose.BackHandler
 import coil.compose.AsyncImage
 import io.grokify.os.BuildConfig
 import io.grokify.os.ui.chat.MarkdownText
@@ -271,9 +275,53 @@ fun GrokifyAppRoot(
     var renameDraft by remember { mutableStateOf("") }
     var notifAccessDialogOpen by remember { mutableStateOf(false) }
     var notifAccessPrompted by remember { mutableStateOf(false) }
+    /** Chat double-back → minimize; timestamp of first back press. */
+    var chatBackPressMs by remember { mutableLongStateOf(0L) }
+    val context = LocalContext.current
     val density = LocalDensity.current
     val imeBottom = WindowInsets.ime.getBottom(density)
     val keyboardOpen = imeBottom > 0
+
+    // System back: inner app → Apps hub → Chat; Chat double-press → background.
+    BackHandler {
+        when {
+            state.showSettings -> onCloseSettings()
+            state.panel != ChatPanel.None -> onSetPanel(ChatPanel.None)
+            renameOpen -> renameOpen = false
+            notifAccessDialogOpen -> notifAccessDialogOpen = false
+            tab == 2 && appsScreen != null -> {
+                appsScreen = null
+                chatBackPressMs = 0L
+            }
+            tab == 2 -> {
+                // Apps hub → Chat
+                tab = 1
+                chatBackPressMs = 0L
+            }
+            tab != 1 -> {
+                // Home / Update → Chat
+                tab = 1
+                onCloseSettings()
+                onSetPanel(ChatPanel.None)
+                chatBackPressMs = 0L
+            }
+            else -> {
+                // Chat: first back arms minimize; second within 2s sends app to background.
+                val now = System.currentTimeMillis()
+                if (now - chatBackPressMs in 1 until 2_000L) {
+                    chatBackPressMs = 0L
+                    (context as? Activity)?.moveTaskToBack(true)
+                } else {
+                    chatBackPressMs = now
+                    Toast.makeText(
+                        context,
+                        "Press back again to minimize",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+    }
 
     // When the persisted token loads (or is saved), keep the draft field aligned
     // unless the user already typed something different.
