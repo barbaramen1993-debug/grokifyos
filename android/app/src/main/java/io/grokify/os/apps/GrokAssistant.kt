@@ -1,8 +1,12 @@
 package io.grokify.os.apps
 
-import android.content.Context
+import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,9 +31,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.ScreenshotMonitor
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -54,6 +62,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -66,9 +75,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.util.UUID
+import kotlin.math.max
+import kotlin.math.roundToInt
 
-private enum class AssistantTab { Chat, Setup }
+private enum class AssistantTab { Chat, History, Setup }
 
 @Composable
 fun GrokAssistantPane(onBack: () -> Unit) {
@@ -101,6 +113,11 @@ fun GrokAssistantPane(onBack: () -> Unit) {
     }
     var templates by remember { mutableStateOf(store.templates()) }
     var transcript by remember { mutableStateOf(store.transcript()) }
+    var sessions by remember { mutableStateOf(store.sessionMetas()) }
+    var activeSessionId by remember { mutableStateOf(store.activeSessionId) }
+    var sessionTitle by remember {
+        mutableStateOf(store.activeConversation().title)
+    }
     var hasXaiKey by remember {
         mutableStateOf(!HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank())
     }
@@ -109,6 +126,40 @@ fun GrokAssistantPane(onBack: () -> Unit) {
     var statusMsg by remember { mutableStateOf<String?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
+
+    fun reloadSessions() {
+        sessions = store.sessionMetas()
+        activeSessionId = store.activeSessionId
+        sessionTitle = store.activeConversation().title
+        transcript = store.transcript()
+    }
+
+    val pickMedia = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri: Uri? ->
+        if (uri == null || !store.enabled || busy || GrokAssistantSession.isBusy) return@rememberLauncherForActivityResult
+        busy = true
+        statusMsg = null
+        val query = draft.trim()
+        draft = ""
+        scope.launch {
+            try {
+                val jpeg = withContext(Dispatchers.IO) {
+                    loadImageUriAsJpeg(appCtx, uri)
+                }
+                if (jpeg == null || jpeg.isEmpty()) {
+                    statusMsg = "Could not read image"
+                    return@launch
+                }
+                withContext(Dispatchers.IO) {
+                    GrokAssistantSession.sendWithImage(appCtx, query, jpeg)
+                }
+            } finally {
+                busy = false
+                reloadSessions()
+            }
+        }
+    }
 
     // Re-check overlay permission when returning from system settings.
     LaunchedEffect(tab) {
@@ -140,12 +191,12 @@ fun GrokAssistantPane(onBack: () -> Unit) {
         ) == android.content.pm.PackageManager.PERMISSION_GRANTED
         isDefaultAssistant = GrokAssistantEntry.isAssistantRoleHeld(appCtx)
         templates = store.templates()
-        transcript = store.transcript()
+        reloadSessions()
         hasXaiKey = !HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank()
     }
 
     fun reloadTranscript() {
-        transcript = store.transcript()
+        reloadSessions()
     }
 
     fun sendMessage(text: String) {
@@ -211,16 +262,42 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                     fontSize = 16.sp,
                 )
                 Text(
-                    if (enabled) {
-                        "${mode.storageKey} · ${if (speakReplies) "speak on" else "silent"}"
-                    } else {
-                        "Off — enable in Setup"
+                    when {
+                        !enabled -> "Off — enable in Setup"
+                        tab == AssistantTab.Chat -> sessionTitle
+                        else -> "${mode.storageKey} · ${if (speakReplies) "speak on" else "silent"}"
                     },
                     color = GrokifyColors.TextDim,
                     fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
             if (tab == AssistantTab.Chat) {
+                IconButton(
+                    onClick = {
+                        store.newSession()
+                        reloadSessions()
+                        draft = ""
+                        statusMsg = "New chat"
+                    },
+                    enabled = !busy,
+                ) {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = "New chat",
+                        tint = GrokifyColors.GlowMint,
+                    )
+                }
+                IconButton(
+                    onClick = { tab = AssistantTab.History; reloadSessions() },
+                ) {
+                    Icon(
+                        Icons.Default.History,
+                        contentDescription = "History",
+                        tint = GrokifyColors.GlowCyan,
+                    )
+                }
                 IconButton(
                     onClick = { showClearConfirm = true },
                     enabled = transcript.isNotEmpty() && !busy,
@@ -241,11 +318,14 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            listOf(AssistantTab.Chat, AssistantTab.Setup).forEach { t ->
+            listOf(AssistantTab.Chat, AssistantTab.History, AssistantTab.Setup).forEach { t ->
                 val selected = tab == t
                 FilterChip(
                     selected = selected,
-                    onClick = { tab = t; if (t == AssistantTab.Setup) reloadAll() },
+                    onClick = {
+                        tab = t
+                        if (t == AssistantTab.Setup || t == AssistantTab.History) reloadAll()
+                    },
                     label = {
                         Text(
                             t.name,
@@ -282,14 +362,34 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                     store.speakReplies = it
                 },
                 onSend = { sendMessage(it) },
-                onLookAtScreen = {
-                    GrokAssistantScreenLookActivity.start(
-                        context,
-                        query = draft.trim(),
-                        hideOverlayFirst = false,
-                    )
+                onAttachMedia = {
+                    if (!store.enabled || busy) {
+                        statusMsg = if (!store.enabled) "Turn on Enabled first" else "Busy"
+                        return@AssistantChatTab
+                    }
+                    pickMedia.launch("image/*")
                 },
                 onGoSetup = { tab = AssistantTab.Setup },
+                onOpenHistory = { tab = AssistantTab.History; reloadSessions() },
+            )
+            AssistantTab.History -> AssistantHistoryTab(
+                sessions = sessions,
+                activeSessionId = activeSessionId,
+                onNew = {
+                    store.newSession()
+                    reloadSessions()
+                    tab = AssistantTab.Chat
+                },
+                onSelect = { id ->
+                    if (store.selectSession(id)) {
+                        reloadSessions()
+                        tab = AssistantTab.Chat
+                    }
+                },
+                onDelete = { id ->
+                    store.deleteSession(id)
+                    reloadSessions()
+                },
             )
             AssistantTab.Setup -> AssistantSetupTab(
                 enabled = enabled,
@@ -390,17 +490,17 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                             android.Manifest.permission.RECORD_AUDIO,
                         ) == android.content.pm.PackageManager.PERMISSION_GRANTED
                         if (!hasMic) {
-                            statusMsg = "Mic permission required for Hey Grok"
+                            statusMsg = "Mic permission required for ${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY}"
                         }
                         GrokAssistantWakeService.sync(appCtx)
                         statusMsg = if (hasMic) {
-                            "Hey Grok on — say “Hey Grok” then your request"
+                            "${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY} on — say “Okay Grok” then your request"
                         } else {
-                            "Hey Grok armed — grant microphone permission"
+                            "${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY} armed — grant microphone permission"
                         }
                     } else {
                         GrokAssistantWakeService.stop(appCtx)
-                        statusMsg = "Hey Grok off"
+                        statusMsg = "${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY} off"
                     }
                 },
                 isDefaultAssistant = isDefaultAssistant,
@@ -561,8 +661,9 @@ private fun AssistantChatTab(
     speakReplies: Boolean,
     onSpeakRepliesChange: (Boolean) -> Unit,
     onSend: (String) -> Unit,
-    onLookAtScreen: () -> Unit,
+    onAttachMedia: () -> Unit,
     onGoSetup: () -> Unit,
+    onOpenHistory: () -> Unit,
 ) {
     val listState = rememberLazyListState()
     LaunchedEffect(transcript.size, busy) {
@@ -606,7 +707,7 @@ private fun AssistantChatTab(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
-                        if (!enabled) "Assistant is off" else "Say hi to Grok Assistant",
+                        if (!enabled) "Assistant is off" else "New conversation",
                         color = GrokifyColors.TextPrimary,
                         fontWeight = FontWeight.Medium,
                         fontSize = 16.sp,
@@ -616,7 +717,8 @@ private fun AssistantChatTab(
                         if (!enabled) {
                             "Turn on the master switch in Setup, then send a message."
                         } else {
-                            "Chat uses Grok Build · Look uses SpaceXAI vision · TTS from vault or device."
+                            "Chat uses Grok Build · attach an image for vision · TTS from vault or device. " +
+                                "Say “${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY}” with wake on."
                         },
                         color = GrokifyColors.TextDim,
                         fontSize = 12.sp,
@@ -626,6 +728,11 @@ private fun AssistantChatTab(
                         TextButton(onClick = onGoSetup) {
                             Text("Open Setup", color = GrokifyColors.GlowViolet)
                         }
+                    } else {
+                        Spacer(Modifier.height(12.dp))
+                        TextButton(onClick = onOpenHistory) {
+                            Text("Open history", color = GrokifyColors.GlowCyan)
+                        }
                     }
                 }
             } else {
@@ -634,7 +741,7 @@ private fun AssistantChatTab(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(horizontal = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     items(transcript, key = { it.id }) { msg ->
                         AssistantBubble(msg)
@@ -696,13 +803,14 @@ private fun AssistantChatTab(
                 shape = RoundedCornerShape(12.dp),
             )
             Spacer(Modifier.width(4.dp))
+            // Full pane: media upload (vision). Screen look stays on the overlay only.
             IconButton(
-                onClick = onLookAtScreen,
+                onClick = onAttachMedia,
                 enabled = enabled && !busy,
             ) {
                 Icon(
-                    Icons.Default.ScreenshotMonitor,
-                    contentDescription = "Look at my screen",
+                    Icons.Default.AttachFile,
+                    contentDescription = "Attach image",
                     tint = if (enabled && !busy) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
                 )
             }
@@ -725,28 +833,169 @@ private fun AssistantChatTab(
 }
 
 @Composable
+private fun AssistantHistoryTab(
+    sessions: List<AssistantSessionMeta>,
+    activeSessionId: String,
+    onNew: () -> Unit,
+    onSelect: (String) -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Button(
+            onClick = onNew,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = GrokifyColors.GlowCyan,
+                contentColor = Color(0xFF041016),
+            ),
+            shape = RoundedCornerShape(10.dp),
+        ) {
+            Icon(Icons.Default.Add, null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("New chat", fontWeight = FontWeight.SemiBold)
+        }
+        Spacer(Modifier.height(10.dp))
+        if (sessions.isEmpty()) {
+            Text("No conversations yet.", color = GrokifyColors.TextMuted)
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(sessions, key = { it.id }) { s ->
+                    val active = s.id.equals(activeSessionId, ignoreCase = true)
+                    val countLabel = when {
+                        s.messageCount <= 0 -> "Empty"
+                        s.messageCount == 1 -> "1 msg"
+                        else -> "${s.messageCount} msgs"
+                    }
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(
+                                if (active) GrokifyColors.GlowCyan.copy(alpha = 0.1f)
+                                else GrokifyColors.PanelSoft,
+                            )
+                            .border(
+                                1.dp,
+                                if (active) GrokifyColors.GlowCyan.copy(alpha = 0.4f)
+                                else GrokifyColors.PanelBorder,
+                                RoundedCornerShape(12.dp),
+                            )
+                            .clickable(role = Role.Button) { onSelect(s.id) }
+                            .padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                s.title,
+                                color = GrokifyColors.TextPrimary,
+                                fontWeight = FontWeight.Medium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                "${formatSessionTime(s.updatedAt)} · $countLabel",
+                                color = if (s.messageCount <= 0) GrokifyColors.TextDim
+                                else GrokifyColors.GlowMint.copy(alpha = 0.85f),
+                                fontSize = 11.sp,
+                            )
+                        }
+                        IconButton(onClick = { onDelete(s.id) }) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "Delete",
+                                tint = GrokifyColors.GlowRose,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatSessionTime(ms: Long): String {
+    if (ms <= 0L) return "—"
+    val sdf = java.text.SimpleDateFormat("MMM d · HH:mm", java.util.Locale.getDefault())
+    return sdf.format(java.util.Date(ms))
+}
+
+/** Load a content Uri into a downscaled JPEG for vision. */
+private fun loadImageUriAsJpeg(
+    ctx: android.content.Context,
+    uri: Uri,
+    maxEdge: Int = 1600,
+    quality: Int = 82,
+): ByteArray? {
+    return try {
+        val resolver = ctx.contentResolver
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        val srcMax = max(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
+        while (srcMax / sample > maxEdge * 2) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bmp = resolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, opts)
+        } ?: return null
+        try {
+            GrokAssistantScreenLookActivity.compressJpeg(bmp, maxEdge = maxEdge, quality = quality)
+                ?: run {
+                    // Fallback if companion not accessible as expected
+                    var working = bmp
+                    val maxDim = max(bmp.width, bmp.height)
+                    if (maxDim > maxEdge) {
+                        val scale = maxEdge.toFloat() / maxDim
+                        val w = max(1, (bmp.width * scale).roundToInt())
+                        val h = max(1, (bmp.height * scale).roundToInt())
+                        working = android.graphics.Bitmap.createScaledBitmap(bmp, w, h, true)
+                    }
+                    val out = ByteArrayOutputStream()
+                    working.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
+                    if (working !== bmp) working.recycle()
+                    out.toByteArray()
+                }
+        } finally {
+            bmp.recycle()
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+@Composable
 private fun AssistantBubble(msg: AssistantChatMessage) {
     val isUser = msg.role == "user"
     val isError = msg.role == "error"
     val bg = when {
-        isUser -> GrokifyColors.GlowViolet.copy(alpha = 0.22f)
-        isError -> GrokifyColors.GlowAmber.copy(alpha = 0.18f)
-        else -> GrokifyColors.PanelSoft
+        isUser -> GrokifyColors.GlowViolet.copy(alpha = 0.2f)
+        isError -> GrokifyColors.GlowAmber.copy(alpha = 0.16f)
+        else -> GrokifyColors.Panel
     }
     val border = when {
-        isUser -> GrokifyColors.GlowViolet.copy(alpha = 0.4f)
-        isError -> GrokifyColors.GlowAmber.copy(alpha = 0.45f)
-        else -> GrokifyColors.PanelBorder
+        isUser -> GrokifyColors.GlowViolet.copy(alpha = 0.38f)
+        isError -> GrokifyColors.GlowAmber.copy(alpha = 0.42f)
+        else -> GrokifyColors.PanelBorder.copy(alpha = 0.9f)
     }
     val align = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
+    val shape = RoundedCornerShape(
+        topStart = 14.dp,
+        topEnd = 14.dp,
+        bottomStart = if (isUser) 14.dp else 4.dp,
+        bottomEnd = if (isUser) 4.dp else 14.dp,
+    )
     Box(Modifier.fillMaxWidth(), contentAlignment = align) {
         Column(
             Modifier
                 .widthIn(max = 340.dp)
-                .clip(RoundedCornerShape(12.dp))
+                .clip(shape)
                 .background(bg)
-                .border(1.dp, border, RoundedCornerShape(12.dp))
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .border(1.dp, border, shape)
+                .padding(horizontal = 12.dp, vertical = 9.dp),
         ) {
             Text(
                 when {
@@ -762,11 +1011,12 @@ private fun AssistantBubble(msg: AssistantChatMessage) {
                 fontSize = 10.sp,
                 fontWeight = FontWeight.SemiBold,
             )
-            Spacer(Modifier.height(2.dp))
+            Spacer(Modifier.height(3.dp))
             Text(
                 msg.text,
                 color = GrokifyColors.TextPrimary,
                 fontSize = 14.sp,
+                lineHeight = 19.sp,
             )
         }
     }
@@ -982,11 +1232,11 @@ private fun AssistantSetupTab(
         }
 
         Spacer(Modifier.height(20.dp))
-        SetupSectionLabel("HEY GROK", GrokifyColors.GlowViolet)
+        SetupSectionLabel("OKAY GROK", GrokifyColors.GlowViolet)
         Text(
-            "Always-listening wake phrases: Hey Grok · Ok Grok · Hi Grok. " +
-                "Uses on-device speech recognition (battery + mic). " +
-                "Works best with Assistant Enabled and Mic granted.",
+            "Primary: Okay Grok / Ok Grok (also Hey/Hi/Yo). " +
+                "Punctuation from speech-to-text is ignored (“Okay, Grok!”). " +
+                "Uses on-device speech recognition (battery + mic).",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
         )
@@ -996,7 +1246,7 @@ private fun AssistantSetupTab(
             subtitle = when {
                 !enabled -> "Enable assistant first"
                 !hasMic -> "Microphone permission needed"
-                wakeWordEnabled -> "Listening in background"
+                wakeWordEnabled -> "Listening for “Okay Grok”"
                 else -> "Off"
             },
         ) {
@@ -1009,7 +1259,7 @@ private fun AssistantSetupTab(
         }
         if (!hasMic) {
             Text(
-                "Grant microphone so Hey Grok can hear you.",
+                "Grant microphone so Okay Grok can hear you.",
                 color = GrokifyColors.GlowAmber,
                 fontSize = 11.sp,
             )

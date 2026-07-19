@@ -1,8 +1,11 @@
 package io.grokify.os.apps
 
 /**
- * Pure wake-phrase detection for "Hey Grok" style hotwords.
+ * Pure wake-phrase detection for "Okay Grok" style hotwords.
  * Used by [GrokAssistantWakeService] and unit tests.
+ *
+ * Speech-to-text often inserts punctuation ("Okay, Grok!", "OK. Grok?") —
+ * [normalize] maps punctuation to spaces so phrase matching still hits.
  */
 object GrokAssistantWake {
     data class Match(
@@ -14,19 +17,25 @@ object GrokAssistantWake {
         val raw: String,
     )
 
-    /** Default phrases users are likely to say. Order = preference when overlapping. */
+    /**
+     * Default phrases. Order = preference when overlapping.
+     * Primary: okay / ok; hey kept as a secondary alias.
+     */
     val DEFAULT_PHRASES: List<String> = listOf(
-        "hey grok",
         "okay grok",
         "ok grok",
+        "hey grok",
         "hi grok",
         "yo grok",
         "hello grok",
     )
 
+    /** Primary phrase shown in UI / notifications. */
+    const val PRIMARY_PHRASE_DISPLAY = "Okay Grok"
+
     /**
      * Normalize for matching: lowercase, collapse whitespace, strip most punctuation
-     * but keep apostrophes inside words.
+     * (including commas/periods STT inserts between words), keep apostrophes inside words.
      */
     fun normalize(text: String): String {
         val lower = text.lowercase().trim()
@@ -35,7 +44,8 @@ object GrokAssistantWake {
                 when {
                     ch.isLetterOrDigit() || ch == '\'' -> append(ch)
                     ch.isWhitespace() -> append(' ')
-                    else -> append(' ') // punctuation → space
+                    // punctuation / symbols → space so "Okay, Grok!" → "okay  grok "
+                    else -> append(' ')
                 }
             }
         }
@@ -45,6 +55,9 @@ object GrokAssistantWake {
     /**
      * If [text] contains a wake phrase, return match with remainder after the first hit.
      * Prefers earlier start index; longer phrases win ties.
+     *
+     * Also tolerates optional filler words between the two tokens for the primary
+     * patterns (e.g. rare STT glitches) via [indexOfPhrase].
      */
     fun match(text: String, phrases: List<String> = DEFAULT_PHRASES): Match? {
         val norm = normalize(text)
@@ -64,12 +77,13 @@ object GrokAssistantWake {
             }
         }
         if (bestPhrase == null) return null
-        val rem = norm.substring(bestEnd).trim().trimStart(',', '.', '!', '?', ':', ';', '-')
+        val rem = norm.substring(bestEnd).trim()
+            .trimStart(',', '.', '!', '?', ':', ';', '-', '—', '–')
             .trim()
         return Match(phrase = bestPhrase, remainder = rem, raw = text)
     }
 
-    /** True if text is (only) a wake phrase or wake + filler like "hey grok please". */
+    /** True if text is (only) a wake phrase or wake + tiny filler. */
     fun isWakeOnly(match: Match, minCommandChars: Int = 2): Boolean =
         match.remainder.length < minCommandChars
 

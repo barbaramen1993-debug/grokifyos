@@ -5,7 +5,7 @@ import android.content.Context
 import android.content.Intent
 
 /**
- * Re-arms Hey Grok wake listening (and overlay if prefs say so) after reboot / update.
+ * Re-arms Okay Grok wake listening (and overlay if prefs say so) after reboot / update.
  */
 class GrokAssistantBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {

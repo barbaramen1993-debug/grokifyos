@@ -287,8 +287,63 @@ data class AssistantChatMessage(
     }
 }
 
+/** One assistant conversation (history list entry + messages). */
+data class AssistantConversation(
+    val id: String,
+    val title: String,
+    val updatedAt: Long,
+    val messages: List<AssistantChatMessage>,
+) {
+    val messageCount: Int get() = messages.size
+
+    fun toJson(): JSONObject =
+        JSONObject()
+            .put("id", id)
+            .put("title", title)
+            .put("updatedAt", updatedAt)
+            .put(
+                "messages",
+                JSONArray().also { arr -> messages.forEach { arr.put(it.toJson()) } },
+            )
+
+    fun meta(): AssistantSessionMeta =
+        AssistantSessionMeta(id = id, title = title, updatedAt = updatedAt, messageCount = messageCount)
+
+    companion object {
+        fun fromJson(o: JSONObject?): AssistantConversation? {
+            if (o == null) return null
+            val id = o.optString("id", "").ifBlank { return null }
+            val title = o.optString("title", "New chat").ifBlank { "New chat" }
+            val updatedAt = o.optLong("updatedAt", 0L)
+            val msgsArr = o.optJSONArray("messages")
+            val messages = mutableListOf<AssistantChatMessage>()
+            if (msgsArr != null) {
+                for (i in 0 until msgsArr.length()) {
+                    AssistantChatMessage.fromJson(msgsArr.optJSONObject(i))?.let { messages.add(it) }
+                }
+            }
+            return AssistantConversation(id, title, updatedAt, messages)
+        }
+
+        fun titleFromFirstUser(messages: List<AssistantChatMessage>, fallback: String = "New chat"): String {
+            val first = messages.firstOrNull { it.role == "user" }?.text?.trim().orEmpty()
+            if (first.isBlank()) return fallback
+            val clean = first.removePrefix("🖼").trim()
+            return if (clean.length <= 48) clean else clean.take(45).trimEnd() + "…"
+        }
+    }
+}
+
+data class AssistantSessionMeta(
+    val id: String,
+    val title: String,
+    val updatedAt: Long,
+    val messageCount: Int,
+)
+
 object AssistantTranscript {
     const val MAX_STORED = 100
+    const val MAX_SESSIONS = 40
     const val MAX_HISTORY_MESSAGES = 24 // 12 turns
     const val MAX_HISTORY_CHARS = 6000
 
@@ -308,8 +363,29 @@ object AssistantTranscript {
         return out
     }
 
+    fun encodeSessions(list: List<AssistantConversation>): String {
+        val arr = JSONArray()
+        list.forEach { arr.put(it.toJson()) }
+        return arr.toString()
+    }
+
+    fun decodeSessions(raw: String?): List<AssistantConversation> {
+        if (raw.isNullOrBlank()) return emptyList()
+        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return emptyList()
+        val out = mutableListOf<AssistantConversation>()
+        for (i in 0 until arr.length()) {
+            AssistantConversation.fromJson(arr.optJSONObject(i))?.let { out.add(it) }
+        }
+        return out
+    }
+
     fun capStored(list: List<AssistantChatMessage>): List<AssistantChatMessage> =
         if (list.size <= MAX_STORED) list else list.takeLast(MAX_STORED)
+
+    fun capSessions(list: List<AssistantConversation>): List<AssistantConversation> {
+        if (list.size <= MAX_SESSIONS) return list
+        return list.sortedByDescending { it.updatedAt }.take(MAX_SESSIONS)
+    }
 
     /** Last N user/assistant messages for model context (not error/system). */
     fun historyWindow(list: List<AssistantChatMessage>): List<AssistantChatMessage> {

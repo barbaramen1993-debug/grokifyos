@@ -27,7 +27,7 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 
 /**
- * Background “Hey Grok” listener.
+ * Background “Okay Grok” listener.
  *
  * Uses [SpeechRecognizer] in a restart loop (not a dedicated DSP hotword engine).
  * When a wake phrase is heard, expands the floating overlay and either:
@@ -84,7 +84,7 @@ class GrokAssistantWakeService : Service() {
             return START_STICKY
         }
         running = true
-        startAsForeground(status = "Listening for “Hey Grok”")
+        startAsForeground(status = "Listening for “${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY}”")
         scheduleRestart(delayMs = 200L)
         return START_STICKY
     }
@@ -129,7 +129,7 @@ class GrokAssistantWakeService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val n: Notification = NotificationCompat.Builder(this, GrokifyApp.CHANNEL_ASSISTANT)
-            .setContentTitle("Hey Grok listening")
+            .setContentTitle("${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY} listening")
             .setContentText(status)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(openApp)
@@ -217,7 +217,11 @@ class GrokAssistantWakeService : Service() {
         runCatching {
             sr.startListening(intent)
             listening = true
-            val label = if (awaitingCommand) "Say your request…" else "Listening for “Hey Grok”"
+            val label = if (awaitingCommand) {
+                "Say your request…"
+            } else {
+                "Listening for “${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY}”"
+            }
             startAsForeground(status = label)
         }.onFailure {
             Log.w(TAG, "startListening: ${it.message}")
@@ -317,7 +321,7 @@ class GrokAssistantWakeService : Service() {
             val cmd = candidates.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
             awaitingCommand = false
             if (cmd.isNotBlank()) {
-                // Avoid re-triggering on "hey grok" alone as the command.
+                // Avoid re-triggering on wake phrase alone as the command.
                 val m = GrokAssistantWake.match(cmd)
                 val text = when {
                     m == null -> cmd
@@ -330,12 +334,14 @@ class GrokAssistantWakeService : Service() {
                     return
                 }
             }
-            startAsForeground(status = "Didn't catch a request — say Hey Grok again")
+            startAsForeground(
+                status = "Didn't catch a request — say ${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY} again",
+            )
             scheduleRestart(delayMs = 800L)
             return
         }
 
-        // Normal wake scan — try each recognition alternative.
+        // Normal wake scan — try each recognition alternative (STT n-best).
         var hit: GrokAssistantWake.Match? = null
         for (c in candidates) {
             hit = GrokAssistantWake.match(c)
@@ -347,43 +353,74 @@ class GrokAssistantWakeService : Service() {
         }
 
         Log.i(TAG, "wake: phrase='${hit.phrase}' rem='${hit.remainder}' raw='${hit.raw}'")
-        // Wake haptic-ish: quiet mic briefly so we don't re-hear ourselves after TTS.
-        activateUi()
 
         if (hit.remainder.isNotBlank() && !GrokAssistantWake.isWakeOnly(hit)) {
+            // Phrase + command in one utterance — show overlay and send.
+            activateUi(listen = false)
             onCommand(hit.remainder)
             scheduleRestart(delayMs = 1_500L)
         } else {
-            awaitingCommand = true
-            activateUi()
-            startAsForeground(status = "Yes? Listening for your request…")
-            // Keep mic on this service for the follow-up utterance (don't fight overlay).
-            scheduleRestart(delayMs = 350L)
+            // Wake alone — expand overlay and let it own the mic for the request.
+            awaitingCommand = false
+            activateUi(listen = true)
+            startAsForeground(status = "Yes? Overlay listening…")
+            // Stay paused long enough for overlay hold/auto listen to grab the mic.
+            GrokAssistantMic.quietFor(400L)
+            scheduleRestart(delayMs = 2_500L)
         }
     }
 
-    private fun activateUi() {
-        val store = GrokAssistantStore(this)
-        if (store.overlayEnabled && GrokAssistantOverlayService.canDrawOverlays(this)) {
-            GrokAssistantOverlayService.start(this, expand = true)
+    /**
+     * Always show the floating overlay when permitted; otherwise open the full app.
+     * Does not require the Setup “Overlay enabled” toggle — wake should be visible.
+     */
+    private fun activateUi(listen: Boolean = false) {
+        if (GrokAssistantOverlayService.canDrawOverlays(this)) {
+            // Remember preference so boot/sync keeps overlay available after wake use.
+            val store = GrokAssistantStore(this)
+            if (!store.overlayEnabled) {
+                store.overlayEnabled = true
+            }
+            if (listen) {
+                GrokAssistantOverlayService.startListeningForCommand(this)
+            } else {
+                GrokAssistantOverlayService.start(this, expand = true)
+            }
             GrokAssistantOverlayService.bumpTranscript(this)
         } else {
-            runCatching {
-                startActivity(
-                    io.grokify.os.widgets.WidgetNav.openPluginIntent(
-                        this,
-                        io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
-                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                )
-            }
+            openFullAssistant()
         }
+    }
+
+    private fun openFullAssistant() {
+        val intent = io.grokify.os.widgets.WidgetNav.openPluginIntent(
+            this,
+            io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
+        )
+        // PendingIntent is more reliable from a background FGS than startActivity alone.
+        val pi = PendingIntent.getActivity(
+            this,
+            77,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        runCatching { pi.send() }
+            .onFailure {
+                runCatching {
+                    startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            }
+        // Ensure Compose nav picks up the plugin even if activity was already resumed.
+        io.grokify.os.widgets.WidgetNav.openPlugin(
+            io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
+        )
     }
 
     private fun onCommand(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
         startAsForeground(status = "Heard: ${trimmed.take(48)}")
-        activateUi()
+        activateUi(listen = false)
         // Quiet while we process + speak so TTS doesn't re-trigger wake.
         GrokAssistantMic.quietFor(1_500L)
         scope.launch(Dispatchers.IO) {
@@ -394,7 +431,7 @@ class GrokAssistantWakeService : Service() {
                 GrokAssistantOverlayService.bumpTranscript(applicationContext)
                 startAsForeground(
                     status = if (result.ok) {
-                        "Listening for “Hey Grok”"
+                        "Listening for “${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY}”"
                     } else {
                         (result.errorText ?: "Error").take(60)
                     },

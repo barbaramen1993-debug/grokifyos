@@ -558,26 +558,36 @@ class GrokAssistantOverlayService : Service() {
             return
         }
 
-        val shape = RoundedCornerShape(16.dp)
+        // Slim dock: narrow panel, short transcript, tight chrome.
+        val shape = RoundedCornerShape(14.dp)
         Column(
             Modifier
-                .widthIn(max = 320.dp)
-                .width(300.dp)
+                .width(248.dp)
                 .clip(shape)
-                .background(GrokifyColors.VoidElevated.copy(alpha = 0.96f))
-                .border(1.dp, GrokifyColors.GlowViolet.copy(alpha = 0.45f), shape)
-                .padding(10.dp),
+                .background(GrokifyColors.VoidElevated.copy(alpha = 0.97f))
+                .border(1.dp, GrokifyColors.GlowViolet.copy(alpha = 0.4f), shape)
+                .padding(horizontal = 8.dp, vertical = 6.dp),
         ) {
             Row(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "Grok Assistant",
+                    "Grok",
                     color = GrokifyColors.TextPrimary,
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
                     modifier = Modifier.weight(1f),
+                )
+                Text(
+                    if (enabled) {
+                        if (speakReplies) "speak" else "silent"
+                    } else {
+                        "off"
+                    },
+                    color = GrokifyColors.TextDim,
+                    fontSize = 9.sp,
+                    modifier = Modifier.padding(end = 2.dp),
                 )
                 IconButton(
                     onClick = {
@@ -585,71 +595,54 @@ class GrokAssistantOverlayService : Service() {
                         applyFocusFlags(focusable = false)
                         destroySpeech()
                     },
-                    modifier = Modifier.size(32.dp),
+                    modifier = Modifier.size(28.dp),
                 ) {
                     Icon(
                         Icons.Default.Remove,
                         contentDescription = "Collapse",
                         tint = GrokifyColors.TextMuted,
-                        modifier = Modifier.size(18.dp),
+                        modifier = Modifier.size(16.dp),
                     )
                 }
                 IconButton(
-                    onClick = {
-                        startActivity(
-                            io.grokify.os.widgets.WidgetNav.openPluginIntent(
-                                this@GrokAssistantOverlayService,
-                                io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
-                            ),
-                        )
-                    },
-                    modifier = Modifier.size(32.dp),
+                    onClick = { openFullAssistantApp() },
+                    modifier = Modifier.size(28.dp),
                 ) {
                     Icon(
                         Icons.Default.OpenInFull,
-                        contentDescription = "Open app",
+                        contentDescription = "Open full app",
                         tint = GrokifyColors.GlowCyan,
-                        modifier = Modifier.size(18.dp),
+                        modifier = Modifier.size(16.dp),
                     )
                 }
                 IconButton(
                     onClick = { stopSelfSafely() },
-                    modifier = Modifier.size(32.dp),
+                    modifier = Modifier.size(28.dp),
                 ) {
                     Icon(
                         Icons.Default.Close,
                         contentDescription = "Close overlay",
                         tint = GrokifyColors.GlowAmber,
-                        modifier = Modifier.size(18.dp),
+                        modifier = Modifier.size(16.dp),
                     )
                 }
             }
-            Text(
-                buildString {
-                    append(if (enabled) store.mode.storageKey else "off")
-                    append(" · ")
-                    append(if (speakReplies) "speak" else "silent")
-                },
-                color = GrokifyColors.TextDim,
-                fontSize = 10.sp,
-            )
-            Spacer(Modifier.height(6.dp))
 
-            val recent = transcript.takeLast(8)
+            val recent = transcript.takeLast(4)
             LazyColumn(
                 state = listState,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 80.dp, max = 200.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                    .heightIn(min = 36.dp, max = 110.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
                 if (recent.isEmpty()) {
                     item {
                         Text(
-                            if (!enabled) "Enable assistant in the app Setup tab."
-                            else "Say something or type below.",
+                            if (!enabled) "Enable in Setup."
+                            else "Ask anything…",
                             color = GrokifyColors.TextDim,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
                         )
                     }
                 }
@@ -659,37 +652,38 @@ class GrokAssistantOverlayService : Service() {
             }
 
             if (!status.isNullOrBlank() || !partial.isNullOrBlank()) {
-                Spacer(Modifier.height(4.dp))
                 Text(
                     partial?.let { "…$it" } ?: status.orEmpty(),
                     color = if (listening) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
-                    fontSize = 11.sp,
-                    maxLines = 2,
+                    fontSize = 10.sp,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp),
                 )
             }
 
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(4.dp))
             Row(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 OutlinedTextField(
                     value = draft,
                     onValueChange = { draftState.value = it.take(2000) },
                     modifier = Modifier
                         .weight(1f)
-                        .heightIn(min = 40.dp, max = 88.dp),
+                        .heightIn(min = 36.dp, max = 64.dp),
                     placeholder = {
                         Text(
-                            if (!enabled) "Assistant off" else "Message…",
-                            fontSize = 12.sp,
+                            if (!enabled) "Off" else "Message…",
+                            fontSize = 11.sp,
                             color = GrokifyColors.TextDim,
                         )
                     },
                     enabled = enabled && !busy,
-                    maxLines = 3,
+                    maxLines = 2,
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = GrokifyColors.TextPrimary,
                         unfocusedTextColor = GrokifyColors.TextPrimary,
@@ -701,7 +695,7 @@ class GrokAssistantOverlayService : Service() {
                         disabledTextColor = GrokifyColors.TextDim,
                     ),
                 )
-                // Look at screen (capture + crop)
+                // Look at screen (capture + crop) — overlay only
                 IconButton(
                     onClick = {
                         if (!enabled || busy) return@IconButton
@@ -713,19 +707,19 @@ class GrokAssistantOverlayService : Service() {
                         )
                     },
                     enabled = enabled && !busy,
-                    modifier = Modifier.size(40.dp),
+                    modifier = Modifier.size(34.dp),
                 ) {
                     Icon(
                         Icons.Default.ScreenshotMonitor,
                         contentDescription = "Look at my screen",
                         tint = if (enabled && !busy) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
-                        modifier = Modifier.size(22.dp),
+                        modifier = Modifier.size(18.dp),
                     )
                 }
                 // Hold to talk
                 Box(
                     Modifier
-                        .size(40.dp)
+                        .size(34.dp)
                         .clip(CircleShape)
                         .background(
                             if (listening) GrokifyColors.GlowMint.copy(alpha = 0.35f)
@@ -755,7 +749,7 @@ class GrokAssistantOverlayService : Service() {
                         Icons.Default.Mic,
                         contentDescription = "Hold to talk",
                         tint = if (listening) GrokifyColors.GlowMint else GrokifyColors.TextPrimary,
-                        modifier = Modifier.size(20.dp),
+                        modifier = Modifier.size(18.dp),
                     )
                 }
                 IconButton(
@@ -774,11 +768,11 @@ class GrokAssistantOverlayService : Service() {
                         }
                     },
                     enabled = enabled && !busy && draft.isNotBlank(),
-                    modifier = Modifier.size(40.dp),
+                    modifier = Modifier.size(34.dp),
                 ) {
                     if (busy) {
                         CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
+                            modifier = Modifier.size(16.dp),
                             strokeWidth = 2.dp,
                             color = GrokifyColors.GlowViolet,
                         )
@@ -788,17 +782,38 @@ class GrokAssistantOverlayService : Service() {
                             contentDescription = "Send",
                             tint = if (enabled && draft.isNotBlank()) GrokifyColors.GlowViolet
                             else GrokifyColors.TextDim,
+                            modifier = Modifier.size(18.dp),
                         )
                     }
                 }
             }
-            Text(
-                "Hold mic · Look (screen crop) · Setup voice",
-                color = GrokifyColors.TextDim,
-                fontSize = 9.sp,
-                modifier = Modifier.padding(top = 4.dp),
-            )
         }
+    }
+
+    /** Open the full Grok Assistant pane (reliable from overlay service). */
+    private fun openFullAssistantApp() {
+        val intent = io.grokify.os.widgets.WidgetNav.openPluginIntent(
+            this,
+            io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
+        )
+        io.grokify.os.widgets.WidgetNav.openPlugin(
+            io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
+        )
+        val pi = PendingIntent.getActivity(
+            this,
+            98,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        runCatching { pi.send() }
+            .onFailure {
+                runCatching {
+                    startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }.onFailure { e ->
+                    Log.w(TAG, "open full assistant failed: ${e.message}")
+                    statusState.value = "Could not open app"
+                }
+            }
     }
 
     @Composable
@@ -809,7 +824,7 @@ class GrokAssistantOverlayService : Service() {
     ) {
         Box(
             Modifier
-                .size(56.dp)
+                .size(48.dp)
                 .clip(CircleShape)
                 .background(
                     when {
@@ -818,13 +833,13 @@ class GrokAssistantOverlayService : Service() {
                         else -> GrokifyColors.GlowViolet.copy(alpha = 0.92f)
                     },
                 )
-                .border(2.dp, Color.White.copy(alpha = 0.35f), CircleShape)
+                .border(1.5.dp, Color.White.copy(alpha = 0.35f), CircleShape)
                 .clickable(onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
             if (busy) {
                 CircularProgressIndicator(
-                    modifier = Modifier.size(22.dp),
+                    modifier = Modifier.size(18.dp),
                     strokeWidth = 2.dp,
                     color = Color.White,
                 )
@@ -833,7 +848,7 @@ class GrokAssistantOverlayService : Service() {
                     "G",
                     color = Color.White,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 22.sp,
+                    fontSize = 18.sp,
                 )
             }
         }
@@ -853,14 +868,14 @@ class GrokAssistantOverlayService : Service() {
             Text(
                 msg.text,
                 color = if (isErr) GrokifyColors.GlowAmber else GrokifyColors.TextPrimary,
-                fontSize = 11.sp,
-                maxLines = 6,
+                fontSize = 10.sp,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
-                    .widthIn(max = 260.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .widthIn(max = 220.dp)
+                    .clip(RoundedCornerShape(8.dp))
                     .background(bg)
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                    .padding(horizontal = 6.dp, vertical = 3.dp),
             )
         }
     }
