@@ -393,6 +393,124 @@ object HostAiClient {
     }
 
     /**
+     * Vision complete via SpaceXAI / xAI chat completions (not Grok Build).
+     * Used by Grok Assistant “Look at my screen” — the phone screenshot never
+     * reaches the host bridge.
+     *
+     * optionsJson (optional):
+     * - system: system instruction
+     * - model: default "grok-2-vision-1212"
+     * - max_tokens: default 1024
+     *
+     * [imageJpeg] is raw JPEG bytes (will be base64 data-URL'd).
+     */
+    fun completeWithImage(
+        ctx: Context,
+        prompt: String,
+        imageJpeg: ByteArray,
+        optionsJson: String? = null,
+    ): String {
+        val appCtx = ctx.applicationContext
+        val xaiKey = HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI)
+        if (xaiKey.isNullOrBlank()) {
+            return JSONObject()
+                .put("ok", false)
+                .put("error", "missing_spacexai_key")
+                .put(
+                    "hint",
+                    "Add a SpaceXAI API key in Settings (vault spacexai_api_key) for Look at my screen.",
+                )
+                .toString()
+        }
+        if (imageJpeg.isEmpty()) {
+            return JSONObject().put("ok", false).put("error", "empty_image").toString()
+        }
+        val opts = runCatching {
+            if (optionsJson.isNullOrBlank()) JSONObject() else JSONObject(optionsJson)
+        }.getOrElse { JSONObject() }
+        val system = opts.optString("system", "").trim()
+        val model = opts.optString("model", "grok-2-vision-1212").ifBlank { "grok-2-vision-1212" }
+        val maxTokens = opts.optInt("max_tokens", 1024).coerceIn(128, 4096)
+        val userText = prompt.trim().ifBlank {
+            "Describe what you see on my screen and call out anything important."
+        }
+        return try {
+            val b64 = android.util.Base64.encodeToString(imageJpeg, android.util.Base64.NO_WRAP)
+            val dataUrl = "data:image/jpeg;base64,$b64"
+            val contentArr = org.json.JSONArray()
+                .put(
+                    JSONObject()
+                        .put("type", "image_url")
+                        .put("image_url", JSONObject().put("url", dataUrl).put("detail", "high")),
+                )
+                .put(JSONObject().put("type", "text").put("text", userText))
+            val messages = org.json.JSONArray()
+            if (system.isNotBlank()) {
+                messages.put(
+                    JSONObject().put("role", "system").put("content", system),
+                )
+            }
+            messages.put(JSONObject().put("role", "user").put("content", contentArr))
+            val body = JSONObject()
+                .put("model", model)
+                .put("messages", messages)
+                .put("max_tokens", maxTokens)
+                .put("temperature", 0.4)
+            val req = Request.Builder()
+                .url("https://api.x.ai/v1/chat/completions")
+                .header("Authorization", "Bearer $xaiKey")
+                .header("Content-Type", "application/json")
+                .post(body.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+            // Longer timeout for large images
+            val visionHttp = http.newBuilder()
+                .readTimeout(120, TimeUnit.SECONDS)
+                .writeTimeout(120, TimeUnit.SECONDS)
+                .build()
+            visionHttp.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    return@use JSONObject()
+                        .put("ok", false)
+                        .put("error", "xai_vision_http_${resp.code}")
+                        .put("body", raw.take(500))
+                        .put(
+                            "hint",
+                            "Vision request failed. Check SpaceXAI key and model access.",
+                        )
+                        .toString()
+                }
+                val json = runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
+                val text = json.optJSONArray("choices")
+                    ?.optJSONObject(0)
+                    ?.optJSONObject("message")
+                    ?.optString("content", "")
+                    ?.trim()
+                    .orEmpty()
+                if (text.isBlank()) {
+                    return@use JSONObject()
+                        .put("ok", false)
+                        .put("error", "empty_vision_reply")
+                        .put("body", raw.take(400))
+                        .toString()
+                }
+                JSONObject()
+                    .put("ok", true)
+                    .put("text", text)
+                    .put("model", model)
+                    .put("provider", "spacexai-vision")
+                    .toString()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "completeWithImage failed", e)
+            JSONObject()
+                .put("ok", false)
+                .put("error", e.message ?: "vision_failed")
+                .toString()
+        }
+    }
+
+    /**
      * Speak [text] for DJ banter, or pre-bake TTS for seamless handoffs.
      *
      * optionsJson (optional):

@@ -15,7 +15,6 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -44,6 +43,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material.icons.filled.ScreenshotMonitor
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -89,7 +89,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
-import kotlin.math.abs
 
 /**
  * Floating mini Grok Assistant over other apps.
@@ -118,6 +117,7 @@ class GrokAssistantOverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
     }
 
@@ -155,6 +155,7 @@ class GrokAssistantOverlayService : Service() {
     }
 
     override fun onDestroy() {
+        if (instance === this) instance = null
         detachOverlay()
         destroySpeech()
         super.onDestroy()
@@ -226,6 +227,7 @@ class GrokAssistantOverlayService : Service() {
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
             if (expand) 0 else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        val bottomPad = (24 * density).toInt()
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -233,9 +235,10 @@ class GrokAssistantOverlayService : Service() {
             flags,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = (8 * density).toInt()
-            y = (96 * density).toInt()
+            // Fixed bottom-center dock (bubble + expanded panel).
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            x = 0
+            y = bottomPad
             softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 layoutInDisplayCutoutMode =
@@ -253,40 +256,6 @@ class GrokAssistantOverlayService : Service() {
                 }
             }
         }
-        // Drag bubble by tracking raw touch on the root when collapsed is handled in Compose;
-        // also allow dragging via layout params updates from the bubble.
-        var lastX = 0f
-        var lastY = 0f
-        var dragging = false
-        view.setOnTouchListener { v, event ->
-            if (expandedState.value) return@setOnTouchListener false
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    lastX = event.rawX
-                    lastY = event.rawY
-                    dragging = false
-                    false
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - lastX
-                    val dy = event.rawY - lastY
-                    if (!dragging && (abs(dx) > 12 || abs(dy) > 12)) dragging = true
-                    if (dragging) {
-                        val params = layoutParams ?: return@setOnTouchListener true
-                        // END gravity: increasing x moves leftward on many devices when gravity=END
-                        params.x = (params.x - dx.toInt()).coerceAtLeast(0)
-                        params.y = (params.y + dy.toInt()).coerceAtLeast(0)
-                        lastX = event.rawX
-                        lastY = event.rawY
-                        runCatching { wm.updateViewLayout(v, params) }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                else -> false
-            }
-        }
         composeView = view
         try {
             wm.addView(view, lp)
@@ -301,11 +270,52 @@ class GrokAssistantOverlayService : Service() {
         val wm = windowManager ?: return
         val view = composeView ?: return
         val lp = layoutParams ?: return
+        // Keep docked bottom-center whenever focus changes (expand/collapse).
+        val density = resources.displayMetrics.density
+        lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        lp.x = 0
+        lp.y = (24 * density).toInt()
         lp.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
             if (focusable) 0 else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         runCatching { wm.updateViewLayout(view, lp) }
+    }
+
+    /** Hide the floating window so MediaProjection does not capture our chrome. */
+    fun hideForScreenCapture() {
+        val wm = windowManager ?: return
+        val view = composeView ?: return
+        runCatching { wm.removeView(view) }
+    }
+
+    /** Restore floating window after screen capture / crop. */
+    fun showAfterScreenCapture(expand: Boolean = true) {
+        val wm = windowManager ?: return
+        val view = composeView
+        val lp = layoutParams
+        if (view == null || lp == null) {
+            attachOverlay(expand = expand)
+            return
+        }
+        if (view.parent == null) {
+            val density = resources.displayMetrics.density
+            lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            lp.x = 0
+            lp.y = (24 * density).toInt()
+            expandedState.value = expand
+            applyFocusFlags(focusable = expand)
+            runCatching { wm.addView(view, lp) }
+                .onFailure { e ->
+                    Log.e(TAG, "re-add overlay failed", e)
+                    composeView = null
+                    attachOverlay(expand = expand)
+                }
+        } else {
+            expandedState.value = expand
+            applyFocusFlags(focusable = expand)
+        }
+        transcriptTick.value = transcriptTick.value + 1
     }
 
     private fun detachOverlay() {
@@ -636,6 +646,27 @@ class GrokAssistantOverlayService : Service() {
                         disabledTextColor = GrokifyColors.TextDim,
                     ),
                 )
+                // Look at screen (capture + crop)
+                IconButton(
+                    onClick = {
+                        if (!enabled || busy) return@IconButton
+                        val q = draftState.value.trim()
+                        GrokAssistantScreenLookActivity.start(
+                            this@GrokAssistantOverlayService,
+                            query = q,
+                            hideOverlayFirst = true,
+                        )
+                    },
+                    enabled = enabled && !busy,
+                    modifier = Modifier.size(40.dp),
+                ) {
+                    Icon(
+                        Icons.Default.ScreenshotMonitor,
+                        contentDescription = "Look at my screen",
+                        tint = if (enabled && !busy) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
                 // Hold to talk
                 Box(
                     Modifier
@@ -707,7 +738,7 @@ class GrokAssistantOverlayService : Service() {
                 }
             }
             Text(
-                "Hold mic to talk · replies use Setup voice",
+                "Hold mic · Look (screen crop) · Setup voice",
                 color = GrokifyColors.TextDim,
                 fontSize = 9.sp,
                 modifier = Modifier.padding(top = 4.dp),
@@ -834,6 +865,9 @@ class GrokAssistantOverlayService : Service() {
             runCatching { ctx.startActivity(intent) }
         }
 
+        @Volatile
+        var instance: GrokAssistantOverlayService? = null
+
         fun start(ctx: Context, expand: Boolean = true) {
             val app = ctx.applicationContext
             if (!Settings.canDrawOverlays(app)) {
@@ -853,6 +887,22 @@ class GrokAssistantOverlayService : Service() {
             runCatching { app.startService(i) }
             // Also try stopService if not running as started with action
             runCatching { app.stopService(Intent(app, GrokAssistantOverlayService::class.java)) }
+        }
+
+        fun hideForCapture(ctx: Context) {
+            instance?.hideForScreenCapture()
+        }
+
+        fun showAfterCapture(ctx: Context, expand: Boolean = true) {
+            val svc = instance
+            if (svc != null) {
+                svc.showAfterScreenCapture(expand = expand)
+            } else {
+                val store = GrokAssistantStore(ctx)
+                if (store.enabled && store.overlayEnabled && Settings.canDrawOverlays(ctx)) {
+                    start(ctx, expand = expand)
+                }
+            }
         }
 
         fun isLikelyRunning(ctx: Context): Boolean {

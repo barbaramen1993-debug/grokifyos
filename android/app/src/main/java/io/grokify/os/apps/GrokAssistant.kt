@@ -28,6 +28,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ScreenshotMonitor
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -263,6 +264,13 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                     store.speakReplies = it
                 },
                 onSend = { sendMessage(it) },
+                onLookAtScreen = {
+                    GrokAssistantScreenLookActivity.start(
+                        context,
+                        query = draft.trim(),
+                        hideOverlayFirst = false,
+                    )
+                },
                 onGoSetup = { tab = AssistantTab.Setup },
             )
             AssistantTab.Setup -> AssistantSetupTab(
@@ -335,7 +343,7 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                     store.overlayEnabled = true
                     overlayEnabled = true
                     GrokAssistantOverlayService.start(appCtx, expand = true)
-                    statusMsg = "Overlay shown — drag the bubble, hold mic to talk"
+                    statusMsg = "Overlay shown — bottom center · hold mic · Look for screen"
                 },
                 onHideOverlay = {
                     GrokAssistantOverlayService.stop(appCtx)
@@ -472,6 +480,7 @@ private fun AssistantChatTab(
     speakReplies: Boolean,
     onSpeakRepliesChange: (Boolean) -> Unit,
     onSend: (String) -> Unit,
+    onLookAtScreen: () -> Unit,
     onGoSetup: () -> Unit,
 ) {
     val listState = rememberLazyListState()
@@ -526,7 +535,7 @@ private fun AssistantChatTab(
                         if (!enabled) {
                             "Turn on the master switch in Setup, then send a message."
                         } else {
-                            "Conversation uses Grok Build. Optional TTS uses the vault SpaceXAI key or device speech."
+                            "Chat uses Grok Build · Look uses SpaceXAI vision · TTS from vault or device."
                         },
                         color = GrokifyColors.TextDim,
                         fontSize = 12.sp,
@@ -605,7 +614,17 @@ private fun AssistantChatTab(
                 ),
                 shape = RoundedCornerShape(12.dp),
             )
-            Spacer(Modifier.width(6.dp))
+            Spacer(Modifier.width(4.dp))
+            IconButton(
+                onClick = onLookAtScreen,
+                enabled = enabled && !busy,
+            ) {
+                Icon(
+                    Icons.Default.ScreenshotMonitor,
+                    contentDescription = "Look at my screen",
+                    tint = if (enabled && !busy) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
+                )
+            }
             IconButton(
                 onClick = { onSend(draft) },
                 enabled = enabled && !busy && draft.isNotBlank(),
@@ -845,7 +864,7 @@ private fun AssistantSetupTab(
         Spacer(Modifier.height(20.dp))
         SetupSectionLabel("MINI OVERLAY", GrokifyColors.GlowCyan)
         Text(
-            "Float a compact chat over any app. Hold the mic to speak.",
+            "Float a compact chat bottom-center over any app. Hold mic · Look (crop screen).",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
         )
@@ -1023,10 +1042,25 @@ private fun AssistantSetupTab(
         }
 
         Spacer(Modifier.height(20.dp))
+        SetupSectionLabel("LOOK AT SCREEN", GrokifyColors.GlowCyan)
+        Text(
+            "Capture the display, drag a crop box, ask Grok. Uses SpaceXAI vision (vault key). " +
+                "Available in Chat and the mini overlay.",
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            if (hasXaiKey) "SpaceXAI key ready for vision"
+            else "Add spacexai_api_key in Settings for Look",
+            color = if (hasXaiKey) GrokifyColors.GlowMint else GrokifyColors.GlowAmber,
+            fontSize = 11.sp,
+        )
+
+        Spacer(Modifier.height(20.dp))
         SetupSectionLabel("COMING SOON", GrokifyColors.TextDim)
         ComingSoonRow("Hey Grok wake word")
         ComingSoonRow("Default assistant / BT / Android Auto")
-        ComingSoonRow("Look at my screen + crop")
         Spacer(Modifier.height(24.dp))
     }
 }

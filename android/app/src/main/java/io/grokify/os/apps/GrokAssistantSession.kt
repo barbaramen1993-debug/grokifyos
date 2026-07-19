@@ -65,32 +65,7 @@ object GrokAssistantSession {
                 .put("session_title", "Grok Assistant")
                 .toString()
             val raw = HostAiClient.complete(appCtx, promptBody, options)
-            val json = runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
-            if (json.optBoolean("ok", false)) {
-                val reply = json.optString("text", "").trim()
-                    .ifBlank { json.optString("content", "").trim() }
-                if (reply.isBlank()) {
-                    store.appendMessage("error", "Empty reply — try again")
-                    SendResult(ok = false, errorText = "Empty reply — try again")
-                } else {
-                    store.appendMessage("assistant", reply)
-                    if (store.speakReplies) {
-                        val speakOpts = JSONObject()
-                            .put("voice_id", store.voiceId)
-                            .put("prefer_device", store.preferDeviceTts)
-                            .put("language", "en")
-                            .toString()
-                        runCatching { HostAiClient.speak(appCtx, reply, speakOpts) }
-                    }
-                    SendResult(ok = true, replyText = reply)
-                }
-            } else {
-                val err = json.optString("error", "request_failed")
-                val hint = json.optString("hint", "")
-                val msg = listOf(err, hint).filter { it.isNotBlank() }.joinToString(" — ")
-                store.appendMessage("error", msg)
-                SendResult(ok = false, errorText = msg)
-            }
+            handleReply(store, appCtx, raw)
         } catch (e: Exception) {
             val msg = e.message ?: "send_failed"
             runCatching { store.appendMessage("error", msg) }
@@ -98,5 +73,84 @@ object GrokAssistantSession {
         } finally {
             busyFlag = false
         }
+    }
+
+    /**
+     * Screen-look path: user message + JPEG crop → SpaceXAI vision (not Grok Build).
+     * [userText] may be blank (default prompt is applied).
+     */
+    suspend fun sendWithImage(
+        ctx: Context,
+        userText: String,
+        imageJpeg: ByteArray,
+    ): SendResult {
+        val appCtx = ctx.applicationContext
+        val store = GrokAssistantStore(appCtx)
+        if (!store.enabled) {
+            return SendResult(ok = false, errorText = "Assistant is off — enable in Setup")
+        }
+        if (imageJpeg.isEmpty()) {
+            return SendResult(ok = false, errorText = "empty image")
+        }
+        if (busyFlag) {
+            return SendResult(ok = false, errorText = "busy")
+        }
+        busyFlag = true
+        return try {
+            val display = userText.trim().ifBlank {
+                "Look at my screen and describe what you see. Call out anything important."
+            }
+            store.appendMessage("user", "🖼 $display")
+            val system = buildString {
+                append(store.systemPrompt())
+                append(
+                    "\n\nThe user shared a screenshot (possibly cropped) of their Android screen. " +
+                        "Answer from what is visible. Be concise and practical. " +
+                        "If text is unreadable, say so.",
+                )
+            }
+            val options = JSONObject()
+                .put("system", system)
+                .toString()
+            val raw = HostAiClient.completeWithImage(appCtx, display, imageJpeg, options)
+            handleReply(store, appCtx, raw)
+        } catch (e: Exception) {
+            val msg = e.message ?: "vision_send_failed"
+            runCatching { store.appendMessage("error", msg) }
+            SendResult(ok = false, errorText = msg)
+        } finally {
+            busyFlag = false
+        }
+    }
+
+    private fun handleReply(
+        store: GrokAssistantStore,
+        appCtx: Context,
+        raw: String,
+    ): SendResult {
+        val json = runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
+        if (json.optBoolean("ok", false)) {
+            val reply = json.optString("text", "").trim()
+                .ifBlank { json.optString("content", "").trim() }
+            if (reply.isBlank()) {
+                store.appendMessage("error", "Empty reply — try again")
+                return SendResult(ok = false, errorText = "Empty reply — try again")
+            }
+            store.appendMessage("assistant", reply)
+            if (store.speakReplies) {
+                val speakOpts = JSONObject()
+                    .put("voice_id", store.voiceId)
+                    .put("prefer_device", store.preferDeviceTts)
+                    .put("language", "en")
+                    .toString()
+                runCatching { HostAiClient.speak(appCtx, reply, speakOpts) }
+            }
+            return SendResult(ok = true, replyText = reply)
+        }
+        val err = json.optString("error", "request_failed")
+        val hint = json.optString("hint", "")
+        val msg = listOf(err, hint).filter { it.isNotBlank() }.joinToString(" — ")
+        store.appendMessage("error", msg)
+        return SendResult(ok = false, errorText = msg)
     }
 }
