@@ -6,6 +6,9 @@ package io.grokify.os.apps
  *
  * Speech-to-text often inserts punctuation ("Okay, Grok!", "OK. Grok?") —
  * [normalize] maps punctuation to spaces so phrase matching still hits.
+ *
+ * STT also frequently mis-hears “Grok” as a near-homophone (brock, rock, crock…).
+ * [GROK_VARIANTS] covers those so wake still fires without training the recognizer.
  */
 object GrokAssistantWake {
     data class Match(
@@ -17,18 +20,58 @@ object GrokAssistantWake {
         val raw: String,
     )
 
-    /**
-     * Default phrases. Order = preference when overlapping.
-     * Primary: okay / ok; hey kept as a secondary alias.
-     */
-    val DEFAULT_PHRASES: List<String> = listOf(
-        "okay grok",
-        "ok grok",
-        "hey grok",
-        "hi grok",
-        "yo grok",
-        "hello grok",
+    /** Attention tokens before the name. Primary first. */
+    val WAKE_PREFIXES: List<String> = listOf(
+        "okay",
+        "ok",
+        "hey",
+        "hi",
+        "yo",
+        "hello",
     )
+
+    /**
+     * “Grok” plus phonetic STT near-misses.
+     * Keep list focused on *grok*-like sounds; avoid bare common words without a prefix.
+     */
+    val GROK_VARIANTS: List<String> = listOf(
+        // Correct / close spellings
+        "grok",
+        "grock",
+        "groc",
+        "groke",
+        "grokk",
+        "grog",
+        "grak",
+        "grawk",
+        "gawk",
+        // User-reported / common STT confusions for “Grok”
+        "brock",
+        "brok",
+        "rock",
+        "crock",
+        "croc",
+        "croak",
+        "flock",
+        "jock",
+        "truck",
+        "quack",
+        "prock",
+        "frock",
+    )
+
+    /**
+     * Default phrases = every prefix × every Grok variant.
+     * Order = preference when overlapping (earlier start wins; longer phrase on ties).
+     * Primary spelling “okay grok” is first so it wins equal-start ties against shorter ok forms.
+     */
+    val DEFAULT_PHRASES: List<String> = buildList {
+        for (prefix in WAKE_PREFIXES) {
+            for (name in GROK_VARIANTS) {
+                add("$prefix $name")
+            }
+        }
+    }
 
     /** Primary phrase shown in UI / notifications. */
     const val PRIMARY_PHRASE_DISPLAY = "Okay Grok"

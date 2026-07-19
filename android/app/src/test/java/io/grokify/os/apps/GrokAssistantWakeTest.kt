@@ -62,6 +62,42 @@ class GrokAssistantWakeTest {
     }
 
     @Test
+    fun match_phoneticSttNearMissesForGrok() {
+        // STT often swaps Grok for near-homophones — still wake.
+        val samples = listOf(
+            "okay brock" to "okay brock",
+            "Okay Brock, what's the weather?" to "okay brock",
+            "ok rock set a timer" to "ok rock",
+            "hey crock" to "hey crock",
+            "hi flock, open maps" to "hi flock",
+            "yo jock" to "yo jock",
+            "hello truck what's 2+2" to "hello truck",
+            "Okay Quack!" to "okay quack",
+            "OK. Grock?" to "ok grock",
+            "okay croak tell me a joke" to "okay croak",
+            "hey brok" to "hey brok",
+        )
+        for ((raw, expectedPhrase) in samples) {
+            val m = GrokAssistantWake.match(raw)
+            assertNotNull("should match phonetic: $raw", m)
+            assertEquals("phrase for '$raw'", expectedPhrase, m!!.phrase)
+        }
+        val withCmd = GrokAssistantWake.match("Okay Brock, what's the weather?")
+        assertNotNull(withCmd)
+        assertTrue(withCmd!!.remainder.contains("weather"))
+        assertFalse(GrokAssistantWake.isWakeOnly(withCmd))
+    }
+
+    @Test
+    fun match_noFalsePositiveOnBareHomophone() {
+        // Without a wake prefix, bare "rock" / "truck" must not fire.
+        assertNull(GrokAssistantWake.match("tell rock about this"))
+        assertNull(GrokAssistantWake.match("the truck is late"))
+        assertNull(GrokAssistantWake.match("flock of birds"))
+        assertNull(GrokAssistantWake.match("brock"))
+    }
+
+    @Test
     fun match_prefersEarlierPhrase() {
         val m = GrokAssistantWake.match("okay grok then later hey grok ignore")
         assertNotNull(m)

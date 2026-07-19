@@ -1235,7 +1235,8 @@ private fun AssistantSetupTab(
         SetupSectionLabel("OKAY GROK", GrokifyColors.GlowViolet)
         Text(
             "Primary: Okay Grok / Ok Grok (also Hey/Hi/Yo). " +
-                "Punctuation from speech-to-text is ignored (“Okay, Grok!”). " +
+                "Punctuation is ignored (“Okay, Grok!”). " +
+                "STT near-misses of Grok also count (Brock, Rock, Crock, Flock, Jock, Truck, Quack…). " +
                 "Uses on-device speech recognition (battery + mic).",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
