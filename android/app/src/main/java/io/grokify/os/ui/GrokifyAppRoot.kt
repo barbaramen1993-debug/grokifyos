@@ -50,6 +50,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
@@ -141,7 +145,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -159,6 +162,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.viewinterop.AndroidView
 import android.app.Activity
 import android.content.Intent
@@ -1213,8 +1217,9 @@ private fun ChatPane(
         }
     }
 
-    // Auto-scroll only while the user is at the bottom. Scrolling up unlocks;
-    // returning to the bottom locks again (mirrors web system-chat.js).
+    // Stick-to-bottom: pin only flips from *user* scroll (or explicit force), never
+    // from content growth. Layout-driven nearBottom checks race streaming remeasure
+    // and falsely unlock mid-token — that was the 0.1.160 regression.
     var pinToBottom by remember { mutableStateOf(true) }
     var prevMessageCount by remember { mutableIntStateOf(0) }
     var lastHandledScrollNonce by remember { mutableIntStateOf(0) }
@@ -1226,12 +1231,12 @@ private fun ChatPane(
         return n
     }
 
-    fun isNearBottom(info: androidx.compose.foundation.lazy.LazyListLayoutInfo, slackPx: Int = 120): Boolean {
+    fun isNearBottom(info: androidx.compose.foundation.lazy.LazyListLayoutInfo, slackPx: Int = 160): Boolean {
         val total = info.totalItemsCount
         if (total <= 0) return true
         val last = info.visibleItemsInfo.lastOrNull() ?: return true
-        // Must actually have the last row on screen (not merely near the end).
-        if (last.index != total - 1) return false
+        // Last row (or second-to-last while a short spacer/tool is animating in).
+        if (last.index < total - 2) return false
         val viewportEnd = info.viewportEndOffset - info.afterContentPadding
         val itemBottom = last.offset + last.size
         // Remaining scroll below the viewport ≤ slack → pinned.
@@ -1241,34 +1246,54 @@ private fun ChatPane(
     val menuBottomPadPx = with(density) { 52.dp.roundToPx() }
     val stickBottomPadPx = with(density) { 10.dp.roundToPx() }
 
+    // Only user fling/drag updates pin — mirrors web scroll listener, not layout.
+    val stickScrollConnection = remember(listState) {
+        object : NestedScrollConnection {
+            private fun syncPinFromUserScroll() {
+                pinToBottom = isNearBottom(listState.layoutInfo)
+            }
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                if (source == NestedScrollSource.UserInput && consumed.y != 0f) {
+                    syncPinFromUserScroll()
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                // Fling settle: re-evaluate once velocity is applied.
+                syncPinFromUserScroll()
+                return Velocity.Zero
+            }
+        }
+    }
+
+    // Load older history near the top (independent of pin).
     LaunchedEffect(listState, state.hasMoreMessages, state.loadingOlder) {
         snapshotFlow {
             val info = listState.layoutInfo
             val first = info.visibleItemsInfo.firstOrNull()
-            Triple(
-                isNearBottom(info),
-                first?.index ?: -1,
-                info.totalItemsCount,
-            )
-        }.collect { (nearEnd, firstIndex, total) ->
-            pinToBottom = nearEnd
-            // Load older when scrolled near the top of a non-empty list
+            Pair(first?.index ?: -1, info.totalItemsCount)
+        }.collect { (firstIndex, total) ->
             if (total > 0 && firstIndex in 0..2 && state.hasMoreMessages && !state.loadingOlder) {
                 onLoadOlder()
             }
         }
     }
 
-    // Session open / forced jump only — once per nonce (NOT on every new message).
-    // Previously keying on visibleMessages.size re-pinned on every tool/thought row
-    // and yanked the user back to the bottom while reading an expanded card.
+    // Session open / send / forced jump — once per nonce (NOT on every new message).
     LaunchedEffect(state.scrollToBottomNonce) {
         val nonce = state.scrollToBottomNonce
         if (nonce <= 0 || nonce <= lastHandledScrollNonce) return@LaunchedEffect
-        // Wait a frame for the list to populate after session switch / history load
-        if (visibleMessages.isEmpty()) {
-            // Size may still be catching up; allow one short wait
+        // History / session switch may lag a frame or two behind the nonce bump.
+        var waits = 0
+        while (visibleMessages.isEmpty() && waits < 12) {
             delay(16)
+            waits++
         }
         if (visibleMessages.isEmpty()) return@LaunchedEffect
         lastHandledScrollNonce = nonce
@@ -1282,6 +1307,8 @@ private fun ChatPane(
                 stickBottomPadPx,
             )
         }
+        // Programmatic stick must leave us pinned even if layout was mid-growth.
+        pinToBottom = true
     }
 
     // Streaming / new messages while pinned; preserve anchor when prepending older pages
@@ -1373,6 +1400,7 @@ private fun ChatPane(
                     state = listState,
                     modifier = Modifier
                         .fillMaxSize()
+                        .nestedScroll(stickScrollConnection)
                         .padding(horizontal = 12.dp)
                         .clickable(
                             indication = null,

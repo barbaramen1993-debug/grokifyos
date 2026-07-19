@@ -2663,6 +2663,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     draft = "",
                     busy = true,
                     error = null,
+                    // Sending always re-pins chat to bottom (user expects to follow reply).
+                    scrollToBottomNonce = it.scrollToBottomNonce + 1,
                 )
             }
             if (sessionId.isBlank() || !isValidSessionId(sessionId)) {
