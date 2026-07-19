@@ -186,34 +186,40 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * System assistant / voice-search entry, or explicit open-assistant extras.
-     * Shows floating overlay when permitted; always deep-links into the Grok Assistant pane.
+     * System assistant / voice-search / BT headset / car entry, or explicit open-assistant extras.
+     * Deep-links into Grok Assistant; expands overlay and starts mic when enabled.
      */
     private fun handleAssistantEntry(intent: Intent?) {
         if (intent == null) return
-        val action = intent.action
-        val openPane = intent.getBooleanExtra(
-            io.grokify.os.apps.GrokAssistantOverlayService.EXTRA_OPEN_ASSISTANT,
-            false,
-        )
-        val isAssist = action == Intent.ACTION_ASSIST ||
-            action == Intent.ACTION_VOICE_COMMAND ||
-            action == "android.intent.action.VOICE_ASSIST" ||
-            action == Intent.ACTION_WEB_SEARCH
-        if (!openPane && !isAssist) return
+        if (!io.grokify.os.apps.GrokAssistantEntry.isAssistantIntent(intent)) return
+
+        val wantListen = intent.getBooleanExtra(
+            io.grokify.os.apps.GrokAssistantEntry.EXTRA_AUTO_LISTEN,
+            true,
+        ) || intent.action == Intent.ACTION_VOICE_COMMAND ||
+            intent.action == "android.intent.action.VOICE_ASSIST" ||
+            intent.action == Intent.ACTION_ASSIST
 
         io.grokify.os.widgets.WidgetNav.openPlugin(
             io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
         )
         val store = io.grokify.os.apps.GrokAssistantStore(this)
-        if (store.enabled &&
-            store.overlayEnabled &&
-            io.grokify.os.apps.GrokAssistantOverlayService.canDrawOverlays(this)
-        ) {
-            io.grokify.os.apps.GrokAssistantOverlayService.start(this, expand = true)
+        if (store.enabled) {
+            // Keep wake loop in sync when arriving from hardware buttons.
+            io.grokify.os.apps.GrokAssistantWakeService.sync(this)
+            if (store.overlayEnabled &&
+                io.grokify.os.apps.GrokAssistantOverlayService.canDrawOverlays(this)
+            ) {
+                if (wantListen) {
+                    io.grokify.os.apps.GrokAssistantOverlayService.startListeningForCommand(this)
+                } else {
+                    io.grokify.os.apps.GrokAssistantOverlayService.start(this, expand = true)
+                }
+            }
         }
         // Consume one-shot flags so rotation doesn't re-fire.
         intent.removeExtra(io.grokify.os.apps.GrokAssistantOverlayService.EXTRA_OPEN_ASSISTANT)
+        intent.removeExtra(io.grokify.os.apps.GrokAssistantEntry.EXTRA_AUTO_LISTEN)
     }
 
     /**

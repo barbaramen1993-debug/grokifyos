@@ -74,6 +74,10 @@
         </intent>
         <package android:name="com.spotify.music" />
         <package android:name="com.spotify.lite" />
+        <!-- On-device / cloud speech recognition for Hey Grok + hold-to-talk -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
     </queries>
 
     <application
@@ -116,13 +120,25 @@
                     android:host="grokifyos.grokpot.io"
                     android:path="/spotify-callback.php" />
             </intent-filter>
-            <!-- Assistant / voice entry -->
+            <!-- Assistant / voice entry (home long-press, some OEMs, web voice search) -->
             <intent-filter>
                 <action android:name="android.intent.action.ASSIST" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <intent-filter>
+                <action android:name="android.intent.action.VOICE_COMMAND" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VOICE_ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
                 <action android:name="android.speech.action.WEB_SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.speech.action.VOICE_SEARCH_HANDS_FREE" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <!-- Android Auto / car projection hook -->
@@ -152,6 +168,15 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="floating_grok_assistant_mini_ui" />
+        </service>
+
+        <service
+            android:name=".apps.GrokAssistantWakeService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="hey_grok_wake_word_listener" />
         </service>
 
         <activity
@@ -210,6 +235,15 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <receiver
+            android:name=".apps.GrokAssistantBootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".apps.LocationNoteReceiver"

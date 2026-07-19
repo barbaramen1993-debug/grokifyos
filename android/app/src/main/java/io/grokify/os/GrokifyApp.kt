@@ -18,6 +18,8 @@ class GrokifyApp : Application() {
         createChannels()
         // Re-arm place-note geofence location updates after process start.
         runCatching { io.grokify.os.apps.LocationNoteWatcher.sync(this) }
+        // Re-arm Hey Grok wake loop if prefs say so.
+        runCatching { io.grokify.os.apps.GrokAssistantWakeService.sync(this) }
     }
 
     private fun createChannels() {

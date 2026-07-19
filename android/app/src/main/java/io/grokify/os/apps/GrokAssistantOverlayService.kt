@@ -135,9 +135,34 @@ class GrokAssistantOverlayService : Service() {
                 expandedState.value = true
                 applyFocusFlags(focusable = true)
             }
+            ACTION_BUMP -> {
+                transcriptTick.value = transcriptTick.value + 1
+            }
+            ACTION_LISTEN -> {
+                expandedState.value = true
+                applyFocusFlags(focusable = true)
+                pendingStartListen = true
+                transcriptTick.value = transcriptTick.value + 1
+            }
+            ACTION_AUTO_SEND -> {
+                val text = intent.getStringExtra(EXTRA_TEXT)?.trim().orEmpty()
+                if (text.isNotBlank()) {
+                    expandedState.value = true
+                    applyFocusFlags(focusable = true)
+                    pendingAutoSend = text
+                    transcriptTick.value = transcriptTick.value + 1
+                }
+            }
             else -> {
                 // START / SHOW
             }
+        }
+        val autoText = intent?.getStringExtra(EXTRA_TEXT)?.trim().orEmpty()
+        if (intent?.action == ACTION_START && autoText.isNotBlank()) {
+            pendingAutoSend = autoText
+        }
+        if (intent?.getBooleanExtra(EXTRA_LISTEN, false) == true) {
+            pendingStartListen = true
         }
         startAsForeground()
         if (!Settings.canDrawOverlays(this)) {
@@ -147,7 +172,11 @@ class GrokAssistantOverlayService : Service() {
         }
         if (composeView == null) {
             attachOverlay(expand = intent?.getBooleanExtra(EXTRA_EXPAND, true) == true)
-        } else if (intent?.getBooleanExtra(EXTRA_EXPAND, false) == true) {
+        } else if (intent?.getBooleanExtra(EXTRA_EXPAND, false) == true ||
+            intent?.action == ACTION_EXPAND ||
+            intent?.action == ACTION_LISTEN ||
+            intent?.action == ACTION_AUTO_SEND
+        ) {
             expandedState.value = true
             applyFocusFlags(focusable = true)
         }
@@ -345,6 +374,8 @@ class GrokAssistantOverlayService : Service() {
         }
         speech = null
         listeningState.value = false
+        GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+        GrokAssistantWakeService.resume(this)
     }
 
     private fun ensureSpeech(): SpeechRecognizer? {
@@ -371,6 +402,8 @@ class GrokAssistantOverlayService : Service() {
             override fun onError(error: Int) {
                 listeningState.value = false
                 partialState.value = null
+                GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+                GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
                 statusState.value = when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH -> "Didn't catch that"
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech"
@@ -381,15 +414,14 @@ class GrokAssistantOverlayService : Service() {
 
             override fun onResults(results: Bundle?) {
                 listeningState.value = false
+                GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+                GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
                 val texts = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val best = texts?.firstOrNull()?.trim().orEmpty()
                 partialState.value = null
                 if (best.isNotBlank()) {
                     draftState.value = best
                     statusState.value = null
-                    // Auto-send after recognition for hands-free feel
-                    // (user can still edit if we didn't auto-send — we auto-send).
-                    // Fire via Compose side by flipping a one-shot? Simpler: set draft and flag.
                     pendingAutoSend = best
                     transcriptTick.value = transcriptTick.value + 1
                 } else {
@@ -411,7 +443,15 @@ class GrokAssistantOverlayService : Service() {
     @Volatile
     private var pendingAutoSend: String? = null
 
+    @Volatile
+    private var pendingStartListen: Boolean = false
+
     private fun startListening() {
+        GrokAssistantWakeService.pause(this)
+        if (!GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Overlay)) {
+            // Force preempt wake
+            GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Overlay)
+        }
         val sr = ensureSpeech() ?: return
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -427,12 +467,16 @@ class GrokAssistantOverlayService : Service() {
         }.onFailure {
             statusState.value = it.message ?: "Could not start mic"
             listeningState.value = false
+            GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+            GrokAssistantWakeService.resume(this)
         }
     }
 
     private fun stopListening() {
         runCatching { speech?.stopListening() }
         listeningState.value = false
+        GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+        GrokAssistantWakeService.resume(this)
     }
 
     @Composable
@@ -459,6 +503,10 @@ class GrokAssistantOverlayService : Service() {
 
         LaunchedEffect(tick) {
             reload()
+            if (pendingStartListen) {
+                pendingStartListen = false
+                startListening()
+            }
             val auto = pendingAutoSend
             if (auto != null) {
                 pendingAutoSend = null
@@ -470,10 +518,17 @@ class GrokAssistantOverlayService : Service() {
                         withContext(Dispatchers.IO) {
                             GrokAssistantSession.send(applicationContext, auto)
                         }
+                        GrokAssistantMic.quietFor(
+                            if (store.speakReplies) 5_000L else 800L,
+                        )
                         busyState.value = false
                         reload()
                         transcriptTick.value = transcriptTick.value + 1
                     }
+                } else if (GrokAssistantSession.isBusy) {
+                    // Wake service (or pane) already sending — just refresh transcript soon.
+                    draftState.value = ""
+                    statusState.value = "Working…"
                 } else {
                     draftState.value = auto
                 }
@@ -852,7 +907,12 @@ class GrokAssistantOverlayService : Service() {
         const val ACTION_STOP = "io.grokify.os.ASSISTANT_OVERLAY_STOP"
         const val ACTION_EXPAND = "io.grokify.os.ASSISTANT_OVERLAY_EXPAND"
         const val ACTION_COLLAPSE = "io.grokify.os.ASSISTANT_OVERLAY_COLLAPSE"
+        const val ACTION_LISTEN = "io.grokify.os.ASSISTANT_OVERLAY_LISTEN"
+        const val ACTION_AUTO_SEND = "io.grokify.os.ASSISTANT_OVERLAY_AUTO_SEND"
+        const val ACTION_BUMP = "io.grokify.os.ASSISTANT_OVERLAY_BUMP"
         const val EXTRA_EXPAND = "expand"
+        const val EXTRA_LISTEN = "listen"
+        const val EXTRA_TEXT = "text"
         const val EXTRA_OPEN_ASSISTANT = "open_grok_assistant"
 
         fun canDrawOverlays(ctx: Context): Boolean = Settings.canDrawOverlays(ctx)
@@ -868,7 +928,7 @@ class GrokAssistantOverlayService : Service() {
         @Volatile
         var instance: GrokAssistantOverlayService? = null
 
-        fun start(ctx: Context, expand: Boolean = true) {
+        fun start(ctx: Context, expand: Boolean = true, listen: Boolean = false, autoText: String? = null) {
             val app = ctx.applicationContext
             if (!Settings.canDrawOverlays(app)) {
                 openOverlayPermissionSettings(app)
@@ -877,6 +937,8 @@ class GrokAssistantOverlayService : Service() {
             val i = Intent(app, GrokAssistantOverlayService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_EXPAND, expand)
+                putExtra(EXTRA_LISTEN, listen)
+                if (!autoText.isNullOrBlank()) putExtra(EXTRA_TEXT, autoText)
             }
             ContextCompat.startForegroundService(app, i)
         }
@@ -887,6 +949,43 @@ class GrokAssistantOverlayService : Service() {
             runCatching { app.startService(i) }
             // Also try stopService if not running as started with action
             runCatching { app.stopService(Intent(app, GrokAssistantOverlayService::class.java)) }
+        }
+
+        /** Expand and start hold-to-talk style listening (system assistant button entry). */
+        fun startListeningForCommand(ctx: Context) {
+            val app = ctx.applicationContext
+            if (!Settings.canDrawOverlays(app)) {
+                start(app, expand = true, listen = true)
+                return
+            }
+            val i = Intent(app, GrokAssistantOverlayService::class.java).apply {
+                action = ACTION_LISTEN
+                putExtra(EXTRA_EXPAND, true)
+                putExtra(EXTRA_LISTEN, true)
+            }
+            ContextCompat.startForegroundService(app, i)
+        }
+
+        fun enqueueAutoSend(ctx: Context, text: String) {
+            val app = ctx.applicationContext
+            val trimmed = text.trim()
+            if (trimmed.isEmpty()) return
+            val i = Intent(app, GrokAssistantOverlayService::class.java).apply {
+                action = ACTION_AUTO_SEND
+                putExtra(EXTRA_EXPAND, true)
+                putExtra(EXTRA_TEXT, trimmed)
+            }
+            ContextCompat.startForegroundService(app, i)
+        }
+
+        fun bumpTranscript(ctx: Context) {
+            val app = ctx.applicationContext
+            val svc = instance
+            if (svc != null) {
+                svc.transcriptTick.value = svc.transcriptTick.value + 1
+                return
+            }
+            // No-op if overlay not running — pane reads store directly.
         }
 
         fun hideForCapture(ctx: Context) {

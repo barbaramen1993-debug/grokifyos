@@ -32,6 +32,11 @@ class GrokAssistantStore(ctx: Context) {
         get() = prefs.getBoolean(KEY_OVERLAY, false)
         set(v) = prefs.edit().putBoolean(KEY_OVERLAY, v).apply()
 
+    /** Continuous “Hey Grok” speech-recognition wake loop. */
+    var wakeWordEnabled: Boolean
+        get() = prefs.getBoolean(KEY_WAKE, false)
+        set(v) = prefs.edit().putBoolean(KEY_WAKE, v).apply()
+
     fun templates(): List<AssistantPromptTemplate> {
         val saved = AssistantPromptCodec.decode(prefs.getString(KEY_PROMPTS, null))
         return AssistantPromptCodec.mergeWithDefaults(saved)
@@ -100,6 +105,7 @@ class GrokAssistantStore(ctx: Context) {
         private const val KEY_PREFER_DEVICE = "prefer_device_tts"
         private const val KEY_SPEAK = "speak_replies"
         private const val KEY_OVERLAY = "overlay_enabled"
+        private const val KEY_WAKE = "wake_word_enabled"
         private const val KEY_PROMPTS = "prompt_templates_v1"
         private const val KEY_TRANSCRIPT = "transcript_v1"
     }

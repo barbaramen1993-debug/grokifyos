@@ -84,8 +84,20 @@ fun GrokAssistantPane(onBack: () -> Unit) {
     var preferDeviceTts by remember { mutableStateOf(store.preferDeviceTts) }
     var speakReplies by remember { mutableStateOf(store.speakReplies) }
     var overlayEnabled by remember { mutableStateOf(store.overlayEnabled) }
+    var wakeWordEnabled by remember { mutableStateOf(store.wakeWordEnabled) }
     var canDrawOverlays by remember {
         mutableStateOf(GrokAssistantOverlayService.canDrawOverlays(appCtx))
+    }
+    var hasMic by remember {
+        mutableStateOf(
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                appCtx,
+                android.Manifest.permission.RECORD_AUDIO,
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED,
+        )
+    }
+    var isDefaultAssistant by remember {
+        mutableStateOf(GrokAssistantEntry.isAssistantRoleHeld(appCtx))
     }
     var templates by remember { mutableStateOf(store.templates()) }
     var transcript by remember { mutableStateOf(store.transcript()) }
@@ -120,7 +132,13 @@ fun GrokAssistantPane(onBack: () -> Unit) {
         preferDeviceTts = store.preferDeviceTts
         speakReplies = store.speakReplies
         overlayEnabled = store.overlayEnabled
+        wakeWordEnabled = store.wakeWordEnabled
         canDrawOverlays = GrokAssistantOverlayService.canDrawOverlays(appCtx)
+        hasMic = androidx.core.content.ContextCompat.checkSelfPermission(
+            appCtx,
+            android.Manifest.permission.RECORD_AUDIO,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        isDefaultAssistant = GrokAssistantEntry.isAssistantRoleHeld(appCtx)
         templates = store.templates()
         transcript = store.transcript()
         hasXaiKey = !HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank()
@@ -278,6 +296,14 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                 onEnabledChange = {
                     enabled = it
                     store.enabled = it
+                    GrokAssistantWakeService.sync(appCtx)
+                    if (!it) {
+                        GrokAssistantOverlayService.stop(appCtx)
+                    } else if (store.overlayEnabled &&
+                        GrokAssistantOverlayService.canDrawOverlays(appCtx)
+                    ) {
+                        GrokAssistantOverlayService.start(appCtx, expand = false)
+                    }
                 },
                 mode = mode,
                 onModeChange = {
@@ -348,6 +374,61 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                 onHideOverlay = {
                     GrokAssistantOverlayService.stop(appCtx)
                     statusMsg = "Overlay hidden"
+                },
+                wakeWordEnabled = wakeWordEnabled,
+                hasMic = hasMic,
+                onWakeWordChange = { on ->
+                    wakeWordEnabled = on
+                    store.wakeWordEnabled = on
+                    if (on) {
+                        if (!store.enabled) {
+                            statusMsg = "Turn on Enabled first"
+                            return@AssistantSetupTab
+                        }
+                        hasMic = androidx.core.content.ContextCompat.checkSelfPermission(
+                            appCtx,
+                            android.Manifest.permission.RECORD_AUDIO,
+                        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                        if (!hasMic) {
+                            statusMsg = "Mic permission required for Hey Grok"
+                        }
+                        GrokAssistantWakeService.sync(appCtx)
+                        statusMsg = if (hasMic) {
+                            "Hey Grok on — say “Hey Grok” then your request"
+                        } else {
+                            "Hey Grok armed — grant microphone permission"
+                        }
+                    } else {
+                        GrokAssistantWakeService.stop(appCtx)
+                        statusMsg = "Hey Grok off"
+                    }
+                },
+                isDefaultAssistant = isDefaultAssistant,
+                onOpenAssistantSettings = {
+                    GrokAssistantEntry.openDefaultAssistantSettings(context)
+                    statusMsg = "Set GrokifyOS as digital assistant / voice input if listed"
+                },
+                onRequestAssistantRole = {
+                    val act = context as? android.app.Activity
+                    val launched = if (act != null) {
+                        GrokAssistantEntry.requestAssistantRole(act)
+                    } else {
+                        false
+                    }
+                    isDefaultAssistant = GrokAssistantEntry.isAssistantRoleHeld(appCtx)
+                    statusMsg = when {
+                        isDefaultAssistant -> "Already default assistant"
+                        launched -> "Confirm in system dialog (OEM may need Voice Input settings)"
+                        else -> "Role unavailable — use Voice input / Default apps settings"
+                    }
+                },
+                onTestHardwareEntry = {
+                    if (!store.enabled) {
+                        statusMsg = "Turn on Enabled first"
+                        return@AssistantSetupTab
+                    }
+                    GrokAssistantEntry.activate(context, listen = true, openPane = false)
+                    statusMsg = "Simulated assist button — overlay listening"
                 },
                 templates = templates,
                 promptKind = promptKind,
@@ -712,6 +793,13 @@ private fun AssistantSetupTab(
     onRequestOverlayPermission: () -> Unit,
     onShowOverlay: () -> Unit,
     onHideOverlay: () -> Unit,
+    wakeWordEnabled: Boolean,
+    hasMic: Boolean,
+    onWakeWordChange: (Boolean) -> Unit,
+    isDefaultAssistant: Boolean,
+    onOpenAssistantSettings: () -> Unit,
+    onRequestAssistantRole: () -> Unit,
+    onTestHardwareEntry: () -> Unit,
     templates: List<AssistantPromptTemplate>,
     promptKind: AssistantPromptKind,
     onPromptKindChange: (AssistantPromptKind) -> Unit,
@@ -894,6 +982,72 @@ private fun AssistantSetupTab(
         }
 
         Spacer(Modifier.height(20.dp))
+        SetupSectionLabel("HEY GROK", GrokifyColors.GlowViolet)
+        Text(
+            "Always-listening wake phrases: Hey Grok · Ok Grok · Hi Grok. " +
+                "Uses on-device speech recognition (battery + mic). " +
+                "Works best with Assistant Enabled and Mic granted.",
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+        )
+        Spacer(Modifier.height(6.dp))
+        SetupRow(
+            title = "Wake word",
+            subtitle = when {
+                !enabled -> "Enable assistant first"
+                !hasMic -> "Microphone permission needed"
+                wakeWordEnabled -> "Listening in background"
+                else -> "Off"
+            },
+        ) {
+            Switch(
+                checked = wakeWordEnabled,
+                onCheckedChange = onWakeWordChange,
+                enabled = enabled,
+                colors = switchColors(GrokifyColors.GlowViolet),
+            )
+        }
+        if (!hasMic) {
+            Text(
+                "Grant microphone so Hey Grok can hear you.",
+                color = GrokifyColors.GlowAmber,
+                fontSize = 11.sp,
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
+        SetupSectionLabel("SYSTEM · BT · AUTO", GrokifyColors.GlowCyan)
+        Text(
+            "Home long-press / assist button, headset voice keys, and Android Auto " +
+                "launcher can open Grok Assistant when the system routes them here.",
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            if (isDefaultAssistant) "Default assistant role: held"
+            else "Default assistant role: not held (OEM-dependent)",
+            color = if (isDefaultAssistant) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+            fontSize = 11.sp,
+        )
+        TextButton(onClick = onRequestAssistantRole) {
+            Text("Request default assistant role", color = GrokifyColors.GlowCyan, fontSize = 13.sp)
+        }
+        TextButton(onClick = onOpenAssistantSettings) {
+            Text("Open voice / default apps settings", color = GrokifyColors.GlowMint, fontSize = 13.sp)
+        }
+        TextButton(onClick = onTestHardwareEntry) {
+            Text("Test assist entry (listen)", color = GrokifyColors.GlowViolet, fontSize = 13.sp)
+        }
+        Text(
+            "BT: use your headset’s assistant / voice button — many headsets fire " +
+                "VOICE_COMMAND or the default digital assistant. " +
+                "Android Auto: GrokifyOS is a car launcher entry; use assist from the head unit when mapped.",
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+        )
+
+        Spacer(Modifier.height(20.dp))
         SetupSectionLabel("PROMPT TEMPLATES", GrokifyColors.GlowAmber)
         Text(
             "Core identity, mode prompts, and style extras. Edit bodies, reset built-ins, toggle extras.",
@@ -1058,9 +1212,9 @@ private fun AssistantSetupTab(
         )
 
         Spacer(Modifier.height(20.dp))
-        SetupSectionLabel("COMING SOON", GrokifyColors.TextDim)
-        ComingSoonRow("Hey Grok wake word")
-        ComingSoonRow("Default assistant / BT / Android Auto")
+        SetupSectionLabel("LATER", GrokifyColors.TextDim)
+        ComingSoonRow("Dev mode real host tools / file edit")
+        ComingSoonRow("DSP keyword engine (lower battery)")
         Spacer(Modifier.height(24.dp))
     }
 }
