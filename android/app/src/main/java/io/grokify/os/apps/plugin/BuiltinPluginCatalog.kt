@@ -10,6 +10,7 @@ object BuiltinPluginCatalog {
     const val PLACE_NOTES = "place_notes"
     const val SPOTIFY_CONTROLLER = "spotify_controller"
     const val SPACEXAI_USAGE = "spacexai_usage_analyzer"
+    const val GROK_ASSISTANT = "grok_assistant"
 
     val all: List<PluginManifest> = listOf(
         PluginManifest(
@@ -96,6 +97,27 @@ object BuiltinPluginCatalog {
                     label = "SpaceXAI Management key",
                     description = "console.x.ai → Management Keys (billing read). Separate from the inference API key used for Voice TTS.",
                     required = true,
+                ),
+            ),
+        ),
+        PluginManifest(
+            id = GROK_ASSISTANT,
+            title = "Grok Assistant",
+            subtitle = "On-device chat + voice assistant. Conversation or Dev mode, editable prompts, Grok Build + TTS.",
+            version = "1.0.0",
+            source = PluginSource.Builtin,
+            kind = PluginKind.HostModule,
+            hostModuleId = GROK_ASSISTANT,
+            capabilities = listOf("AI", "Voice", "Chat"),
+            accent = PluginAccent.Violet,
+            icon = PluginIconKey.Apps,
+            featured = true,
+            requiredKeys = listOf(
+                PluginRequiredKey(
+                    id = "spacexai_api_key",
+                    label = "SpaceXAI API key",
+                    description = "Optional — Grok Voice TTS for spoken replies. Device TTS works without it.",
+                    required = false,
                 ),
             ),
         ),

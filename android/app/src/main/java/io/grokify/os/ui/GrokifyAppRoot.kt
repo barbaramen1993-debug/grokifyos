@@ -89,6 +89,7 @@ import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.LinkOff
 import io.grokify.os.apps.BluetoothScannerPane
+import io.grokify.os.apps.GrokAssistantPane
 import io.grokify.os.apps.LocationNotesPane
 import io.grokify.os.apps.SpaceXaiUsageAnalyzerPane
 import io.grokify.os.apps.SpotifyControllerPane
@@ -4358,6 +4359,9 @@ private fun AppsPane(
         BuiltinPluginCatalog.SPACEXAI_USAGE, "spacexai_usage_analyzer" -> SpaceXaiUsageAnalyzerPane(
             onBack = onBackToHub,
         )
+        BuiltinPluginCatalog.GROK_ASSISTANT, "grok_assistant" -> GrokAssistantPane(
+            onBack = onBackToHub,
+        )
         else -> AppsHub(
             appOrder = appOrder,
             onOpenApp = onOpenApp,
@@ -4586,6 +4590,7 @@ private fun appsNavShortTitle(app: PluginManifest): String = when (app.id) {
     BuiltinPluginCatalog.PLACE_NOTES -> "Places"
     BuiltinPluginCatalog.SPOTIFY_CONTROLLER -> "Spotify"
     BuiltinPluginCatalog.SPACEXAI_USAGE -> "Usage"
+    BuiltinPluginCatalog.GROK_ASSISTANT -> "Assistant"
     else -> app.title.take(12)
 }
 
