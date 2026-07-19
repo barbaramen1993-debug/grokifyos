@@ -137,10 +137,147 @@ private const val KEY_NAME = "listener_name_v1"
 private const val KEY_PROMPTS = "prompt_templates_v1"
 /** Active behavior template id (built-in or custom). */
 private const val KEY_ACTIVE_BEHAVIOR_ID = "active_behavior_prompt_id_v1"
+/**
+ * Queue system: which radio-pool sources are enabled.
+ * Missing / empty pref = full default blend (all sources on).
+ */
+private const val KEY_QUEUE_SOURCES = "queue_sources_v1"
+/** Explicit multi-select playlist ids for pool sampling (empty = random sample when Playlists on). */
+private const val KEY_QUEUE_PLAYLISTS = "queue_playlists_v1"
+/** Cached playlist chips for UI: JSON [{id,name,trackCount}]. */
+private const val KEY_QUEUE_PLAYLIST_CACHE = "queue_playlist_cache_v1"
 
 /** Inclusive bounds for “talk every N songs” settings. */
 const val BANTER_EVERY_MIN = 1
 const val BANTER_EVERY_MAX = 20
+/** Max playlists the user can pin into the queue pool. */
+const val MAX_DJ_QUEUE_PLAYLISTS = 12
+
+/**
+ * Radio-pool sources for Live DJ New queue / Refill.
+ * Default = every source enabled (today’s full blend). Toggle any subset.
+ */
+enum class DjQueueSource(
+    val id: String,
+    val label: String,
+    val blurb: String,
+) {
+    Liked(
+        "liked",
+        "Liked",
+        "Saved Liked Songs enter the candidate pool",
+    ),
+    Top(
+        "top",
+        "Top tracks",
+        "Short + medium term top tracks",
+    ),
+    TopArtists(
+        "top_artists",
+        "Top artists",
+        "Top artists seed artist-radio expansion",
+    ),
+    Recent(
+        "recent",
+        "Recent",
+        "Recently played: exclude from UP NEXT, seed radio vibe",
+    ),
+    History(
+        "history",
+        "History",
+        "Skip cuts already heard this session / soft played set",
+    ),
+    Excluded(
+        "excluded",
+        "Disliked",
+        "Honor permanent dislikes and “tired for now” cooldowns",
+    ),
+    ArtistRadio(
+        "artist_radio",
+        "Artist radio",
+        "Top cuts from seed artists",
+    ),
+    Related(
+        "related",
+        "Related",
+        "Related-artist expansion from seeds",
+    ),
+    SongRadio(
+        "song_radio",
+        "Song radio",
+        "More from artists of seed tracks",
+    ),
+    Playlists(
+        "playlists",
+        "Playlists",
+        "Sample your Spotify playlists (all random, or pin specific ones)",
+    ),
+    ;
+
+    companion object {
+        fun fromId(raw: String?): DjQueueSource? {
+            val id = raw?.lowercase()?.trim().orEmpty()
+            if (id.isBlank()) return null
+            return entries.firstOrNull { it.id == id }
+        }
+
+        /** Full current-system blend. */
+        fun defaultEnabledIds(): Set<String> = entries.map { it.id }.toSet()
+
+        fun parseEnabled(raw: String?): Set<String> {
+            if (raw.isNullOrBlank()) return defaultEnabledIds()
+            return runCatching {
+                val arr = org.json.JSONArray(raw)
+                val out = LinkedHashSet<String>()
+                for (i in 0 until arr.length()) {
+                    val id = arr.optString(i, "").trim().lowercase()
+                    if (fromId(id) != null) out.add(id)
+                }
+                // Empty array is intentional “none”; null/missing stays default.
+                if (out.isEmpty() && arr.length() == 0) emptySet() else {
+                    // If user had an older partial list, keep only known ids.
+                    // If parsing yielded nothing from non-empty junk, fall back to default.
+                    if (out.isEmpty()) defaultEnabledIds() else out
+                }
+            }.getOrElse { defaultEnabledIds() }
+        }
+
+        fun encodeEnabled(ids: Set<String>): String {
+            val arr = org.json.JSONArray()
+            // Stable order matching enum declaration
+            entries.forEach { src ->
+                if (src.id in ids) arr.put(src.id)
+            }
+            return arr.toString()
+        }
+    }
+}
+
+/** Lightweight playlist chip for the queue-system picker. */
+data class DjQueuePlaylistRef(
+    val id: String,
+    val name: String,
+    val trackCount: Int = 0,
+) {
+    fun toJson(): org.json.JSONObject =
+        org.json.JSONObject()
+            .put("id", id)
+            .put("name", name)
+            .put("trackCount", trackCount)
+
+    companion object {
+        fun fromJson(o: org.json.JSONObject?): DjQueuePlaylistRef? {
+            if (o == null) return null
+            val id = o.optString("id", "").trim()
+            if (id.isBlank()) return null
+            return DjQueuePlaylistRef(
+                id = id,
+                name = o.optString("name", id).ifBlank { id },
+                trackCount = o.optInt("trackCount", 0),
+            )
+        }
+    }
+}
 
 /**
  * Multi-select reasons for the Dislike control / chat-bubble modal.
@@ -700,6 +837,74 @@ class SpotifyDjStore(context: Context) {
             .putString(KEY_GENRE_BOARD, encodeStringList(value.distinct().take(40)))
             .apply()
 
+    /**
+     * Enabled radio-pool sources for New queue / Refill.
+     * Missing pref → all sources (current default blend).
+     */
+    var queueSourcesEnabled: Set<String>
+        get() = DjQueueSource.parseEnabled(prefs.getString(KEY_QUEUE_SOURCES, null))
+        set(value) = prefs.edit()
+            .putString(KEY_QUEUE_SOURCES, DjQueueSource.encodeEnabled(value))
+            .apply()
+
+    fun isQueueSourceEnabled(source: DjQueueSource): Boolean =
+        source.id in queueSourcesEnabled
+
+    /** True when every source is on (stock behavior). */
+    fun isDefaultQueueSystem(): Boolean {
+        val on = queueSourcesEnabled
+        return on == DjQueueSource.defaultEnabledIds() && queuePlaylistIds.isEmpty()
+    }
+
+    fun resetQueueSystemToDefault() {
+        prefs.edit()
+            .putString(KEY_QUEUE_SOURCES, DjQueueSource.encodeEnabled(DjQueueSource.defaultEnabledIds()))
+            .putString(KEY_QUEUE_PLAYLISTS, encodeStringList(emptyList()))
+            .apply()
+    }
+
+    fun toggleQueueSource(source: DjQueueSource, enabled: Boolean) {
+        val next = queueSourcesEnabled.toMutableSet()
+        if (enabled) next.add(source.id) else next.remove(source.id)
+        queueSourcesEnabled = next
+    }
+
+    /**
+     * Explicit playlist ids to sample when [DjQueueSource.Playlists] is on.
+     * Empty = random sample of a few playlists each fill (default).
+     */
+    var queuePlaylistIds: List<String>
+        get() = decodeStringList(prefs.getString(KEY_QUEUE_PLAYLISTS, null))
+            .distinct()
+            .take(MAX_DJ_QUEUE_PLAYLISTS)
+        set(value) = prefs.edit()
+            .putString(
+                KEY_QUEUE_PLAYLISTS,
+                encodeStringList(value.map { it.trim() }.filter { it.isNotBlank() }
+                    .distinct()
+                    .take(MAX_DJ_QUEUE_PLAYLISTS)),
+            )
+            .apply()
+
+    /** Cached playlist chips for the queue-system UI (survives leave/return). */
+    var queuePlaylistCache: List<DjQueuePlaylistRef>
+        get() {
+            val raw = prefs.getString(KEY_QUEUE_PLAYLIST_CACHE, null) ?: return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        DjQueuePlaylistRef.fromJson(arr.optJSONObject(i))?.let { add(it) }
+                    }
+                }
+            }.getOrElse { emptyList() }
+        }
+        set(value) {
+            val arr = JSONArray()
+            value.distinctBy { it.id }.take(80).forEach { arr.put(it.toJson()) }
+            prefs.edit().putString(KEY_QUEUE_PLAYLIST_CACHE, arr.toString()).apply()
+        }
+
     var lastCurrentUri: String
         get() = prefs.getString(KEY_CURRENT_URI, "") ?: ""
         set(value) = prefs.edit().putString(KEY_CURRENT_URI, value).apply()
@@ -740,13 +945,17 @@ class SpotifyDjStore(context: Context) {
         require(
             kind == DjPromptKind.BanterSystem ||
                 kind == DjPromptKind.ResearchSystem ||
-                kind == DjPromptKind.ChatSystem,
+                kind == DjPromptKind.ChatSystem ||
+                kind == DjPromptKind.QueueRankSystem ||
+                kind == DjPromptKind.QueueRankUser,
         )
         return loadPromptTemplates().firstOrNull { it.kind == kind }
             ?: when (kind) {
                 DjPromptKind.BanterSystem -> DjPromptDefaults.banterSystem()
                 DjPromptKind.ResearchSystem -> DjPromptDefaults.researchSystem()
                 DjPromptKind.ChatSystem -> DjPromptDefaults.chatSystem()
+                DjPromptKind.QueueRankSystem -> DjPromptDefaults.queueRankSystem()
+                DjPromptKind.QueueRankUser -> DjPromptDefaults.queueRankUser()
                 else -> DjPromptDefaults.banterSystem()
             }
     }
@@ -764,7 +973,9 @@ class SpotifyDjStore(context: Context) {
         // System cores cannot be deleted — reset instead.
         if (t.kind == DjPromptKind.BanterSystem ||
             t.kind == DjPromptKind.ResearchSystem ||
-            t.kind == DjPromptKind.ChatSystem
+            t.kind == DjPromptKind.ChatSystem ||
+            t.kind == DjPromptKind.QueueRankSystem ||
+            t.kind == DjPromptKind.QueueRankUser
         ) {
             val def = DjPromptDefaults.defaultFor(id) ?: return false
             upsertPromptTemplate(def)
@@ -1392,6 +1603,31 @@ fun resolveListenerName(context: Context, store: SpotifyDjStore = SpotifyDjStore
         SpotifyDjBus.patch { it.copy(listenerName = name) }
     }
     return name
+}
+
+/**
+ * Short label for status lines: "liked · top · recent" or "default mix" when all on.
+ */
+fun queueSourcesStatusLabel(store: SpotifyDjStore): String {
+    if (store.isDefaultQueueSystem()) return "liked · top · recent"
+    val on = store.queueSourcesEnabled
+    val labels = DjQueueSource.entries
+        .filter { it.id in on && it != DjQueueSource.History && it != DjQueueSource.Excluded }
+        .map { it.label.lowercase() }
+    if (labels.isEmpty()) {
+        return when {
+            DjQueueSource.History.id in on || DjQueueSource.Excluded.id in on ->
+                "filters only"
+            else -> "no sources"
+        }
+    }
+    val pl = store.queuePlaylistIds
+    val base = labels.take(5).joinToString(" · ")
+    return if (pl.isNotEmpty() && DjQueueSource.Playlists.id in on) {
+        "$base · ${pl.size} playlist${if (pl.size == 1) "" else "s"}"
+    } else {
+        base
+    }
 }
 
 /** Push banter prefs + countdown into the UI bus (and live service when running). */
@@ -2386,7 +2622,9 @@ class SpotifyLiveDjService : Service() {
         if (store.enabled) {
             ensureMediaSession()
             syncMediaSession(force = false)
-            startAsForeground(SpotifyDjBus.state.value.status.ifBlank { "Watching playback…" })
+            startAsForeground(
+                SpotifyDjBus.state.value.status.ifBlank { "Watching playback…" },
+            )
             if (loopJob?.isActive != true) {
                 loopJob = scope.launch { runLoop() }
             }
@@ -2451,7 +2689,7 @@ class SpotifyLiveDjService : Service() {
                     "Live DJ on — restored $restored track${if (restored == 1) "" else "s"} in the app list. " +
                         "Direct-play: we start each cut ourselves (Spotify’s Up Next is not used)."
                 } else {
-                    "Live DJ on — building a radio set from liked · top · recent. " +
+                    "Live DJ on — building a radio set from ${queueSourcesStatusLabel(store)}. " +
                         "UP NEXT stays in the app; each song is played directly when its turn comes."
                 },
             ),
@@ -3074,8 +3312,11 @@ class SpotifyLiveDjService : Service() {
             else -> 9_000L // still researching / baking — modest early arm only
         }
         // Never arm near-end in the first half of a long cut (stale progress_ms glitches).
+        // Auto-handoff only when Live DJ toggle is on.
+        val autoHandoffOn = store.enabled
         val pastIntro = duration <= 0L || progress >= 12_000L || remain <= duration / 2
         if (
+            autoHandoffOn &&
             !autoHandoffHeld &&
             banterDue &&
             banterThreshold > 0L &&
@@ -3100,6 +3341,7 @@ class SpotifyLiveDjService : Service() {
         // Silent: arm a few seconds early so background polls don't miss the end, then
         // waitUntilRemainAbout inside the transition holds until ~0.8s remain.
         if (
+            autoHandoffOn &&
             !autoHandoffHeld &&
             !banterDue &&
             playing &&
@@ -3121,6 +3363,7 @@ class SpotifyLiveDjService : Service() {
         // Hard stop while auto-handoff is held (user pause / empty session).
         // Do not use sticky wasPlaying to override the hold — that resumed sets hours later.
         if (
+            autoHandoffOn &&
             !autoHandoffHeld &&
             !playing &&
             duration > 0 &&
@@ -6439,10 +6682,11 @@ class SpotifyLiveDjService : Service() {
             return
         }
         if (!filling.compareAndSet(false, true)) return
+        val srcLabel = queueSourcesStatusLabel(store)
         val statusStart = if (replace) {
-            "New queue — clearing upcoming, rebuilding from liked · top · recent…"
+            "New queue — clearing upcoming, rebuilding from $srcLabel…"
         } else {
-            "Building radio from liked · top · recent…"
+            "Building radio from $srcLabel…"
         }
         publish(filling = true, status = statusStart)
         try {
@@ -6503,16 +6747,20 @@ class SpotifyLiveDjService : Service() {
                 batch = pickFromPool(pool, curForPool, (if (replace) 8 else 6) + (0..3).random())
                 aiBanterLine = null
             }
-            // Never re-add recently played / already heard / disliked
+            // Never re-add already heard / disliked when those sources are enabled
+            val honorHistory = store.isQueueSourceEnabled(DjQueueSource.History)
+            val honorExcluded = store.isQueueSourceEnabled(DjQueueSource.Excluded)
             batch = batch.filter {
-                !isPlayed(it.uri) && !isDisliked(it) && it.uri != curForPool?.uri
+                (!honorHistory || !isPlayed(it.uri)) &&
+                    (!honorExcluded || !isDisliked(it)) &&
+                    it.uri != curForPool?.uri
             }
             val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
             synchronized(queue) {
                 batch.forEach { t ->
                     if (queue.none { it.uri == t.uri } &&
-                        !isPlayed(t.uri) &&
-                        !isDisliked(t)
+                        (!honorHistory || !isPlayed(t.uri)) &&
+                        (!honorExcluded || !isDisliked(t))
                     ) {
                         queue.addLast(t)
                     }
@@ -6671,12 +6919,17 @@ class SpotifyLiveDjService : Service() {
     /**
      * Spotify-AI-DJ-style pool: seed from liked, top tracks/artists, recently played,
      * then expand via artist radio (top tracks + related artists) and a few playlists.
+     * Which steps run is controlled by [SpotifyDjStore.queueSourcesEnabled] (default = all).
      */
     private fun gatherRadioPool(current: DjQueueTrack?): List<DjQueueTrack> {
         val pool = ArrayList<DjQueueTrack>(120)
         val seen = HashSet<String>()
         val seedTracks = ArrayList<DjQueueTrack>(40)
         val seedArtistIds = LinkedHashSet<String>()
+        val src = store.queueSourcesEnabled
+        fun on(s: DjQueueSource): Boolean = s.id in src
+        val honorHistory = on(DjQueueSource.History)
+        val honorExcluded = on(DjQueueSource.Excluded)
         // Abort expansion once Spotify 429s so we don't dig a deeper rate-limit hole.
         fun rateLimitedOut(): Boolean = isRateLimited()
 
@@ -6694,8 +6947,8 @@ class SpotifyLiveDjService : Service() {
         ) {
             if (uri.isBlank() || uri.contains("local:")) return
             if (!seen.add(uri)) return
-            if (isPlayed(uri)) return
-            if (isDisliked(uri, artistIds, artists, artistUri)) return
+            if (honorHistory && isPlayed(uri)) return
+            if (honorExcluded && isDisliked(uri, artistIds, artists, artistUri)) return
             if (current?.uri == uri) return
             // Still allow as seed-only when artist is blocked? No — skip entirely.
             val t = DjQueueTrack(
@@ -6712,7 +6965,11 @@ class SpotifyLiveDjService : Service() {
             pool.add(t)
             if (asSeed) seedTracks.add(t)
             artistIds.forEach { id ->
-                if (id.isNotBlank() && !store.isArtistIdBlocked(id)) seedArtistIds.add(id)
+                if (id.isNotBlank() &&
+                    (!honorExcluded || !store.isArtistIdBlocked(id))
+                ) {
+                    seedArtistIds.add(id)
+                }
             }
         }
 
@@ -6736,80 +6993,91 @@ class SpotifyLiveDjService : Service() {
 
         // 1) Recently played — EXCLUDE from the radio queue (already listened), but still
         // harvest artists / seed tracks for radio expansion so the set stays in the vibe.
-        if (rateLimitedOut()) return pool
-        val recent = spotifyGet("/v1/me/player/recently-played?limit=50")
-        if (recent.ok) {
-            val items = recent.json?.optJSONArray("items")
-            if (items != null) {
-                for (i in 0 until items.length()) {
-                    val it = items.optJSONObject(i) ?: continue
-                    val t = it.optJSONObject("track") ?: continue
-                    if (t.optBoolean("is_local", false)) continue
-                    val uri = t.optString("uri", "")
-                    if (uri.isNotBlank()) {
-                        // Durable exclude so refill / AI pick won't re-queue this cut
-                        markPlayed(uri)
-                        seen.add(uri) // keep out of pool even if mark is flushed later mid-fill
+        if (on(DjQueueSource.Recent) && !rateLimitedOut()) {
+            val recent = spotifyGet("/v1/me/player/recently-played?limit=50")
+            if (recent.ok) {
+                val items = recent.json?.optJSONArray("items")
+                if (items != null) {
+                    for (i in 0 until items.length()) {
+                        val it = items.optJSONObject(i) ?: continue
+                        val t = it.optJSONObject("track") ?: continue
+                        if (t.optBoolean("is_local", false)) continue
+                        val uri = t.optString("uri", "")
+                        if (uri.isNotBlank()) {
+                            // Durable exclude so refill / AI pick won't re-queue this cut
+                            if (honorHistory) {
+                                markPlayed(uri)
+                            }
+                            seen.add(uri) // keep out of pool even if mark is flushed later mid-fill
+                        }
+                        val ids = artistIdsOf(t)
+                        ids.forEach { id ->
+                            if (id.isNotBlank() &&
+                                (!honorExcluded || !store.isArtistIdBlocked(id))
+                            ) {
+                                seedArtistIds.add(id)
+                            }
+                        }
+                        // Seed for song_radio expansion only — not a queue candidate
+                        val arts = artistsOf(t)
+                        val aUri = artistUriOf(t)
+                        val blocked = honorExcluded && isDisliked(uri, ids, arts, aUri)
+                        if (uri.isNotBlank() && !blocked) {
+                            seedTracks.add(
+                                DjQueueTrack(
+                                    uri = uri,
+                                    name = t.optString("name", ""),
+                                    artists = arts,
+                                    reason = "recently played (exclude)",
+                                    artistIds = ids,
+                                    albumArtUrl = albumArtUrlOf(t),
+                                    albumUri = albumUriOf(t),
+                                    artistUri = aUri,
+                                ),
+                            )
+                        }
                     }
-                    val ids = artistIdsOf(t)
-                    ids.forEach { id ->
-                        if (id.isNotBlank() && !store.isArtistIdBlocked(id)) seedArtistIds.add(id)
-                    }
-                    // Seed for song_radio expansion only — not a queue candidate
-                    // (skip seeds for permanently blocked artists)
-                    val arts = artistsOf(t)
-                    val aUri = artistUriOf(t)
-                    if (uri.isNotBlank() && !isDisliked(uri, ids, arts, aUri)) {
-                        seedTracks.add(
-                            DjQueueTrack(
-                                uri = uri,
-                                name = t.optString("name", ""),
-                                artists = arts,
-                                reason = "recently played (exclude)",
-                                artistIds = ids,
-                                albumArtUrl = albumArtUrlOf(t),
-                                albumUri = albumUriOf(t),
-                                artistUri = aUri,
-                            ),
-                        )
-                    }
+                    Log.i(TAG, "recently-played exclude seeds=${seedTracks.size} artists=${seedArtistIds.size}")
                 }
-                Log.i(TAG, "recently-played exclude seeds=${seedTracks.size} artists=${seedArtistIds.size}")
             }
         }
 
         // 2) Top tracks (short + medium term — what Spotify DJ leans on)
-        for (range in listOf("short_term", "medium_term")) {
-            if (rateLimitedOut()) return pool
-            val top = spotifyGet("/v1/me/top/tracks?time_range=$range&limit=20")
-            if (top.ok) {
-                val items = top.json?.optJSONArray("items")
-                if (items != null) {
-                    for (i in 0 until items.length()) {
-                        addFromTrackObj(items.optJSONObject(i), "top tracks ($range)", asSeed = true)
+        if (on(DjQueueSource.Top)) {
+            for (range in listOf("short_term", "medium_term")) {
+                if (rateLimitedOut()) return pool
+                val top = spotifyGet("/v1/me/top/tracks?time_range=$range&limit=20")
+                if (top.ok) {
+                    val items = top.json?.optJSONArray("items")
+                    if (items != null) {
+                        for (i in 0 until items.length()) {
+                            addFromTrackObj(items.optJSONObject(i), "top tracks ($range)", asSeed = true)
+                        }
                     }
                 }
             }
         }
 
         // 3) Top artists → later expand as artist radio
-        for (range in listOf("short_term", "medium_term")) {
-            if (rateLimitedOut()) return pool
-            val topA = spotifyGet("/v1/me/top/artists?time_range=$range&limit=15")
-            if (topA.ok) {
-                val items = topA.json?.optJSONArray("items")
-                if (items != null) {
-                    for (i in 0 until items.length()) {
-                        val a = items.optJSONObject(i) ?: continue
-                        val id = a.optString("id", "")
-                        if (id.isNotBlank()) seedArtistIds.add(id)
+        if (on(DjQueueSource.TopArtists)) {
+            for (range in listOf("short_term", "medium_term")) {
+                if (rateLimitedOut()) return pool
+                val topA = spotifyGet("/v1/me/top/artists?time_range=$range&limit=15")
+                if (topA.ok) {
+                    val items = topA.json?.optJSONArray("items")
+                    if (items != null) {
+                        for (i in 0 until items.length()) {
+                            val a = items.optJSONObject(i) ?: continue
+                            val id = a.optString("id", "")
+                            if (id.isNotBlank()) seedArtistIds.add(id)
+                        }
                     }
                 }
             }
         }
 
         // 4) Liked / saved tracks
-        if (!rateLimitedOut()) {
+        if (on(DjQueueSource.Liked) && !rateLimitedOut()) {
             val liked = spotifyGet("/v1/me/tracks?limit=40")
             if (liked.ok) {
                 val items = liked.json?.optJSONArray("items")
@@ -6822,18 +7090,20 @@ class SpotifyLiveDjService : Service() {
             }
         }
 
-        // Current track's artists are strong radio seeds
-        current?.artistIds?.forEach { if (it.isNotBlank()) seedArtistIds.add(it) }
-        if (current != null && current.artistIds.isEmpty() && !rateLimitedOut()) {
-            val hint = primaryArtist(current.artists)
-            if (hint.isNotBlank()) {
-                val q = java.net.URLEncoder.encode(hint, "UTF-8")
-                val s = spotifyGet("/v1/search?type=artist&limit=1&q=$q")
-                val id = s.json?.optJSONObject("artists")
-                    ?.optJSONArray("items")
-                    ?.optJSONObject(0)
-                    ?.optString("id", "")
-                if (!id.isNullOrBlank()) seedArtistIds.add(id)
+        // Current track's artists are strong radio seeds (when any radio expansion is on)
+        if (on(DjQueueSource.ArtistRadio) || on(DjQueueSource.Related) || on(DjQueueSource.SongRadio)) {
+            current?.artistIds?.forEach { if (it.isNotBlank()) seedArtistIds.add(it) }
+            if (current != null && current.artistIds.isEmpty() && !rateLimitedOut()) {
+                val hint = primaryArtist(current.artists)
+                if (hint.isNotBlank()) {
+                    val q = java.net.URLEncoder.encode(hint, "UTF-8")
+                    val s = spotifyGet("/v1/search?type=artist&limit=1&q=$q")
+                    val id = s.json?.optJSONObject("artists")
+                        ?.optJSONArray("items")
+                        ?.optJSONObject(0)
+                        ?.optString("id", "")
+                    if (!id.isNullOrBlank()) seedArtistIds.add(id)
+                }
             }
         }
 
@@ -6845,49 +7115,57 @@ class SpotifyLiveDjService : Service() {
         radioModeIdx++
 
         // Drop any artist seeds the user permanently blocked via Dislike.
-        seedArtistIds.removeAll { store.isArtistIdBlocked(it) }
+        if (honorExcluded) {
+            seedArtistIds.removeAll { store.isArtistIdBlocked(it) }
+        }
 
         // 5) Artist radio: top tracks + related artists for a handful of seeds
-        val artistPick = seedArtistIds.shuffled().take(
-            when (mode) {
-                "artist_radio" -> 6
-                "song_radio" -> 3
-                else -> 4
-            },
-        )
-        for (aid in artistPick) {
-            if (store.isArtistIdBlocked(aid)) continue
-            if (rateLimitedOut()) return pool
-            val tops = spotifyGet(
-                "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/top-tracks?market=US",
+        if (on(DjQueueSource.ArtistRadio) || on(DjQueueSource.Related)) {
+            val artistPick = seedArtistIds.shuffled().take(
+                when (mode) {
+                    "artist_radio" -> 6
+                    "song_radio" -> 3
+                    else -> 4
+                },
             )
-            val tracks = tops.json?.optJSONArray("tracks")
-            if (tracks != null) {
-                val pick = (0 until tracks.length()).shuffled().take(4)
-                for (j in pick) {
-                    addFromTrackObj(tracks.optJSONObject(j), "artist radio")
-                }
-            }
-            if (mode == "artist_radio" || mode == "liked_blend") {
+            for (aid in artistPick) {
+                if (honorExcluded && store.isArtistIdBlocked(aid)) continue
                 if (rateLimitedOut()) return pool
-                val rel = spotifyGet(
-                    "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/related-artists",
-                )
-                val related = rel.json?.optJSONArray("artists")
-                if (related != null) {
-                    val rPick = (0 until related.length()).shuffled().take(2)
-                    for (j in rPick) {
-                        if (rateLimitedOut()) return pool
-                        val ra = related.optJSONObject(j) ?: continue
-                        val rid = ra.optString("id", "")
-                        if (rid.isBlank() || store.isArtistIdBlocked(rid)) continue
-                        val rt = spotifyGet(
-                            "/v1/artists/${java.net.URLEncoder.encode(rid, "UTF-8")}/top-tracks?market=US",
-                        )
-                        val rTracks = rt.json?.optJSONArray("tracks") ?: continue
-                        val k = (0 until rTracks.length()).shuffled().take(2)
-                        for (m in k) {
-                            addFromTrackObj(rTracks.optJSONObject(m), "related artist radio")
+                if (on(DjQueueSource.ArtistRadio)) {
+                    val tops = spotifyGet(
+                        "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/top-tracks?market=US",
+                    )
+                    val tracks = tops.json?.optJSONArray("tracks")
+                    if (tracks != null) {
+                        val pick = (0 until tracks.length()).shuffled().take(4)
+                        for (j in pick) {
+                            addFromTrackObj(tracks.optJSONObject(j), "artist radio")
+                        }
+                    }
+                }
+                val wantRelated = on(DjQueueSource.Related) &&
+                    (mode == "artist_radio" || mode == "liked_blend" || !on(DjQueueSource.ArtistRadio))
+                if (wantRelated) {
+                    if (rateLimitedOut()) return pool
+                    val rel = spotifyGet(
+                        "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/related-artists",
+                    )
+                    val related = rel.json?.optJSONArray("artists")
+                    if (related != null) {
+                        val rPick = (0 until related.length()).shuffled().take(2)
+                        for (j in rPick) {
+                            if (rateLimitedOut()) return pool
+                            val ra = related.optJSONObject(j) ?: continue
+                            val rid = ra.optString("id", "")
+                            if (rid.isBlank() || (honorExcluded && store.isArtistIdBlocked(rid))) continue
+                            val rt = spotifyGet(
+                                "/v1/artists/${java.net.URLEncoder.encode(rid, "UTF-8")}/top-tracks?market=US",
+                            )
+                            val rTracks = rt.json?.optJSONArray("tracks") ?: continue
+                            val k = (0 until rTracks.length()).shuffled().take(2)
+                            for (m in k) {
+                                addFromTrackObj(rTracks.optJSONObject(m), "related artist radio")
+                            }
                         }
                     }
                 }
@@ -6895,11 +7173,15 @@ class SpotifyLiveDjService : Service() {
         }
 
         // 6) Song radio: more from primary artists of seed tracks (when mode wants it)
-        if (mode == "song_radio" || mode == "top_blend") {
+        if (on(DjQueueSource.SongRadio) && (mode == "song_radio" || mode == "top_blend" ||
+                (!on(DjQueueSource.ArtistRadio) && !on(DjQueueSource.Related)))
+        ) {
             val seeds = seedTracks.shuffled().take(5)
             for (s in seeds) {
                 if (rateLimitedOut()) return pool
-                val aid = s.artistIds.firstOrNull { !store.isArtistIdBlocked(it) }.orEmpty()
+                val aid = s.artistIds.firstOrNull {
+                    !honorExcluded || !store.isArtistIdBlocked(it)
+                }.orEmpty()
                 if (aid.isBlank()) continue
                 val tops = spotifyGet(
                     "/v1/artists/${java.net.URLEncoder.encode(aid, "UTF-8")}/top-tracks?market=US",
@@ -6912,24 +7194,46 @@ class SpotifyLiveDjService : Service() {
             }
         }
 
-        // 7) A couple of user playlists for variety
-        val plsRes = spotifyGet("/v1/me/playlists?limit=40")
-        val playlists = plsRes.json?.optJSONArray("items")
-        if (playlists != null && playlists.length() > 0) {
-            val indices = (0 until playlists.length()).shuffled().take(3)
-            for (idx in indices) {
-                val pl = playlists.optJSONObject(idx) ?: continue
-                val id = pl.optString("id", "")
-                if (id.isBlank()) continue
-                val plName = pl.optString("name", "set")
-                val tr = spotifyGet(
-                    "/v1/playlists/${java.net.URLEncoder.encode(id, "UTF-8")}/tracks?limit=30",
-                )
-                val items = tr.json?.optJSONArray("items") ?: continue
-                val pick = (0 until items.length()).shuffled().take(8)
-                for (j in pick) {
-                    val it = items.optJSONObject(j) ?: continue
-                    addFromTrackObj(it.optJSONObject("track"), "playlist: $plName")
+        // 7) User playlists — pinned selection, or random sample when none pinned (default)
+        if (on(DjQueueSource.Playlists) && !rateLimitedOut()) {
+            val pinned = store.queuePlaylistIds
+            if (pinned.isNotEmpty()) {
+                val nameById = store.queuePlaylistCache.associate { it.id to it.name }
+                for (id in pinned.shuffled().take(MAX_DJ_QUEUE_PLAYLISTS)) {
+                    if (rateLimitedOut()) return pool
+                    if (id.isBlank()) continue
+                    val plName = nameById[id]?.ifBlank { "set" } ?: "set"
+                    val tr = spotifyGet(
+                        "/v1/playlists/${java.net.URLEncoder.encode(id, "UTF-8")}/tracks?limit=40",
+                    )
+                    val items = tr.json?.optJSONArray("items") ?: continue
+                    val pick = (0 until items.length()).shuffled().take(10)
+                    for (j in pick) {
+                        val it = items.optJSONObject(j) ?: continue
+                        addFromTrackObj(it.optJSONObject("track"), "playlist: $plName")
+                    }
+                }
+            } else {
+                val plsRes = spotifyGet("/v1/me/playlists?limit=40")
+                val playlists = plsRes.json?.optJSONArray("items")
+                if (playlists != null && playlists.length() > 0) {
+                    val indices = (0 until playlists.length()).shuffled().take(3)
+                    for (idx in indices) {
+                        if (rateLimitedOut()) return pool
+                        val pl = playlists.optJSONObject(idx) ?: continue
+                        val id = pl.optString("id", "")
+                        if (id.isBlank()) continue
+                        val plName = pl.optString("name", "set")
+                        val tr = spotifyGet(
+                            "/v1/playlists/${java.net.URLEncoder.encode(id, "UTF-8")}/tracks?limit=30",
+                        )
+                        val items = tr.json?.optJSONArray("items") ?: continue
+                        val pick = (0 until items.length()).shuffled().take(8)
+                        for (j in pick) {
+                            val it = items.optJSONObject(j) ?: continue
+                            addFromTrackObj(it.optJSONObject("track"), "playlist: $plName")
+                        }
+                    }
                 }
             }
         }
@@ -7069,38 +7373,47 @@ class SpotifyLiveDjService : Service() {
         val genres = store.selectedGenres
         val city = store.listenerCity
         val behavior = store.behaviorMode
-        val system =
-            "You are a radio DJ music director (Spotify DJ style). Reply ONLY with valid JSON: " +
-                "{\"picks\":[{\"uri\":\"spotify:track:...\",\"banter_note\":\"short why\"}],\"banter\":\"\"}. " +
-                "Pick exactly $n tracks from the CANDIDATES list only (use their uris). " +
-                "Blend liked/top seeds with artist-radio variety" +
-                (if (genres.isNotEmpty()) {
-                    " and lean into these genres when candidates support it: ${genres.joinToString(", ")}."
-                } else {
-                    "."
-                }) +
-                " Candidates already exclude recently played and already-heard tracks — never re-pick those. " +
-                "Avoid stacking the same primary artist twice in a row. " +
-                "Leave banter empty (spoken lines are generated separately). No markdown."
-        val prompt = buildString {
-            appendLine("CURRENT: $curLine")
-            appendLine("Behavior mode (queue energy, not spoken line): ${behavior.label}")
-            if (genres.isNotEmpty()) {
-                appendLine("Genre board (optional bias — prefer matching candidates): ${genres.joinToString(", ")}")
-            }
-            if (city.isNotBlank()) {
-                appendLine(
-                    "Listener city: $city — prefer familiar artists / discovery that fits a " +
-                        "local-show-aware set when candidates allow (don't invent).",
-                )
-            }
-            if (vibeHint.isNotBlank()) appendLine("Vibe hint: $vibeHint")
-            appendLine()
-            appendLine("CANDIDATES (not recently played):")
-            appendLine(list)
-            appendLine()
-            appendLine("Pick $n next tracks for a continuous live DJ set. Do not repeat recently heard songs.")
+        val genreBias = if (genres.isNotEmpty()) {
+            " and lean into these genres when candidates support it: ${genres.joinToString(", ")}."
+        } else {
+            "."
         }
+        val genreBoardLine = if (genres.isNotEmpty()) {
+            "Genre board (optional bias — prefer matching candidates): ${genres.joinToString(", ")}\n"
+        } else {
+            ""
+        }
+        val cityLine = if (city.isNotBlank()) {
+            "Listener city: $city — prefer familiar artists / discovery that fits a " +
+                "local-show-aware set when candidates allow (don't invent).\n"
+        } else {
+            ""
+        }
+        val vibeLine = if (vibeHint.isNotBlank()) {
+            "Vibe hint: $vibeHint\n"
+        } else {
+            ""
+        }
+        val nStr = n.toString()
+        val system = applyPromptPlaceholders(
+            store.systemTemplate(DjPromptKind.QueueRankSystem).body,
+            mapOf(
+                "N" to nStr,
+                "GENRE_BIAS" to genreBias,
+            ),
+        )
+        val prompt = applyPromptPlaceholders(
+            store.systemTemplate(DjPromptKind.QueueRankUser).body,
+            mapOf(
+                "CURRENT" to curLine,
+                "BEHAVIOR" to behavior.label,
+                "GENRE_BOARD_LINE" to genreBoardLine,
+                "CITY_LINE" to cityLine,
+                "VIBE_LINE" to vibeLine,
+                "CANDIDATES" to list,
+                "N" to nStr,
+            ),
+        )
         val opts = JSONObject()
             .put("system", system)
             .put("session_title", "· Spotify Live DJ")
@@ -7112,12 +7425,15 @@ class SpotifyLiveDjService : Service() {
         val json = extractJson(text) ?: return null
         val picks = json.optJSONArray("picks") ?: return null
         val byUri = sample.associateBy { it.uri }
+        val honorHistory = store.isQueueSourceEnabled(DjQueueSource.History)
+        val honorExcluded = store.isQueueSourceEnabled(DjQueueSource.Excluded)
         val out = ArrayList<DjQueueTrack>()
         for (i in 0 until picks.length()) {
             val p = picks.optJSONObject(i) ?: continue
             val uri = p.optString("uri", "")
             val hit = byUri[uri] ?: continue
-            if (isPlayed(hit.uri) || isDisliked(hit)) continue
+            if (honorHistory && isPlayed(hit.uri)) continue
+            if (honorExcluded && isDisliked(hit)) continue
             // Keep original pool reason (liked / top / artist radio / chat:…) for attribution.
             // Never let AI banter_note overwrite source — that made the DJ claim "you queued" DJ picks.
             out.add(hit)

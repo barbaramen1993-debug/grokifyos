@@ -2604,6 +2604,7 @@
       toggleWrap('sc-settings-wrap');
       if ($('sc-settings-wrap') && $('sc-settings-wrap').classList.contains('open')) {
         loadUsage(false);
+        loadWorkDir();
       }
     });
     $('sc-usage-chip') &&
@@ -2801,6 +2802,162 @@
     $('sc-set-show-thoughts') &&
       $('sc-set-show-thoughts').addEventListener('change', (e) => {
         setShowThoughts(e.target.checked);
+      });
+
+    bindWorkDirUi();
+  }
+
+  let workDirState = {
+    path: '',
+    defaultPath: '',
+    isDefault: true,
+    browsePath: '',
+    browseParent: null,
+    browserOpen: false,
+  };
+
+  function setWorkDirStatus(msg, isError) {
+    const el = $('sc-workdir-status');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.style.color = isError ? '#f87171' : '#9ca3af';
+  }
+
+  function applyWorkDirToUi(data) {
+    if (!data) return;
+    workDirState.path = data.path || '';
+    workDirState.defaultPath = data.default_path || '';
+    workDirState.isDefault = !!data.is_default;
+    const cur = $('sc-workdir-current');
+    if (cur) {
+      cur.textContent = workDirState.path || '—';
+    }
+    const inp = $('sc-workdir-input');
+    if (inp && document.activeElement !== inp) {
+      inp.value = workDirState.path || '';
+    }
+    const hint = $('sc-workdir-hint');
+    if (hint) {
+      hint.textContent = workDirState.isDefault
+        ? 'Default — GrokifyOS install workspace'
+        : 'Custom project directory on the bridge server';
+    }
+  }
+
+  async function loadWorkDir() {
+    try {
+      const data = await apiGet('/admin-system-chat-workdir.php');
+      if (data && data.ok) {
+        applyWorkDirToUi(data);
+        setWorkDirStatus('');
+      } else {
+        setWorkDirStatus((data && data.error) || 'Could not load working directory', true);
+      }
+    } catch (e) {
+      setWorkDirStatus(e.message || 'Could not load working directory', true);
+    }
+  }
+
+  async function setWorkDir(path, reset) {
+    setWorkDirStatus(reset ? 'Resetting…' : 'Saving…');
+    try {
+      const body = reset ? { reset: true } : { path: path };
+      const data = await apiPost('/admin-system-chat-workdir.php', body);
+      if (data && data.ok) {
+        applyWorkDirToUi(data);
+        setWorkDirStatus(reset ? 'Reset to default' : 'Saved — new chats use this folder');
+      } else {
+        setWorkDirStatus((data && (data.message || data.error)) || 'Save failed', true);
+      }
+    } catch (e) {
+      setWorkDirStatus(e.message || 'Save failed', true);
+    }
+  }
+
+  async function browseWorkDir(path) {
+    try {
+      const q =
+        '/admin-system-chat-workdir.php?list=1' +
+        (path ? '&path=' + encodeURIComponent(path) : '');
+      const data = await apiGet(q);
+      if (!data || !data.ok) {
+        setWorkDirStatus((data && (data.message || data.error)) || 'Browse failed', true);
+        return;
+      }
+      workDirState.browsePath = data.path || '';
+      workDirState.browseParent = data.parent || null;
+      const pathEl = $('sc-workdir-browse-path');
+      if (pathEl) pathEl.textContent = workDirState.browsePath;
+      const list = $('sc-workdir-list');
+      if (list) {
+        list.innerHTML = '';
+        const entries = data.entries || [];
+        if (!entries.length) {
+          const empty = document.createElement('div');
+          empty.className = 'sc-setting-sub';
+          empty.style.padding = '0.45rem 0.55rem';
+          empty.textContent = 'No subfolders';
+          list.appendChild(empty);
+        } else {
+          entries.forEach((ent) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'sc-workdir-item';
+            btn.textContent = '📁 ' + (ent.name || '');
+            btn.addEventListener('click', () => browseWorkDir(ent.path));
+            list.appendChild(btn);
+          });
+        }
+      }
+      const browser = $('sc-workdir-browser');
+      if (browser) browser.classList.remove('hidden');
+      workDirState.browserOpen = true;
+      const inp = $('sc-workdir-input');
+      if (inp) inp.value = workDirState.browsePath;
+    } catch (e) {
+      setWorkDirStatus(e.message || 'Browse failed', true);
+    }
+  }
+
+  function bindWorkDirUi() {
+    if (!$('sc-workdir-current')) return;
+    $('sc-workdir-apply') &&
+      $('sc-workdir-apply').addEventListener('click', () => {
+        const v = ($('sc-workdir-input') && $('sc-workdir-input').value.trim()) || '';
+        if (!v) {
+          setWorkDirStatus('Enter an absolute path', true);
+          return;
+        }
+        setWorkDir(v, false);
+      });
+    $('sc-workdir-reset') &&
+      $('sc-workdir-reset').addEventListener('click', () => setWorkDir('', true));
+    $('sc-workdir-browse') &&
+      $('sc-workdir-browse').addEventListener('click', () => {
+        if (workDirState.browserOpen) {
+          const browser = $('sc-workdir-browser');
+          if (browser) browser.classList.add('hidden');
+          workDirState.browserOpen = false;
+          return;
+        }
+        browseWorkDir(workDirState.path || workDirState.defaultPath || '');
+      });
+    $('sc-workdir-up') &&
+      $('sc-workdir-up').addEventListener('click', () => {
+        if (workDirState.browseParent) browseWorkDir(workDirState.browseParent);
+      });
+    $('sc-workdir-use') &&
+      $('sc-workdir-use').addEventListener('click', () => {
+        const p = workDirState.browsePath || '';
+        if (!p) return;
+        setWorkDir(p, false);
+      });
+    $('sc-workdir-input') &&
+      $('sc-workdir-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          $('sc-workdir-apply') && $('sc-workdir-apply').click();
+        }
       });
   }
 

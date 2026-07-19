@@ -246,6 +246,11 @@ fun GrokifyAppRoot(
     onToggleNote: (Int, Boolean) -> Unit = { _, _ -> },
     onDeleteNote: (Int) -> Unit = {},
     onSelectModel: (String) -> Unit = {},
+    onSetWorkDir: (String) -> Unit = {},
+    onResetWorkDir: () -> Unit = {},
+    onToggleWorkDirBrowser: () -> Unit = {},
+    onBrowseWorkDir: (String) -> Unit = {},
+    onUseBrowsedWorkDir: () -> Unit = {},
     onToggleMessageExclude: (String) -> Unit = {},
     onDeleteMessage: (String) -> Unit = {},
     onEditMessage: (String, String) -> Unit = { _, _ -> },
@@ -522,6 +527,11 @@ fun GrokifyAppRoot(
                         onRefreshUsage = onRefreshUsage,
                         onGrokLogin = onGrokLogin,
                         onSelectModel = onSelectModel,
+                        onSetWorkDir = onSetWorkDir,
+                        onResetWorkDir = onResetWorkDir,
+                        onToggleWorkDirBrowser = onToggleWorkDirBrowser,
+                        onBrowseWorkDir = onBrowseWorkDir,
+                        onUseBrowsedWorkDir = onUseBrowsedWorkDir,
                         onToggleHistory = onToggleHistory,
                         onToggleKeepScreenOn = onToggleKeepScreenOn,
                         onToggleEnterForNewline = onToggleEnterForNewline,
@@ -1194,16 +1204,20 @@ private fun ChatPane(
         }
     }
 
-    // Fingerprint tail growth (streaming text, tools, thoughts, expand) for stick-to-bottom.
+    // Fingerprint tail growth (streaming text/tools/thoughts) for stick-to-bottom.
+    // Intentionally omit [ChatLine.expanded]: expanding a card must not yank the list
+    // to the newest row while the user is reading it.
     val tailFingerprint = remember(visibleMessages) {
         visibleMessages.takeLast(4).joinToString("|") { m ->
-            "${m.id}:${m.role}:${m.text.length}:${m.toolResult.length}:${m.expanded}:${m.streaming}"
+            "${m.id}:${m.role}:${m.text.length}:${m.toolResult.length}:${m.streaming}"
         }
     }
 
-    // Auto-scroll only when the user is already near the bottom (or list grew while pinned)
+    // Auto-scroll only while the user is at the bottom. Scrolling up unlocks;
+    // returning to the bottom locks again (mirrors web system-chat.js).
     var pinToBottom by remember { mutableStateOf(true) }
     var prevMessageCount by remember { mutableIntStateOf(0) }
+    var lastHandledScrollNonce by remember { mutableIntStateOf(0) }
 
     fun listPrefixCount(): Int {
         var n = 0
@@ -1212,25 +1226,29 @@ private fun ChatPane(
         return n
     }
 
+    fun isNearBottom(info: androidx.compose.foundation.lazy.LazyListLayoutInfo, slackPx: Int = 120): Boolean {
+        val total = info.totalItemsCount
+        if (total <= 0) return true
+        val last = info.visibleItemsInfo.lastOrNull() ?: return true
+        // Must actually have the last row on screen (not merely near the end).
+        if (last.index != total - 1) return false
+        val viewportEnd = info.viewportEndOffset - info.afterContentPadding
+        val itemBottom = last.offset + last.size
+        // Remaining scroll below the viewport ≤ slack → pinned.
+        return itemBottom - viewportEnd <= slackPx
+    }
+
     val menuBottomPadPx = with(density) { 52.dp.roundToPx() }
     val stickBottomPadPx = with(density) { 10.dp.roundToPx() }
 
     LaunchedEffect(listState, state.hasMoreMessages, state.loadingOlder) {
         snapshotFlow {
             val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()
             val first = info.visibleItemsInfo.firstOrNull()
-            val total = info.totalItemsCount
-            // Near end if last rows are on screen AND the bottom of the last visible
-            // row is not far above the viewport (user hasn't scrolled content up).
-            val viewportEnd = info.viewportEndOffset - info.afterContentPadding
-            val slackPx = 160
-            val nearEnd = last != null && total > 0 && last.index >= total - 2 &&
-                (last.offset + last.size) >= (viewportEnd - slackPx)
             Triple(
-                nearEnd,
+                isNearBottom(info),
                 first?.index ?: -1,
-                total,
+                info.totalItemsCount,
             )
         }.collect { (nearEnd, firstIndex, total) ->
             pinToBottom = nearEnd
@@ -1241,19 +1259,28 @@ private fun ChatPane(
         }
     }
 
-    // Session open / initial page load → jump to bottom immediately
-    LaunchedEffect(state.scrollToBottomNonce, visibleMessages.size) {
-        if (state.scrollToBottomNonce > 0 && visibleMessages.isNotEmpty()) {
-            pinToBottom = true
-            val index = listPrefixCount() + visibleMessages.lastIndex
-            listState.ensureItemBottomVisible(index, stickBottomPadPx)
-            delay(48)
-            if (visibleMessages.isNotEmpty()) {
-                listState.ensureItemBottomVisible(
-                    listPrefixCount() + visibleMessages.lastIndex,
-                    stickBottomPadPx,
-                )
-            }
+    // Session open / forced jump only — once per nonce (NOT on every new message).
+    // Previously keying on visibleMessages.size re-pinned on every tool/thought row
+    // and yanked the user back to the bottom while reading an expanded card.
+    LaunchedEffect(state.scrollToBottomNonce) {
+        val nonce = state.scrollToBottomNonce
+        if (nonce <= 0 || nonce <= lastHandledScrollNonce) return@LaunchedEffect
+        // Wait a frame for the list to populate after session switch / history load
+        if (visibleMessages.isEmpty()) {
+            // Size may still be catching up; allow one short wait
+            delay(16)
+        }
+        if (visibleMessages.isEmpty()) return@LaunchedEffect
+        lastHandledScrollNonce = nonce
+        pinToBottom = true
+        val index = listPrefixCount() + visibleMessages.lastIndex
+        listState.ensureItemBottomVisible(index, stickBottomPadPx)
+        delay(48)
+        if (visibleMessages.isNotEmpty()) {
+            listState.ensureItemBottomVisible(
+                listPrefixCount() + visibleMessages.lastIndex,
+                stickBottomPadPx,
+            )
         }
     }
 
@@ -1463,8 +1490,22 @@ private fun ChatPane(
                                     )
                                 },
                             )
-                            ChatRole.Thinking -> ThinkingCard(msg) { onToggleExpand(msg.id) }
-                            ChatRole.Tool -> ToolCard(msg) { onToggleExpand(msg.id) }
+                            ChatRole.Thinking -> ThinkingCard(msg) {
+                                // Expanding an older thought: unlock stick-to-bottom so
+                                // new stream rows don't jump us off the card.
+                                val idx = visibleMessages.indexOfFirst { it.id == msg.id }
+                                if (!msg.expanded && idx >= 0 && idx < visibleMessages.lastIndex) {
+                                    pinToBottom = false
+                                }
+                                onToggleExpand(msg.id)
+                            }
+                            ChatRole.Tool -> ToolCard(msg) {
+                                val idx = visibleMessages.indexOfFirst { it.id == msg.id }
+                                if (!msg.expanded && idx >= 0 && idx < visibleMessages.lastIndex) {
+                                    pinToBottom = false
+                                }
+                                onToggleExpand(msg.id)
+                            }
                             ChatRole.Media -> MediaCard(msg)
                             ChatRole.PermissionRequest -> PermissionRequestCard(
                                 msg = msg,
@@ -2130,6 +2171,11 @@ private fun SettingsPage(
     state: UiState,
     onBack: () -> Unit,
     onSelectModel: (String) -> Unit,
+    onSetWorkDir: (String) -> Unit = {},
+    onResetWorkDir: () -> Unit = {},
+    onToggleWorkDirBrowser: () -> Unit = {},
+    onBrowseWorkDir: (String) -> Unit = {},
+    onUseBrowsedWorkDir: () -> Unit = {},
     onToggleHistory: () -> Unit,
     onToggleKeepScreenOn: () -> Unit,
     onToggleEnterForNewline: () -> Unit,
@@ -2148,6 +2194,9 @@ private fun SettingsPage(
     onSaveApiKey: (id: String, value: String, label: String?, description: String?) -> Unit = { _, _, _, _ -> },
     onClearApiKey: (String) -> Unit = {},
 ) {
+    var workDirDraft by remember(state.workDir) {
+        mutableStateOf(state.workDir)
+    }
     var mapboxDraft by remember(state.mapboxAccessToken) {
         mutableStateOf(state.mapboxAccessToken)
     }
@@ -2255,6 +2304,167 @@ private fun SettingsPage(
             checked = state.showThoughts,
             onToggle = onToggleShowThoughts,
         )
+
+        Text(
+            "WORKSPACE",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        Text(
+            if (state.workDirIsDefault) {
+                "Default — GrokifyOS install workspace. Agents run with this folder as cwd."
+            } else {
+                "Custom project directory on the bridge server. Agents run with this as cwd."
+            },
+            color = GrokifyColors.TextMuted,
+            fontSize = 12.sp,
+        )
+        Text(
+            state.workDir.ifBlank { "…" },
+            color = GrokifyColors.GlowCyan,
+            fontSize = 12.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(GrokifyColors.Panel)
+                .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(10.dp))
+                .padding(12.dp),
+        )
+        OutlinedTextField(
+            value = workDirDraft,
+            onValueChange = { workDirDraft = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("Absolute path on server") },
+            placeholder = { Text("/root/my-project") },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = GrokifyColors.TextPrimary,
+                unfocusedTextColor = GrokifyColors.TextPrimary,
+                focusedBorderColor = GrokifyColors.GlowCyan,
+                unfocusedBorderColor = GrokifyColors.PanelBorder,
+                focusedLabelColor = GrokifyColors.GlowCyan,
+                unfocusedLabelColor = GrokifyColors.TextDim,
+                cursorColor = GrokifyColors.GlowCyan,
+            ),
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            OutlinedButton(
+                onClick = { onSetWorkDir(workDirDraft.trim()) },
+                enabled = !state.workDirLoading && workDirDraft.isNotBlank(),
+                border = BorderStroke(1.dp, GrokifyColors.GlowCyan.copy(alpha = 0.5f)),
+            ) {
+                Text("Set", color = GrokifyColors.GlowCyan)
+            }
+            OutlinedButton(
+                onClick = onToggleWorkDirBrowser,
+                enabled = !state.workDirLoading,
+                border = BorderStroke(1.dp, GrokifyColors.PanelBorder),
+            ) {
+                Text(
+                    if (state.workDirBrowserOpen) "Hide" else "Browse",
+                    color = GrokifyColors.TextPrimary,
+                )
+            }
+            OutlinedButton(
+                onClick = onResetWorkDir,
+                enabled = !state.workDirLoading && !state.workDirIsDefault,
+                border = BorderStroke(1.dp, GrokifyColors.PanelBorder),
+            ) {
+                Text("Default", color = GrokifyColors.TextPrimary)
+            }
+        }
+        if (state.workDirBrowserOpen) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(GrokifyColors.Panel)
+                    .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(10.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            state.workDirBrowseParent?.let { onBrowseWorkDir(it) }
+                        },
+                        enabled = !state.workDirBrowseParent.isNullOrBlank() && !state.workDirLoading,
+                        border = BorderStroke(1.dp, GrokifyColors.PanelBorder),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    ) {
+                        Text("↑ Up", color = GrokifyColors.TextPrimary, fontSize = 12.sp)
+                    }
+                    Text(
+                        state.workDirBrowsePath,
+                        color = GrokifyColors.TextDim,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 2,
+                    )
+                    OutlinedButton(
+                        onClick = onUseBrowsedWorkDir,
+                        enabled = state.workDirBrowsePath.isNotBlank() && !state.workDirLoading,
+                        border = BorderStroke(1.dp, GrokifyColors.GlowMint.copy(alpha = 0.5f)),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    ) {
+                        Text("Use", color = GrokifyColors.GlowMint, fontSize = 12.sp)
+                    }
+                }
+                if (state.workDirLoading && state.workDirEntries.isEmpty()) {
+                    CircularProgressIndicator(
+                        color = GrokifyColors.GlowCyan,
+                        modifier = Modifier.size(22.dp),
+                    )
+                } else if (state.workDirEntries.isEmpty()) {
+                    Text("No subfolders", color = GrokifyColors.TextMuted, fontSize = 12.sp)
+                } else {
+                    state.workDirEntries.forEach { entry ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onBrowseWorkDir(entry.path) }
+                                .padding(vertical = 8.dp, horizontal = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "📁 ${entry.name}",
+                                color = GrokifyColors.TextPrimary,
+                                fontSize = 13.sp,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        if (state.workDirStatus.isNotBlank()) {
+            Text(
+                state.workDirStatus,
+                color = if (
+                    state.workDirStatus.contains("Saved", ignoreCase = true) ||
+                    state.workDirStatus.contains("Reset", ignoreCase = true)
+                ) {
+                    GrokifyColors.GlowMint
+                } else if (
+                    state.workDirStatus.contains("…") ||
+                    state.workDirStatus.contains("Saving", ignoreCase = true) ||
+                    state.workDirStatus.contains("Resetting", ignoreCase = true)
+                ) {
+                    GrokifyColors.TextDim
+                } else {
+                    GrokifyColors.GlowAmber
+                },
+                fontSize = 12.sp,
+            )
+        }
 
         Text(
             "API KEYS",

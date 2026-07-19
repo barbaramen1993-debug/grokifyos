@@ -67,6 +67,12 @@ let GROK_MODELS_FULL = [];
 
 const agents = new Map();
 
+/** app_settings key: agent process cwd (empty/missing → WORKSPACE install path). */
+const SETTING_AGENT_CWD = 'bridge_agent_cwd';
+/** In-memory cache so multi-worker lag is short without a DB hit every spawn. */
+let agentCwdCache = { path: null, loadedAt: 0 };
+const AGENT_CWD_CACHE_MS = 10000;
+
 const { createRuntime } = require('./agent-runtime');
 const runtime = createRuntime({
     workspace: WORKSPACE,
@@ -175,6 +181,200 @@ function refreshGrokModels() {
     } catch (err) {
         log('warning', 'error', `Grok model list failed: ${err.message}`, {});
     }
+}
+
+function defaultAgentCwd() {
+    return path.resolve(WORKSPACE);
+}
+
+/**
+ * Normalize + validate an absolute directory path for agent cwd.
+ * @returns {string} resolved real path
+ * @throws {Error} with short code-ish message
+ */
+function validateAgentCwd(input) {
+    if (input == null || typeof input !== 'string') {
+        throw new Error('path_required');
+    }
+    let p = input.trim();
+    if (!p) throw new Error('path_required');
+    if (p.includes('\0')) throw new Error('invalid_path');
+    if (!path.isAbsolute(p)) throw new Error('path_must_be_absolute');
+    // Collapse . / .. without following symlinks first
+    p = path.resolve(p);
+    if (!fs.existsSync(p)) throw new Error('path_not_found');
+    let real;
+    try {
+        real = fs.realpathSync(p);
+    } catch {
+        throw new Error('path_not_found');
+    }
+    let st;
+    try {
+        st = fs.statSync(real);
+    } catch {
+        throw new Error('path_not_found');
+    }
+    if (!st.isDirectory()) throw new Error('not_a_directory');
+    return real;
+}
+
+async function loadAgentCwdFromDb() {
+    let conn;
+    try {
+        conn = await mysql.createConnection(DB_CONFIG);
+        const [rows] = await conn.execute(
+            'SELECT setting_value FROM app_settings WHERE setting_key = ? LIMIT 1',
+            [SETTING_AGENT_CWD]
+        );
+        if (rows && rows[0] && typeof rows[0].setting_value === 'string') {
+            return rows[0].setting_value.trim();
+        }
+        return '';
+    } catch {
+        return '';
+    } finally {
+        if (conn) await conn.end();
+    }
+}
+
+async function saveAgentCwdToDb(value) {
+    let conn;
+    try {
+        conn = await mysql.createConnection(DB_CONFIG);
+        if (value === '' || value == null) {
+            await conn.execute('DELETE FROM app_settings WHERE setting_key = ?', [SETTING_AGENT_CWD]);
+        } else {
+            await conn.execute(
+                `INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?)
+                 ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), updated_at = CURRENT_TIMESTAMP`,
+                [SETTING_AGENT_CWD, value]
+            );
+        }
+        return true;
+    } catch (err) {
+        log('warning', 'error', `save agent cwd failed: ${err.message}`, {});
+        return false;
+    } finally {
+        if (conn) await conn.end();
+    }
+}
+
+/**
+ * Resolve effective agent working directory (default = bridge WORKSPACE).
+ * Cached briefly so multi-worker set lag is short without DB on every spawn.
+ */
+async function getAgentCwd({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && agentCwdCache.path && (now - agentCwdCache.loadedAt) < AGENT_CWD_CACHE_MS) {
+        return agentCwdCache.path;
+    }
+    const fromDb = await loadAgentCwdFromDb();
+    let resolved = defaultAgentCwd();
+    if (fromDb) {
+        try {
+            resolved = validateAgentCwd(fromDb);
+        } catch {
+            // Stale/missing path → fall back to install workspace
+            resolved = defaultAgentCwd();
+        }
+    }
+    agentCwdCache = { path: resolved, loadedAt: now };
+    return resolved;
+}
+
+/**
+ * Set or reset agent cwd. Empty / reset → default workspace (clears setting).
+ * @returns {{ ok: true, path: string, default_path: string, is_default: boolean } | { ok: false, error: string }}
+ */
+async function setAgentCwd(rawPath, { reset = false } = {}) {
+    const def = defaultAgentCwd();
+    if (reset || rawPath === '' || rawPath == null) {
+        const saved = await saveAgentCwdToDb('');
+        if (!saved) return { ok: false, error: 'db_write_failed' };
+        agentCwdCache = { path: def, loadedAt: Date.now() };
+        log('info', 'access', 'Agent working directory reset to default', { path: def });
+        return { ok: true, path: def, default_path: def, is_default: true };
+    }
+    let validated;
+    try {
+        validated = validateAgentCwd(String(rawPath));
+    } catch (err) {
+        return { ok: false, error: err.message || 'invalid_path' };
+    }
+    // Store default as empty so install moves stay default
+    const isDefault = path.resolve(validated) === path.resolve(def);
+    const saved = await saveAgentCwdToDb(isDefault ? '' : validated);
+    if (!saved) return { ok: false, error: 'db_write_failed' };
+    agentCwdCache = { path: validated, loadedAt: Date.now() };
+    log('info', 'access', 'Agent working directory updated', {
+        path: validated,
+        is_default: isDefault,
+    });
+    return {
+        ok: true,
+        path: validated,
+        default_path: def,
+        is_default: isDefault,
+    };
+}
+
+/**
+ * List immediate child directories for the picker UI.
+ */
+function listWorkDirEntries(dirPath) {
+    let base;
+    try {
+        base = validateAgentCwd(dirPath || defaultAgentCwd());
+    } catch (err) {
+        return { ok: false, error: err.message || 'invalid_path' };
+    }
+    const parent = path.dirname(base);
+    let names = [];
+    try {
+        names = fs.readdirSync(base, { withFileTypes: true });
+    } catch (err) {
+        return { ok: false, error: 'read_failed', message: err.message };
+    }
+    const entries = [];
+    for (const ent of names) {
+        if (!ent.isDirectory()) continue;
+        // Skip common noisy / unusable dirs
+        const name = ent.name;
+        if (name === '.' || name === '..') continue;
+        entries.push({
+            name,
+            path: path.join(base, name),
+        });
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    return {
+        ok: true,
+        path: base,
+        parent: parent !== base ? parent : null,
+        default_path: defaultAgentCwd(),
+        entries,
+    };
+}
+
+function readRequestBody(req, limit = 65536) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let size = 0;
+        req.on('data', (c) => {
+            size += c.length;
+            if (size > limit) {
+                reject(new Error('body_too_large'));
+                req.destroy();
+                return;
+            }
+            chunks.push(c);
+        });
+        req.on('end', () => {
+            resolve(Buffer.concat(chunks).toString('utf8'));
+        });
+        req.on('error', reject);
+    });
 }
 
 refreshGrokModels();
@@ -1772,7 +1972,7 @@ function startAgentWatchers(agent) {
     }, AGENT_TIMEOUT_MS);
 }
 
-function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId) {
+async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId) {
     const existing = agents.get(sessionId);
     if (existing && !existing.done) cleanupAgent(sessionId, { killProcess: true });
 
@@ -1790,6 +1990,8 @@ function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId
         fullPrompt = buildPromptWithHistory(prompt, (history || []).slice(-10), notes);
     }
 
+    const agentCwd = await getAgentCwd();
+
     log('info', 'agent', 'Spawning Grok Build', {
         session_id: sessionId,
         model: realModel,
@@ -1798,6 +2000,7 @@ function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId
         prompt_bytes: Buffer.byteLength(fullPrompt),
         detach: DETACH_AGENTS,
         instance: INSTANCE_ID,
+        cwd: agentCwd,
     });
 
     const args = [
@@ -1814,13 +2017,16 @@ function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId
     let outPath = null;
 
     if (DETACH_AGENTS) {
-        const spawned = runtime.spawnDetached(GROK_BIN, args, env, sessionId, { truncate: true });
+        const spawned = runtime.spawnDetached(GROK_BIN, args, env, sessionId, {
+            truncate: true,
+            cwd: agentCwd,
+        });
         proc = spawned.proc;
         pid = spawned.pid;
         outPath = spawned.outPath;
     } else {
         proc = spawn(GROK_BIN, args, {
-            cwd: WORKSPACE,
+            cwd: agentCwd,
             stdio: ['ignore', 'pipe', 'pipe'],
             env,
         });
@@ -2016,6 +2222,54 @@ const httpServer = http.createServer((req, res) => {
             allowed: [...ALLOWED_MODELS],
             default_model: resolveGrokModel(null),
         }));
+        return;
+    }
+    // Agent working directory (global): get / set / list children for picker
+    if (url.pathname === '/work-dir' && req.method === 'GET') {
+        getAgentCwd({ force: true })
+            .then((cwd) => {
+                const def = defaultAgentCwd();
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    ok: true,
+                    path: cwd,
+                    default_path: def,
+                    is_default: path.resolve(cwd) === path.resolve(def),
+                }));
+            })
+            .catch((err) => {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: err.message || 'failed' }));
+            });
+        return;
+    }
+    if (url.pathname === '/work-dir' && req.method === 'POST') {
+        readRequestBody(req)
+            .then(async (raw) => {
+                let body = {};
+                try {
+                    body = raw ? JSON.parse(raw) : {};
+                } catch {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+                    return;
+                }
+                const reset = !!(body.reset || body.path === '' || body.path === null);
+                const result = await setAgentCwd(reset ? '' : body.path, { reset });
+                res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            })
+            .catch((err) => {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: err.message || 'bad_request' }));
+            });
+        return;
+    }
+    if (url.pathname === '/work-dir/list' && req.method === 'GET') {
+        const listPath = url.searchParams.get('path') || '';
+        const result = listWorkDirEntries(listPath || undefined);
+        res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
         return;
     }
     if (url.pathname === '/health' && req.method === 'GET') {
@@ -2217,7 +2471,7 @@ wss.on('connection', (ws, req) => {
             prompt_len: prompt.length,
         });
 
-        spawnGrokBuild(sessionId, prompt, model, ws, history, notes, ws.userId);
+        await spawnGrokBuild(sessionId, prompt, model, ws, history, notes, ws.userId);
     });
 
     ws.on('close', () => {
@@ -2243,12 +2497,26 @@ httpServer.listen(PORT, () => {
     } catch (err) {
         log('warning', 'error', `Agent recovery failed: ${err.message}`, { instance: INSTANCE_ID });
     }
-    log('info', 'connection', `Bridge listening on ${PORT}`, {
-        workspace: WORKSPACE,
-        instance: INSTANCE_ID,
-        detach: DETACH_AGENTS,
-    });
-    console.log(`grokpot-bridge ${INSTANCE_ID} on :${PORT} (detach=${DETACH_AGENTS})`);
+    getAgentCwd({ force: true })
+        .then((cwd) => {
+            log('info', 'connection', `Bridge listening on ${PORT}`, {
+                workspace: WORKSPACE,
+                agent_cwd: cwd,
+                instance: INSTANCE_ID,
+                detach: DETACH_AGENTS,
+            });
+            console.log(
+                `grokpot-bridge ${INSTANCE_ID} on :${PORT} (detach=${DETACH_AGENTS}, cwd=${cwd})`
+            );
+        })
+        .catch(() => {
+            log('info', 'connection', `Bridge listening on ${PORT}`, {
+                workspace: WORKSPACE,
+                instance: INSTANCE_ID,
+                detach: DETACH_AGENTS,
+            });
+            console.log(`grokpot-bridge ${INSTANCE_ID} on :${PORT} (detach=${DETACH_AGENTS})`);
+        });
 });
 
 // Flush in-flight assistant messages to MySQL before process exit (systemd restart, etc.)

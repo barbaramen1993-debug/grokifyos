@@ -431,7 +431,10 @@ object SpotifyOAuth {
         return raw
     }
 
-    /** @return pair(success, errorMessage?) */
+    /**
+     * PKCE token exchange. Prefer pure PKCE (no client_secret).
+     * Falls back to secret only if pure-PKCE is rejected as confidential-client.
+     */
     private fun exchangeCode(
         ctx: Context,
         clientId: String,
@@ -439,6 +442,37 @@ object SpotifyOAuth {
         code: String,
         verifier: String,
     ): Pair<Boolean, String?> {
+        val pure = postTokenExchange(clientId, null, code, verifier)
+        if (pure.first) {
+            persistTokens(ctx, pure.third!!)
+            return true to null
+        }
+        // Retry once with secret if present and Spotify complained about client auth.
+        val err = pure.second.orEmpty()
+        val wantSecret = !clientSecret.isNullOrBlank() &&
+            (err.contains("client", ignoreCase = true) ||
+                err.contains("invalid_client", ignoreCase = true) ||
+                err.contains("unauthorized", ignoreCase = true))
+        if (wantSecret) {
+            val withSecret = postTokenExchange(clientId, clientSecret, code, verifier)
+            if (withSecret.first) {
+                persistTokens(ctx, withSecret.third!!)
+                return true to null
+            }
+            Log.w(TAG, "token exchange failed with secret: ${withSecret.second}")
+            return false to (withSecret.second ?: pure.second)
+        }
+        Log.w(TAG, "token exchange failed: $err")
+        return false to pure.second
+    }
+
+    /** @return Triple(ok, errorMessage?, jsonBody?) */
+    private fun postTokenExchange(
+        clientId: String,
+        clientSecret: String?,
+        code: String,
+        verifier: String,
+    ): Triple<Boolean, String?, JSONObject?> {
         return try {
             val form = FormBody.Builder()
                 .add("grant_type", "authorization_code")
@@ -457,17 +491,16 @@ object SpotifyOAuth {
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "token exchange ${resp.code}: $body")
+                    Log.w(TAG, "token exchange ${resp.code} secret=${!clientSecret.isNullOrBlank()}: $body")
                     val msg = parseOAuthError(body)
                         ?: "Token exchange failed (HTTP ${resp.code})"
-                    return false to msg
+                    return Triple(false, msg, null)
                 }
-                persistTokens(ctx, JSONObject(body))
-                true to null
+                Triple(true, null, JSONObject(body))
             }
         } catch (e: Exception) {
             Log.e(TAG, "exchange failed", e)
-            false to (e.message ?: "exchange_failed")
+            Triple(false, e.message ?: "exchange_failed", null)
         }
     }
 
@@ -564,6 +597,20 @@ object SpotifyOAuth {
     private fun refreshAccessToken(ctx: Context, refreshToken: String): Boolean {
         val clientId = HostApiKeyStore.getValue(ctx, ApiKeyIds.SPOTIFY_CLIENT_ID) ?: return false
         val clientSecret = HostApiKeyStore.getValue(ctx, ApiKeyIds.SPOTIFY_CLIENT_SECRET)
+        // PKCE refresh first; secret only as fallback.
+        if (postRefresh(ctx, clientId, null, refreshToken)) return true
+        if (!clientSecret.isNullOrBlank()) {
+            return postRefresh(ctx, clientId, clientSecret, refreshToken)
+        }
+        return false
+    }
+
+    private fun postRefresh(
+        ctx: Context,
+        clientId: String,
+        clientSecret: String?,
+        refreshToken: String,
+    ): Boolean {
         return try {
             val form = FormBody.Builder()
                 .add("grant_type", "refresh_token")
@@ -580,7 +627,7 @@ object SpotifyOAuth {
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    Log.w(TAG, "refresh ${resp.code}: $body")
+                    Log.w(TAG, "refresh ${resp.code} secret=${!clientSecret.isNullOrBlank()}: $body")
                     return false
                 }
                 val json = JSONObject(body)

@@ -69,7 +69,7 @@ function gos_public_user(array $user): array
  *
  * @return array<string, mixed>
  */
-function gos_create_user(string $username, string $password, string $role = 'admin', string $displayName = ''): array
+function gos_create_user(string $username, string $password, ?string $role = null, string $displayName = ''): array
 {
     $username = strtolower(trim($username));
     if (!preg_match('/^[a-z0-9_]{3,32}$/', $username)) {
@@ -78,7 +78,15 @@ function gos_create_user(string $username, string $password, string $role = 'adm
     if (strlen($password) < 8) {
         throw new InvalidArgumentException('password_too_short');
     }
-    $role = $role === 'user' ? 'user' : 'admin';
+    // First account on empty install is always admin; later accounts default to user.
+    if ($role === null || $role === '') {
+        $role = gos_default_new_user_role();
+    } elseif ($role !== 'user' && $role !== 'admin') {
+        $role = gos_default_new_user_role();
+    }
+    if (gos_user_count() === 0) {
+        $role = 'admin';
+    }
     $hash = password_hash($password, PASSWORD_DEFAULT);
     $display = $displayName !== '' ? $displayName : $username;
     $pdo = gos_pdo();
@@ -124,6 +132,21 @@ function gos_login_user(array $user): void
     } catch (Throwable) {
         // non-fatal
     }
+}
+
+/** True when the user row has role=admin. */
+function gos_user_is_admin(array $user): bool
+{
+    return strtolower((string) ($user['role'] ?? '')) === 'admin';
+}
+
+/**
+ * First account created on an empty install is always admin (setup.php / install.php).
+ * Subsequent creates default to role=user unless an admin explicitly requests admin.
+ */
+function gos_default_new_user_role(): string
+{
+    return gos_user_count() === 0 ? 'admin' : 'user';
 }
 
 function gos_logout(): void

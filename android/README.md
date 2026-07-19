@@ -72,3 +72,16 @@ Server: `GET /api/update.php?version_code=N` then `GET /api/apk-download.php` wi
 ## Package
 
 `io.grokify.os` · minSdk 26 · targetSdk 35 · compileSdk 35 · AGP 8.7.3 · Kotlin 2.0.21
+
+## Current release
+
+See root **[README.md § Changelog](../README.md#changelog)** for full history. Ship notes:
+
+| versionName | versionCode | Notes |
+|-------------|-------------|--------|
+| **0.1.160** | 160 | Chat stick-to-bottom unlock when scrolled up |
+| 0.1.159 | 159 | Bridge agent working directory (Settings picker) |
+| 0.1.158 | 158 | Live DJ shared radio removed |
+| 0.1.149–0.1.157 | … | Queue system, prompt templates, console UI, OAuth/PKCE, temporary host-keys experiment |
+
+**Settings → Working directory** picks the bridge agent `cwd` (default = GrokifyOS install path).

@@ -135,7 +135,7 @@ function createRuntime(opts) {
      * Spawn agent detached with stdout/stderr redirected to a file.
      * Child outlives the bridge when systemd uses KillMode=process.
      */
-    function spawnDetached(bin, args, env, sessionId, { truncate = true } = {}) {
+    function spawnDetached(bin, args, env, sessionId, { truncate = true, cwd } = {}) {
         ensureRoot();
         const dir = sessionDir(sessionId);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -144,10 +144,11 @@ function createRuntime(opts) {
             fs.writeFileSync(out, '');
         }
         const fd = fs.openSync(out, 'a');
+        const agentCwd = (cwd && typeof cwd === 'string' && cwd.trim()) ? cwd : WORKSPACE;
         let proc;
         try {
             proc = spawn(bin, args, {
-                cwd: WORKSPACE,
+                cwd: agentCwd,
                 stdio: ['ignore', fd, fd],
                 detached: true,
                 env: { ...env, HOME: env.HOME || process.env.HOME || '/root' },

@@ -109,6 +109,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -2157,6 +2158,11 @@ fun SpotifyControllerPane(
             loggedIn = SpotifyOAuth.isLoggedIn(appCtx)
             authMsg = SpotifyOAuth.lastAuthMessage.orEmpty()
             hasXaiKey = !HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank()
+            // Host-synced client id (me.php) may land after Account opens.
+            if (clientId.isBlank()) {
+                val hostCid = HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPOTIFY_CLIENT_ID).orEmpty()
+                if (hostCid.isNotBlank()) clientId = hostCid
+            }
             delay(1_200L)
         }
     }
@@ -3025,68 +3031,107 @@ fun SpotifyControllerPane(
             }
 
             1 -> Column(Modifier.weight(1f, fill = true).fillMaxWidth()) {
-                // Slim header — on/off + one-line status (settings/queue live in sub-tabs)
+                // Slim console header — ON AIR chip + mono status
                 Row(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
                         .background(GrokifyColors.Panel)
-                        .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .border(
+                            1.dp,
+                            if (djState.enabled || djStore.enabled) {
+                                GrokifyColors.GlowMint.copy(alpha = 0.35f)
+                            } else {
+                                GrokifyColors.PanelBorder
+                            },
+                            RoundedCornerShape(12.dp),
+                        )
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    val liveOn = djState.enabled || djStore.enabled
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(
+                                if (liveOn) GrokifyColors.GlowMint.copy(alpha = 0.14f)
+                                else GrokifyColors.PanelSoft,
+                            )
+                            .border(
+                                1.dp,
+                                if (liveOn) GrokifyColors.GlowMint.copy(alpha = 0.4f)
+                                else GrokifyColors.PanelBorder,
+                                RoundedCornerShape(6.dp),
+                            )
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        Text(
+                            if (liveOn) "ON AIR" else "BOOTH",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (liveOn) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
                         Text(
-                            "Live AI DJ",
+                            "LIVE DJ",
                             color = GrokifyColors.TextPrimary,
                             fontWeight = FontWeight.SemiBold,
-                            fontSize = 14.sp,
+                            fontSize = 13.sp,
+                            letterSpacing = 0.6.sp,
                         )
                         Text(
                             when {
-                                djState.transitioning -> "Transition…"
-                                djState.filling -> "Filling queue…"
-                                djState.chatBusy -> "Reading chat…"
-                                djState.enabled || djStore.enabled -> {
-                                    val base = djState.status.ifBlank { "On" }
+                                djState.transitioning -> "transition"
+                                djState.filling -> "filling"
+                                djState.chatBusy -> "chat"
+                                liveOn -> {
+                                    val base = djState.status.ifBlank { "live" }
                                     if (!djState.banterEnabled && !djStore.banterEnabled) {
-                                        if (base.contains("banter off")) base
+                                        if (base.contains("banter off")) base.lowercase()
                                         else {
                                             val root = base
                                                 .substringBefore(" · talk in")
                                                 .substringBefore(" · banter")
-                                            "$root · banter off"
+                                            "$root · banter off".lowercase()
                                         }
                                     } else {
                                         val cd = banterCountdownLabel(
                                             djState.songsSinceBanter,
                                             djState.banterEvery,
                                         )
-                                        if (base.contains("talk in") || base.contains("banter")) base
-                                        else "$base · $cd"
+                                        if (base.contains("talk in") || base.contains("banter")) {
+                                            base.lowercase()
+                                        } else {
+                                            "$base · $cd".lowercase()
+                                        }
                                     }
                                 }
                                 else -> djState.status.ifBlank {
                                     val n = djState.queue.size
-                                    if (n > 0) "Booth ready · $n queued" else "Booth ready"
-                                }
+                                    if (n > 0) "ready · $n up next" else "ready"
+                                }.lowercase()
                             },
                             color = GrokifyColors.TextDim,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
                     if (djState.queue.isNotEmpty()) {
                         Text(
-                            "${djState.queue.size} queued",
+                            "Q${djState.queue.size}",
                             color = GrokifyColors.GlowCyan,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.padding(end = 8.dp),
                         )
                     }
                     Switch(
-                        checked = djState.enabled || djStore.enabled,
+                        checked = liveOn,
                         onCheckedChange = { on ->
                             if (on && !loggedIn) {
                                 tab = 3
@@ -3117,16 +3162,17 @@ fun SpotifyControllerPane(
 
                 Spacer(Modifier.height(6.dp))
 
-                // Inner tabs: Chat · Queue · Settings
+                // Inner tabs: CHAT · QUEUE · SETTINGS
                 Row(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(10.dp))
                         .background(GrokifyColors.PanelSoft)
+                        .border(1.dp, GrokifyColors.PanelBorder.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
                         .padding(3.dp),
                     horizontalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
-                    listOf("Chat", "Queue", "Settings").forEachIndexed { i, label ->
+                    listOf("CHAT", "QUEUE", "SETTINGS").forEachIndexed { i, label ->
                         val selected = djSubTab == i
                         val badge = when (i) {
                             1 -> if (djState.queue.isNotEmpty()) " ${djState.queue.size}" else ""
@@ -3137,8 +3183,14 @@ fun SpotifyControllerPane(
                                 .weight(1f)
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(
-                                    if (selected) GrokifyColors.Panel
+                                    if (selected) GrokifyColors.GlowMint.copy(alpha = 0.12f)
                                     else androidx.compose.ui.graphics.Color.Transparent,
+                                )
+                                .border(
+                                    1.dp,
+                                    if (selected) GrokifyColors.GlowMint.copy(alpha = 0.35f)
+                                    else androidx.compose.ui.graphics.Color.Transparent,
+                                    RoundedCornerShape(8.dp),
                                 )
                                 .clickable { djSubTab = i }
                                 .padding(vertical = 7.dp),
@@ -3148,7 +3200,9 @@ fun SpotifyControllerPane(
                                 label + badge,
                                 color = if (selected) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
                                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                letterSpacing = 0.5.sp,
                             )
                         }
                     }
@@ -3190,28 +3244,28 @@ fun SpotifyControllerPane(
                                     Column(
                                         Modifier
                                             .fillMaxWidth()
-                                            .clip(RoundedCornerShape(14.dp))
+                                            .clip(RoundedCornerShape(12.dp))
                                             .background(GrokifyColors.PanelSoft)
-                                            .padding(14.dp),
+                                            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(12.dp))
+                                            .padding(12.dp),
                                     ) {
                                         Text(
-                                            "DJ booth chat",
-                                            color = GrokifyColors.TextPrimary,
-                                            fontWeight = FontWeight.SemiBold,
-                                            fontSize = 13.sp,
+                                            "BOOTH · IDLE",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = GrokifyColors.GlowCyan,
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        Text(
+                                            "Chat · ♥ · more-like · dislike · ▶ replay",
+                                            color = GrokifyColors.TextMuted,
+                                            fontSize = 11.sp,
+                                            fontFamily = FontFamily.Monospace,
                                         )
                                         Spacer(Modifier.height(4.dp))
                                         Text(
-                                            "Chat, queue, and play work even when Live DJ auto-handoff is off. " +
-                                                "Tracks & banter show here. Heart any cut (now or past) to Liked Songs. " +
-                                                "More like this prepends a mixed batch (some same-artist + mostly similar) to UP NEXT. " +
-                                                "Dislike opens reasons (artist / song / lyrics / tired for now) so the " +
-                                                "radio set won’t re-queue those picks. " +
-                                                "Ask for a new queue, top-up, drop songs, or song/artist info. " +
-                                                "Tap ▶ on past songs to replay. Queue tab is the app radio set " +
-                                                "(not Spotify’s Up Next).",
+                                            "Auto-handoff optional · queue is in-app only",
                                             color = GrokifyColors.TextDim,
-                                            fontSize = 12.sp,
+                                            fontSize = 11.sp,
                                         )
                                     }
                                 }
@@ -3400,9 +3454,10 @@ fun SpotifyControllerPane(
                                 maxLines = 3,
                                 placeholder = {
                                     Text(
-                                        "Vibes, new queue, remove a song, artist info…",
+                                        "vibes · queue · cut · artist…",
                                         color = GrokifyColors.TextDim,
-                                        fontSize = 13.sp,
+                                        fontSize = 12.sp,
+                                        fontFamily = FontFamily.Monospace,
                                     )
                                 },
                                 colors = OutlinedTextFieldDefaults.colors(
@@ -3443,13 +3498,10 @@ fun SpotifyControllerPane(
                             .verticalScroll(rememberScrollState()),
                     ) {
                         Text(
-                            "UP NEXT lives only in this app. Queue / play / skip work with Live DJ off. " +
-                                "When auto-handoff is on, ending a cut (or skip/jump) direct-plays the next URI — " +
-                                "Spotify’s native queue is never written. " +
-                                "Tap a title or ▶ to jump (drops songs above · no talk). " +
-                                "Sync adopts whatever Spotify is on now. Refill adds · New queue replaces.",
+                            "IN-APP SET · tap title/▶ jump · direct-play only",
                             color = GrokifyColors.TextDim,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
                         )
                         Spacer(Modifier.height(8.dp))
                         Row(
@@ -3459,25 +3511,26 @@ fun SpotifyControllerPane(
                             TextButton(
                                 onClick = { spotifyLiveDjSyncToSpotify(appCtx) },
                             ) {
-                                Text("Sync to Spotify", color = GrokifyColors.GlowMint, fontSize = 12.sp)
+                                Text("SYNC", color = GrokifyColors.GlowMint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjNewQueue(appCtx) },
                             ) {
-                                Text("New queue", color = GrokifyColors.GlowMint, fontSize = 12.sp)
+                                Text("NEW", color = GrokifyColors.GlowMint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjRefill(appCtx) },
                             ) {
-                                Text("Refill", color = GrokifyColors.GlowCyan, fontSize = 12.sp)
+                                Text("REFILL", color = GrokifyColors.GlowCyan, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                             }
                             TextButton(
                                 onClick = { spotifyLiveDjSkip(appCtx, forceTalk = true) },
                             ) {
                                 Text(
-                                    if (djState.banterEnabled) "Skip + talk" else "Skip",
+                                    if (djState.banterEnabled) "SKIP+TALK" else "SKIP",
                                     color = GrokifyColors.GlowCyan,
-                                    fontSize = 12.sp,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
                                 )
                             }
                         }
@@ -3505,9 +3558,10 @@ fun SpotifyControllerPane(
                         Spacer(Modifier.height(4.dp))
                         if (djState.queue.isEmpty()) {
                             Text(
-                                "Empty — New queue or Refill builds from liked · top · recent.",
+                                "empty · NEW or REFILL",
                                 color = GrokifyColors.TextMuted,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
                             )
                         } else {
                             djState.queue.forEachIndexed { i, t ->
@@ -4092,21 +4146,12 @@ fun SpotifyControllerPane(
                     Spacer(Modifier.height(8.dp))
                     StatusLine(
                         ok = loggedIn,
-                        okText = "Connected — re-authorize anytime for new permissions",
-                        badText = "Not logged in — save Client ID + Connect",
+                        okText = "Linked",
+                        badText = if (clientId.isBlank()) "Need client id (host Keys or below)" else "Not linked",
                     )
                     if (authMsg.isNotBlank()) {
                         Spacer(Modifier.height(6.dp))
                         Text(authMsg, color = GrokifyColors.TextMuted, fontSize = 12.sp)
-                    }
-                    if (loggedIn) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            "Already connected? Re-authorize to grant new scopes " +
-                                "(Liked Songs, library, etc.) without logging out first.",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 12.sp,
-                        )
                     }
                     Spacer(Modifier.height(10.dp))
                     Text("Client ID", color = GrokifyColors.TextDim, fontSize = 11.sp)
@@ -4208,14 +4253,11 @@ fun SpotifyControllerPane(
                     }
                 }
 
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
                 Text(
-                    "Create an app at developer.spotify.com → add the Redirect URI above → " +
-                        "paste Client ID → Connect. Already connected? Use Re-authorize Spotify " +
-                        "when features need new permissions (e.g. Liked Songs). PKCE does not " +
-                        "require Client Secret. Optional xAI key in host Settings for Grok Voice.",
+                    "Settings → API keys → Spotify Client ID · Redirect URI exact · PKCE",
                     color = GrokifyColors.TextDim,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                 )
                 Spacer(Modifier.height(24.dp))
             }
@@ -4931,6 +4973,17 @@ private fun LiveDjSettingsTab(
     var genreBoardMsg by remember { mutableStateOf<String?>(null) }
     var nameBusy by remember { mutableStateOf(false) }
     var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
+    var queueSourcesOn by remember {
+        mutableStateOf(djStore.queueSourcesEnabled)
+    }
+    var queuePlaylistIds by remember {
+        mutableStateOf(djStore.queuePlaylistIds)
+    }
+    var queuePlaylistCache by remember {
+        mutableStateOf(djStore.queuePlaylistCache)
+    }
+    var queuePlaylistBusy by remember { mutableStateOf(false) }
+    var queueSystemMsg by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(
         djState.selectedGenres,
@@ -5129,6 +5182,24 @@ private fun LiveDjSettingsTab(
                     )
 
                     Spacer(Modifier.height(16.dp))
+                    DjQueueSystemSection(
+                        djStore = djStore,
+                        loggedIn = loggedIn,
+                        queueSourcesOn = queueSourcesOn,
+                        onSourcesChange = { queueSourcesOn = it },
+                        queuePlaylistIds = queuePlaylistIds,
+                        onPlaylistIdsChange = { queuePlaylistIds = it },
+                        queuePlaylistCache = queuePlaylistCache,
+                        onPlaylistCacheChange = { queuePlaylistCache = it },
+                        queuePlaylistBusy = queuePlaylistBusy,
+                        onBusyChange = { queuePlaylistBusy = it },
+                        queueSystemMsg = queueSystemMsg,
+                        onMsgChange = { queueSystemMsg = it },
+                        scope = scope,
+                        appCtx = appCtx,
+                    )
+
+                    Spacer(Modifier.height(16.dp))
                     Text(
                         "GENRE BOARD",
                         style = MaterialTheme.typography.labelSmall,
@@ -5262,10 +5333,10 @@ private fun LiveDjSettingsTab(
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "How the DJ addresses you on mic. Pulled from Spotify display name " +
-                            "when possible — city is never used as a name.",
+                        "On-mic address · not a place",
                         color = GrokifyColors.TextDim,
                         fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
                     )
                     Spacer(Modifier.height(6.dp))
                     OutlinedTextField(
@@ -5645,21 +5716,279 @@ private fun LiveDjSettingsTab(
                     }
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "Live DJ toggle = auto-handoff between songs. Chat, queue build, play, and " +
-                            "Spotify control work with it off (booth mode). " +
-                            "Radio seeds from liked, top, recently played" +
-                            (if (selectedGenres.isNotEmpty()) ", plus genre board" else "") +
-                            (if (listenerCity.isNotBlank()) ", and local-show discovery" else "") +
-                            ". Each talk randomly picks from your enabled research templates. " +
-                            "Your name is for on-air address; city is location only. " +
-                            "Prompt templates (research, behavior, banter/chat/research systems) " +
-                            "are fully editable. " +
-                            "UP NEXT is in-app only — each track is direct-played when due. " +
-                            "Queue, chat, and settings survive leave/return.",
+                        "handoff toggle · booth works off-air · queue in-app only",
                         color = GrokifyColors.TextDim,
-                        fontSize = 11.sp,
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
                     )
                     Spacer(Modifier.height(12.dp))
+    }
+}
+
+
+/**
+ * Queue system: toggle radio-pool sources + multi-select playlists.
+ * Default = full blend (all sources on, random playlist sample).
+ */
+@Composable
+private fun DjQueueSystemSection(
+    djStore: SpotifyDjStore,
+    loggedIn: Boolean,
+    queueSourcesOn: Set<String>,
+    onSourcesChange: (Set<String>) -> Unit,
+    queuePlaylistIds: List<String>,
+    onPlaylistIdsChange: (List<String>) -> Unit,
+    queuePlaylistCache: List<DjQueuePlaylistRef>,
+    onPlaylistCacheChange: (List<DjQueuePlaylistRef>) -> Unit,
+    queuePlaylistBusy: Boolean,
+    onBusyChange: (Boolean) -> Unit,
+    queueSystemMsg: String?,
+    onMsgChange: (String?) -> Unit,
+    scope: kotlinx.coroutines.CoroutineScope,
+    appCtx: Context,
+) {
+    val isDefault = remember(queueSourcesOn, queuePlaylistIds) {
+        queueSourcesOn == DjQueueSource.defaultEnabledIds() && queuePlaylistIds.isEmpty()
+    }
+    Text(
+        "QUEUE SYSTEM",
+        style = MaterialTheme.typography.labelSmall,
+        color = GrokifyColors.GlowViolet,
+    )
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "What feeds New queue / Refill. Default is the full blend " +
+            "(liked · top · recent · radio · playlists). Toggle sources, " +
+            "and pin specific playlists — empty playlist pick = random sample.",
+        color = GrokifyColors.TextDim,
+        fontSize = 10.sp,
+    )
+    Spacer(Modifier.height(8.dp))
+    // Source chips (multi-toggle)
+    val srcScroll = rememberScrollState()
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .horizontalScroll(srcScroll),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        DjQueueSource.entries.forEach { src ->
+            val on = src.id in queueSourcesOn
+            FilterChip(
+                selected = on,
+                onClick = {
+                    val next = queueSourcesOn.toMutableSet()
+                    if (on) next.remove(src.id) else next.add(src.id)
+                    onSourcesChange(next)
+                    djStore.queueSourcesEnabled = next
+                    onMsgChange(
+                        if (src.id in next) "On · ${src.label}" else "Off · ${src.label}",
+                    )
+                },
+                label = {
+                    Text(src.label, fontSize = 11.sp, maxLines = 1)
+                },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = GrokifyColors.GlowViolet.copy(alpha = 0.22f),
+                    selectedLabelColor = GrokifyColors.GlowViolet,
+                    containerColor = GrokifyColors.PanelSoft,
+                    labelColor = GrokifyColors.TextPrimary,
+                ),
+                border = FilterChipDefaults.filterChipBorder(
+                    enabled = true,
+                    selected = on,
+                    borderColor = GrokifyColors.PanelBorder,
+                    selectedBorderColor = GrokifyColors.GlowViolet,
+                ),
+            )
+        }
+    }
+    Spacer(Modifier.height(4.dp))
+    val activeBlurbs = DjQueueSource.entries
+        .filter { it.id in queueSourcesOn }
+        .take(3)
+        .joinToString(" · ") { it.blurb }
+    Text(
+        when {
+            isDefault -> "Default mix · all sources on"
+            queueSourcesOn.isEmpty() -> "No sources — refill may find nothing"
+            else -> activeBlurbs.ifBlank { "${queueSourcesOn.size} sources on" }
+        },
+        color = GrokifyColors.TextMuted,
+        fontSize = 10.sp,
+    )
+    Spacer(Modifier.height(10.dp))
+    Text(
+        "PLAYLISTS",
+        style = MaterialTheme.typography.labelSmall,
+        color = GrokifyColors.GlowViolet.copy(alpha = 0.85f),
+    )
+    Spacer(Modifier.height(2.dp))
+    val playlistsOn = DjQueueSource.Playlists.id in queueSourcesOn
+    Text(
+        if (!playlistsOn) {
+            "Playlists source is off — turn it on above to sample sets."
+        } else if (queuePlaylistIds.isEmpty()) {
+            "None pinned · each fill samples ~3 random playlists (default)."
+        } else {
+            "Pinned ${queuePlaylistIds.size} — only these feed the pool."
+        },
+        color = GrokifyColors.TextDim,
+        fontSize = 10.sp,
+    )
+    Spacer(Modifier.height(6.dp))
+    Row(
+        Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        TextButton(
+            onClick = {
+                if (queuePlaylistBusy) return@TextButton
+                onBusyChange(true)
+                onMsgChange(null)
+                scope.launch {
+                    val (pls, err) = withContext(Dispatchers.IO) {
+                        SpotifyPlaylistAi.listPlaylists(appCtx)
+                    }
+                    onBusyChange(false)
+                    if (err != null && pls.isEmpty()) {
+                        onMsgChange(err)
+                    } else {
+                        val cache = pls.map {
+                            DjQueuePlaylistRef(
+                                id = it.id,
+                                name = it.name,
+                                trackCount = it.trackCount,
+                            )
+                        }
+                        onPlaylistCacheChange(cache)
+                        djStore.queuePlaylistCache = cache
+                        // Drop pins that no longer exist
+                        val ids = cache.map { it.id }.toSet()
+                        val kept = queuePlaylistIds.filter { it in ids }
+                        if (kept.size != queuePlaylistIds.size) {
+                            onPlaylistIdsChange(kept)
+                            djStore.queuePlaylistIds = kept
+                        }
+                        onMsgChange(
+                            err ?: "Loaded ${cache.size} playlists",
+                        )
+                    }
+                }
+            },
+            enabled = !queuePlaylistBusy && loggedIn,
+        ) {
+            Text(
+                if (queuePlaylistBusy) "Loading…" else "Load playlists",
+                fontSize = 12.sp,
+                color = GrokifyColors.GlowViolet,
+            )
+        }
+        if (queuePlaylistIds.isNotEmpty()) {
+            TextButton(
+                onClick = {
+                    onPlaylistIdsChange(emptyList())
+                    djStore.queuePlaylistIds = emptyList()
+                    onMsgChange("Cleared pins · random sample again")
+                },
+            ) {
+                Text("Clear pins", fontSize = 12.sp, color = GrokifyColors.TextDim)
+            }
+        }
+        if (!isDefault) {
+            TextButton(
+                onClick = {
+                    djStore.resetQueueSystemToDefault()
+                    onSourcesChange(DjQueueSource.defaultEnabledIds())
+                    onPlaylistIdsChange(emptyList())
+                    onMsgChange("Reset to default mix")
+                },
+            ) {
+                Text("Default mix", fontSize = 12.sp, color = GrokifyColors.GlowMint)
+            }
+        }
+    }
+    if (!queueSystemMsg.isNullOrBlank()) {
+        Text(queueSystemMsg, color = GrokifyColors.TextMuted, fontSize = 10.sp)
+    }
+    Spacer(Modifier.height(6.dp))
+    val chips = remember(queuePlaylistCache, queuePlaylistIds) {
+        val byId = queuePlaylistCache.associateBy { it.id }
+        val pinnedMissing = queuePlaylistIds
+            .filter { it !in byId }
+            .map { DjQueuePlaylistRef(id = it, name = "Playlist $it") }
+        (queuePlaylistCache + pinnedMissing).distinctBy { it.id }
+    }
+    if (chips.isEmpty()) {
+        Text(
+            if (loggedIn) {
+                "Tap Load playlists to multi-select which sets feed the radio pool."
+            } else {
+                "Sign in on Account, then load playlists."
+            },
+            color = GrokifyColors.TextMuted,
+            fontSize = 11.sp,
+        )
+    } else {
+        val plScroll = rememberScrollState()
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .horizontalScroll(plScroll),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            chips.forEach { pl ->
+                val pinned = queuePlaylistIds.contains(pl.id)
+                FilterChip(
+                    selected = pinned,
+                    onClick = {
+                        if (!playlistsOn) {
+                            // Auto-enable playlists source when pinning
+                            val next = queueSourcesOn + DjQueueSource.Playlists.id
+                            onSourcesChange(next)
+                            djStore.queueSourcesEnabled = next
+                        }
+                        val nextIds = if (pinned) {
+                            queuePlaylistIds.filterNot { it == pl.id }
+                        } else {
+                            (queuePlaylistIds + pl.id)
+                                .distinct()
+                                .take(MAX_DJ_QUEUE_PLAYLISTS)
+                        }
+                        onPlaylistIdsChange(nextIds)
+                        djStore.queuePlaylistIds = nextIds
+                        onMsgChange(
+                            if (pl.id in nextIds) {
+                                "Pinned · ${pl.name}"
+                            } else {
+                                "Unpinned · ${pl.name}"
+                            },
+                        )
+                    },
+                    label = {
+                        val n = if (pl.trackCount > 0) " · ${pl.trackCount}" else ""
+                        Text(
+                            pl.name.take(28) + n,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = GrokifyColors.GlowViolet.copy(alpha = 0.22f),
+                        selectedLabelColor = GrokifyColors.GlowViolet,
+                        containerColor = GrokifyColors.PanelSoft,
+                        labelColor = GrokifyColors.TextPrimary,
+                    ),
+                    border = FilterChipDefaults.filterChipBorder(
+                        enabled = true,
+                        selected = pinned,
+                        borderColor = GrokifyColors.PanelBorder,
+                        selectedBorderColor = GrokifyColors.GlowViolet,
+                    ),
+                )
+            }
+        }
     }
 }
 
@@ -5697,8 +6026,8 @@ private fun DjPromptTemplatesSection(
     Spacer(Modifier.height(4.dp))
     Text(
         "Full control: research angles (random pack), behaviors, and the " +
-            "system prompts for banter / research / chat. Toggle research angles " +
-            "on for the random list, edit any body, or add your own.",
+            "system prompts for banter / research / chat / queue rank (AI pick). " +
+            "Toggle research angles on for the random list, edit any body, or add your own.",
         color = GrokifyColors.TextDim,
         fontSize = 10.sp,
     )

@@ -82,6 +82,12 @@ data class ModelItem(
     val provider: String,
 )
 
+/** Directory entry from bridge work-dir list API. */
+data class WorkDirEntry(
+    val name: String,
+    val path: String,
+)
+
 data class UsageProduct(
     val product: String,
     val usagePercent: Double? = null,
@@ -174,6 +180,16 @@ data class UiState(
     val loadingPanel: Boolean = false,
     val usage: UsageInfo? = null,
     val usageLoading: Boolean = false,
+    /** Bridge agent working directory (server path). Empty until loaded. */
+    val workDir: String = "",
+    val workDirDefault: String = "",
+    val workDirIsDefault: Boolean = true,
+    val workDirStatus: String = "",
+    val workDirLoading: Boolean = false,
+    val workDirBrowsePath: String = "",
+    val workDirBrowseParent: String? = null,
+    val workDirEntries: List<WorkDirEntry> = emptyList(),
+    val workDirBrowserOpen: Boolean = false,
     /** Mapbox public access token (pk.…) from Settings / API key vault. Empty disables maps. */
     val mapboxAccessToken: String = "",
     /**
@@ -525,6 +541,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
     fun openSettings() {
         _state.update { it.copy(showSettings = true, panel = ChatPanel.None) }
         loadModels()
+        loadWorkDir()
         refreshUsage(force = false)
         refreshPermissions()
         refreshNotificationAccessState()
@@ -1896,6 +1913,170 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { it.copy(error = e.message) }
             }
         }
+    }
+
+    fun loadWorkDir() {
+        viewModelScope.launch {
+            _state.update { it.copy(workDirLoading = true, workDirStatus = "") }
+            try {
+                val json = withContext(Dispatchers.IO) { api.workDir() }
+                if (json.optBoolean("ok")) {
+                    applyWorkDirJson(json)
+                    _state.update { it.copy(workDirLoading = false, workDirStatus = "") }
+                } else {
+                    _state.update {
+                        it.copy(
+                            workDirLoading = false,
+                            workDirStatus = json.optString("error", "Could not load working directory"),
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        workDirLoading = false,
+                        workDirStatus = e.message ?: "Could not load working directory",
+                    )
+                }
+            }
+        }
+    }
+
+    private fun applyWorkDirJson(json: JSONObject) {
+        _state.update {
+            it.copy(
+                workDir = json.optString("path", ""),
+                workDirDefault = json.optString("default_path", ""),
+                workDirIsDefault = json.optBoolean("is_default", true),
+            )
+        }
+    }
+
+    fun setWorkDir(path: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(workDirLoading = true, workDirStatus = "Saving…") }
+            try {
+                val json = withContext(Dispatchers.IO) { api.setWorkDir(path = path.trim(), reset = false) }
+                if (json.optBoolean("ok")) {
+                    applyWorkDirJson(json)
+                    _state.update {
+                        it.copy(
+                            workDirLoading = false,
+                            workDirStatus = "Saved — new chats use this folder",
+                            workDirBrowserOpen = false,
+                        )
+                    }
+                } else {
+                    _state.update {
+                        it.copy(
+                            workDirLoading = false,
+                            workDirStatus = json.optString(
+                                "message",
+                                json.optString("error", "Save failed"),
+                            ),
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(workDirLoading = false, workDirStatus = e.message ?: "Save failed")
+                }
+            }
+        }
+    }
+
+    fun resetWorkDir() {
+        viewModelScope.launch {
+            _state.update { it.copy(workDirLoading = true, workDirStatus = "Resetting…") }
+            try {
+                val json = withContext(Dispatchers.IO) { api.setWorkDir(reset = true) }
+                if (json.optBoolean("ok")) {
+                    applyWorkDirJson(json)
+                    _state.update {
+                        it.copy(
+                            workDirLoading = false,
+                            workDirStatus = "Reset to default",
+                            workDirBrowserOpen = false,
+                        )
+                    }
+                } else {
+                    _state.update {
+                        it.copy(
+                            workDirLoading = false,
+                            workDirStatus = json.optString("error", "Reset failed"),
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(workDirLoading = false, workDirStatus = e.message ?: "Reset failed")
+                }
+            }
+        }
+    }
+
+    fun toggleWorkDirBrowser() {
+        val open = !_state.value.workDirBrowserOpen
+        if (!open) {
+            _state.update { it.copy(workDirBrowserOpen = false) }
+            return
+        }
+        val start = _state.value.workDir.ifBlank { _state.value.workDirDefault }
+        browseWorkDir(start)
+    }
+
+    fun browseWorkDir(path: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(workDirLoading = true) }
+            try {
+                val json = withContext(Dispatchers.IO) { api.listWorkDir(path) }
+                if (json.optBoolean("ok")) {
+                    val arr = json.optJSONArray("entries")
+                    val entries = buildList {
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val o = arr.optJSONObject(i) ?: continue
+                                val name = o.optString("name", "").trim()
+                                val p = o.optString("path", "").trim()
+                                if (name.isNotEmpty() && p.isNotEmpty()) {
+                                    add(WorkDirEntry(name = name, path = p))
+                                }
+                            }
+                        }
+                    }
+                    val parent = json.optString("parent", "").trim().ifEmpty { null }
+                    _state.update {
+                        it.copy(
+                            workDirLoading = false,
+                            workDirBrowserOpen = true,
+                            workDirBrowsePath = json.optString("path", path),
+                            workDirBrowseParent = parent,
+                            workDirEntries = entries,
+                            workDirStatus = "",
+                        )
+                    }
+                } else {
+                    _state.update {
+                        it.copy(
+                            workDirLoading = false,
+                            workDirStatus = json.optString(
+                                "message",
+                                json.optString("error", "Browse failed"),
+                            ),
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(workDirLoading = false, workDirStatus = e.message ?: "Browse failed")
+                }
+            }
+        }
+    }
+
+    fun useBrowsedWorkDir() {
+        val p = _state.value.workDirBrowsePath
+        if (p.isNotBlank()) setWorkDir(p)
     }
 
     private fun connectBridge(wsUrl: String) {

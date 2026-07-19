@@ -178,6 +178,80 @@ function gos_system_chat_bridge_url(): string
     return 'http://127.0.0.1:8876';
 }
 
+/**
+ * Low-level HTTP call to the agent bridge.
+ *
+ * @return array{ok: bool, error?: string, http_code?: int, message?: string}|array<string, mixed>
+ */
+function gos_bridge_http(string $path, string $method = 'GET', ?array $body = null, int $timeout = 8): array
+{
+    $base = rtrim(gos_system_chat_bridge_url(), '/');
+    $url = $base . (str_starts_with($path, '/') ? $path : '/' . $path);
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return ['ok' => false, 'error' => 'curl_init_failed'];
+    }
+    $headers = ['Accept: application/json'];
+    $opts = [
+        CURLOPT_CUSTOMREQUEST => strtoupper($method),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 2,
+    ];
+    if ($body !== null) {
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $headers[] = 'Content-Type: application/json';
+        $opts[CURLOPT_POSTFIELDS] = $payload !== false ? $payload : '{}';
+    }
+    $opts[CURLOPT_HTTPHEADER] = $headers;
+    curl_setopt_array($ch, $opts);
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if (!is_string($resp) || $resp === '') {
+        return [
+            'ok' => false,
+            'error' => $err !== '' ? $err : 'empty_response',
+            'http_code' => $code,
+        ];
+    }
+    $json = json_decode($resp, true);
+    if (!is_array($json)) {
+        return ['ok' => false, 'error' => 'parse_failed', 'http_code' => $code];
+    }
+    $json['http_code'] = $code;
+    if (!array_key_exists('ok', $json)) {
+        $json['ok'] = $code >= 200 && $code < 300;
+    }
+
+    return $json;
+}
+
+/** @return array<string, mixed> */
+function gos_bridge_work_dir_get(): array
+{
+    return gos_bridge_http('/work-dir', 'GET');
+}
+
+/** @return array<string, mixed> */
+function gos_bridge_work_dir_set(string $path, bool $reset = false): array
+{
+    if ($reset || $path === '') {
+        return gos_bridge_http('/work-dir', 'POST', ['reset' => true]);
+    }
+
+    return gos_bridge_http('/work-dir', 'POST', ['path' => $path]);
+}
+
+/** @return array<string, mixed> */
+function gos_bridge_work_dir_list(string $path = ''): array
+{
+    $q = $path !== '' ? ('?path=' . rawurlencode($path)) : '';
+
+    return gos_bridge_http('/work-dir/list' . $q, 'GET');
+}
+
 function gos_system_chat_ws_path(): string
 {
     $path = gos_env('GROKIFY_WS_PATH', '/grokify-ws/') ?? '/grokify-ws/';

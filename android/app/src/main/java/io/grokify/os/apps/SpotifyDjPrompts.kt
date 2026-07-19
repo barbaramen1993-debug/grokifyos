@@ -12,12 +12,17 @@ import org.json.JSONObject
  * - [DjPromptKind.BanterSystem] — full on-air banter system rules (one body)
  * - [DjPromptKind.ResearchSystem] — research agent envelope (one body)
  * - [DjPromptKind.ChatSystem] — booth chat system rules (one body)
+ * - [DjPromptKind.QueueRankSystem] — AI rank next-tracks music director (one body)
+ * - [DjPromptKind.QueueRankUser] — AI rank user/request message shell (one body)
  *
  * Placeholders replaced at runtime (leave them in the body):
  * - Research angle: `{{CITY}}`
  * - Research system: `{{ANGLE_BRIEFS}}`
  * - Banter system: `{{WORD_CAP}}`, `{{BEHAVIOR_STYLE}}`, `{{UNHINGED_EXTRA}}`, `{{NAME_BLOCK}}`
  * - Chat system: `{{BEHAVIOR_STYLE}}`
+ * - Queue rank system: `{{N}}`, `{{GENRE_BIAS}}`
+ * - Queue rank user: `{{CURRENT}}`, `{{BEHAVIOR}}`, `{{GENRE_BOARD_LINE}}`,
+ *   `{{CITY_LINE}}`, `{{VIBE_LINE}}`, `{{CANDIDATES}}`, `{{N}}`
  */
 enum class DjPromptKind {
     Research,
@@ -25,6 +30,8 @@ enum class DjPromptKind {
     BanterSystem,
     ResearchSystem,
     ChatSystem,
+    QueueRankSystem,
+    QueueRankUser,
     ;
 
     val storageKey: String
@@ -34,6 +41,8 @@ enum class DjPromptKind {
             BanterSystem -> "banter_system"
             ResearchSystem -> "research_system"
             ChatSystem -> "chat_system"
+            QueueRankSystem -> "queue_rank_system"
+            QueueRankUser -> "queue_rank_user"
         }
 
     val sectionLabel: String
@@ -43,6 +52,8 @@ enum class DjPromptKind {
             BanterSystem -> "Banter system"
             ResearchSystem -> "Research system"
             ChatSystem -> "Chat system"
+            QueueRankSystem -> "Queue rank system"
+            QueueRankUser -> "Queue rank request"
         }
 
     val sectionBlurb: String
@@ -61,6 +72,13 @@ enum class DjPromptKind {
                     "Must keep JSON-only reply shape. Placeholder: {{ANGLE_BRIEFS}}"
             ChatSystem ->
                 "Booth chat steering rules (JSON actions). Placeholder: {{BEHAVIOR_STYLE}}"
+            QueueRankSystem ->
+                "System rules when AI rank picks next tracks from the candidate pool. " +
+                    "Must keep JSON-only reply shape. Placeholders: {{N}} {{GENRE_BIAS}}"
+            QueueRankUser ->
+                "Request message sent with candidates (AI rank on). Placeholders: " +
+                    "{{CURRENT}} {{BEHAVIOR}} {{GENRE_BOARD_LINE}} {{CITY_LINE}} " +
+                    "{{VIBE_LINE}} {{CANDIDATES}} {{N}}"
         }
 
     companion object {
@@ -71,6 +89,8 @@ enum class DjPromptKind {
                 "banter_system", "banter" -> BanterSystem
                 "research_system" -> ResearchSystem
                 "chat_system", "chat" -> ChatSystem
+                "queue_rank_system", "queue_rank", "ai_rank", "ai_rank_system" -> QueueRankSystem
+                "queue_rank_user", "ai_rank_user" -> QueueRankUser
                 else -> null
             }
     }
@@ -144,12 +164,16 @@ object DjPromptDefaults {
     const val ID_BANTER_SYSTEM = "banter_system_core"
     const val ID_RESEARCH_SYSTEM = "research_system_core"
     const val ID_CHAT_SYSTEM = "chat_system_core"
+    const val ID_QUEUE_RANK_SYSTEM = "queue_rank_system_core"
+    const val ID_QUEUE_RANK_USER = "queue_rank_user_core"
 
     fun all(): List<DjPromptTemplate> =
         researchAngles() + behaviors() + listOf(
             banterSystem(),
             researchSystem(),
             chatSystem(),
+            queueRankSystem(),
+            queueRankUser(),
         )
 
     fun researchAngles(): List<DjPromptTemplate> = listOf(
@@ -402,6 +426,48 @@ object DjPromptDefaults {
         builtIn = true,
     )
 
+    /**
+     * System rules for AI rank (music director) — used only when “AI rank next tracks” is on.
+     * Placeholders: {{N}} pick count, {{GENRE_BIAS}} genre lean sentence or ".".
+     */
+    fun queueRankSystem(): DjPromptTemplate = DjPromptTemplate(
+        id = ID_QUEUE_RANK_SYSTEM,
+        kind = DjPromptKind.QueueRankSystem,
+        label = "Queue rank (AI pick) rules",
+        blurb = "Music director system when AI ranks the pool",
+        body =
+            "You are a radio DJ music director (Spotify DJ style). Reply ONLY with valid JSON: " +
+                "{\"picks\":[{\"uri\":\"spotify:track:...\",\"banter_note\":\"short why\"}],\"banter\":\"\"}. " +
+                "Pick exactly {{N}} tracks from the CANDIDATES list only (use their uris). " +
+                "Blend liked/top seeds with artist-radio variety{{GENRE_BIAS}} " +
+                "Candidates already exclude recently played and already-heard tracks — never re-pick those. " +
+                "Avoid stacking the same primary artist twice in a row. " +
+                "Leave banter empty (spoken lines are generated separately). No markdown.",
+        builtIn = true,
+    )
+
+    /**
+     * User/request shell for AI rank. Data lines are filled via placeholders at fill time.
+     */
+    fun queueRankUser(): DjPromptTemplate = DjPromptTemplate(
+        id = ID_QUEUE_RANK_USER,
+        kind = DjPromptKind.QueueRankUser,
+        label = "Queue rank request",
+        blurb = "User message with current cut + candidates",
+        body =
+            "CURRENT: {{CURRENT}}\n" +
+                "Behavior mode (queue energy, not spoken line): {{BEHAVIOR}}\n" +
+                "{{GENRE_BOARD_LINE}}" +
+                "{{CITY_LINE}}" +
+                "{{VIBE_LINE}}" +
+                "\n" +
+                "CANDIDATES (not recently played):\n" +
+                "{{CANDIDATES}}\n" +
+                "\n" +
+                "Pick {{N}} next tracks for a continuous live DJ set. Do not repeat recently heard songs.",
+        builtIn = true,
+    )
+
     fun defaultBody(id: String): String? =
         all().firstOrNull { it.id == id }?.body
 
@@ -447,6 +513,8 @@ fun mergePromptTemplates(saved: List<DjPromptTemplate>): List<DjPromptTemplate> 
         DjPromptDefaults.banterSystem(),
         DjPromptDefaults.researchSystem(),
         DjPromptDefaults.chatSystem(),
+        DjPromptDefaults.queueRankSystem(),
+        DjPromptDefaults.queueRankUser(),
     ).forEach { sys ->
         if (byId.values.none { it.kind == sys.kind }) {
             byId[sys.id] = sys

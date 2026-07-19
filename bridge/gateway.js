@@ -249,6 +249,48 @@ const httpServer = http.createServer(async (req, res) => {
         proxy.end();
         return;
     }
+    // Agent working directory (get / set / list) — any healthy worker (DB-backed).
+    if (url.pathname === '/work-dir' || url.pathname === '/work-dir/list') {
+        const be = pickBackend();
+        const q = url.search || '';
+        const method = req.method === 'POST' ? 'POST' : 'GET';
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const body = Buffer.concat(chunks);
+            const headers = { Accept: 'application/json' };
+            if (method === 'POST' && body.length) {
+                headers['Content-Type'] = req.headers['content-type'] || 'application/json';
+                headers['Content-Length'] = String(body.length);
+            }
+            const proxy = http.request(
+                {
+                    host: be.host,
+                    port: be.port,
+                    path: url.pathname + q,
+                    method,
+                    headers,
+                    timeout: 10000,
+                },
+                (up) => {
+                    res.writeHead(up.statusCode || 502, { 'Content-Type': 'application/json' });
+                    up.pipe(res);
+                }
+            );
+            proxy.on('error', () => {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'backend_unavailable' }));
+            });
+            proxy.on('timeout', () => {
+                proxy.destroy();
+                res.writeHead(504, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'backend_timeout' }));
+            });
+            if (method === 'POST' && body.length) proxy.write(body);
+            proxy.end();
+        });
+        return;
+    }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'not_found', role: 'gateway' }));
 });

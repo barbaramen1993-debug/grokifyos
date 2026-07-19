@@ -314,6 +314,59 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.160 — Chat stick-to-bottom unlock
+
+- **Auto-scroll only while at bottom**: scrolling up unlocks stick-to-bottom so new stream chunks cannot yank the viewport.
+- Expanding an older tool/thought card unlocks immediately so expanded content stays put mid-stream.
+- Returning to the bottom re-enables pin-to-bottom.
+
+### 0.1.159 — Bridge agent working directory
+
+- **Global workspace setting**: choose the agent process `cwd` on the bridge host (default = GrokifyOS install / `GROKIFY_WORKSPACE`).
+- Bridge install paths (runtime logs, uploads, auth) stay on the install workspace; only agent `cwd` changes.
+- Stored as `app_settings.bridge_agent_cwd` (empty/missing → default).
+- Bridge HTTP: `GET/POST /work-dir`, `GET /work-dir/list` (directory browser); gateway proxies the same routes.
+- PHP: `GET/POST /api/admin-system-chat-workdir.php` (get, set, reset, list).
+- **Android Settings** + **web system-chat Settings**: show current path, type a path, browse folders on the server, reset to default.
+- New chats/spawns use the selected directory after save.
+
+### 0.1.158 — Remove shared radio from Live DJ
+
+- **Removed** in-app shared radio (TX/RX codes, tune-in, host publish) from Spotify Live DJ.
+- Live DJ is local booth only again — no shared-room client hooks.
+- Radio stays a separate project if/when rebuilt.
+
+### 0.1.157 — Spotify keys on-device only
+
+- Removed the temporary host-keys dashboard / DB sync for Spotify Client ID/Secret.
+- OAuth credentials stay in the on-device vault (and Mapbox / other vault keys as before).
+- First-account-is-admin behavior from 0.1.151 remains.
+
+### 0.1.152–0.1.156 — Web console skin + Live DJ radio experiment
+
+- **Web dashboard**: high-tech console skin (styles extracted to `web/assets/css/app.css`); system-chat chrome updated to match.
+- **Spotify OAuth**: pure PKCE token exchange first, secret fallback only when Spotify rejects confidential-client; bounce page (`spotify-callback.php`) intent URLs + App Link polish.
+- **Live DJ**: console restyle (ON AIR chip, CHAT · QUEUE · SETTINGS tabs).
+- **Shared radio (later removed in 0.1.158)**: TX/RX room codes and mid-song sync shipped briefly in 0.1.153–0.1.156, then pulled.
+
+### 0.1.151 — First-account admin (+ short-lived host keys)
+
+- **First account is admin** (setup / install). Later accounts default to `user` (`schema/001_init.sql` default role + `gos_default_new_user_role()`).
+- A host-keys Admin panel and `host_keys` device sync shipped here and were **removed in 0.1.157** — do not rely on `admin-settings` / `003_host_keys` (they are not in tree).
+
+### 0.1.150 — Live DJ: AI queue-rank prompts as templates
+
+- **Queue rank system** + **Queue rank request** under Prompt templates — the music-director system rules and candidate request message used when **AI rank next tracks** is on.
+- Editable / resettable like banter · research · chat system cores. Placeholders: `{{N}}`, `{{GENRE_BIAS}}`, `{{CURRENT}}`, `{{BEHAVIOR}}`, `{{CANDIDATES}}`, etc.
+- Default text matches the previous hard-coded prompt.
+
+### 0.1.149 — Live DJ: queue system sources + playlists
+
+- **Queue system** in Live DJ → Settings (next to prompt templates): toggle the radio-pool selection processes — Liked, Top tracks, Top artists, Recent, History, Disliked, Artist radio, Related, Song radio, Playlists.
+- **Default = current full blend** (all sources on; playlists randomly sample ~3 each fill).
+- **Multi-select playlists**: Load playlists → pin any number (up to 12). Pinned only those feed the pool; empty pin list keeps the random-sample default.
+- **Reset to default mix** restores all sources + clears pins.
+
 ### 0.1.148 — System back navigation
 
 - **Inner app → Apps hub**: Android system back closes the open inner app instead of leaving the activity.

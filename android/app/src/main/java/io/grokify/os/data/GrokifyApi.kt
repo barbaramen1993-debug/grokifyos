@@ -225,6 +225,36 @@ class GrokifyApi(
         return executeJson(req)
     }
 
+    /** Current bridge agent working directory. */
+    fun workDir(): JSONObject {
+        val req = authRequest("/admin-system-chat-workdir.php").get().build()
+        return executeJson(req)
+    }
+
+    /** Set agent cwd (absolute path) or reset when [reset] is true. */
+    fun setWorkDir(path: String = "", reset: Boolean = false): JSONObject {
+        val body = if (reset) {
+            JSONObject().put("reset", true)
+        } else {
+            JSONObject().put("path", path)
+        }
+        val req = authRequest("/admin-system-chat-workdir.php")
+            .post(jsonBody(body))
+            .build()
+        return executeJson(req)
+    }
+
+    /** List child directories of [path] on the bridge host for the folder picker. */
+    fun listWorkDir(path: String = ""): JSONObject {
+        val q = if (path.isNotBlank()) {
+            "?list=1&path=${java.net.URLEncoder.encode(path, "UTF-8")}"
+        } else {
+            "?list=1"
+        }
+        val req = authRequest("/admin-system-chat-workdir.php$q").get().build()
+        return executeJson(req)
+    }
+
     fun listNotes(): JSONObject {
         val body = JSONObject().put("action", "list")
         val req = authRequest("/admin-system-chat-notes.php")

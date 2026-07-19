@@ -22,7 +22,7 @@ GrokifyOS is an **open-source, self-hosted** stack for a Grokify-style AI assist
 |------|--------|
 | **Web dashboard** | Password login, device pairing, chat UI, APK upload |
 | **REST APIs** | Auth, devices, chat sessions/messages, models, usage, OTA |
-| **Bridge** | Agent WebSocket gateway (own port + workspace) |
+| **Bridge** | Agent WebSocket gateway (own port + install workspace; agent `cwd` selectable via `bridge_agent_cwd`) |
 | **Android** | Package `io.grokify.os` |
 | **Schema** | Users (password hash), chat tables, devices, APK releases |
 | **Auth** | Username/password sessions + device Bearer tokens (`gos_…`) |
@@ -43,6 +43,8 @@ GrokifyOS is an **open-source, self-hosted** stack for a Grokify-style AI assist
 | Database | Dedicated `grokifyos` schema — never share with unrelated apps |
 | Site URL | `GROKIFY_SITE_URL` (local `http://…` or public `https://…`) |
 | Bridge | `GROKIFY_BRIDGE_URL` / `GROKIFY_WS_PATH` / `GROKIFY_WS_AUTH_SECRET` |
+| Bridge install workspace | `GROKIFY_WORKSPACE` (logs, runtime, uploads) — not the same as agent cwd |
+| Agent working directory | `app_settings.bridge_agent_cwd` (empty → install workspace); UI in Android/web Settings; bridge `/work-dir` |
 | Grok Build | `GROKIFY_GROK_AUTH_JSON` → real usage and agents |
 
 ## Local vs remote
