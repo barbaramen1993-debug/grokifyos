@@ -397,12 +397,9 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                     enabled = it
                     store.enabled = it
                     GrokAssistantWakeService.sync(appCtx)
+                    // Overlay is ephemeral — never auto-start a permanent bubble.
                     if (!it) {
                         GrokAssistantOverlayService.stop(appCtx)
-                    } else if (store.overlayEnabled &&
-                        GrokAssistantOverlayService.canDrawOverlays(appCtx)
-                    ) {
-                        GrokAssistantOverlayService.start(appCtx, expand = false)
                     }
                 },
                 mode = mode,
@@ -438,17 +435,14 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                     store.overlayEnabled = on
                     if (on) {
                         if (!GrokAssistantOverlayService.canDrawOverlays(appCtx)) {
-                            statusMsg = "Grant “Display over other apps”, then Show overlay"
+                            statusMsg = "Grant “Display over other apps” for wake sessions"
                             GrokAssistantOverlayService.openOverlayPermissionSettings(context)
-                        } else if (store.enabled) {
-                            GrokAssistantOverlayService.start(appCtx, expand = true)
-                            statusMsg = "Overlay shown"
                         } else {
-                            statusMsg = "Overlay pref on — enable Assistant + Show overlay"
+                            statusMsg = "Overlay allowed — shows only on Okay Grok / Show"
                         }
                     } else {
                         GrokAssistantOverlayService.stop(appCtx)
-                        statusMsg = "Overlay stopped"
+                        statusMsg = "Overlay disabled"
                     }
                 },
                 onRequestOverlayPermission = {
@@ -468,12 +462,12 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                     }
                     store.overlayEnabled = true
                     overlayEnabled = true
-                    GrokAssistantOverlayService.start(appCtx, expand = true)
-                    statusMsg = "Overlay shown — bottom center · hold mic · Look for screen"
+                    GrokAssistantOverlayService.startListeningForCommand(appCtx)
+                    statusMsg = "Session open — listening · close when done"
                 },
                 onHideOverlay = {
                     GrokAssistantOverlayService.stop(appCtx)
-                    statusMsg = "Overlay hidden"
+                    statusMsg = "Overlay dismissed"
                 },
                 wakeWordEnabled = wakeWordEnabled,
                 hasMic = hasMic,
@@ -1202,14 +1196,20 @@ private fun AssistantSetupTab(
         Spacer(Modifier.height(20.dp))
         SetupSectionLabel("MINI OVERLAY", GrokifyColors.GlowCyan)
         Text(
-            "Float a compact chat bottom-center over any app. Hold mic · Look (crop screen).",
+            "Ephemeral panel over other apps — not always on. " +
+                "Opens on Okay Grok / Show, closes with ✕ or Expand. " +
+                "No history here · Look crops the screen · tap mic to listen.",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
         )
         Spacer(Modifier.height(6.dp))
         SetupRow(
-            title = "Overlay enabled",
-            subtitle = if (canDrawOverlays) "Permission granted" else "Needs “Display over other apps”",
+            title = "Allow overlay",
+            subtitle = if (canDrawOverlays) {
+                "Permission granted · not always visible"
+            } else {
+                "Needs “Display over other apps”"
+            },
         ) {
             Switch(
                 checked = overlayEnabled,
@@ -1224,10 +1224,10 @@ private fun AssistantSetupTab(
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = onShowOverlay) {
-                Text("Show overlay", color = GrokifyColors.GlowMint, fontSize = 13.sp)
+                Text("Show & listen", color = GrokifyColors.GlowMint, fontSize = 13.sp)
             }
             TextButton(onClick = onHideOverlay) {
-                Text("Hide", color = GrokifyColors.TextMuted, fontSize = 13.sp)
+                Text("Dismiss", color = GrokifyColors.TextMuted, fontSize = 13.sp)
             }
         }
 

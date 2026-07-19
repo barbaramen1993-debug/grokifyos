@@ -190,8 +190,11 @@ class GrokAssistantWakeService : Service() {
             scheduleRestart(delayMs = 1_200L)
             return
         }
-        if (GrokAssistantMic.current() == GrokAssistantMic.Owner.Overlay) {
-            scheduleRestart(delayMs = 900L)
+        if (GrokAssistantMic.current() == GrokAssistantMic.Owner.Overlay ||
+            GrokAssistantOverlayService.isRunning()
+        ) {
+            // Overlay session owns the mic — stay quiet.
+            scheduleRestart(delayMs = 1_500L)
             return
         }
         if (!GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Wake)) {
@@ -355,29 +358,31 @@ class GrokAssistantWakeService : Service() {
         Log.i(TAG, "wake: phrase='${hit.phrase}' rem='${hit.remainder}' raw='${hit.raw}'")
 
         if (hit.remainder.isNotBlank() && !GrokAssistantWake.isWakeOnly(hit)) {
-            // Phrase + command in one utterance — show overlay and send.
+            // Phrase + command in one utterance — show ephemeral overlay and send.
             activateUi(listen = false)
             onCommand(hit.remainder)
-            scheduleRestart(delayMs = 1_500L)
+            scheduleRestart(delayMs = 2_000L)
         } else {
-            // Wake alone — expand overlay and let it own the mic for the request.
+            // Wake alone — stop our STT, hand mic to ephemeral overlay for free-listen.
             awaitingCommand = false
+            cancelListening()
+            GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
             activateUi(listen = true)
             startAsForeground(status = "Yes? Overlay listening…")
-            // Stay paused long enough for overlay hold/auto listen to grab the mic.
-            GrokAssistantMic.quietFor(400L)
-            scheduleRestart(delayMs = 2_500L)
+            // Stay quiet long enough for overlay STT to start; do not re-arm immediately.
+            GrokAssistantMic.quietFor(2_500L)
+            scheduleRestart(delayMs = 4_000L)
         }
     }
 
     /**
-     * Always show the floating overlay when permitted; otherwise open the full app.
-     * Does not require the Setup “Overlay enabled” toggle — wake should be visible.
+     * Show ephemeral floating overlay when permitted; otherwise open the full app.
+     * Does not force a permanent “always show bubble” preference.
      */
     private fun activateUi(listen: Boolean = false) {
         if (GrokAssistantOverlayService.canDrawOverlays(this)) {
-            // Remember preference so boot/sync keeps overlay available after wake use.
             val store = GrokAssistantStore(this)
+            // Allow wake→overlay without requiring the Setup toggle; still ephemeral.
             if (!store.overlayEnabled) {
                 store.overlayEnabled = true
             }

@@ -56,7 +56,9 @@ object GrokAssistantEntry {
             }
         }
         if (!store.enabled) return
-        if (store.overlayEnabled && GrokAssistantOverlayService.canDrawOverlays(app)) {
+        // Hardware/assist entry: ephemeral overlay when permitted (not a permanent bubble).
+        if (GrokAssistantOverlayService.canDrawOverlays(app)) {
+            if (!store.overlayEnabled) store.overlayEnabled = true
             if (listen) {
                 GrokAssistantOverlayService.startListeningForCommand(app)
             } else {

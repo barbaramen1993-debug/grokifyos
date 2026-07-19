@@ -5,7 +5,8 @@ import android.content.Context
 import android.content.Intent
 
 /**
- * Re-arms Okay Grok wake listening (and overlay if prefs say so) after reboot / update.
+ * Re-arms Okay Grok wake listening after reboot / update.
+ * Does not start the floating overlay — that is ephemeral (wake / manual Show only).
  */
 class GrokAssistantBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
@@ -18,10 +19,6 @@ class GrokAssistantBootReceiver : BroadcastReceiver() {
                 val store = GrokAssistantStore(app)
                 if (!store.enabled) return
                 GrokAssistantWakeService.sync(app)
-                if (store.overlayEnabled && GrokAssistantOverlayService.canDrawOverlays(app)) {
-                    // Collapsed bubble after boot — less intrusive.
-                    GrokAssistantOverlayService.start(app, expand = false)
-                }
             }
         }
     }

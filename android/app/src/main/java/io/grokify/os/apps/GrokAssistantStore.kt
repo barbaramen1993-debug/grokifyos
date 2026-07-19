@@ -27,7 +27,10 @@ class GrokAssistantStore(ctx: Context) {
         get() = prefs.getBoolean(KEY_SPEAK, true)
         set(v) = prefs.edit().putBoolean(KEY_SPEAK, v).apply()
 
-    /** User wants the floating mini overlay when assistant is on. */
+    /**
+     * Allow ephemeral floating sessions (wake / Show).
+     * Does not mean a permanent bubble — overlay stops when dismissed.
+     */
     var overlayEnabled: Boolean
         get() = prefs.getBoolean(KEY_OVERLAY, false)
         set(v) = prefs.edit().putBoolean(KEY_OVERLAY, v).apply()

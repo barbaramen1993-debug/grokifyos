@@ -8,7 +8,9 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -18,7 +20,6 @@ import android.view.Gravity
 import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,10 +32,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -42,7 +39,6 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.OpenInFull
-import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.ScreenshotMonitor
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -57,11 +53,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.font.FontWeight
@@ -91,10 +85,11 @@ import kotlinx.coroutines.withContext
 import java.util.Locale
 
 /**
- * Floating mini Grok Assistant over other apps.
+ * Ephemeral floating Grok Assistant over other apps.
  *
- * Requires [Settings.canDrawOverlays]. Collapsed bubble ↔ expanded chat panel
- * with text send + hold-to-talk (SpeechRecognizer).
+ * Shown only while a session is active (wake / assist / manual Show).
+ * No always-on bubble, no chat history — just status + current turn + input.
+ * Closing or expanding to the full app stops this service.
  */
 class GrokAssistantOverlayService : Service() {
 
@@ -103,15 +98,20 @@ class GrokAssistantOverlayService : Service() {
     private var layoutParams: WindowManager.LayoutParams? = null
     private var lifecycleOwner: OverlayLifecycleOwner? = null
 
-    private val expandedState = mutableStateOf(false)
     private val draftState = mutableStateOf("")
     private val busyState = mutableStateOf(false)
     private val listeningState = mutableStateOf(false)
     private val partialState = mutableStateOf<String?>(null)
     private val statusState = mutableStateOf<String?>(null)
-    private val transcriptTick = mutableStateOf(0)
+    /** Current-session lines only (not full chat history). */
+    private val turnUserState = mutableStateOf<String?>(null)
+    private val turnReplyState = mutableStateOf<String?>(null)
+    private val sessionTick = mutableStateOf(0)
 
     private var speech: SpeechRecognizer? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    /** Auto-listen (wake / assist) vs manual hold-to-talk. */
+    private var autoListenActive = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -127,30 +127,19 @@ class GrokAssistantOverlayService : Service() {
                 stopSelfSafely()
                 return START_NOT_STICKY
             }
-            ACTION_COLLAPSE -> {
-                expandedState.value = false
-                applyFocusFlags(focusable = false)
-            }
-            ACTION_EXPAND -> {
-                expandedState.value = true
-                applyFocusFlags(focusable = true)
-            }
             ACTION_BUMP -> {
-                transcriptTick.value = transcriptTick.value + 1
+                sessionTick.value = sessionTick.value + 1
             }
             ACTION_LISTEN -> {
-                expandedState.value = true
-                applyFocusFlags(focusable = true)
                 pendingStartListen = true
-                transcriptTick.value = transcriptTick.value + 1
+                statusState.value = "Listening…"
+                sessionTick.value = sessionTick.value + 1
             }
             ACTION_AUTO_SEND -> {
                 val text = intent.getStringExtra(EXTRA_TEXT)?.trim().orEmpty()
                 if (text.isNotBlank()) {
-                    expandedState.value = true
-                    applyFocusFlags(focusable = true)
                     pendingAutoSend = text
-                    transcriptTick.value = transcriptTick.value + 1
+                    sessionTick.value = sessionTick.value + 1
                 }
             }
             else -> {
@@ -163,22 +152,21 @@ class GrokAssistantOverlayService : Service() {
         }
         if (intent?.getBooleanExtra(EXTRA_LISTEN, false) == true) {
             pendingStartListen = true
+            statusState.value = "Listening…"
         }
         startAsForeground()
         if (!Settings.canDrawOverlays(this)) {
             statusState.value = "Overlay permission required"
-            // Stay alive briefly so notification can open settings; no window without perm.
             return START_STICKY
         }
         if (composeView == null) {
-            attachOverlay(expand = intent?.getBooleanExtra(EXTRA_EXPAND, true) == true)
-        } else if (intent?.getBooleanExtra(EXTRA_EXPAND, false) == true ||
-            intent?.action == ACTION_EXPAND ||
-            intent?.action == ACTION_LISTEN ||
-            intent?.action == ACTION_AUTO_SEND
-        ) {
-            expandedState.value = true
-            applyFocusFlags(focusable = true)
+            attachOverlay()
+        } else {
+            // Ensure window is visible (may have been hidden for screen capture).
+            showAfterScreenCapture()
+        }
+        if (pendingStartListen) {
+            scheduleAutoListen(delayMs = 500L)
         }
         return START_STICKY
     }
@@ -207,8 +195,8 @@ class GrokAssistantOverlayService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val n: Notification = NotificationCompat.Builder(this, GrokifyApp.CHANNEL_ASSISTANT)
-            .setContentTitle("Grok Assistant overlay")
-            .setContentText("Tap to open · floating mini chat active")
+            .setContentTitle("Grok Assistant")
+            .setContentText("Quick overlay session · tap to open full app")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(openApp)
             .setOngoing(true)
@@ -217,7 +205,7 @@ class GrokAssistantOverlayService : Service() {
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .addAction(0, "Stop", stopPi)
+            .addAction(0, "Dismiss", stopPi)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFERRED)
             .build()
         try {
@@ -236,7 +224,7 @@ class GrokAssistantOverlayService : Service() {
         }
     }
 
-    private fun attachOverlay(expand: Boolean) {
+    private fun attachOverlay() {
         if (composeView != null) return
         val wm = windowManager ?: return
         val density = resources.displayMetrics.density
@@ -245,17 +233,15 @@ class GrokAssistantOverlayService : Service() {
             it.onStart()
             lifecycleOwner = it
         }
-        expandedState.value = expand
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
         }
+        // Always focusable panel while visible (ephemeral session, not a bubble).
         val flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
-            if (expand) 0 else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
         val bottomPad = (24 * density).toInt()
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -264,7 +250,6 @@ class GrokAssistantOverlayService : Service() {
             flags,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            // Fixed bottom-center dock (bubble + expanded panel).
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             x = 0
             y = bottomPad
@@ -295,22 +280,6 @@ class GrokAssistantOverlayService : Service() {
         }
     }
 
-    private fun applyFocusFlags(focusable: Boolean) {
-        val wm = windowManager ?: return
-        val view = composeView ?: return
-        val lp = layoutParams ?: return
-        // Keep docked bottom-center whenever focus changes (expand/collapse).
-        val density = resources.displayMetrics.density
-        lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        lp.x = 0
-        lp.y = (24 * density).toInt()
-        lp.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
-            if (focusable) 0 else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        runCatching { wm.updateViewLayout(view, lp) }
-    }
-
     /** Hide the floating window so MediaProjection does not capture our chrome. */
     fun hideForScreenCapture() {
         val wm = windowManager ?: return
@@ -324,7 +293,7 @@ class GrokAssistantOverlayService : Service() {
         val view = composeView
         val lp = layoutParams
         if (view == null || lp == null) {
-            attachOverlay(expand = expand)
+            attachOverlay()
             return
         }
         if (view.parent == null) {
@@ -332,19 +301,14 @@ class GrokAssistantOverlayService : Service() {
             lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
             lp.x = 0
             lp.y = (24 * density).toInt()
-            expandedState.value = expand
-            applyFocusFlags(focusable = expand)
             runCatching { wm.addView(view, lp) }
                 .onFailure { e ->
                     Log.e(TAG, "re-add overlay failed", e)
                     composeView = null
-                    attachOverlay(expand = expand)
+                    attachOverlay()
                 }
-        } else {
-            expandedState.value = expand
-            applyFocusFlags(focusable = expand)
         }
-        transcriptTick.value = transcriptTick.value + 1
+        sessionTick.value = sessionTick.value + 1
     }
 
     private fun detachOverlay() {
@@ -360,13 +324,15 @@ class GrokAssistantOverlayService : Service() {
     }
 
     private fun stopSelfSafely() {
+        mainHandler.removeCallbacksAndMessages(null)
+        autoListenActive = false
         detachOverlay()
-        destroySpeech()
+        destroySpeech(resumeWake = true)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private fun destroySpeech() {
+    private fun destroySpeech(resumeWake: Boolean = true) {
         runCatching {
             speech?.stopListening()
             speech?.cancel()
@@ -374,8 +340,11 @@ class GrokAssistantOverlayService : Service() {
         }
         speech = null
         listeningState.value = false
+        autoListenActive = false
         GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
-        GrokAssistantWakeService.resume(this)
+        if (resumeWake) {
+            GrokAssistantWakeService.resume(this)
+        }
     }
 
     private fun ensureSpeech(): SpeechRecognizer? {
@@ -389,7 +358,7 @@ class GrokAssistantOverlayService : Service() {
             override fun onReadyForSpeech(params: Bundle?) {
                 listeningState.value = true
                 partialState.value = null
-                statusState.value = "Listening…"
+                statusState.value = "Listening… say your request"
             }
 
             override fun onBeginningOfSpeech() {}
@@ -402,20 +371,33 @@ class GrokAssistantOverlayService : Service() {
             override fun onError(error: Int) {
                 listeningState.value = false
                 partialState.value = null
+                val wasAuto = autoListenActive
+                autoListenActive = false
                 GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+                // Soft errors during auto-listen: one quick retry, then idle (keep overlay).
+                val soft = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                    error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                    error == SpeechRecognizer.ERROR_CLIENT
+                if (wasAuto && soft) {
+                    statusState.value = "Didn't catch that — tap mic or type"
+                    GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
+                    return
+                }
                 GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
                 statusState.value = when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH -> "Didn't catch that"
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech"
                     SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission needed"
+                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Mic busy — try again"
                     else -> "Mic error ($error)"
                 }
             }
 
             override fun onResults(results: Bundle?) {
                 listeningState.value = false
+                autoListenActive = false
                 GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
-                GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
+                // Don't resume wake until send completes (busy path resumes later).
                 val texts = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 val best = texts?.firstOrNull()?.trim().orEmpty()
                 partialState.value = null
@@ -423,9 +405,10 @@ class GrokAssistantOverlayService : Service() {
                     draftState.value = best
                     statusState.value = null
                     pendingAutoSend = best
-                    transcriptTick.value = transcriptTick.value + 1
+                    sessionTick.value = sessionTick.value + 1
                 } else {
                     statusState.value = "No speech text"
+                    GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
                 }
             }
 
@@ -446,33 +429,85 @@ class GrokAssistantOverlayService : Service() {
     @Volatile
     private var pendingStartListen: Boolean = false
 
-    private fun startListening() {
-        GrokAssistantWakeService.pause(this)
-        if (!GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Overlay)) {
-            // Force preempt wake
-            GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Overlay)
+    private var listenRetryCount = 0
+    private val autoListenKick = Runnable {
+        if (listeningState.value || busyState.value) {
+            pendingStartListen = false
+            return@Runnable
         }
-        val sr = ensureSpeech() ?: return
+        pendingStartListen = false
+        startListening(auto = true, retry = 0)
+    }
+
+    private fun scheduleAutoListen(delayMs: Long = 400L) {
+        pendingStartListen = true
+        mainHandler.removeCallbacks(autoListenKick)
+        mainHandler.postDelayed(autoListenKick, delayMs)
+    }
+
+    /**
+     * @param auto true for wake/assist free-listen until result; false for hold-to-talk.
+     */
+    private fun startListening(auto: Boolean = false, retry: Int = 0) {
+        if (busyState.value || GrokAssistantSession.isBusy) {
+            statusState.value = "Busy…"
+            return
+        }
+        autoListenActive = auto
+        listenRetryCount = retry
+        // Fully free the wake recognizer before we grab the mic.
+        GrokAssistantWakeService.pause(this)
+        GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
+        GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Overlay)
+        // Fresh recognizer avoids OEM "busy" after wake loop.
+        runCatching {
+            speech?.cancel()
+            speech?.destroy()
+        }
+        speech = null
+        val sr = ensureSpeech() ?: run {
+            autoListenActive = false
+            GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+            GrokAssistantWakeService.resume(this)
+            return
+        }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1_800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1_400L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 400L)
         }
         runCatching {
             sr.startListening(intent)
             listeningState.value = true
-            statusState.value = "Listening…"
+            listenRetryCount = 0
+            statusState.value = if (auto) "Listening… say your request" else "Listening…"
+            Log.i(TAG, "overlay listening (auto=$auto)")
         }.onFailure {
+            Log.w(TAG, "startListening: ${it.message}")
             statusState.value = it.message ?: "Could not start mic"
             listeningState.value = false
+            autoListenActive = false
             GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
-            GrokAssistantWakeService.resume(this)
+            if (auto && retry < 2) {
+                statusState.value = "Mic starting…"
+                mainHandler.postDelayed({
+                    if (!listeningState.value && !busyState.value) {
+                        startListening(auto = true, retry = retry + 1)
+                    }
+                }, 700L)
+            } else {
+                GrokAssistantWakeService.resume(this)
+            }
         }
     }
 
     private fun stopListening() {
+        autoListenActive = false
         runCatching { speech?.stopListening() }
         listeningState.value = false
         GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
@@ -481,52 +516,53 @@ class GrokAssistantOverlayService : Service() {
 
     @Composable
     private fun OverlayRoot() {
-        val expanded by expandedState
         val draft by draftState
         val busy by busyState
         val listening by listeningState
         val partial by partialState
         val status by statusState
-        val tick by transcriptTick
+        val turnUser by turnUserState
+        val turnReply by turnReplyState
+        val tick by sessionTick
         val store = remember { GrokAssistantStore(applicationContext) }
-        var speakReplies by remember { mutableStateOf(store.speakReplies) }
-        var enabled by remember { mutableStateOf(store.enabled) }
-        var transcript by remember { mutableStateOf(store.transcript()) }
+        val enabled = store.enabled
         val scope = rememberCoroutineScope()
-        val listState = rememberLazyListState()
 
-        fun reload() {
-            transcript = store.transcript()
-            speakReplies = store.speakReplies
-            enabled = store.enabled
+        fun sendText(text: String) {
+            val trimmed = text.trim()
+            if (trimmed.isEmpty() || !enabled || busyState.value || GrokAssistantSession.isBusy) return
+            draftState.value = ""
+            turnUserState.value = trimmed
+            turnReplyState.value = null
+            busyState.value = true
+            statusState.value = "Thinking…"
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    GrokAssistantSession.send(applicationContext, trimmed)
+                }
+                GrokAssistantMic.quietFor(
+                    if (store.speakReplies) 5_000L else 800L,
+                )
+                busyState.value = false
+                if (result.ok) {
+                    turnReplyState.value = result.replyText?.take(400)
+                    statusState.value = null
+                } else {
+                    turnReplyState.value = null
+                    statusState.value = (result.errorText ?: "Error").take(80)
+                }
+                GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
+            }
         }
 
         LaunchedEffect(tick) {
-            reload()
-            if (pendingStartListen) {
-                pendingStartListen = false
-                startListening()
-            }
+            // Auto-listen is scheduled from the service (debounced) — only handle auto-send here.
             val auto = pendingAutoSend
             if (auto != null) {
                 pendingAutoSend = null
-                if (enabled && !busy && !GrokAssistantSession.isBusy) {
-                    draftState.value = ""
-                    busyState.value = true
-                    statusState.value = null
-                    scope.launch {
-                        withContext(Dispatchers.IO) {
-                            GrokAssistantSession.send(applicationContext, auto)
-                        }
-                        GrokAssistantMic.quietFor(
-                            if (store.speakReplies) 5_000L else 800L,
-                        )
-                        busyState.value = false
-                        reload()
-                        transcriptTick.value = transcriptTick.value + 1
-                    }
+                if (enabled && !busyState.value && !GrokAssistantSession.isBusy) {
+                    sendText(auto)
                 } else if (GrokAssistantSession.isBusy) {
-                    // Wake service (or pane) already sending — just refresh transcript soon.
                     draftState.value = ""
                     statusState.value = "Working…"
                 } else {
@@ -535,38 +571,18 @@ class GrokAssistantOverlayService : Service() {
             }
         }
 
-        LaunchedEffect(transcript.size, busy) {
-            if (transcript.isNotEmpty()) {
-                listState.animateScrollToItem(transcript.lastIndex.coerceAtLeast(0))
-            }
-        }
-
         DisposableEffect(Unit) {
-            onDispose { destroySpeech() }
+            onDispose { destroySpeech(resumeWake = true) }
         }
 
-        if (!expanded) {
-            Bubble(
-                listening = listening,
-                busy = busy,
-                onClick = {
-                    expandedState.value = true
-                    applyFocusFlags(focusable = true)
-                    reload()
-                },
-            )
-            return
-        }
-
-        // Slim dock: narrow panel, short transcript, tight chrome.
-        val shape = RoundedCornerShape(14.dp)
+        val shape = RoundedCornerShape(16.dp)
         Column(
             Modifier
-                .width(248.dp)
+                .width(280.dp)
                 .clip(shape)
                 .background(GrokifyColors.VoidElevated.copy(alpha = 0.97f))
-                .border(1.dp, GrokifyColors.GlowViolet.copy(alpha = 0.4f), shape)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .border(1.dp, GrokifyColors.GlowViolet.copy(alpha = 0.45f), shape)
+                .padding(horizontal = 10.dp, vertical = 8.dp),
         ) {
             Row(
                 Modifier.fillMaxWidth(),
@@ -576,114 +592,105 @@ class GrokAssistantOverlayService : Service() {
                     "Grok",
                     color = GrokifyColors.TextPrimary,
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     modifier = Modifier.weight(1f),
                 )
-                Text(
-                    if (enabled) {
-                        if (speakReplies) "speak" else "silent"
-                    } else {
-                        "off"
-                    },
-                    color = GrokifyColors.TextDim,
-                    fontSize = 9.sp,
-                    modifier = Modifier.padding(end = 2.dp),
-                )
-                IconButton(
-                    onClick = {
-                        expandedState.value = false
-                        applyFocusFlags(focusable = false)
-                        destroySpeech()
-                    },
-                    modifier = Modifier.size(28.dp),
-                ) {
-                    Icon(
-                        Icons.Default.Remove,
-                        contentDescription = "Collapse",
-                        tint = GrokifyColors.TextMuted,
-                        modifier = Modifier.size(16.dp),
-                    )
-                }
                 IconButton(
                     onClick = { openFullAssistantApp() },
-                    modifier = Modifier.size(28.dp),
+                    modifier = Modifier.size(30.dp),
                 ) {
                     Icon(
                         Icons.Default.OpenInFull,
                         contentDescription = "Open full app",
                         tint = GrokifyColors.GlowCyan,
-                        modifier = Modifier.size(16.dp),
+                        modifier = Modifier.size(17.dp),
                     )
                 }
                 IconButton(
                     onClick = { stopSelfSafely() },
-                    modifier = Modifier.size(28.dp),
+                    modifier = Modifier.size(30.dp),
                 ) {
                     Icon(
                         Icons.Default.Close,
-                        contentDescription = "Close overlay",
+                        contentDescription = "Dismiss overlay",
                         tint = GrokifyColors.GlowAmber,
-                        modifier = Modifier.size(16.dp),
+                        modifier = Modifier.size(17.dp),
                     )
                 }
             }
 
-            val recent = transcript.takeLast(4)
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 36.dp, max = 110.dp),
-                verticalArrangement = Arrangement.spacedBy(3.dp),
-            ) {
-                if (recent.isEmpty()) {
-                    item {
-                        Text(
-                            if (!enabled) "Enable in Setup."
-                            else "Ask anything…",
-                            color = GrokifyColors.TextDim,
-                            fontSize = 10.sp,
-                        )
-                    }
-                }
-                items(recent, key = { it.id }) { msg ->
-                    MiniBubble(msg)
-                }
+            // Current turn only — no history list.
+            if (!turnUser.isNullOrBlank()) {
+                Text(
+                    turnUser.orEmpty(),
+                    color = GrokifyColors.TextPrimary,
+                    fontSize = 12.sp,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(GrokifyColors.GlowViolet.copy(alpha = 0.18f))
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+            if (!turnReply.isNullOrBlank()) {
+                Text(
+                    turnReply.orEmpty(),
+                    color = GrokifyColors.TextPrimary,
+                    fontSize = 12.sp,
+                    maxLines = 5,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(GrokifyColors.PanelSoft)
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                )
+                Spacer(Modifier.height(4.dp))
+            } else if (turnUser.isNullOrBlank() && !listening && status.isNullOrBlank() && !busy) {
+                Text(
+                    if (!enabled) "Enable assistant in Setup."
+                    else "Say something or type…",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(bottom = 4.dp),
+                )
             }
 
             if (!status.isNullOrBlank() || !partial.isNullOrBlank()) {
                 Text(
                     partial?.let { "…$it" } ?: status.orEmpty(),
                     color = if (listening) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
-                    fontSize = 10.sp,
-                    maxLines = 1,
+                    fontSize = 11.sp,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 2.dp),
+                    modifier = Modifier.padding(bottom = 4.dp),
                 )
             }
 
-            Spacer(Modifier.height(4.dp))
             Row(
                 Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 OutlinedTextField(
                     value = draft,
                     onValueChange = { draftState.value = it.take(2000) },
                     modifier = Modifier
                         .weight(1f)
-                        .heightIn(min = 36.dp, max = 64.dp),
+                        .heightIn(min = 40.dp, max = 72.dp),
                     placeholder = {
                         Text(
                             if (!enabled) "Off" else "Message…",
-                            fontSize = 11.sp,
+                            fontSize = 12.sp,
                             color = GrokifyColors.TextDim,
                         )
                     },
                     enabled = enabled && !busy,
                     maxLines = 2,
-                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = GrokifyColors.TextPrimary,
                         unfocusedTextColor = GrokifyColors.TextPrimary,
@@ -695,7 +702,6 @@ class GrokAssistantOverlayService : Service() {
                         disabledTextColor = GrokifyColors.TextDim,
                     ),
                 )
-                // Look at screen (capture + crop) — overlay only
                 IconButton(
                     onClick = {
                         if (!enabled || busy) return@IconButton
@@ -707,19 +713,19 @@ class GrokAssistantOverlayService : Service() {
                         )
                     },
                     enabled = enabled && !busy,
-                    modifier = Modifier.size(34.dp),
+                    modifier = Modifier.size(36.dp),
                 ) {
                     Icon(
                         Icons.Default.ScreenshotMonitor,
                         contentDescription = "Look at my screen",
                         tint = if (enabled && !busy) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
-                        modifier = Modifier.size(18.dp),
+                        modifier = Modifier.size(19.dp),
                     )
                 }
-                // Hold to talk
+                // Tap to start/stop free-listen (wake uses the same path).
                 Box(
                     Modifier
-                        .size(34.dp)
+                        .size(36.dp)
                         .clip(CircleShape)
                         .background(
                             if (listening) GrokifyColors.GlowMint.copy(alpha = 0.35f)
@@ -732,14 +738,9 @@ class GrokAssistantOverlayService : Service() {
                         )
                         .pointerInput(enabled, busy) {
                             detectTapGestures(
-                                onPress = {
+                                onTap = {
                                     if (!enabled || busy) return@detectTapGestures
-                                    startListening()
-                                    try {
-                                        tryAwaitRelease()
-                                    } finally {
-                                        stopListening()
-                                    }
+                                    if (listening) stopListening() else startListening(auto = true)
                                 },
                             )
                         },
@@ -747,32 +748,19 @@ class GrokAssistantOverlayService : Service() {
                 ) {
                     Icon(
                         Icons.Default.Mic,
-                        contentDescription = "Hold to talk",
+                        contentDescription = "Listen",
                         tint = if (listening) GrokifyColors.GlowMint else GrokifyColors.TextPrimary,
-                        modifier = Modifier.size(18.dp),
+                        modifier = Modifier.size(19.dp),
                     )
                 }
                 IconButton(
-                    onClick = {
-                        val text = draftState.value.trim()
-                        if (text.isEmpty() || !enabled || busy || GrokAssistantSession.isBusy) return@IconButton
-                        draftState.value = ""
-                        busyState.value = true
-                        statusState.value = null
-                        scope.launch {
-                            withContext(Dispatchers.IO) {
-                                GrokAssistantSession.send(applicationContext, text)
-                            }
-                            busyState.value = false
-                            reload()
-                        }
-                    },
+                    onClick = { sendText(draftState.value) },
                     enabled = enabled && !busy && draft.isNotBlank(),
-                    modifier = Modifier.size(34.dp),
+                    modifier = Modifier.size(36.dp),
                 ) {
                     if (busy) {
                         CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
+                            modifier = Modifier.size(17.dp),
                             strokeWidth = 2.dp,
                             color = GrokifyColors.GlowViolet,
                         )
@@ -782,7 +770,7 @@ class GrokAssistantOverlayService : Service() {
                             contentDescription = "Send",
                             tint = if (enabled && draft.isNotBlank()) GrokifyColors.GlowViolet
                             else GrokifyColors.TextDim,
-                            modifier = Modifier.size(18.dp),
+                            modifier = Modifier.size(19.dp),
                         )
                     }
                 }
@@ -790,7 +778,7 @@ class GrokAssistantOverlayService : Service() {
         }
     }
 
-    /** Open the full Grok Assistant pane (reliable from overlay service). */
+    /** Open full Assistant and dismiss this overlay so it does not stay on top. */
     private fun openFullAssistantApp() {
         val intent = io.grokify.os.widgets.WidgetNav.openPluginIntent(
             this,
@@ -811,73 +799,10 @@ class GrokAssistantOverlayService : Service() {
                     startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 }.onFailure { e ->
                     Log.w(TAG, "open full assistant failed: ${e.message}")
-                    statusState.value = "Could not open app"
                 }
             }
-    }
-
-    @Composable
-    private fun Bubble(
-        listening: Boolean,
-        busy: Boolean,
-        onClick: () -> Unit,
-    ) {
-        Box(
-            Modifier
-                .size(48.dp)
-                .clip(CircleShape)
-                .background(
-                    when {
-                        listening -> GrokifyColors.GlowMint.copy(alpha = 0.9f)
-                        busy -> GrokifyColors.GlowViolet.copy(alpha = 0.85f)
-                        else -> GrokifyColors.GlowViolet.copy(alpha = 0.92f)
-                    },
-                )
-                .border(1.5.dp, Color.White.copy(alpha = 0.35f), CircleShape)
-                .clickable(onClick = onClick),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (busy) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(18.dp),
-                    strokeWidth = 2.dp,
-                    color = Color.White,
-                )
-            } else {
-                Text(
-                    "G",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 18.sp,
-                )
-            }
-        }
-    }
-
-    @Composable
-    private fun MiniBubble(msg: AssistantChatMessage) {
-        val isUser = msg.role == "user"
-        val isErr = msg.role == "error"
-        val bg = when {
-            isErr -> GrokifyColors.GlowAmber.copy(alpha = 0.15f)
-            isUser -> GrokifyColors.GlowViolet.copy(alpha = 0.22f)
-            else -> GrokifyColors.PanelSoft
-        }
-        val align = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
-        Box(Modifier.fillMaxWidth(), contentAlignment = align) {
-            Text(
-                msg.text,
-                color = if (isErr) GrokifyColors.GlowAmber else GrokifyColors.TextPrimary,
-                fontSize = 10.sp,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier
-                    .widthIn(max = 220.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(bg)
-                    .padding(horizontal = 6.dp, vertical = 3.dp),
-            )
-        }
+        // Always hide overlay when handing off to the full app.
+        stopSelfSafely()
     }
 
     /** Minimal Lifecycle + SavedState host so ComposeView works outside an Activity. */
@@ -951,7 +876,7 @@ class GrokAssistantOverlayService : Service() {
             }
             val i = Intent(app, GrokAssistantOverlayService::class.java).apply {
                 action = ACTION_START
-                putExtra(EXTRA_EXPAND, expand)
+                putExtra(EXTRA_EXPAND, true) // always a panel while shown
                 putExtra(EXTRA_LISTEN, listen)
                 if (!autoText.isNullOrBlank()) putExtra(EXTRA_TEXT, autoText)
             }
@@ -962,15 +887,14 @@ class GrokAssistantOverlayService : Service() {
             val app = ctx.applicationContext
             val i = Intent(app, GrokAssistantOverlayService::class.java).setAction(ACTION_STOP)
             runCatching { app.startService(i) }
-            // Also try stopService if not running as started with action
             runCatching { app.stopService(Intent(app, GrokAssistantOverlayService::class.java)) }
         }
 
-        /** Expand and start hold-to-talk style listening (system assistant button entry). */
+        /** Show ephemeral overlay and free-listen for the next command. */
         fun startListeningForCommand(ctx: Context) {
             val app = ctx.applicationContext
             if (!Settings.canDrawOverlays(app)) {
-                start(app, expand = true, listen = true)
+                openOverlayPermissionSettings(app)
                 return
             }
             val i = Intent(app, GrokAssistantOverlayService::class.java).apply {
@@ -985,6 +909,7 @@ class GrokAssistantOverlayService : Service() {
             val app = ctx.applicationContext
             val trimmed = text.trim()
             if (trimmed.isEmpty()) return
+            if (!Settings.canDrawOverlays(app)) return
             val i = Intent(app, GrokAssistantOverlayService::class.java).apply {
                 action = ACTION_AUTO_SEND
                 putExtra(EXTRA_EXPAND, true)
@@ -994,13 +919,8 @@ class GrokAssistantOverlayService : Service() {
         }
 
         fun bumpTranscript(ctx: Context) {
-            val app = ctx.applicationContext
-            val svc = instance
-            if (svc != null) {
-                svc.transcriptTick.value = svc.transcriptTick.value + 1
-                return
-            }
-            // No-op if overlay not running — pane reads store directly.
+            val svc = instance ?: return
+            svc.sessionTick.value = svc.sessionTick.value + 1
         }
 
         fun hideForCapture(ctx: Context) {
@@ -1011,18 +931,10 @@ class GrokAssistantOverlayService : Service() {
             val svc = instance
             if (svc != null) {
                 svc.showAfterScreenCapture(expand = expand)
-            } else {
-                val store = GrokAssistantStore(ctx)
-                if (store.enabled && store.overlayEnabled && Settings.canDrawOverlays(ctx)) {
-                    start(ctx, expand = expand)
-                }
             }
+            // Do not auto-restart a permanent overlay after capture if user dismissed it.
         }
 
-        fun isLikelyRunning(ctx: Context): Boolean {
-            // Lightweight: preference + overlay permission; true running state is soft.
-            val store = GrokAssistantStore(ctx)
-            return store.overlayEnabled && Settings.canDrawOverlays(ctx)
-        }
+        fun isRunning(): Boolean = instance != null
     }
 }
