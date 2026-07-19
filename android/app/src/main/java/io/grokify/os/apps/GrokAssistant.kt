@@ -82,6 +82,10 @@ fun GrokAssistantPane(onBack: () -> Unit) {
     var voiceId by remember { mutableStateOf(store.voiceId) }
     var preferDeviceTts by remember { mutableStateOf(store.preferDeviceTts) }
     var speakReplies by remember { mutableStateOf(store.speakReplies) }
+    var overlayEnabled by remember { mutableStateOf(store.overlayEnabled) }
+    var canDrawOverlays by remember {
+        mutableStateOf(GrokAssistantOverlayService.canDrawOverlays(appCtx))
+    }
     var templates by remember { mutableStateOf(store.templates()) }
     var transcript by remember { mutableStateOf(store.transcript()) }
     var hasXaiKey by remember {
@@ -92,6 +96,13 @@ fun GrokAssistantPane(onBack: () -> Unit) {
     var statusMsg by remember { mutableStateOf<String?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var voicePreviewMsg by remember { mutableStateOf<String?>(null) }
+
+    // Re-check overlay permission when returning from system settings.
+    LaunchedEffect(tab) {
+        if (tab == AssistantTab.Setup) {
+            canDrawOverlays = GrokAssistantOverlayService.canDrawOverlays(appCtx)
+        }
+    }
 
     // Prompt editor
     var promptKind by remember { mutableStateOf(AssistantPromptKind.Core) }
@@ -107,6 +118,8 @@ fun GrokAssistantPane(onBack: () -> Unit) {
         voiceId = store.voiceId
         preferDeviceTts = store.preferDeviceTts
         speakReplies = store.speakReplies
+        overlayEnabled = store.overlayEnabled
+        canDrawOverlays = GrokAssistantOverlayService.canDrawOverlays(appCtx)
         templates = store.templates()
         transcript = store.transcript()
         hasXaiKey = !HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank()
@@ -117,7 +130,7 @@ fun GrokAssistantPane(onBack: () -> Unit) {
     }
 
     fun sendMessage(text: String) {
-        if (!store.enabled || busy) return
+        if (!store.enabled || busy || GrokAssistantSession.isBusy) return
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
         busy = true
@@ -127,55 +140,9 @@ fun GrokAssistantPane(onBack: () -> Unit) {
         reloadTranscript()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) {
-                    val system = store.systemPrompt()
-                    val prior = store.transcript().dropLast(1) // exclude current user already in history
-                    val history = AssistantTranscript.formatHistoryForPrompt(
-                        AssistantTranscript.historyWindow(prior),
-                    )
-                    val promptBody = buildString {
-                        if (history.isNotBlank()) {
-                            append("Recent conversation:\n")
-                            append(history)
-                            append("\n\n")
-                        }
-                        append(trimmed)
-                    }
-                    val options = JSONObject()
-                        .put("system", system)
-                        .put("session_title", "Grok Assistant")
-                        .toString()
-                    HostAiClient.complete(appCtx, promptBody, options)
+                withContext(Dispatchers.IO) {
+                    GrokAssistantSession.send(appCtx, trimmed, userAlreadyAppended = true)
                 }
-                val json = runCatching { JSONObject(result) }.getOrElse { JSONObject() }
-                if (json.optBoolean("ok", false)) {
-                    val reply = json.optString("text", "").trim()
-                        .ifBlank { json.optString("content", "").trim() }
-                    if (reply.isBlank()) {
-                        store.appendMessage("error", "Empty reply — try again")
-                    } else {
-                        store.appendMessage("assistant", reply)
-                        if (store.speakReplies) {
-                            withContext(Dispatchers.IO) {
-                                val speakOpts = JSONObject()
-                                    .put("voice_id", store.voiceId)
-                                    .put("prefer_device", store.preferDeviceTts)
-                                    .put("language", "en")
-                                    .toString()
-                                HostAiClient.speak(appCtx, reply, speakOpts)
-                            }
-                        }
-                    }
-                } else {
-                    val err = json.optString("error", "request_failed")
-                    val hint = json.optString("hint", "")
-                    store.appendMessage(
-                        "error",
-                        listOf(err, hint).filter { it.isNotBlank() }.joinToString(" — "),
-                    )
-                }
-            } catch (e: Exception) {
-                store.appendMessage("error", e.message ?: "send_failed")
             } finally {
                 busy = false
                 reloadTranscript()
@@ -330,6 +297,50 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                 hasXaiKey = hasXaiKey,
                 voicePreviewMsg = voicePreviewMsg,
                 onPreviewVoice = { previewVoice() },
+                overlayEnabled = overlayEnabled,
+                canDrawOverlays = canDrawOverlays,
+                onOverlayEnabledChange = { on ->
+                    overlayEnabled = on
+                    store.overlayEnabled = on
+                    if (on) {
+                        if (!GrokAssistantOverlayService.canDrawOverlays(appCtx)) {
+                            statusMsg = "Grant “Display over other apps”, then Show overlay"
+                            GrokAssistantOverlayService.openOverlayPermissionSettings(context)
+                        } else if (store.enabled) {
+                            GrokAssistantOverlayService.start(appCtx, expand = true)
+                            statusMsg = "Overlay shown"
+                        } else {
+                            statusMsg = "Overlay pref on — enable Assistant + Show overlay"
+                        }
+                    } else {
+                        GrokAssistantOverlayService.stop(appCtx)
+                        statusMsg = "Overlay stopped"
+                    }
+                },
+                onRequestOverlayPermission = {
+                    GrokAssistantOverlayService.openOverlayPermissionSettings(context)
+                    statusMsg = "Open system setting, allow overlay, return here"
+                },
+                onShowOverlay = {
+                    canDrawOverlays = GrokAssistantOverlayService.canDrawOverlays(appCtx)
+                    if (!canDrawOverlays) {
+                        GrokAssistantOverlayService.openOverlayPermissionSettings(context)
+                        statusMsg = "Grant overlay permission first"
+                        return@AssistantSetupTab
+                    }
+                    if (!store.enabled) {
+                        statusMsg = "Turn on Enabled first"
+                        return@AssistantSetupTab
+                    }
+                    store.overlayEnabled = true
+                    overlayEnabled = true
+                    GrokAssistantOverlayService.start(appCtx, expand = true)
+                    statusMsg = "Overlay shown — drag the bubble, hold mic to talk"
+                },
+                onHideOverlay = {
+                    GrokAssistantOverlayService.stop(appCtx)
+                    statusMsg = "Overlay hidden"
+                },
                 templates = templates,
                 promptKind = promptKind,
                 onPromptKindChange = {
@@ -676,6 +687,12 @@ private fun AssistantSetupTab(
     hasXaiKey: Boolean,
     voicePreviewMsg: String?,
     onPreviewVoice: () -> Unit,
+    overlayEnabled: Boolean,
+    canDrawOverlays: Boolean,
+    onOverlayEnabledChange: (Boolean) -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onShowOverlay: () -> Unit,
+    onHideOverlay: () -> Unit,
     templates: List<AssistantPromptTemplate>,
     promptKind: AssistantPromptKind,
     onPromptKindChange: (AssistantPromptKind) -> Unit,
@@ -823,6 +840,38 @@ private fun AssistantSetupTab(
             )
             Spacer(Modifier.width(6.dp))
             Text("Preview voice", color = GrokifyColors.GlowMint, fontSize = 13.sp)
+        }
+
+        Spacer(Modifier.height(20.dp))
+        SetupSectionLabel("MINI OVERLAY", GrokifyColors.GlowCyan)
+        Text(
+            "Float a compact chat over any app. Hold the mic to speak.",
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+        )
+        Spacer(Modifier.height(6.dp))
+        SetupRow(
+            title = "Overlay enabled",
+            subtitle = if (canDrawOverlays) "Permission granted" else "Needs “Display over other apps”",
+        ) {
+            Switch(
+                checked = overlayEnabled,
+                onCheckedChange = onOverlayEnabledChange,
+                colors = switchColors(GrokifyColors.GlowCyan),
+            )
+        }
+        if (!canDrawOverlays) {
+            TextButton(onClick = onRequestOverlayPermission) {
+                Text("Grant overlay permission", color = GrokifyColors.GlowCyan, fontSize = 13.sp)
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onShowOverlay) {
+                Text("Show overlay", color = GrokifyColors.GlowMint, fontSize = 13.sp)
+            }
+            TextButton(onClick = onHideOverlay) {
+                Text("Hide", color = GrokifyColors.TextMuted, fontSize = 13.sp)
+            }
         }
 
         Spacer(Modifier.height(20.dp))
@@ -976,7 +1025,6 @@ private fun AssistantSetupTab(
         Spacer(Modifier.height(20.dp))
         SetupSectionLabel("COMING SOON", GrokifyColors.TextDim)
         ComingSoonRow("Hey Grok wake word")
-        ComingSoonRow("On-device mini overlay")
         ComingSoonRow("Default assistant / BT / Android Auto")
         ComingSoonRow("Look at my screen + crop")
         Spacer(Modifier.height(24.dp))
