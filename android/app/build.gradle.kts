@@ -12,8 +12,8 @@ android {
         applicationId = "io.grokify.os"
         minSdk = 26
         targetSdk = 35
-        versionCode = 196
-        versionName = "0.1.196"
+        versionCode = 200
+        versionName = "0.1.200"
         buildConfigField("String", "API_BASE", "\"https://grokifyos.grokpot.io/api\"")
         buildConfigField("String", "WS_URL", "\"wss://grokifyos.grokpot.io/grokify-ws/\"")
         buildConfigField("String", "SITE_URL", "\"https://grokifyos.grokpot.io\"")
@@ -48,6 +48,10 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+    androidResources {
+        // Keep VRM binary uncompressed so WebView/AssetManager serves intact glTF.
+        noCompress += "vrm"
     }
 }
 

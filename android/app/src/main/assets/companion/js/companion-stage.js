@@ -1,37 +1,44 @@
 /**
- * Companion Live2D stage — offline PixiJS + pixi-live2d-display (Cubism 4).
- * Host bridge: window.GrokifyCompanion.{onReady,onModelLoaded,onError,onAvatarTapped}
+ * Companion VRM stage — offline Three.js + @pixiv/three-vrm.
+ * Host bridge: window.GrokifyCompanion.{onReady,onModelLoaded,onError,onAvatarTapped,openVrm,readVrmBase64,closeVrm}
  * Stage API:   window.CompanionStage.{loadModel,setState,setMouth,playMotion}
+ *
+ * Android WebView cannot reliably fetch() file:// VRMs ("Failed to fetch").
+ * Bytes are streamed from Kotlin via openVrm/readVrmBase64, then GLTFLoader.parse.
+ *
+ * Vendored libs expose window.CompanionVrmLibs = {
+ *   THREE, GLTFLoader, VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName
+ * }
  */
 (function () {
   "use strict";
-
-  var BUNDLED_MODEL_CANDIDATES = [
-    "models/default/Wanko.model3.json",
-    "models/default/default.model3.json",
-  ];
-
-  var MOUTH_PARAM_CANDIDATES = [
-    "ParamMouthOpenY",
-    "PARAM_MOUTH_OPEN_Y",
-    "ParamMouthOpen",
-    "PARAM_MOUTH_OPEN",
-  ];
 
   var STATE_IDLE = "idle";
   var STATE_LISTENING = "listening";
   var STATE_THINKING = "thinking";
   var STATE_SPEAKING = "speaking";
 
-  var app = null;
-  var model = null;
+  // Chunk size for bridge base64 reads (~256KB raw → ~350KB b64).
+  var BRIDGE_CHUNK = 256 * 1024;
+
+  var libs = null;
+  var renderer = null;
+  var scene = null;
+  var camera = null;
+  var clock = null;
+  var vrm = null;
   var currentState = STATE_IDLE;
   var mouthValue = 0;
-  var mouthParamId = null;
+  var targetMouth = 0;
   var usingFallback = false;
-  var resizeObserver = null;
-  var idleMotionTimer = null;
   var readyNotified = false;
+  var animFrame = 0;
+  var idleTime = 0;
+  var lookTarget = { x: 0, y: 0 };
+  var lookSmooth = { x: 0, y: 0 };
+  var blinkNext = 2.5;
+  var blinkT = -1;
+  var loadToken = 0;
 
   function hostCall(method) {
     try {
@@ -40,8 +47,12 @@
       var args = Array.prototype.slice.call(arguments, 1);
       bridge[method].apply(bridge, args);
     } catch (e) {
-      // Host may not be ready yet; ignore.
+      // Host may not be ready yet.
     }
+  }
+
+  function hostBridge() {
+    return window.GrokifyCompanion || null;
   }
 
   function notifyReady() {
@@ -58,11 +69,10 @@
     hostCall("onModelLoaded", info || "");
   }
 
-  function getLive2DModelClass() {
-    if (window.PIXI && PIXI.live2d && PIXI.live2d.Live2DModel) {
-      return PIXI.live2d.Live2DModel;
-    }
-    return null;
+  function getLibs() {
+    if (libs) return libs;
+    libs = window.CompanionVrmLibs || null;
+    return libs;
   }
 
   function showFallback(show) {
@@ -89,335 +99,503 @@
     var mouth = document.getElementById("fallback-mouth");
     if (!mouth) return;
     var open = Math.max(0, Math.min(1, Number(v) || 0));
-    // Closed ~0.15 scaleY, open ~1.0
     mouth.style.transform = "scaleY(" + (0.15 + open * 0.85).toFixed(3) + ")";
   }
 
-  function destroyModel() {
-    if (idleMotionTimer) {
-      clearTimeout(idleMotionTimer);
-      idleMotionTimer = null;
-    }
-    if (model && app) {
-      try {
-        app.stage.removeChild(model);
-      } catch (_) {}
-      try {
-        if (typeof model.destroy === "function") model.destroy({ children: true });
-      } catch (_) {}
-    }
-    model = null;
-    mouthParamId = null;
-  }
-
-  function fitModel() {
-    if (!model || !app) return;
-    var w = app.renderer.width;
-    var h = app.renderer.height;
-    if (w < 2 || h < 2) return;
-
-    // Prefer fitting height; keep character lower-center like a companion avatar.
-    var scale = Math.min(w / model.width, h / model.height) * 0.95;
-    if (!isFinite(scale) || scale <= 0) scale = 0.2;
-    model.scale.set(scale);
-    model.anchor.set(0.5, 0.9);
-    model.x = w / 2;
-    model.y = h * 0.98;
-  }
-
-  function resolveMouthParam(m) {
-    if (!m || !m.internalModel || !m.internalModel.coreModel) return null;
-    var core = m.internalModel.coreModel;
-    var i;
-    for (i = 0; i < MOUTH_PARAM_CANDIDATES.length; i++) {
-      var id = MOUTH_PARAM_CANDIDATES[i];
-      try {
-        if (typeof core.getParameterIndex === "function") {
-          var idx = core.getParameterIndex(id);
-          if (idx != null && idx >= 0) return id;
-        }
-      } catch (_) {}
-    }
-    // Scan parameter ids if available
+  function destroyVrm() {
+    if (!vrm) return;
     try {
-      var count =
-        typeof core.getParameterCount === "function" ? core.getParameterCount() : 0;
-      for (i = 0; i < count; i++) {
-        var pid =
-          typeof core.getParameterId === "function" ? core.getParameterId(i) : null;
-        if (!pid) continue;
-        var name = String(pid);
-        if (/mouth.*open/i.test(name) || /open.*mouth/i.test(name)) {
-          return name;
-        }
+      if (scene) scene.remove(vrm.scene);
+    } catch (_) {}
+    try {
+      var L = getLibs();
+      if (L && L.VRMUtils && typeof L.VRMUtils.deepDispose === "function") {
+        L.VRMUtils.deepDispose(vrm.scene);
       }
     } catch (_) {}
-    return MOUTH_PARAM_CANDIDATES[0];
+    vrm = null;
   }
 
-  function applyMouthToModel(v) {
-    if (!model || !model.internalModel || !model.internalModel.coreModel) return;
-    var core = model.internalModel.coreModel;
-    var id = mouthParamId || resolveMouthParam(model);
-    mouthParamId = id;
-    if (!id) return;
-    var open = Math.max(0, Math.min(1, Number(v) || 0));
+  function fitCamera() {
+    if (!camera || !renderer) return;
+    var w = window.innerWidth || 1;
+    var h = window.innerHeight || 1;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h, false);
+
+    if (vrm && vrm.scene && getLibs() && getLibs().THREE) {
+      try {
+        var THREE = getLibs().THREE;
+        var box = new THREE.Box3().setFromObject(vrm.scene);
+        if (isFinite(box.min.x) && isFinite(box.max.y) && box.getSize) {
+          var size = new THREE.Vector3();
+          var center = new THREE.Vector3();
+          box.getSize(size);
+          box.getCenter(center);
+          if (size.y > 0.01) {
+            var lookY = center.y + size.y * 0.18;
+            var dist = Math.max(size.y * 0.95, size.x * 1.4, 1.1);
+            if (w >= h) dist *= 1.15;
+            camera.position.set(center.x, lookY, center.z + dist);
+            camera.lookAt(center.x, lookY, center.z);
+            return;
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (w < h) {
+      camera.position.set(0, 1.35, 1.55);
+      camera.lookAt(0, 1.25, 0);
+    } else {
+      camera.position.set(0, 1.3, 1.85);
+      camera.lookAt(0, 1.2, 0);
+    }
+  }
+
+  function setHud(text) {
+    var el = document.getElementById("stage-hud");
+    if (!el) return;
+    if (!text) {
+      el.textContent = "";
+      el.classList.remove("visible");
+      return;
+    }
+    el.textContent = text;
+    el.classList.add("visible");
+  }
+
+  function setExpression(name, value) {
+    if (!vrm || !vrm.expressionManager) return;
     try {
-      if (typeof core.setParameterValueById === "function") {
-        core.setParameterValueById(id, open);
-      } else if (typeof core.setParameterValueByIndex === "function") {
-        var idx = core.getParameterIndex(id);
-        if (idx >= 0) core.setParameterValueByIndex(idx, open);
-      }
+      vrm.expressionManager.setValue(name, Math.max(0, Math.min(1, value)));
     } catch (_) {}
   }
 
-  function pickMotionGroup(preferred) {
-    if (!model || !model.internalModel) return null;
-    var defs =
-      (model.internalModel.motionManager &&
-        model.internalModel.motionManager.definitions) ||
-      {};
-    var keys = Object.keys(defs);
-    if (!keys.length) return null;
-    var i;
-    for (i = 0; i < preferred.length; i++) {
-      var p = preferred[i];
-      if (defs[p] && defs[p].length) return p;
-      // case-insensitive
-      for (var j = 0; j < keys.length; j++) {
-        if (keys[j].toLowerCase() === p.toLowerCase() && defs[keys[j]].length) {
-          return keys[j];
-        }
-      }
-    }
-    return keys[0];
-  }
-
-  function playGroupMotion(groupName, index) {
-    if (!model || typeof model.motion !== "function") return Promise.resolve(false);
-    try {
-      var p = model.motion(groupName, index == null ? undefined : index);
-      if (p && typeof p.then === "function") return p.then(function () { return true; });
-      return Promise.resolve(true);
-    } catch (e) {
-      return Promise.resolve(false);
-    }
-  }
-
-  function scheduleIdleLoop() {
-    if (idleMotionTimer) {
-      clearTimeout(idleMotionTimer);
-      idleMotionTimer = null;
-    }
-    if (!model || currentState !== STATE_IDLE) return;
-    var group = pickMotionGroup(["Idle", "idle", "Idle1"]);
-    if (!group) return;
-    playGroupMotion(group).finally(function () {
-      if (currentState !== STATE_IDLE || !model) return;
-      idleMotionTimer = setTimeout(scheduleIdleLoop, 2500 + Math.random() * 2500);
+  function clearTalkExpressions() {
+    ["aa", "ih", "ou", "ee", "oh"].forEach(function (n) {
+      setExpression(n, 0);
     });
   }
 
-  function mapStateToMotion(state) {
+  function applyMouth(v) {
+    var open = Math.max(0, Math.min(1, Number(v) || 0));
+    mouthValue = open;
+    if (usingFallback) {
+      setFallbackMouth(open);
+      return;
+    }
+    if (!vrm) return;
+    clearTalkExpressions();
+    if (open > 0.01) {
+      setExpression("aa", open);
+      setExpression("oh", open * 0.25);
+    }
+  }
+
+  function applyStateExpressions(state) {
+    if (!vrm || !vrm.expressionManager) return;
+    ["happy", "angry", "sad", "relaxed", "surprised", "neutral"].forEach(function (n) {
+      try {
+        vrm.expressionManager.setValue(n, 0);
+      } catch (_) {}
+    });
     switch (state) {
       case STATE_LISTENING:
-        return playGroupMotion(pickMotionGroup(["TapBody", "tap_body", "Touch", "Idle"]) || "Idle");
+        setExpression("happy", 0.35);
+        setExpression("relaxed", 0.2);
+        lookTarget.x = 0;
+        lookTarget.y = 0.05;
+        break;
       case STATE_THINKING:
-        return playGroupMotion(pickMotionGroup(["Shake", "shake", "Flick", "Idle"]) || "Idle");
+        setExpression("relaxed", 0.15);
+        lookTarget.x = 0.35;
+        lookTarget.y = 0.2;
+        break;
       case STATE_SPEAKING:
-        return playGroupMotion(pickMotionGroup(["TapBody", "Talk", "Speak", "Idle"]) || "Idle");
+        setExpression("happy", 0.25);
+        lookTarget.x = 0;
+        lookTarget.y = 0.02;
+        break;
       case STATE_IDLE:
       default:
-        scheduleIdleLoop();
-        return Promise.resolve(true);
+        setExpression("relaxed", 0.12);
+        lookTarget.x = 0;
+        lookTarget.y = 0;
+        break;
     }
   }
 
   function onCanvasPointer() {
     hostCall("onAvatarTapped");
-    if (model && currentState === STATE_IDLE) {
-      var group = pickMotionGroup(["TapBody", "tap_body", "Touch", "Idle"]);
-      if (group) playGroupMotion(group);
+    if (vrm && currentState === STATE_IDLE) {
+      setExpression("happy", 0.55);
+      setTimeout(function () {
+        if (currentState === STATE_IDLE) applyStateExpressions(STATE_IDLE);
+      }, 600);
     }
   }
 
-  function ensureApp() {
-    if (app) return app;
-    var canvas = document.getElementById("live2d-canvas");
-    if (!canvas || !window.PIXI) {
-      throw new Error("PixiJS or canvas not available");
+  function ensureScene() {
+    if (renderer) return;
+    var L = getLibs();
+    if (!L || !L.THREE) {
+      throw new Error("CompanionVrmLibs (three + three-vrm) not loaded");
     }
+    var THREE = L.THREE;
+    var canvas = document.getElementById("vrm-canvas");
+    if (!canvas) throw new Error("vrm-canvas missing");
 
-    // Expose for pixi-live2d-display ticker integration
-    window.PIXI = PIXI;
-
-    app = new PIXI.Application({
-      view: canvas,
-      resizeTo: window,
-      backgroundAlpha: 0,
-      antialias: true,
-      autoDensity: true,
-      resolution: Math.min(window.devicePixelRatio || 1, 2),
-      powerPreference: "high-performance",
-    });
-
-    // Keep transparent stage
-    app.renderer.background.alpha = 0;
-    if (app.renderer.background) {
-      try {
-        app.renderer.background.color = 0x000000;
-      } catch (_) {}
+    try {
+      renderer = new THREE.WebGLRenderer({
+        canvas: canvas,
+        alpha: true,
+        antialias: true,
+        powerPreference: "high-performance",
+      });
+    } catch (e1) {
+      renderer = new THREE.WebGLRenderer({
+        canvas: canvas,
+        alpha: true,
+        antialias: false,
+      });
     }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x000000, 0);
+    try {
+      if (THREE.SRGBColorSpace) renderer.outputColorSpace = THREE.SRGBColorSpace;
+    } catch (_) {}
+
+    scene = new THREE.Scene();
+
+    camera = new THREE.PerspectiveCamera(30, 1, 0.1, 20);
+    clock = new THREE.Clock();
+
+    var amb = new THREE.AmbientLight(0xffffff, 0.65);
+    scene.add(amb);
+    var key = new THREE.DirectionalLight(0xffffff, 1.1);
+    key.position.set(1.2, 1.8, 1.5);
+    scene.add(key);
+    var fill = new THREE.DirectionalLight(0xa8c0ff, 0.45);
+    fill.position.set(-1.4, 1.0, -0.6);
+    scene.add(fill);
+    var rim = new THREE.DirectionalLight(0xffe0c0, 0.25);
+    rim.position.set(0, 1.2, -1.5);
+    scene.add(rim);
 
     canvas.addEventListener("pointerdown", onCanvasPointer, { passive: true });
-    window.addEventListener("resize", function () {
-      fitModel();
-    });
+    window.addEventListener("resize", fitCamera);
+    fitCamera();
 
-    // Apply mouth after Live2D internal update each frame
-    app.ticker.add(function () {
-      if (model && !usingFallback) {
-        applyMouthToModel(mouthValue);
+    function tick() {
+      animFrame = requestAnimationFrame(tick);
+      var dt = clock ? clock.getDelta() : 0.016;
+      idleTime += dt;
+
+      var mouthDelta = targetMouth - mouthValue;
+      if (Math.abs(mouthDelta) > 0.001) {
+        mouthValue += mouthDelta * Math.min(1, dt * 18);
+        if (!usingFallback) applyMouth(mouthValue);
       }
+
+      if (vrm && !usingFallback) {
+        var sway =
+          currentState === STATE_THINKING
+            ? Math.sin(idleTime * 1.4) * 0.04
+            : Math.sin(idleTime * 0.9) * 0.02;
+        var breath = 1 + Math.sin(idleTime * 2.2) * 0.008;
+        try {
+          if (vrm.scene) {
+            vrm.scene.rotation.y = sway;
+            vrm.scene.scale.setScalar(breath);
+          }
+        } catch (_) {}
+
+        lookSmooth.x += (lookTarget.x - lookSmooth.x) * Math.min(1, dt * 3);
+        lookSmooth.y += (lookTarget.y - lookSmooth.y) * Math.min(1, dt * 3);
+        if (vrm.lookAt) {
+          try {
+            if (typeof vrm.lookAt.lookAt === "function" && camera) {
+              var THREE2 = getLibs().THREE;
+              var target = new THREE2.Vector3(
+                lookSmooth.x * 0.6,
+                1.35 + lookSmooth.y * 0.4,
+                1.2
+              );
+              vrm.lookAt.lookAt(target);
+            }
+          } catch (_) {}
+        }
+
+        blinkNext -= dt;
+        if (blinkT >= 0) {
+          blinkT += dt;
+          var b = blinkT < 0.06 ? blinkT / 0.06 : blinkT < 0.12 ? 1 : 1 - (blinkT - 0.12) / 0.08;
+          if (b < 0) {
+            blinkT = -1;
+            b = 0;
+            blinkNext = 2.2 + Math.random() * 3.5;
+          }
+          setExpression("blink", Math.max(0, Math.min(1, b)));
+        } else if (blinkNext <= 0) {
+          blinkT = 0;
+        }
+
+        if (currentState === STATE_SPEAKING || targetMouth > 0.02) {
+          applyMouth(mouthValue);
+        }
+
+        try {
+          vrm.update(dt);
+        } catch (_) {}
+      }
+
+      if (renderer && scene && camera) {
+        renderer.render(scene, camera);
+      }
+    }
+    tick();
+  }
+
+  function installVrmFromGltf(gltf, label, L) {
+    var loaded = gltf.userData.vrm;
+    if (!loaded) {
+      throw new Error("No VRM data in file (need a .vrm avatar, not plain GLB)");
+    }
+    try {
+      if (L.VRMUtils && typeof L.VRMUtils.rotateVRM0 === "function") {
+        L.VRMUtils.rotateVRM0(loaded);
+      }
+    } catch (_) {}
+    try {
+      loaded.scene.traverse(function (obj) {
+        if (obj.isMesh || obj.isSkinnedMesh) {
+          obj.frustumCulled = false;
+        }
+      });
+    } catch (_) {}
+
+    vrm = loaded;
+    scene.add(vrm.scene);
+    currentState = STATE_IDLE;
+    applyStateExpressions(STATE_IDLE);
+    applyMouth(0);
+    usingFallback = false;
+    showFallback(false);
+    fitCamera();
+    requestAnimationFrame(function () {
+      fitCamera();
+    });
+    return label || "VRM";
+  }
+
+  function parseVrmBuffer(arrayBuffer, label) {
+    var L = getLibs();
+    if (!L) return Promise.reject(new Error("CompanionVrmLibs not loaded"));
+    ensureScene();
+    destroyVrm();
+    showFallback(false);
+
+    if (!arrayBuffer || arrayBuffer.byteLength < 12) {
+      return Promise.reject(new Error("VRM buffer empty"));
+    }
+    // glTF binary magic "glTF"
+    var head = new Uint8Array(arrayBuffer, 0, 4);
+    if (
+      head[0] !== 0x67 ||
+      head[1] !== 0x6c ||
+      head[2] !== 0x54 ||
+      head[3] !== 0x46
+    ) {
+      return Promise.reject(
+        new Error("Not a glTF/VRM binary (bad magic) — is this a .vrm file?")
+      );
+    }
+
+    var loader = new L.GLTFLoader();
+    loader.register(function (parser) {
+      return new L.VRMLoaderPlugin(parser);
     });
 
-    return app;
-  }
-
-  function findBundledModelUrl() {
-    // Prefer known default, else first model3.json via static candidates.
-    return BUNDLED_MODEL_CANDIDATES[0];
-  }
-
-  /**
-   * Probe whether a relative/absolute URL is fetchable (best-effort).
-   * Prefer XHR: Android WebView file:///android_asset often blocks fetch().
-   */
-  function probeUrl(url) {
     return new Promise(function (resolve, reject) {
       try {
-        var xhr = new XMLHttpRequest();
-        xhr.open("GET", url, true);
-        xhr.onload = function () {
-          if (xhr.status === 0 || (xhr.status >= 200 && xhr.status < 300)) {
-            resolve(url);
-          } else {
-            reject(new Error("HTTP " + xhr.status));
+        loader.parse(
+          arrayBuffer,
+          "",
+          function (gltf) {
+            try {
+              resolve(installVrmFromGltf(gltf, label, L));
+            } catch (e) {
+              reject(e);
+            }
+          },
+          function (err) {
+            reject(
+              new Error(
+                ((err && err.message) || String(err) || "parse failed") +
+                  (label ? " (" + label + ")" : "")
+              )
+            );
           }
-        };
-        xhr.onerror = function () {
-          reject(new Error("probe failed: " + url));
-        };
-        xhr.send();
+        );
       } catch (e) {
         reject(e);
       }
     });
   }
 
-  async function resolveBundledModelPath() {
-    var i;
-    for (i = 0; i < BUNDLED_MODEL_CANDIDATES.length; i++) {
-      try {
-        await probeUrl(BUNDLED_MODEL_CANDIDATES[i]);
-        return BUNDLED_MODEL_CANDIDATES[i];
-      } catch (_) {}
+  /**
+   * Read VRM bytes from Kotlin (works offline; no file:// fetch).
+   * Yields to the event loop between chunks so the UI can paint progress.
+   */
+  function loadVrmFromBridge(path) {
+    var bridge = hostBridge();
+    if (!bridge || typeof bridge.openVrm !== "function") {
+      return Promise.reject(new Error("Native VRM bridge missing"));
     }
-    // Default entry even if probe failed — Live2D loader will surface the real error.
-    return BUNDLED_MODEL_CANDIDATES[0];
-  }
-
-  function normalizeUserPath(path) {
-    if (!path) return "";
-    var p = String(path).trim();
-    // Android may pass absolute filesystem path without file://
-    if (/^https?:\/\//i.test(p) || /^file:\/\//i.test(p) || /^content:\/\//i.test(p)) {
-      return p;
-    }
-    if (p.charAt(0) === "/") {
-      return "file://" + p;
-    }
-    return p;
-  }
-
-  async function loadLive2DFromUrl(url) {
-    var Live2DModel = getLive2DModelClass();
-    if (!Live2DModel) {
-      throw new Error("pixi-live2d-display Cubism4 not loaded");
+    if (typeof bridge.readVrmBase64 !== "function") {
+      return Promise.reject(new Error("Native VRM read bridge missing"));
     }
 
-    // Ensure Cubism core is present
-    if (!window.Live2DCubismCore) {
-      throw new Error("live2dcubismcore not loaded");
-    }
-
-    ensureApp();
-    destroyModel();
-    showFallback(false);
-
-    var m = await Live2DModel.from(url, {
-      autoInteract: false,
-    });
-
-    // Disable built-in lip-sync so host-driven setMouth wins
+    var size;
     try {
-      if (m.internalModel) {
-        m.internalModel.lipSync = false;
+      size = bridge.openVrm(path || "bundled");
+    } catch (e) {
+      return Promise.reject(
+        new Error("openVrm threw: " + ((e && e.message) || String(e)))
+      );
+    }
+    if (typeof size !== "number" || size <= 0) {
+      try {
+        if (typeof bridge.closeVrm === "function") bridge.closeVrm();
+      } catch (_) {}
+      return Promise.reject(
+        new Error("openVrm failed (code " + size + ") path=" + (path || "bundled"))
+      );
+    }
+
+    var label = "VRM";
+    try {
+      if (typeof bridge.vrmLabel === "function") {
+        var n = bridge.vrmLabel();
+        if (n) label = String(n).replace(/\.vrm$/i, "");
       }
     } catch (_) {}
 
-    model = m;
-    mouthParamId = resolveMouthParam(m);
-    app.stage.addChild(model);
-    fitModel();
+    var bytes = new Uint8Array(size);
+    var offset = 0;
 
-    // Interactive hit / tap
-    try {
-      model.interactive = true;
-      model.buttonMode = true;
-      model.on("pointertap", onCanvasPointer);
-      model.on("hit", function () {
-        onCanvasPointer();
-      });
-    } catch (_) {}
+    function readNext() {
+      if (offset >= size) {
+        try {
+          if (typeof bridge.closeVrm === "function") bridge.closeVrm();
+        } catch (_) {}
+        setHud("Parsing " + label + "…");
+        return parseVrmBuffer(bytes.buffer, label);
+      }
+      var n = Math.min(BRIDGE_CHUNK, size - offset);
+      var b64;
+      try {
+        b64 = bridge.readVrmBase64(offset, n);
+      } catch (e) {
+        try {
+          if (typeof bridge.closeVrm === "function") bridge.closeVrm();
+        } catch (_) {}
+        return Promise.reject(
+          new Error("readVrmBase64 threw at " + offset + ": " + ((e && e.message) || e))
+        );
+      }
+      if (!b64) {
+        try {
+          if (typeof bridge.closeVrm === "function") bridge.closeVrm();
+        } catch (_) {}
+        return Promise.reject(new Error("Empty VRM chunk at offset " + offset));
+      }
+      var bin;
+      try {
+        bin = atob(b64);
+      } catch (e) {
+        try {
+          if (typeof bridge.closeVrm === "function") bridge.closeVrm();
+        } catch (_) {}
+        return Promise.reject(new Error("Base64 decode failed at " + offset));
+      }
+      for (var i = 0; i < bin.length; i++) {
+        bytes[offset + i] = bin.charCodeAt(i);
+      }
+      offset += bin.length;
+      var pct = Math.min(99, Math.floor((offset / size) * 100));
+      setHud("Loading " + label + "… " + pct + "%");
 
-    currentState = STATE_IDLE;
-    scheduleIdleLoop();
-    usingFallback = false;
-    return url;
+      // Yield so WebView can paint + not hit ANR-ish long blocks.
+      return new Promise(function (resolve) {
+        setTimeout(resolve, 0);
+      }).then(readNext);
+    }
+
+    setHud("Loading " + label + "… 0%");
+    return readNext();
   }
 
   function activateFallback(reason) {
-    destroyModel();
+    destroyVrm();
     showFallback(true);
     setFallbackState(currentState || STATE_IDLE);
     setFallbackMouth(mouthValue);
     usingFallback = true;
-    notifyError(reason || "model load failed; using fallback avatar");
+    var msg = reason || "model load failed; using fallback avatar";
+    setHud("VRM failed — placeholder face");
+    var label = document.getElementById("fallback-label");
+    if (label) {
+      var short = String(msg).replace(/\s+/g, " ").trim();
+      if (short.length > 72) short = short.slice(0, 69) + "…";
+      label.textContent = short ? "VRM unavailable — " + short : "VRM unavailable";
+    }
+    notifyError(msg);
   }
 
   /**
    * @param {'bundled'|'user'|string} source
-   * @param {string} [path] user model path / URL
+   * @param {string} [path] absolute filesystem path, "bundled", or file:// URL
    */
   async function loadModel(source, path) {
     var src = (source || "bundled").toString().toLowerCase();
+    var token = ++loadToken;
     try {
-      ensureApp();
-      var url;
+      if (!getLibs()) {
+        throw new Error("CompanionVrmLibs missing — vendor bundle failed to load");
+      }
+      ensureScene();
+
+      var bridgePath;
       if (src === "user") {
-        url = normalizeUserPath(path);
-        if (!url) throw new Error("user model path is empty");
+        if (!path || !String(path).trim()) {
+          throw new Error("user model path is empty — pick a .vrm in Settings");
+        }
+        bridgePath = String(path).trim();
       } else {
-        url = await resolveBundledModelPath();
+        bridgePath = path && String(path).trim() ? String(path).trim() : "bundled";
       }
 
-      await loadLive2DFromUrl(url);
-      notifyModelLoaded(url);
+      setHud("Loading VRM…");
+      var label = await loadVrmFromBridge(bridgePath);
+      if (token !== loadToken) {
+        // Superseded by a newer loadModel call.
+        return false;
+      }
+      setHud(label + " (VRM)");
+      setTimeout(function () {
+        if (!usingFallback && token === loadToken) setHud("");
+      }, 4000);
+      notifyModelLoaded(label);
       return true;
     } catch (e) {
+      if (token !== loadToken) return false;
       var msg = (e && e.message) || String(e);
+      try {
+        console.warn("[CompanionStage] load failed", msg);
+      } catch (_) {}
       activateFallback(msg);
       return false;
     }
@@ -435,50 +613,40 @@
     }
     currentState = s;
     setFallbackState(s);
-
-    if (usingFallback || !model) return;
-    if (idleMotionTimer) {
-      clearTimeout(idleMotionTimer);
-      idleMotionTimer = null;
+    if (usingFallback || !vrm) return;
+    applyStateExpressions(s);
+    if (s !== STATE_SPEAKING && targetMouth < 0.02) {
+      clearTalkExpressions();
     }
-    mapStateToMotion(s);
   }
 
   function setMouth(v) {
-    mouthValue = Math.max(0, Math.min(1, Number(v) || 0));
+    targetMouth = Math.max(0, Math.min(1, Number(v) || 0));
     if (usingFallback) {
+      mouthValue = targetMouth;
       setFallbackMouth(mouthValue);
       return;
     }
-    applyMouthToModel(mouthValue);
+    if (Math.abs(targetMouth - mouthValue) > 0.2) {
+      mouthValue = mouthValue + (targetMouth - mouthValue) * 0.5;
+    }
+    applyMouth(mouthValue);
   }
 
   function playMotion(name) {
     if (!name) return;
-    if (usingFallback || !model) return;
-    var n = String(name);
-    // Accept "Group" or "Group:index"
-    var parts = n.split(":");
-    var group = parts[0];
-    var index = parts.length > 1 ? parseInt(parts[1], 10) : undefined;
-    if (!pickMotionGroup([group])) {
-      // Try as raw group name even if not in preferred list
-      playGroupMotion(group, isNaN(index) ? undefined : index);
-      return;
-    }
-    playGroupMotion(
-      pickMotionGroup([group]) || group,
-      isNaN(index) ? undefined : index
-    );
+    var n = String(name).toLowerCase();
+    if (n.indexOf("happy") >= 0) setExpression("happy", 0.7);
+    else if (n.indexOf("sad") >= 0) setExpression("sad", 0.6);
+    else if (n.indexOf("angry") >= 0) setExpression("angry", 0.6);
+    else if (n.indexOf("surprise") >= 0) setExpression("surprised", 0.7);
   }
 
-  // Public API
   window.CompanionStage = {
     loadModel: loadModel,
     setState: setState,
     setMouth: setMouth,
     playMotion: playMotion,
-    /** @internal debug helpers */
     getState: function () {
       return currentState;
     },
@@ -489,16 +657,17 @@
 
   function boot() {
     try {
-      ensureApp();
+      if (!getLibs()) {
+        throw new Error("CompanionVrmLibs missing — vendor bundle failed to load");
+      }
+      ensureScene();
     } catch (e) {
-      showFallback(true);
-      notifyError((e && e.message) || String(e));
-    }
-    notifyReady();
-    // Auto-load bundled model
-    loadModel("bundled").catch(function (e) {
       activateFallback((e && e.message) || String(e));
-    });
+      notifyReady();
+      return;
+    }
+    // Host onReady → pushLoadModel with absolute path; do not fetch file:// here.
+    notifyReady();
   }
 
   if (document.readyState === "loading") {

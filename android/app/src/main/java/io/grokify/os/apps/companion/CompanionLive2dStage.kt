@@ -5,6 +5,7 @@ import android.graphics.Color as AndroidColor
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Base64
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -12,6 +13,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -26,8 +28,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import java.io.File
+import java.io.FileInputStream
+import java.io.RandomAccessFile
 import kotlin.math.abs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 enum class CompanionAvatarState {
@@ -38,9 +46,10 @@ enum class CompanionAvatarState {
 }
 
 /**
- * Offline Live2D stage hosted in a WebView (`assets/companion/index.html`).
+ * Offline VRM stage hosted in a WebView (`assets/companion/index.html`).
  *
- * JS bridge name: [GrokifyCompanion]. Host → page via `window.CompanionStage.*`.
+ * Uses Three.js + @pixiv/three-vrm (vendored). JS bridge name: [GrokifyCompanion].
+ * Host → page via `window.CompanionStage.*` (loadModel / setState / setMouth).
  * Do not Compose-clip the WebView; it blanks the surface on many OEMs.
  */
 @SuppressLint("SetJavaScriptEnabled")
@@ -51,23 +60,35 @@ fun CompanionLive2dStage(
     avatarState: CompanionAvatarState,
     mouth: Float,
     onReady: () -> Unit = {},
+    onModelLoaded: (String) -> Unit = {},
     onModelError: (String) -> Unit = {},
     onAvatarTapped: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
+    val appContext = LocalContext.current.applicationContext
     var webView by remember { mutableStateOf<WebView?>(null) }
     var stageReady by remember { mutableStateOf(false) }
     var lastPushedMouth by remember { mutableFloatStateOf(Float.NaN) }
     var lastMouthPushMs by remember { mutableLongStateOf(0L) }
+    // Prefer real filesystem path — WebView XHR to android_asset often fails for ~11MB VRMs.
+    var bundledVrmPath by remember { mutableStateOf<String?>(null) }
 
     val onReadyLatest = rememberUpdatedState(onReady)
+    val onModelLoadedLatest = rememberUpdatedState(onModelLoaded)
     val onModelErrorLatest = rememberUpdatedState(onModelError)
     val onAvatarTappedLatest = rememberUpdatedState(onAvatarTapped)
     val modelSourceLatest = rememberUpdatedState(modelSource)
     val userModelPathLatest = rememberUpdatedState(userModelPath)
     val avatarStateLatest = rememberUpdatedState(avatarState)
     val mouthLatest = rememberUpdatedState(mouth)
+    val bundledVrmPathLatest = rememberUpdatedState(bundledVrmPath)
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
+
+    LaunchedEffect(Unit) {
+        bundledVrmPath = withContext(Dispatchers.IO) {
+            CompanionModelAssets.ensureBundledVrmFile(appContext)
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -84,10 +105,10 @@ fun CompanionLive2dStage(
     }
 
     // Model pack: reload when source/path changes after the stage is ready.
-    LaunchedEffect(modelSource, userModelPath, stageReady) {
+    LaunchedEffect(modelSource, userModelPath, bundledVrmPath, stageReady) {
         val wv = webView ?: return@LaunchedEffect
         if (!stageReady) return@LaunchedEffect
-        pushLoadModel(wv, modelSource, userModelPath)
+        pushLoadModel(wv, modelSource, userModelPath, bundledVrmPath)
     }
 
     LaunchedEffect(avatarState, stageReady) {
@@ -127,7 +148,8 @@ fun CompanionLive2dStage(
 
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
-                settings.cacheMode = WebSettings.LOAD_DEFAULT
+                // Never reuse a stale Live2D stage after OTA — assets live in the APK.
+                settings.cacheMode = WebSettings.LOAD_NO_CACHE
                 settings.allowFileAccess = true
                 settings.allowContentAccess = true
                 // Offline stage: no remote network (bundled assets + optional local user pack).
@@ -140,7 +162,9 @@ fun CompanionLive2dStage(
                 settings.loadWithOverviewMode = true
                 settings.builtInZoomControls = false
                 settings.displayZoomControls = false
-                settings.userAgentString = settings.userAgentString + " GrokifyCompanion/1"
+                settings.userAgentString = settings.userAgentString + " GrokifyCompanion/2"
+                clearCache(true)
+                clearHistory()
                 @Suppress("DEPRECATION")
                 settings.allowFileAccessFromFileURLs = true
                 @Suppress("DEPRECATION")
@@ -162,17 +186,18 @@ fun CompanionLive2dStage(
                 }
 
                 addJavascriptInterface(
-                    object {
-                        @JavascriptInterface
-                        fun onReady() {
+                    CompanionJsBridge(
+                        ctx = appContext,
+                        onReady = {
                             mainHandler.post {
                                 stageReady = true
                                 val wv = webView ?: return@post
-                                // Re-apply host props (JS also auto-loads bundled on boot).
+                                // Host drives load via bridge bytes (no file:// fetch).
                                 pushLoadModel(
                                     wv,
                                     modelSourceLatest.value,
                                     userModelPathLatest.value,
+                                    bundledVrmPathLatest.value,
                                 )
                                 pushState(wv, avatarStateLatest.value)
                                 val m = mouthLatest.value.coerceIn(0f, 1f)
@@ -181,29 +206,25 @@ fun CompanionLive2dStage(
                                 pushMouth(wv, m)
                                 onReadyLatest.value()
                             }
-                        }
-
-                        @JavascriptInterface
-                        fun onModelLoaded(detail: String?) {
-                            android.util.Log.d(TAG, "model loaded: ${detail.orEmpty()}")
-                        }
-
-                        @JavascriptInterface
-                        fun onError(message: String?) {
+                        },
+                        onModelLoaded = { detail ->
+                            android.util.Log.d(TAG, "model loaded: $detail")
                             mainHandler.post {
-                                val msg = message?.take(240)?.ifBlank { null }
-                                    ?: "Live2D model failed"
+                                onModelLoadedLatest.value(detail)
+                            }
+                        },
+                        onError = { message ->
+                            mainHandler.post {
+                                val msg = message.take(240).ifBlank { "VRM model failed" }
                                 android.util.Log.w(TAG, "stage error: $msg")
-                                // Parent should fall back to bundled when user pack fails.
                                 onModelErrorLatest.value(msg)
                             }
-                        }
-
-                        @JavascriptInterface
-                        fun onAvatarTapped() {
+                        },
+                        onAvatarTapped = {
                             mainHandler.post { onAvatarTappedLatest.value() }
-                        }
-                    },
+                        },
+                        resolveBundledPath = { bundledVrmPathLatest.value },
+                    ),
                     "GrokifyCompanion",
                 )
 
@@ -214,7 +235,19 @@ fun CompanionLive2dStage(
                     ): Boolean {
                         // Stay on the offline asset stage; ignore navigations.
                         val url = request?.url?.toString().orEmpty()
-                        return !url.startsWith("file:///android_asset/companion")
+                        return !url.startsWith("file:///android_asset/companion") &&
+                            !url.startsWith("file://${appContext.filesDir}") &&
+                            !url.startsWith("file://${appContext.filesDir.absolutePath}")
+                    }
+
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                    ): WebResourceResponse? {
+                        val raw = request?.url?.toString().orEmpty()
+                        if (raw.isBlank()) return super.shouldInterceptRequest(view, request)
+                        interceptCompanionResource(appContext, raw)?.let { return it }
+                        return super.shouldInterceptRequest(view, request)
                     }
 
                     override fun onReceivedError(
@@ -222,6 +255,11 @@ fun CompanionLive2dStage(
                         request: WebResourceRequest?,
                         error: WebResourceError?,
                     ) {
+                        val url = request?.url?.toString().orEmpty()
+                        android.util.Log.w(
+                            TAG,
+                            "resource error isMain=${request?.isForMainFrame} $url :: ${error?.description}",
+                        )
                         if (request?.isForMainFrame == true) {
                             mainHandler.post {
                                 onModelErrorLatest.value(
@@ -239,6 +277,7 @@ fun CompanionLive2dStage(
                         description: String?,
                         failingUrl: String?,
                     ) {
+                        android.util.Log.w(TAG, "resource error code=$errorCode $failingUrl :: $description")
                         mainHandler.post {
                             onModelErrorLatest.value(
                                 description ?: "Companion stage failed to load",
@@ -247,6 +286,7 @@ fun CompanionLive2dStage(
                     }
                 }
 
+                // Cache-bust query so WebView cannot keep a pre-VRM stage document.
                 loadUrl(ASSET_URL)
                 webView = this
             }
@@ -267,8 +307,170 @@ fun CompanionLive2dStage(
     )
 }
 
-private const val TAG = "CompanionLive2d"
-private const val ASSET_URL = "file:///android_asset/companion/index.html"
+private const val TAG = "CompanionVrm"
+// Version bump forces a fresh document after Live2D → VRM migrations.
+private const val ASSET_URL =
+    "file:///android_asset/companion/index.html?stage=vrm4&v=200"
+
+/**
+ * Host bridge for the offline VRM stage.
+ *
+ * Critical: Android WebView `fetch`/`XHR` to `file://` almost always fails with
+ * "Failed to fetch" (even with shouldInterceptRequest). The stage therefore
+ * reads VRM bytes via [openVrm]/[readVrmBase64]/[closeVrm] and parses them in JS.
+ */
+private class CompanionJsBridge(
+    private val ctx: android.content.Context,
+    private val onReady: () -> Unit,
+    private val onModelLoaded: (String) -> Unit,
+    private val onError: (String) -> Unit,
+    private val onAvatarTapped: () -> Unit,
+    private val resolveBundledPath: () -> String?,
+) {
+    private val lock = Any()
+    private var openFile: RandomAccessFile? = null
+    private var openLength: Long = 0L
+    private var openLabel: String = ""
+
+    @JavascriptInterface
+    fun onReady() {
+        onReady.invoke()
+    }
+
+    @JavascriptInterface
+    fun onModelLoaded(detail: String?) {
+        onModelLoaded.invoke(detail.orEmpty())
+    }
+
+    @JavascriptInterface
+    fun onError(message: String?) {
+        onError.invoke(message?.ifBlank { null } ?: "VRM model failed")
+    }
+
+    @JavascriptInterface
+    fun onAvatarTapped() {
+        onAvatarTapped.invoke()
+    }
+
+    /**
+     * Open a VRM for chunked base64 reads.
+     * @param path absolute filesystem path, `bundled`, or empty (= bundled)
+     * @return byte length, or negative on error
+     */
+    @JavascriptInterface
+    fun openVrm(path: String?): Int {
+        synchronized(lock) {
+            closeVrmLocked()
+            return try {
+                val file = resolveReadableVrm(path)
+                    ?: run {
+                        android.util.Log.w(TAG, "openVrm: unreadable path=$path")
+                        return -1
+                    }
+                if (!file.isFile || file.length() < 64L) {
+                    android.util.Log.w(TAG, "openVrm: missing/empty ${file.absolutePath}")
+                    return -2
+                }
+                // Soft size cap — absurd files will OOM the WebView base64 path.
+                if (file.length() > 80L * 1024L * 1024L) {
+                    android.util.Log.w(TAG, "openVrm: too large ${file.length()}")
+                    return -3
+                }
+                val raf = RandomAccessFile(file, "r")
+                openFile = raf
+                openLength = file.length()
+                openLabel = file.name
+                android.util.Log.i(TAG, "openVrm ${file.absolutePath} (${openLength} bytes)")
+                openLength.toInt()
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "openVrm failed", e)
+                closeVrmLocked()
+                -4
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun vrmLabel(): String = synchronized(lock) { openLabel }
+
+    @JavascriptInterface
+    fun readVrmBase64(offset: Int, length: Int): String {
+        synchronized(lock) {
+            val raf = openFile ?: return ""
+            if (offset < 0 || length <= 0) return ""
+            if (offset.toLong() >= openLength) return ""
+            val toRead = minOf(length.toLong(), openLength - offset.toLong(), 512L * 1024L).toInt()
+            return try {
+                val buf = ByteArray(toRead)
+                raf.seek(offset.toLong())
+                var got = 0
+                while (got < toRead) {
+                    val n = raf.read(buf, got, toRead - got)
+                    if (n < 0) break
+                    got += n
+                }
+                if (got <= 0) return ""
+                Base64.encodeToString(
+                    if (got == toRead) buf else buf.copyOf(got),
+                    Base64.NO_WRAP,
+                )
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "readVrmBase64 failed off=$offset: ${e.message}")
+                ""
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun closeVrm() {
+        synchronized(lock) { closeVrmLocked() }
+    }
+
+    private fun closeVrmLocked() {
+        try {
+            openFile?.close()
+        } catch (_: Exception) {
+        }
+        openFile = null
+        openLength = 0L
+        openLabel = ""
+    }
+
+    private fun resolveReadableVrm(path: String?): File? {
+        val raw = path?.trim().orEmpty()
+        val filesRoot = ctx.filesDir.absolutePath
+        val cacheRoot = ctx.cacheDir.absolutePath
+
+        fun underAppStorage(f: File): Boolean {
+            val p = try {
+                f.canonicalPath
+            } catch (_: Exception) {
+                f.absolutePath
+            }
+            return p.startsWith(filesRoot) || p.startsWith(cacheRoot)
+        }
+
+        if (raw.isBlank() || raw.equals("bundled", ignoreCase = true)) {
+            val extracted = resolveBundledPath()
+                ?: CompanionModelAssets.ensureBundledVrmFile(ctx)
+                ?: return null
+            val f = File(extracted)
+            return if (underAppStorage(f)) f else null
+        }
+
+        val abs = when {
+            raw.startsWith("file://") -> {
+                // file:///data/... → /data/...
+                raw.removePrefix("file://")
+                    .removePrefix("localhost")
+                    .let { if (it.startsWith("/")) it else "/$it" }
+            }
+            else -> raw
+        }
+        val f = File(abs)
+        return if (underAppStorage(f) && f.isFile) f else null
+    }
+}
 
 private fun CompanionAvatarState.toJsState(): String = when (this) {
     CompanionAvatarState.Idle -> "idle"
@@ -277,10 +479,96 @@ private fun CompanionAvatarState.toJsState(): String = when (this) {
     CompanionAvatarState.Speaking -> "speaking"
 }
 
-private fun pushLoadModel(webView: WebView, source: String, path: String) {
+/**
+ * Serve companion assets (HTML/JS/CSS) with explicit MIME types.
+ * VRM binaries are no longer loaded via URL — see [CompanionJsBridge.openVrm].
+ */
+private fun interceptCompanionResource(
+    ctx: android.content.Context,
+    rawUrl: String,
+): WebResourceResponse? {
+    val url = rawUrl.substringBefore('#').substringBefore('?')
+    return try {
+        when {
+            url.startsWith("file:///android_asset/companion/") -> {
+                val assetPath = url.removePrefix("file:///android_asset/")
+                // Never serve multi‑MB VRMs through intercept+fetch (fails on OEMs).
+                if (assetPath.endsWith(".vrm", ignoreCase = true) ||
+                    assetPath.endsWith(".glb", ignoreCase = true)
+                ) {
+                    return null
+                }
+                val stream = ctx.assets.open(assetPath)
+                WebResourceResponse(mimeForPath(assetPath), charsetForPath(assetPath), stream)
+            }
+            url.startsWith("file://") -> {
+                val path = url.removePrefix("file://").let { p ->
+                    if (p.startsWith("/")) p else "/$p"
+                }.removePrefix("/localhost")
+                val filesRoot = ctx.filesDir.absolutePath
+                if (!path.startsWith(filesRoot)) return null
+                val file = File(path)
+                if (!file.isFile) return null
+                if (file.name.endsWith(".vrm", ignoreCase = true) ||
+                    file.name.endsWith(".glb", ignoreCase = true)
+                ) {
+                    return null
+                }
+                WebResourceResponse(
+                    mimeForPath(file.name),
+                    charsetForPath(file.name),
+                    FileInputStream(file),
+                )
+            }
+            else -> null
+        }
+    } catch (e: Exception) {
+        android.util.Log.w(TAG, "intercept failed for $url: ${e.message}")
+        null
+    }
+}
+
+private fun mimeForPath(path: String): String {
+    val p = path.lowercase()
+    return when {
+        p.endsWith(".html") || p.endsWith(".htm") -> "text/html"
+        p.endsWith(".js") -> "application/javascript"
+        p.endsWith(".css") -> "text/css"
+        p.endsWith(".json") -> "application/json"
+        p.endsWith(".vrm") || p.endsWith(".glb") -> "model/gltf-binary"
+        p.endsWith(".gltf") -> "model/gltf+json"
+        p.endsWith(".png") -> "image/png"
+        p.endsWith(".jpg") || p.endsWith(".jpeg") -> "image/jpeg"
+        p.endsWith(".webp") -> "image/webp"
+        p.endsWith(".wasm") -> "application/wasm"
+        else -> "application/octet-stream"
+    }
+}
+
+private fun charsetForPath(path: String): String? {
+    val p = path.lowercase()
+    return when {
+        p.endsWith(".html") || p.endsWith(".js") || p.endsWith(".css") ||
+            p.endsWith(".json") || p.endsWith(".gltf") -> "utf-8"
+        else -> null
+    }
+}
+
+private fun pushLoadModel(
+    webView: WebView,
+    source: String,
+    path: String,
+    bundledPath: String?,
+) {
     val src = source.ifBlank { CompanionStore.SOURCE_BUNDLED }
+    // Absolute filesystem path (or "bundled") — stage reads via Kotlin bridge.
+    val effectivePath = when {
+        src == CompanionStore.SOURCE_USER && path.isNotBlank() -> path
+        !bundledPath.isNullOrBlank() -> bundledPath
+        else -> "bundled"
+    }
     val sourceJs = JSONObject.quote(src)
-    val pathJs = JSONObject.quote(path)
+    val pathJs = JSONObject.quote(effectivePath)
     webView.evaluateJavascript(
         "window.CompanionStage && window.CompanionStage.loadModel($sourceJs, $pathJs);",
         null,

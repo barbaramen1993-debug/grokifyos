@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -238,14 +237,14 @@ fun CompanionPane(onBack: () -> Unit) {
         }
     }
 
-    val openModelTree = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocumentTree(),
+    val openVrmFile = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
-            flashStatus("Copying model pack…")
+            flashStatus("Copying VRM…")
             val result = withContext(Dispatchers.IO) {
-                copyUserModelTree(appCtx, uri)
+                copyUserVrmFile(appCtx, uri)
             }
             if (result.isSuccess) {
                 val path = result.getOrNull().orEmpty()
@@ -253,9 +252,9 @@ fun CompanionPane(onBack: () -> Unit) {
                 modelSource = CompanionStore.SOURCE_USER
                 store.userModelPath = path
                 store.modelSource = CompanionStore.SOURCE_USER
-                flashStatus("User model loaded")
+                flashStatus("User VRM loaded")
             } else {
-                flashStatus(result.exceptionOrNull()?.message ?: "Could not load model pack")
+                flashStatus(result.exceptionOrNull()?.message ?: "Could not load VRM")
                 modelSource = CompanionStore.SOURCE_BUNDLED
                 store.modelSource = CompanionStore.SOURCE_BUNDLED
             }
@@ -428,12 +427,19 @@ fun CompanionPane(onBack: () -> Unit) {
             avatarState = avatarState,
             mouth = mouth,
             onReady = { stageReady = true },
+            onModelLoaded = { path ->
+                val name = path.substringAfterLast('/').substringAfterLast('\\')
+                    .ifBlank { "VRM" }
+                    .removeSuffix(".vrm")
+                    .removeSuffix(".VRM")
+                flashStatus("Avatar: $name")
+            },
             onModelError = { msg ->
                 flashStatus(msg.take(160))
                 if (modelSource == CompanionStore.SOURCE_USER) {
                     modelSource = CompanionStore.SOURCE_BUNDLED
                     store.modelSource = CompanionStore.SOURCE_BUNDLED
-                    flashStatus("User model failed — using bundled")
+                    flashStatus("User model failed — using Seed-san")
                 }
             },
             onAvatarTapped = {
@@ -533,7 +539,16 @@ fun CompanionPane(onBack: () -> Unit) {
                     }
                 },
                 userModelPath = userModelPath,
-                onLoadModel = { openModelTree.launch(null) },
+                onLoadModel = {
+                    openVrmFile.launch(
+                        arrayOf(
+                            "application/octet-stream",
+                            "model/gltf-binary",
+                            "application/gltf-buffer",
+                            "*/*",
+                        ),
+                    )
+                },
                 hasXaiKey = hasXaiKey,
                 onClearHistory = { showClearConfirm = true },
                 onClose = { showSettings = false },
@@ -601,7 +616,7 @@ private fun CompanionTopBar(
                 fontSize = 16.sp,
             )
             Text(
-                "Warm friend · Live2D + voice",
+                "Warm friend · VRM + voice",
                 color = GrokifyColors.TextDim,
                 fontSize = 11.sp,
                 maxLines = 1,
@@ -969,14 +984,14 @@ private fun CompanionSettingsSheet(
         }
 
         Spacer(Modifier.height(12.dp))
-        SectionLabel("LIVE2D MODEL")
+        SectionLabel("VRM AVATAR")
         ModelSourceRow(
-            label = "Bundled",
+            label = "Bundled (Seed-san)",
             selected = modelSource == CompanionStore.SOURCE_BUNDLED,
             onClick = { onModelSourceChange(CompanionStore.SOURCE_BUNDLED) },
         )
         ModelSourceRow(
-            label = "User pack",
+            label = "User .vrm",
             selected = modelSource == CompanionStore.SOURCE_USER,
             onClick = { onModelSourceChange(CompanionStore.SOURCE_USER) },
         )
@@ -998,13 +1013,12 @@ private fun CompanionSettingsSheet(
             ),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("Load model pack…")
+            Text("Load .vrm file…")
         }
         Text(
-            "Pick a folder with a Cubism 3/4 pack (*.model3.json + .moc3 + textures). " +
-                "Live2D free samples (Akari, Hiyori, …) work if you download them from " +
-                "live2d.com — most GitHub “avatar” repos do not ship model binaries (license). " +
-                "Copied into app storage and selectable as User pack.",
+            "Pick a single .vrm file (VRoid Hub, booth.pm VRChat packs, etc.). " +
+                "Copied into app storage. Needs real VRM 0.x/1.0 (not FBX/Unity package). " +
+                "Default: Seed-san (VRM Public License 1.0).",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
             modifier = Modifier.padding(top = 4.dp),
@@ -1212,14 +1226,13 @@ private fun completeCompanionTurn(
 }
 
 /**
- * Copy a SAF document tree into `filesDir/companion/user_model/` and return the
- * absolute path of the first `*.model3.json` found.
+ * Copy a single SAF document (`.vrm`) into `filesDir/companion/user_model/`.
  */
-private fun copyUserModelTree(ctx: Context, treeUri: Uri): Result<String> {
+private fun copyUserVrmFile(ctx: Context, fileUri: Uri): Result<String> {
     return try {
         runCatching {
             ctx.contentResolver.takePersistableUriPermission(
-                treeUri,
+                fileUri,
                 android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
             )
         }
@@ -1229,52 +1242,50 @@ private fun copyUserModelTree(ctx: Context, treeUri: Uri): Result<String> {
         }
         destRoot.mkdirs()
 
-        val treeId = DocumentsContract.getTreeDocumentId(treeUri)
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeId)
-        copyDocumentChildren(ctx, treeUri, childrenUri, destRoot)
-
-        val modelJson = destRoot.walkTopDown()
-            .firstOrNull { it.isFile && it.name.endsWith(".model3.json", ignoreCase = true) }
-            ?: return Result.failure(Exception("No .model3.json found in pack"))
-        Result.success(modelJson.absolutePath)
-    } catch (e: Exception) {
-        Result.failure(Exception(e.message ?: "model_copy_failed"))
-    }
-}
-
-private fun copyDocumentChildren(
-    ctx: Context,
-    treeUri: Uri,
-    childrenUri: Uri,
-    destDir: File,
-) {
-    val resolver = ctx.contentResolver
-    val projection = arrayOf(
-        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-        DocumentsContract.Document.COLUMN_MIME_TYPE,
-    )
-    resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-        val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-        val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-        val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-        while (cursor.moveToNext()) {
-            val docId = cursor.getString(idIdx) ?: continue
-            val name = cursor.getString(nameIdx)?.ifBlank { null } ?: continue
-            val mime = cursor.getString(mimeIdx).orEmpty()
-            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-            if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                val sub = File(destDir, name)
-                sub.mkdirs()
-                val subChildren = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
-                copyDocumentChildren(ctx, treeUri, subChildren, sub)
-            } else {
-                val out = File(destDir, name)
-                resolver.openInputStream(docUri)?.use { input ->
-                    FileOutputStream(out).use { output -> input.copyTo(output) }
-                }
+        var displayName = "avatar.vrm"
+        ctx.contentResolver.query(fileUri, null, null, null, null)?.use { cursor ->
+            val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (cursor.moveToFirst() && nameIdx >= 0) {
+                cursor.getString(nameIdx)?.ifBlank { null }?.let { displayName = it }
             }
         }
+        if (!displayName.endsWith(".vrm", ignoreCase = true)) {
+            // Many providers omit the extension or use a generic name.
+            if (displayName.contains('.')) {
+                return Result.failure(Exception("Pick a .vrm avatar file (got $displayName)"))
+            }
+            displayName = "$displayName.vrm"
+        }
+
+        val out = File(destRoot, displayName)
+        ctx.contentResolver.openInputStream(fileUri)?.use { input ->
+            FileOutputStream(out).use { output -> input.copyTo(output) }
+        } ?: return Result.failure(Exception("Could not read VRM file"))
+
+        if (out.length() < 64) {
+            return Result.failure(Exception("VRM file looks empty"))
+        }
+        // glTF binary magic "glTF" — catches zip/unity packages renamed to .vrm.
+        out.inputStream().use { input ->
+            val magic = ByteArray(4)
+            val n = input.read(magic)
+            if (n < 4 ||
+                magic[0] != 0x67.toByte() ||
+                magic[1] != 0x6c.toByte() ||
+                magic[2] != 0x54.toByte() ||
+                magic[3] != 0x46.toByte()
+            ) {
+                out.delete()
+                return Result.failure(
+                    Exception(
+                        "Not a binary VRM/glTF file (booth Unity packages need the .vrm inside the zip)",
+                    ),
+                )
+            }
+        }
+        Result.success(out.absolutePath)
+    } catch (e: Exception) {
+        Result.failure(Exception(e.message ?: "vrm_copy_failed"))
     }
 }
 
