@@ -145,6 +145,12 @@ fun CompanionLive2dStage(
                 setLayerType(View.LAYER_TYPE_NONE, null)
                 isFocusable = true
                 isFocusableInTouchMode = true
+                // Keep multi-touch orbit (rotate / pinch / pan) inside the WebView;
+                // parents must not steal the gesture mid-drag.
+                setOnTouchListener { v, _ ->
+                    v.parent?.requestDisallowInterceptTouchEvent(true)
+                    false
+                }
 
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
@@ -190,15 +196,10 @@ fun CompanionLive2dStage(
                         ctx = appContext,
                         onReady = {
                             mainHandler.post {
+                                // Mark ready only — LaunchedEffect(modelSource, …, stageReady)
+                                // is the single load entrypoint (avoids stacked dual loads).
                                 stageReady = true
                                 val wv = webView ?: return@post
-                                // Host drives load via bridge bytes (no file:// fetch).
-                                pushLoadModel(
-                                    wv,
-                                    modelSourceLatest.value,
-                                    userModelPathLatest.value,
-                                    bundledVrmPathLatest.value,
-                                )
                                 pushState(wv, avatarStateLatest.value)
                                 val m = mouthLatest.value.coerceIn(0f, 1f)
                                 lastPushedMouth = m
@@ -310,7 +311,7 @@ fun CompanionLive2dStage(
 private const val TAG = "CompanionVrm"
 // Version bump forces a fresh document after Live2D → VRM migrations.
 private const val ASSET_URL =
-    "file:///android_asset/companion/index.html?stage=vrm5&v=201"
+    "file:///android_asset/companion/index.html?stage=vrm6&v=202"
 
 /**
  * Host bridge for the offline VRM stage.

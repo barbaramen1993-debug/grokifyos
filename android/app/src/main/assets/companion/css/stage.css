@@ -22,12 +22,17 @@ body {
   background: transparent;
 }
 
-#vrm-canvas,
-#live2d-canvas {
+#vrm-canvas {
   display: block;
   width: 100%;
   height: 100%;
   touch-action: none;
+  cursor: grab;
+  outline: none;
+}
+
+#vrm-canvas:active {
+  cursor: grabbing;
 }
 
 /* Fallback silhouette (shown when VRM model fails to load) */

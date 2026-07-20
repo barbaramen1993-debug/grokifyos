@@ -442,14 +442,9 @@ fun CompanionPane(onBack: () -> Unit) {
                     flashStatus("User model failed — using Seed-san")
                 }
             },
-            onAvatarTapped = {
-                if (CompanionVoiceSession.isActive()) {
-                    CompanionVoiceSession.interrupt()
-                } else if (!busy) {
-                    // Idle tap opens chat; double-use: start voice if chat already open.
-                    if (showChat) requestVoiceStart() else showChat = true
-                }
-            },
+            // Stage canvas is orbit-only (rotate / pan / pinch-zoom).
+            // Chat + voice stay on their toolbar buttons — no avatar-tap side effects.
+            onAvatarTapped = {},
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth(),
