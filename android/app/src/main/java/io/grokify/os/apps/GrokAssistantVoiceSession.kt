@@ -113,6 +113,11 @@ object GrokAssistantVoiceSession {
      * Covers cancelled/text-only replies where response.done never paired with audio.
      */
     private const val SPEAKING_IDLE_TIMEOUT_MS = 2_800L
+    /**
+     * Local RMS (0..1) required to treat speech_started during Thinking as a real
+     * barge-in (user still finishing after an early VAD stop), not room noise.
+     */
+    private const val THINKING_BARGE_RMS = 0.045f
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val listeners = ConcurrentLinkedQueue<Listener>()
@@ -499,16 +504,19 @@ object GrokAssistantVoiceSession {
     }
 
     /**
-     * Half-duplex: mic only while Listening / UserSpeaking.
+     * Half-duplex: stream mic while Listening / UserSpeaking / Thinking.
      *
-     * Leaving the mic open during Thinking let speaker echo hit server VAD as
-     * soon as the first TTS samples played — the server cancelled the response
-     * (chat text still arrived, local audio died mid-stream, turn never finished).
+     * Thinking must stay open — server_vad can fire speech_stopped on a short
+     * pause while the user is still talking. Muting there dropped the rest of
+     * the utterance and left "thinking" with a partial/empty commit.
+     *
+     * Mute only once Grok is actually speaking (or tools / post-TTS hold), so
+     * speaker echo cannot cancel TTS mid-stream.
      */
     private fun isMicSendAllowed(): Boolean {
         when (turn.get()) {
-            Turn.Listening, Turn.UserSpeaking -> Unit
-            Turn.GrokSpeaking, Turn.Thinking, Turn.ToolBusy,
+            Turn.Listening, Turn.UserSpeaking, Turn.Thinking -> Unit
+            Turn.GrokSpeaking, Turn.ToolBusy,
             Turn.Idle, Turn.Error, Turn.Connecting,
             -> return false
         }
@@ -561,11 +569,19 @@ object GrokAssistantVoiceSession {
     /**
      * True only when we're confident the *user* is trying to interrupt —
      * not speaker bleed while Grok is still talking.
-     * Half-duplex: while mic is muted, never honor server speech_started.
+     *
+     * During Thinking: honor only if local RMS looks like real speech so a
+     * late finish after an early VAD stop can restart the turn; ignore hiss.
      */
     private fun shouldHonorBargeIn(): Boolean {
-        if (micMuted.get() || !isMicSendAllowed()) return false
-        if (!isPlaybackActive()) return true
+        if (isPlaybackActive()) return false
+        when (turn.get()) {
+            Turn.GrokSpeaking, Turn.ToolBusy,
+            Turn.Idle, Turn.Error, Turn.Connecting,
+            -> return false
+            Turn.Thinking -> return lastLocalRms.get() >= THINKING_BARGE_RMS
+            Turn.Listening, Turn.UserSpeaking -> return true
+        }
         return false
     }
 
@@ -664,11 +680,9 @@ object GrokAssistantVoiceSession {
     /**
      * Edge-triggered mute/unmute. Stop streaming immediately on mute.
      *
-     * **Do not** clear the server input buffer on speech_stopped → Thinking:
-     * server_vad commits that buffer to create the response. Clearing it here
-     * discards the user's just-finished utterance → stuck "thinking" with no
-     * audio/text. Only clear residual/echo after Grok is already speaking
-     * (or tools/drain), or when ignoring echo barge-in.
+     * Only clear the server input buffer once Grok is already speaking / tools /
+     * drain — never on speech_stopped→Thinking (that wiped the just-finished
+     * utterance and stuck the UI on "thinking").
      */
     private fun applyMicMutePolicy(client: GrokAssistantVoiceClient?) {
         val wantMute = !isMicSendAllowed()
@@ -891,10 +905,9 @@ object GrokAssistantVoiceSession {
                 }
             }
             "input_audio_buffer.speech_started" -> {
-                // Half-duplex + mute: any speech_started while we are thinking/speaking
-                // is almost always speaker echo. Do NOT flush local TTS — that was the
-                // "glitch / never finishes" path. Also clear server buffer so echo
-                // does not become a fake user turn.
+                // While Grok is speaking / playback active: almost always speaker echo.
+                // Do NOT flush local TTS (that was the mid-sentence glitch path).
+                // Clear only when playback is active so residual echo is not committed.
                 if (!shouldHonorBargeIn()) {
                     Log.d(
                         TAG,
@@ -903,14 +916,19 @@ object GrokAssistantVoiceSession {
                             "rms=${lastLocalRms.get()} remMs=${playbackRemainingMs()} " +
                             "pcm=${responsePcmBytes.get()})",
                     )
-                    clientRef.get()?.clearInputAudioBuffer()
+                    if (isPlaybackActive() || turn.get() == Turn.GrokSpeaking) {
+                        clientRef.get()?.clearInputAudioBuffer()
+                    }
                     return
                 }
+                // Real barge-in (incl. finishing after an early VAD stop while Thinking).
+                clientRef.get()?.cancelResponse()
                 flushPlayback("barge-in")
                 partialUser.set("")
                 partialAssistant.set(null)
                 assistantCommittedThisResponse.set(false)
                 responsePcmBytes.set(0)
+                awaitingPlaybackDrain.set(false)
                 // New utterance — allow a fresh user commit.
                 lastUserCommitItemId.set(null)
                 lastUserCommitText.set(null)
@@ -918,10 +936,9 @@ object GrokAssistantVoiceSession {
                 setPhase("hearing", Turn.UserSpeaking, "Hearing you…")
             }
             "input_audio_buffer.speech_stopped" -> {
-                // Mute outbound mic so room noise can't barge-in-cancel the reply,
-                // but NEVER clearInputAudioBuffer here — server_vad is about to
-                // commit that buffer and create the response. Clearing wiped the
-                // user utterance and left the UI stuck on "thinking" with no output.
+                // Show processing, but keep mic open (see isMicSendAllowed) so a
+                // mid-thought pause + continue still streams. NEVER clear the
+                // input buffer here — server_vad commits it for the response.
                 setPhase("processing", Turn.Thinking, phaseStatus("processing"))
             }
             "conversation.item.input_audio_transcription.updated" -> {
@@ -1345,18 +1362,24 @@ object GrokAssistantVoiceSession {
                     applyMicMutePolicy(client)
                     val muted = micMuted.get() || !isMicSendAllowed()
                     val t = turn.get()
-                    if (!muted && (t == Turn.UserSpeaking || t == Turn.Listening)) {
+                    if (!muted && (
+                            t == Turn.UserSpeaking ||
+                                t == Turn.Listening ||
+                                t == Turn.Thinking
+                            )
+                    ) {
                         noteLevel(
                             when (t) {
                                 Turn.UserSpeaking -> max(rms, 0.08f)
+                                Turn.Thinking -> max(rms * 0.7f, 0.04f)
                                 else -> rms * 0.55f
                             },
                         )
                     } else if (t != Turn.GrokSpeaking) {
-                        // Soft idle when thinking / tools / muted
+                        // Soft idle when tools / muted
                         noteLevel(rms * 0.08f)
                     }
-                    // Half-duplex: never stream while thinking/speaking/tools or post-TTS hold.
+                    // Half-duplex: stream during listen/speak/think; mute only for Grok TTS / tools.
                     if (muted) continue
                     if (hasLocalPlaybackRemaining()) continue
                     if (useBinary.get()) {

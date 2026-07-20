@@ -179,11 +179,12 @@ class GrokAssistantVoiceClient(
                 "turn_detection",
                 JSONObject()
                     .put("type", "server_vad")
-                    // Half-duplex mute owns echo now — 0.9 was too deaf to quiet speech.
-                    // Default-ish 0.55 + longer silence keeps natural pauses.
-                    .put("threshold", 0.55)
-                    .put("silence_duration_ms", 700)
-                    .put("prefix_padding_ms", 300),
+                    // Docs default threshold=0.85, prefix=333. 700ms silence was cutting
+                    // mid-sentence on natural pauses ("doesn't let me finish speaking").
+                    // Higher silence + mid threshold = finish a thought, still start cleanly.
+                    .put("threshold", 0.70)
+                    .put("silence_duration_ms", 1_600)
+                    .put("prefix_padding_ms", 400),
             )
             .put("audio", audio)
             .put("resumption", JSONObject().put("enabled", true))
