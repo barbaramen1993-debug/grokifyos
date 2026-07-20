@@ -81,7 +81,7 @@ CompanionStage.loadModel("user", "/absolute/or/file/url/MyAvatar.vrm");
 |--------|-------------|
 | `loadModel(source, path?)` | `source`: `"bundled"` \| `"user"`. For `"user"`, `path` is a file URL or absolute path to a `.vrm`. |
 | `setState(state)` | `"idle"` \| `"listening"` \| `"thinking"` \| `"speaking"` — mood expressions + look drift. |
-| `setMouth(v)` | Mouth open amount `0..1` → VRM viseme `aa` (+ light `oh`). |
+| `setMouth(v)` | Mouth open `0..1` → multi-viseme blend (`aa`/`ih`/`ou`/`ee`/`oh` + `jawOpen`) with speech-phase modulation. |
 | `playMotion(name)` | Soft expression flash for names containing happy/sad/angry/surprise. |
 
 Host callbacks on `window.GrokifyCompanion` (Android `@JavascriptInterface`):

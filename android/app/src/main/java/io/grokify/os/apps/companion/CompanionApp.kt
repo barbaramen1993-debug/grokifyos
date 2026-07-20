@@ -115,6 +115,7 @@ fun CompanionPane(onBack: () -> Unit) {
 
     var busy by remember { mutableStateOf(false) }
     var statusMsg by remember { mutableStateOf<String?>(null) }
+    var statusEpoch by remember { mutableStateOf(0) }
     var showChat by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
@@ -135,6 +136,13 @@ fun CompanionPane(onBack: () -> Unit) {
 
     fun flashStatus(msg: String?) {
         statusMsg = msg
+        if (msg.isNullOrBlank()) return
+        val epoch = statusEpoch + 1
+        statusEpoch = epoch
+        scope.launch {
+            delay(3_500)
+            if (statusEpoch == epoch) statusMsg = null
+        }
     }
 
     fun mapTurn(turn: CompanionVoiceSession.Turn): CompanionAvatarState = when (turn) {
@@ -153,14 +161,14 @@ fun CompanionPane(onBack: () -> Unit) {
     val onHistoryCommitted = rememberUpdatedState { role: String, text: String ->
         val body = text.trim()
         if (body.isEmpty()) return@rememberUpdatedState
-        when (role.lowercase()) {
+        val next = when (role.lowercase()) {
             "user" -> storeLatest.value.appendMessage(CompanionMessage.user(body, source = "voice"))
             "assistant" -> storeLatest.value.appendMessage(
                 CompanionMessage.assistant(body, source = "voice"),
             )
             else -> return@rememberUpdatedState
         }
-        history = storeLatest.value.history()
+        history = next
     }
 
     val voiceListener = remember {
@@ -255,8 +263,11 @@ fun CompanionPane(onBack: () -> Unit) {
                 flashStatus("User VRM loaded")
             } else {
                 flashStatus(result.exceptionOrNull()?.message ?: "Could not load VRM")
-                modelSource = CompanionStore.SOURCE_BUNDLED
-                store.modelSource = CompanionStore.SOURCE_BUNDLED
+                // Keep prior good path if copy failed without replacing files.
+                if (userModelPath.isBlank() || !File(userModelPath).isFile) {
+                    modelSource = CompanionStore.SOURCE_BUNDLED
+                    store.modelSource = CompanionStore.SOURCE_BUNDLED
+                }
             }
         }
     }
@@ -311,11 +322,19 @@ fun CompanionPane(onBack: () -> Unit) {
     fun sendText(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty() || busy) return
-        // Text path pauses local avatar control; voice session can still be active but we avoid clobber.
+        // Text path needs exclusive audio: stop voice so mic/TTS cannot stack.
+        if (CompanionVoiceSession.isActive() ||
+            CompanionVoiceSession.currentTurn() == CompanionVoiceSession.Turn.Connecting
+        ) {
+            CompanionVoiceSession.stop()
+            voiceActive = false
+            voiceStatus = null
+            partialUser = null
+            partialAssistant = null
+        }
         busy = true
         draft = ""
-        store.appendMessage(CompanionMessage.user(trimmed, source = "text"))
-        reloadHistory()
+        history = store.appendMessage(CompanionMessage.user(trimmed, source = "text"))
         avatarState = CompanionAvatarState.Thinking
         mouth = 0f
         flashStatus(null)
@@ -326,25 +345,34 @@ fun CompanionPane(onBack: () -> Unit) {
                 }
                 if (reply.isFailure) {
                     val err = reply.exceptionOrNull()?.message ?: "complete_failed"
-                    store.appendMessage(CompanionMessage.error(err))
-                    reloadHistory()
+                    history = store.appendMessage(CompanionMessage.error(err))
                     flashStatus(err.take(160))
                     avatarState = CompanionAvatarState.Idle
                     return@launch
                 }
                 val answer = reply.getOrNull().orEmpty()
-                store.appendMessage(CompanionMessage.assistant(answer, source = "text"))
-                reloadHistory()
+                history = store.appendMessage(CompanionMessage.assistant(answer, source = "text"))
                 if (answer.isNotBlank()) {
                     avatarState = CompanionAvatarState.Speaking
-                    // Coarse mouth pulse while TTS plays (no PCM from speak API).
+                    // Pseudo-syllable mouth while device TTS plays (no PCM stream).
                     val speakJob = launch {
                         var t = 0f
+                        var syllable = 0f
                         while (isActive && busyLatest.value) {
-                            t += 0.18f
-                            mouth = (0.25f + 0.35f * kotlin.math.sin(t.toDouble()).toFloat())
-                                .coerceIn(0f, 1f)
-                            delay(50)
+                            t += 0.22f
+                            syllable += 0.38f
+                            // Burst open on syllable peaks, dip toward closed between.
+                            val syll = kotlin.math.sin(syllable.toDouble()).toFloat()
+                            val syll2 = kotlin.math.sin((syllable * 1.7f + 0.4f).toDouble()).toFloat()
+                            val open = (
+                                0.12f +
+                                    0.42f * ((syll + 1f) * 0.5f) +
+                                    0.18f * ((syll2 + 1f) * 0.5f) +
+                                    0.08f * kotlin.math.sin((t * 2.1f).toDouble()).toFloat()
+                                ).coerceIn(0f, 1f)
+                            // Occasional near-closed "consonant" dip.
+                            mouth = if (syll > 0.92f) open * 0.25f else open
+                            delay(36)
                         }
                     }
                     withContext(Dispatchers.IO) {
@@ -372,15 +400,12 @@ fun CompanionPane(onBack: () -> Unit) {
                     speakJob.cancel()
                 }
             } catch (e: Exception) {
-                store.appendMessage(CompanionMessage.error(e.message ?: "send_failed"))
-                reloadHistory()
+                history = store.appendMessage(CompanionMessage.error(e.message ?: "send_failed"))
                 flashStatus(e.message?.take(160) ?: "send_failed")
             } finally {
                 busy = false
                 mouth = 0f
-                if (!CompanionVoiceSession.isActive()) {
-                    avatarState = CompanionAvatarState.Idle
-                }
+                avatarState = CompanionAvatarState.Idle
             }
         }
     }
@@ -1235,6 +1260,7 @@ private fun completeCompanionTurn(
 
 /**
  * Copy a single SAF document (`.vrm`) into `filesDir/companion/user_model/`.
+ * Writes into a staging dir first so a failed import never wipes the previous model.
  */
 private fun copyUserVrmFile(ctx: Context, fileUri: Uri): Result<String> {
     return try {
@@ -1245,10 +1271,13 @@ private fun copyUserVrmFile(ctx: Context, fileUri: Uri): Result<String> {
             )
         }
         val destRoot = File(ctx.filesDir, "companion/user_model")
-        if (destRoot.exists()) {
-            destRoot.deleteRecursively()
+        val staging = File(ctx.filesDir, "companion/user_model_staging")
+        if (staging.exists()) {
+            staging.deleteRecursively()
         }
-        destRoot.mkdirs()
+        if (!staging.mkdirs()) {
+            return Result.failure(Exception("Could not create model staging dir"))
+        }
 
         var displayName = "avatar.vrm"
         ctx.contentResolver.query(fileUri, null, null, null, null)?.use { cursor ->
@@ -1257,42 +1286,72 @@ private fun copyUserVrmFile(ctx: Context, fileUri: Uri): Result<String> {
                 cursor.getString(nameIdx)?.ifBlank { null }?.let { displayName = it }
             }
         }
+        // Sanitize path segments (SAF names can contain slashes on some providers).
+        displayName = displayName
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .replace(Regex("""[^\w.\- ]+"""), "_")
+            .ifBlank { "avatar.vrm" }
         if (!displayName.endsWith(".vrm", ignoreCase = true)) {
             // Many providers omit the extension or use a generic name.
             if (displayName.contains('.')) {
+                staging.deleteRecursively()
                 return Result.failure(Exception("Pick a .vrm avatar file (got $displayName)"))
             }
             displayName = "$displayName.vrm"
         }
 
-        val out = File(destRoot, displayName)
+        val staged = File(staging, displayName)
         ctx.contentResolver.openInputStream(fileUri)?.use { input ->
-            FileOutputStream(out).use { output -> input.copyTo(output) }
-        } ?: return Result.failure(Exception("Could not read VRM file"))
+            FileOutputStream(staged).use { output -> input.copyTo(output) }
+        } ?: run {
+            staging.deleteRecursively()
+            return Result.failure(Exception("Could not read VRM file"))
+        }
 
-        if (out.length() < 64) {
+        if (staged.length() < 64) {
+            staging.deleteRecursively()
             return Result.failure(Exception("VRM file looks empty"))
         }
         // glTF binary magic "glTF" — catches zip/unity packages renamed to .vrm.
-        out.inputStream().use { input ->
-            val magic = ByteArray(4)
-            val n = input.read(magic)
-            if (n < 4 ||
-                magic[0] != 0x67.toByte() ||
-                magic[1] != 0x6c.toByte() ||
-                magic[2] != 0x54.toByte() ||
-                magic[3] != 0x46.toByte()
-            ) {
-                out.delete()
-                return Result.failure(
-                    Exception(
-                        "Not a binary VRM/glTF file (booth Unity packages need the .vrm inside the zip)",
-                    ),
-                )
+        if (!CompanionModelAssets.looksLikeGltfBinary(staged)) {
+            staging.deleteRecursively()
+            return Result.failure(
+                Exception(
+                    "Not a binary VRM/glTF file (booth Unity packages need the .vrm inside the zip)",
+                ),
+            )
+        }
+
+        // Swap: only replace the live pack after validation succeeds.
+        if (destRoot.exists()) {
+            destRoot.deleteRecursively()
+        }
+        if (!staging.renameTo(destRoot)) {
+            // Cross-filesystem fallback: copy then delete staging.
+            if (!destRoot.mkdirs()) {
+                staging.deleteRecursively()
+                return Result.failure(Exception("Could not create model dir"))
             }
+            val out = File(destRoot, displayName)
+            staged.inputStream().use { input ->
+                FileOutputStream(out).use { output -> input.copyTo(output) }
+            }
+            staging.deleteRecursively()
+            if (!out.isFile || !CompanionModelAssets.looksLikeGltfBinary(out)) {
+                return Result.failure(Exception("Could not install VRM file"))
+            }
+            return Result.success(out.absolutePath)
+        }
+        val out = File(destRoot, displayName)
+        if (!out.isFile) {
+            return Result.failure(Exception("VRM install missing after swap"))
         }
         Result.success(out.absolutePath)
     } catch (e: Exception) {
+        runCatching {
+            File(ctx.filesDir, "companion/user_model_staging").deleteRecursively()
+        }
         Result.failure(Exception(e.message ?: "vrm_copy_failed"))
     }
 }

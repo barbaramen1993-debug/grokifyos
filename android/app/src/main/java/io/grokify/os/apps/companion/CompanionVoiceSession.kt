@@ -15,6 +15,7 @@ import android.os.SystemClock
 import android.util.Log
 import io.grokify.os.apps.GrokAssistantMic
 import io.grokify.os.apps.GrokAssistantVoiceClient
+import io.grokify.os.apps.GrokAssistantVoiceTools
 import io.grokify.os.apps.plugin.HostAiClient
 import io.grokify.os.apps.plugin.HostApiKeyStore
 import io.grokify.os.data.ApiKeyIds
@@ -24,7 +25,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -40,7 +41,7 @@ import kotlin.math.min
  *
  * Independent of [io.grokify.os.apps.GrokAssistantVoiceSession] so both panes
  * can exist without sharing that singleton. Uses [GrokAssistantVoiceClient]
- * for WebSocket + token mint; empty tools; lip-sync via [CompanionAmplitude].
+ * for WebSocket + token mint; body tools ([CompanionBodyTools]); lip-sync via [CompanionAmplitude].
  */
 object CompanionVoiceSession {
     private const val TAG = "CompanionVoiceSession"
@@ -63,9 +64,18 @@ object CompanionVoiceSession {
         fun onError(message: String)
     }
 
-    private const val LEVEL_PUBLISH_MS = 40L
+    /** ~40–50 fps mouth/level publish for responsive lip-sync. */
+    private const val LEVEL_PUBLISH_MS = 22L
     private const val WATCHDOG_MS = 250L
+    /**
+     * Hard ceiling while a response is in flight (serverResponseActive).
+     * Empty turns (speech_stopped, never response.created) recover sooner.
+     */
     private const val THINKING_TIMEOUT_MS = 35_000L
+    /** speech_stopped with no response.created → nudge response.create once. */
+    private const val THINKING_NUDGE_MS = 6_000L
+    /** No response.created after this → reopen mic (do not wait full 35s). */
+    private const val THINKING_EMPTY_TIMEOUT_MS = 14_000L
     /** Whole connect path (mint + WS + session.update) must finish by this. */
     private const val CONNECTING_TIMEOUT_MS = 16_000L
     private const val PLAYBACK_MUTE_HOLD_MS = 900L
@@ -95,6 +105,10 @@ object CompanionVoiceSession {
     private val playbackDrainUntilMs = AtomicLong(0L)
     private val awaitingPlaybackDrain = AtomicBoolean(false)
     private val responsePcmBytes = AtomicInteger(0)
+    /** Bytes actually written to AudioTrack this response (for silent-first-reply recovery). */
+    private val responseWrittenPcmBytes = AtomicInteger(0)
+    /** Prime/re-arm speakers once per reply so cold AudioTrack does not eat the first frame. */
+    private val needsPlaybackPrime = AtomicBoolean(true)
     private val lastLocalRms = AtomicReference(0f)
     private val micMuted = AtomicBoolean(false)
     private val phaseStartedMs = AtomicLong(0L)
@@ -132,6 +146,14 @@ object CompanionVoiceSession {
     private val sessionVoiceId = AtomicReference("eve")
     private val sessionPreferDeviceTts = AtomicBoolean(false)
     private val firstAudioLogged = AtomicBoolean(false)
+    /**
+     * One-shot recovery: if speech_stopped never yields response.created
+     * (cleared buffer / VAD race / silent hang), force response.create once.
+     */
+    private val thinkingResponseNudged = AtomicBoolean(false)
+    /** Client body tools in flight (gesture / hands) — wait before response.create. */
+    private val inFlightTools = AtomicInteger(0)
+    private val pendingResponseAfterTools = AtomicBoolean(false)
 
     private val playbackQueue = LinkedBlockingQueue<ByteArray>(512)
     private val playbackExecutor = Executors.newSingleThreadExecutor { r ->
@@ -187,6 +209,12 @@ object CompanionVoiceSession {
         postSpeakCooldownUntilMs.set(0L)
         listenOpenUntilMs.set(0L)
         firstAudioLogged.set(false)
+        thinkingResponseNudged.set(false)
+        inFlightTools.set(0)
+        pendingResponseAfterTools.set(false)
+        serverResponseActive.set(false)
+        responseWrittenPcmBytes.set(0)
+        needsPlaybackPrime.set(true)
         val storePrefs = runCatching { CompanionStore(app) }.getOrNull()
         sessionVoiceId.set(voiceId.ifBlank { storePrefs?.voiceId ?: "eve" })
         sessionPreferDeviceTts.set(storePrefs?.preferDeviceTts == true)
@@ -202,7 +230,11 @@ object CompanionVoiceSession {
         startWatchdog()
 
         val voice = sessionVoiceId.get().ifBlank { "eve" }
-        val system = instructions.ifBlank { CompanionPrompts.DEFAULT_SYSTEM }
+        val system = buildString {
+            append(instructions.ifBlank { CompanionPrompts.DEFAULT_SYSTEM })
+            append("\n\n")
+            append(CompanionBodyTools.toolInstructions())
+        }
         val resumeId = storePrefs?.voiceConversationId?.trim().orEmpty()
             .ifBlank { null }
 
@@ -355,7 +387,7 @@ object CompanionVoiceSession {
                     client.sessionUpdate(
                         instructions = system,
                         voice = voice,
-                        tools = JSONArray(),
+                        tools = CompanionBodyTools.sessionTools(),
                         sampleRate = GrokAssistantVoiceClient.SAMPLE_RATE,
                         useBinaryAudio = false,
                         reasoningEffort = "none",
@@ -399,9 +431,13 @@ object CompanionVoiceSession {
                     return@launch
                 }
                 if (!client.isSessionReady) {
-                    // Socket is open; continue so the user can still talk (server may
-                    // accept audio with defaults). Surface a soft note in status.
-                    Log.w(TAG, "proceeding without session.updated ack")
+                    // Defaults use reasoning.effort=high → long silent "thinking" then
+                    // our 35s timeout. Do not go live without an applied session.update.
+                    fail(
+                        "Voice session did not configure (no session.updated) — " +
+                            "tap mic to retry",
+                    )
+                    return@launch
                 }
 
                 // Drop any pre-ready mic/ambient that never should have been committed.
@@ -413,7 +449,7 @@ object CompanionVoiceSession {
                 listenOpenUntilMs.set(SystemClock.uptimeMillis() + LISTEN_OPEN_SETTLE_MS)
                 markPhase(Turn.Listening, "Companion · listening — say something")
                 startMicCapture(client)
-                Log.i(TAG, "Companion voice live (sessionReady=${client.isSessionReady})")
+                Log.i(TAG, "Companion voice live (sessionReady=true)")
             } catch (e: Exception) {
                 if (startGeneration.get() != gen) return@launch
                 Log.e(TAG, "start failed", e)
@@ -433,7 +469,10 @@ object CompanionVoiceSession {
         flushPlayback("interrupt")
         partialAssistant.set(null)
         responsePcmBytes.set(0)
+        responseWrittenPcmBytes.set(0)
+        needsPlaybackPrime.set(true)
         awaitingPlaybackDrain.set(false)
+        thinkingResponseNudged.set(false)
         mouthSmoother.reset()
         mouth.set(0f)
         markPhase(Turn.Listening, "Companion · listening")
@@ -466,11 +505,16 @@ object CompanionVoiceSession {
         postSpeakCooldownUntilMs.set(0L)
         listenOpenUntilMs.set(0L)
         firstAudioLogged.set(false)
+        thinkingResponseNudged.set(false)
+        inFlightTools.set(0)
+        pendingResponseAfterTools.set(false)
         awaitingPlaybackDrain.set(false)
         micMuted.set(false)
         lastPlaybackActivityMs.set(0L)
         queuedPcmBytes.set(0)
         responsePcmBytes.set(0)
+        responseWrittenPcmBytes.set(0)
+        needsPlaybackPrime.set(true)
         playbackDrainUntilMs.set(0L)
         lastLocalRms.set(0f)
         phaseStartedMs.set(0L)
@@ -494,17 +538,19 @@ object CompanionVoiceSession {
         level.set(0f)
         mouthSmoother.reset()
         mouth.set(0f)
-        // Error path publishes Turn.Error separately; normal stop → Idle.
-        if (turn.get() != Turn.Error) {
-            setTurn(Turn.Idle, null)
-        } else {
-            // Drop to Idle after resources are gone so isActive() is false.
-            turn.set(Turn.Idle)
-            statusLine.set(null)
-        }
+        // Always land on Idle so isActive() is false after teardown.
+        turn.set(Turn.Idle)
+        statusLine.set(null)
+        // Capture listener *before* clear, then post Idle. setTurn+clearListener used to
+        // race: publish() ran after listenerRef was nulled and the UI stuck on Connecting.
+        val listener = listenerRef.get()
+        val snap = snapshot()
         if (clearListener) {
             listenerRef.set(null)
             appCtx = null
+        }
+        if (listener != null) {
+            mainHandler.post { listener.onSnapshot(snap) }
         }
     }
 
@@ -571,16 +617,58 @@ object CompanionVoiceSession {
             Turn.Thinking -> {
                 val elapsed = phaseElapsedMs()
                 val sec = (elapsed / 1000L).toInt()
-                val line = if (sec > 0) "Companion · thinking · ${sec}s" else "Companion · thinking"
+                val active = serverResponseActive.get()
+                val line = when {
+                    active && sec > 0 -> "Companion · thinking · ${sec}s"
+                    !active && sec >= 3 -> "Companion · thinking · ${sec}s"
+                    else -> "Companion · thinking"
+                }
                 if (statusLine.get() != line) {
                     statusLine.set(line)
                     publish()
                 }
-                if (elapsed >= THINKING_TIMEOUT_MS) {
+                // Empty turn: speech_stopped never produced response.created.
+                // Nudge once, then recover before the full 35s ceiling.
+                if (!active) {
+                    if (elapsed >= THINKING_NUDGE_MS &&
+                        thinkingResponseNudged.compareAndSet(false, true)
+                    ) {
+                        Log.w(
+                            TAG,
+                            "Thinking nudge response.create after ${sec}s " +
+                                "lastEvent=${lastEventType.get()}",
+                        )
+                        val ok = clientRef.get()?.responseCreate() == true
+                        if (!ok) {
+                            Log.w(TAG, "Thinking nudge failed — socket not writable")
+                        } else {
+                            statusLine.set("Companion · thinking · retrying…")
+                            publish()
+                        }
+                    }
+                    if (elapsed >= THINKING_EMPTY_TIMEOUT_MS) {
+                        Log.w(
+                            TAG,
+                            "Thinking empty timeout ${sec}s lastEvent=${lastEventType.get()}",
+                        )
+                        commitPartialAssistantOnInterrupt("thinking empty timeout")
+                        returnToListening("thinking empty timeout")
+                        statusLine.set("Timed out · Companion listening")
+                        publish()
+                        mainHandler.post {
+                            listenerRef.get()?.onError(
+                                "No reply after ${sec}s — say that again",
+                            )
+                        }
+                        return
+                    }
+                } else if (elapsed >= THINKING_TIMEOUT_MS) {
                     Log.w(TAG, "Thinking timeout ${sec}s lastEvent=${lastEventType.get()}")
                     cancelActiveResponse("thinking timeout")
                     commitPartialAssistantOnInterrupt("thinking timeout")
-                    markPhase(Turn.Listening, "Timed out · Companion listening")
+                    returnToListening("thinking timeout")
+                    statusLine.set("Timed out · Companion listening")
+                    publish()
                     mainHandler.post {
                         listenerRef.get()?.onError(
                             "Companion voice timed out after ${sec}s (still connected)",
@@ -600,11 +688,18 @@ object CompanionVoiceSession {
     }
 
     private fun isMicSendAllowed(): Boolean {
-        // Strict half-duplex: only stream mic while Listening. Thinking used to
-        // still send ambient (Spotify bleed) *before* response.created, which
-        // cancelled the first assistant turn — second turn often "worked" after
-        // the room/buffer settled. Interrupt button covers barge-in.
-        if (turn.get() != Turn.Listening) return false
+        // Match Grok Assistant: keep the mic open through Thinking until the
+        // server commits to a response. Muting the whole Thinking phase (strict
+        // Listening-only) caused early VAD cutoffs to sit on "thinking" with
+        // partial/empty audio and time out after ~35s with no reply.
+        // Half-duplex starts at response.created (serverResponseActive) / TTS.
+        when (turn.get()) {
+            Turn.Listening -> Unit
+            Turn.Thinking -> {
+                if (serverResponseActive.get()) return false
+            }
+            Turn.Speaking, Turn.Idle, Turn.Error, Turn.Connecting -> return false
+        }
         if (serverResponseActive.get()) return false
         if (awaitingPlaybackDrain.get()) return false
         if (hasLocalPlaybackRemaining()) return false
@@ -718,6 +813,8 @@ object CompanionVoiceSession {
     private fun returnToListening(reason: String) {
         Log.d(TAG, "returnToListening: $reason")
         awaitingPlaybackDrain.set(false)
+        serverResponseActive.set(false)
+        thinkingResponseNudged.set(false)
         partialAssistant.set(null)
         // Brief cooldown so speaker ring-out does not open a phantom user turn.
         val now = SystemClock.uptimeMillis()
@@ -748,10 +845,16 @@ object CompanionVoiceSession {
     private fun maybeSpeakTextFallback(text: String?) {
         val body = text?.trim().orEmpty()
         if (body.isEmpty()) return
-        if (responsePcmBytes.get() > 0 || hasLocalPlaybackRemaining()) return
+        // Prefer "actually heard" over "received on socket" — cold AudioTrack can
+        // accept deltas into the queue then fail to write, leaving a silent reply.
+        if (responseWrittenPcmBytes.get() > 0 || hasLocalPlaybackRemaining()) return
         val ctx = appCtx ?: return
         if (!running.get()) return
-        Log.w(TAG, "no realtime audio — TTS fallback (${body.length} chars)")
+        Log.w(
+            TAG,
+            "no audible realtime audio (recv=${responsePcmBytes.get()} " +
+                "written=${responseWrittenPcmBytes.get()}) — TTS fallback (${body.length} chars)",
+        )
         scope.launch {
             try {
                 markPhase(Turn.Speaking, "Companion · speaking (TTS)")
@@ -834,7 +937,7 @@ object CompanionVoiceSession {
     private fun fail(msg: String) {
         Log.w(TAG, msg)
         val listener = listenerRef.get()
-        setTurn(Turn.Error, msg)
+        // Surface the fault before teardown so the UI can flash a reason.
         mainHandler.post {
             listener?.onError(msg)
             listener?.onSnapshot(
@@ -848,10 +951,8 @@ object CompanionVoiceSession {
                 ),
             )
         }
-        // Keep listener long enough for the Error snapshot/onError above; clear after stop.
-        stopInternal(clearListener = false)
-        listenerRef.set(null)
-        appCtx = null
+        // Teardown posts a final Idle snapshot with the same captured listener path.
+        stopInternal(clearListener = true)
     }
 
     private fun snapshot(): Snapshot = Snapshot(
@@ -896,9 +997,17 @@ object CompanionVoiceSession {
     }
 
     private fun noteMouthFromPcm(pcm: ByteArray) {
-        val rms = CompanionAmplitude.rmsPcm16Bytes(pcm)
-        mouth.set(mouthSmoother.next(rms))
-        noteLevel(min(1f, rms * 3.5f))
+        val samples = CompanionAmplitude.pcm16LeToShorts(pcm)
+        val rms = CompanionAmplitude.rmsPcm16(samples, samples.size)
+        val peak = CompanionAmplitude.peakPcm16(samples, samples.size)
+        val prev = mouth.get()
+        val next = mouthSmoother.next(rms, peak)
+        mouth.set(next)
+        // Always publish mouth while audio is leaving the speaker — throttle only
+        // kills lip-sync when PCM chunks are small/frequent.
+        val changed = abs(next - prev) > 0.012f
+        val onset = next - prev > 0.08f
+        noteLevel(min(1f, max(rms * 4.2f, peak * 1.6f)), force = onset || changed)
     }
 
     private fun extractTranscript(event: JSONObject): String {
@@ -1009,6 +1118,8 @@ object CompanionVoiceSession {
                 flushPlayback("response cancelled")
                 partialAssistant.set(null)
                 responsePcmBytes.set(0)
+                responseWrittenPcmBytes.set(0)
+                needsPlaybackPrime.set(true)
                 firstAudioLogged.set(false)
                 awaitingPlaybackDrain.set(false)
                 returnToListening("response cancelled")
@@ -1051,6 +1162,8 @@ object CompanionVoiceSession {
                 partialAssistant.set(null)
                 assistantCommittedThisResponse.set(false)
                 responsePcmBytes.set(0)
+                responseWrittenPcmBytes.set(0)
+                needsPlaybackPrime.set(true)
                 firstAudioLogged.set(false)
                 awaitingPlaybackDrain.set(false)
                 if (!continuingUserTurn) {
@@ -1063,10 +1176,10 @@ object CompanionVoiceSession {
                 markPhase(Turn.Listening, "Hearing you…")
             }
             "input_audio_buffer.speech_stopped" -> {
-                // Mute outbound mic so room noise can't barge-in-cancel the reply,
-                // but NEVER clearInputAudioBuffer here — server_vad is about to
-                // commit that buffer and create the response. Clearing wiped the
-                // user utterance and left the UI stuck on "thinking" with no output.
+                // Keep mic open until response.created (see isMicSendAllowed) so a
+                // mid-thought pause + continue still streams. NEVER clear the
+                // input buffer here — server_vad commits it for the response.
+                thinkingResponseNudged.set(false)
                 markPhase(Turn.Thinking, "Companion · thinking")
             }
             "conversation.item.input_audio_transcription.updated" -> {
@@ -1098,11 +1211,22 @@ object CompanionVoiceSession {
                 if (type == "response.created") {
                     assistantCommittedThisResponse.set(false)
                     responsePcmBytes.set(0)
+                    responseWrittenPcmBytes.set(0)
+                    needsPlaybackPrime.set(true)
                     firstAudioLogged.set(false)
+                    thinkingResponseNudged.set(false)
                     partialAssistant.set("")
                     serverResponseActive.set(true)
                     // Mute mic immediately so ambient audio cannot cancel this turn.
                     applyMicMutePolicy(clientRef.get())
+                    // Warm speakers before the first PCM so cold-start silence is less likely.
+                    scope.launch {
+                        runCatching {
+                            ensurePlaybackTrack()
+                            requestPlaybackFocus()
+                            primePlaybackTrack(ms = 60)
+                        }
+                    }
                 }
                 if (turn.get() != Turn.Speaking) {
                     markPhase(Turn.Thinking, "Companion · thinking")
@@ -1177,6 +1301,60 @@ object CompanionVoiceSession {
                     .ifBlank { partialAssistant.get().orEmpty() }
                 commitAssistantIfNeeded(text)
             }
+            "response.function_call_arguments.done" -> {
+                val call = GrokAssistantVoiceTools.parseFunctionCallEvent(event) ?: return
+                inFlightTools.incrementAndGet()
+                Log.i(TAG, "function_call name=${call.name} id=${call.callId.take(12)}")
+                // Body tools are instant; still mark thinking so UI doesn't look stuck idle.
+                if (turn.get() != Turn.Speaking) {
+                    markPhase(Turn.Thinking, "Companion · ${call.name}")
+                }
+                scope.launch {
+                    val result = try {
+                        if (CompanionBodyTools.isBodyTool(call.name)) {
+                            CompanionBodyTools.execute(call)
+                        } else {
+                            GrokAssistantVoiceTools.FunctionResult(
+                                callId = call.callId,
+                                outputJson = JSONObject()
+                                    .put("ok", false)
+                                    .put("error", "unknown_function")
+                                    .put("name", call.name)
+                                    .toString(),
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "tool failed ${call.name}", e)
+                        GrokAssistantVoiceTools.FunctionResult(
+                            callId = call.callId,
+                            outputJson = JSONObject()
+                                .put("ok", false)
+                                .put("error", e.message ?: "tool_failed")
+                                .toString(),
+                        )
+                    }
+                    val client = clientRef.get()
+                    if (client != null && running.get()) {
+                        client.sendFunctionOutput(result)
+                    }
+                    val left = inFlightTools.decrementAndGet()
+                    if (left <= 0) {
+                        inFlightTools.set(0)
+                        pendingResponseAfterTools.set(true)
+                        // Body tools are local/instant — brief settle so JS applies, then continue.
+                        try {
+                            Thread.sleep(80)
+                        } catch (_: InterruptedException) {
+                        }
+                        if (running.get() && pendingResponseAfterTools.getAndSet(false)) {
+                            clientRef.get()?.responseCreate()
+                            if (turn.get() != Turn.Speaking) {
+                                markPhase(Turn.Thinking, "Companion · thinking")
+                            }
+                        }
+                    }
+                }
+            }
             "response.done" -> {
                 serverResponseActive.set(false)
                 val leftover = partialAssistant.get()
@@ -1187,14 +1365,16 @@ object CompanionVoiceSession {
                         extractTranscript(event)
                     }
                 commitAssistantIfNeeded(leftover)
+                val recv = responsePcmBytes.get()
+                val written = responseWrittenPcmBytes.get()
                 Log.d(
                     TAG,
-                    "response.done pcmBytes=${responsePcmBytes.get()} " +
+                    "response.done pcmRecv=$recv pcmWritten=$written " +
                         "queued=${queuedPcmBytes.get()} textLen=${leftover.length}",
                 )
-                // Transcript-only replies: speak via host TTS so voice is never silent.
+                // No audible audio (including cold-track drop of received PCM): TTS fallback.
                 if (leftover.isNotEmpty() &&
-                    responsePcmBytes.get() == 0 &&
+                    written == 0 &&
                     !hasLocalPlaybackRemaining()
                 ) {
                     maybeSpeakTextFallback(leftover)
@@ -1254,13 +1434,26 @@ object CompanionVoiceSession {
     private fun requestPlaybackFocus() {
         val ctx = appCtx ?: return
         val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        if (focusRequestRef.get() != null) return
         // Keep device out of call routing (earpiece) while Companion speaks.
         runCatching {
             if (am.mode != AudioManager.MODE_NORMAL) {
                 am.mode = AudioManager.MODE_NORMAL
             }
+            // USAGE_MEDIA usually hits the loudspeaker, but some OEMs still route
+            // the first stream to the earpiece until speakerphone is asserted.
+            @Suppress("DEPRECATION")
+            if (!am.isSpeakerphoneOn) {
+                am.isSpeakerphoneOn = true
+            }
         }
+        runCatching {
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (max > 0 && cur == 0) {
+                Log.w(TAG, "STREAM_MUSIC volume is 0 — TTS will be silent until raised")
+            }
+        }
+        if (focusRequestRef.get() != null) return
         val attrs = speechAudioAttributes()
         val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
             .setAudioAttributes(attrs)
@@ -1291,6 +1484,12 @@ object CompanionVoiceSession {
         val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         focusRequestRef.getAndSet(null)?.let { req ->
             runCatching { am.abandonAudioFocusRequest(req) }
+        }
+        runCatching {
+            @Suppress("DEPRECATION")
+            if (am.isSpeakerphoneOn) {
+                am.isSpeakerphoneOn = false
+            }
         }
     }
 
@@ -1327,12 +1526,15 @@ object CompanionVoiceSession {
         Log.d(TAG, "AudioTrack started rate=$rate buf=${minBuf * 4}")
     }
 
-    /** Write a short silence burst so the first real PCM is not lost to cold start. */
-    private fun primePlaybackTrack() {
+    /**
+     * Write a short silence burst so the first real PCM is not lost to cold start.
+     * @param ms duration of silence pad (60–120ms is typical for OEM underrun).
+     */
+    private fun primePlaybackTrack(ms: Int = 80) {
         val track = audioTrackRef.get() ?: return
         val rate = GrokAssistantVoiceClient.SAMPLE_RATE
-        // ~40ms of zeros at 24k mono PCM16.
-        val silence = ByteArray((rate / 25) * 2)
+        val samples = ((rate * ms.coerceIn(20, 200)) / 1000).coerceAtLeast(rate / 50)
+        val silence = ByteArray(samples * 2)
         runCatching {
             if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
             if (Build.VERSION.SDK_INT >= 23) {
@@ -1347,7 +1549,7 @@ object CompanionVoiceSession {
 
     private fun playPcm(pcm: ByteArray) {
         if (pcm.isEmpty() || !running.get()) return
-        responsePcmBytes.addAndGet(pcm.size)
+        val total = responsePcmBytes.addAndGet(pcm.size)
         ensurePlaybackWorker()
         ensurePlaybackTrack()
         requestPlaybackFocus()
@@ -1358,7 +1560,11 @@ object CompanionVoiceSession {
         } else {
             applyMicMutePolicy(clientRef.get())
         }
-        noteMouthFromPcm(pcm)
+        if (total == pcm.size) {
+            Log.d(TAG, "playPcm first frame size=${pcm.size} focus=${focusRequestRef.get() != null}")
+        }
+        // Mouth is driven from the playback worker (writePcmBlocking) so lips
+        // track what actually leaves the speaker, not the socket receive time.
         if (!playbackQueue.offer(pcm)) {
             Log.w(TAG, "playback queue full — dropping ${pcm.size}b")
             queuedPcmBytes.updateAndGet { (it - pcm.size).coerceAtLeast(0) }
@@ -1371,16 +1577,47 @@ object CompanionVoiceSession {
             return
         }
         ensurePlaybackTrack()
-        val track = audioTrackRef.get() ?: run {
+        requestPlaybackFocus()
+        // Once per reply: re-arm a track that may have underrun while idle since connect.
+        // Cold first-reply fix: stop/flush/play + silence pad so OEM tracks do not
+        // swallow the first real PCM under Spotify / idle underrun.
+        if (needsPlaybackPrime.compareAndSet(true, false)) {
+            runCatching {
+                var track = audioTrackRef.get()
+                if (track == null) {
+                    ensurePlaybackTrack()
+                    track = audioTrackRef.get()
+                }
+                if (track != null) {
+                    runCatching {
+                        if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                            track.pause()
+                        }
+                        track.flush()
+                        track.play()
+                    }
+                    primePlaybackTrack(ms = 120)
+                }
+            }
+            Log.d(TAG, "playback primed for response")
+        }
+        var active = audioTrackRef.get()
+        if (active == null) {
+            ensurePlaybackTrack()
+            active = audioTrackRef.get()
+        }
+        if (active == null) {
             queuedPcmBytes.updateAndGet { (it - pcm.size).coerceAtLeast(0) }
             return
         }
         try {
+            var track: AudioTrack = active
             if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 track.play()
             }
             var offset = 0
             var writtenTotal = 0
+            var retried = false
             while (offset < pcm.size && running.get()) {
                 val written = if (Build.VERSION.SDK_INT >= 23) {
                     track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
@@ -1388,8 +1625,22 @@ object CompanionVoiceSession {
                     track.write(pcm, offset, pcm.size - offset)
                 }
                 if (written < 0) {
-                    Log.w(TAG, "AudioTrack.write error $written")
-                    break
+                    Log.w(TAG, "AudioTrack.write error $written — recreating track")
+                    if (retried) break
+                    retried = true
+                    // Dead track: drop it and rebuild once, then retry remaining bytes.
+                    val dead = track
+                    runCatching {
+                        dead.pause()
+                        dead.flush()
+                        dead.release()
+                    }
+                    audioTrackRef.compareAndSet(dead, null)
+                    ensurePlaybackTrack()
+                    primePlaybackTrack(ms = 80)
+                    val retry = audioTrackRef.get() ?: break
+                    track = retry
+                    continue
                 }
                 if (written == 0) {
                     try {
@@ -1401,7 +1652,12 @@ object CompanionVoiceSession {
                 offset += written
                 writtenTotal += written
             }
-            if (writtenTotal > 0) extendPlaybackDeadline(writtenTotal)
+            if (writtenTotal > 0) {
+                responseWrittenPcmBytes.addAndGet(writtenTotal)
+                extendPlaybackDeadline(writtenTotal)
+                // Lip-sync from audio that is actually leaving the speaker.
+                noteMouthFromPcm(pcm)
+            }
         } catch (e: Exception) {
             Log.w(TAG, "writePcm: ${e.message}")
         } finally {
@@ -1451,9 +1707,10 @@ object CompanionVoiceSession {
                     val rms = CompanionAmplitude.rmsPcm16Bytes(chunk)
                     lastLocalRms.set(rms)
                     applyMicMutePolicy(client)
-                    val muted = micMuted.get() || !isMicSendAllowed()
+                    // Stream while Listening and during Thinking-until-response.created.
+                    val sendOk = isMicSendAllowed()
                     val t = turn.get()
-                    if (!muted && (t == Turn.Listening || t == Turn.Thinking)) {
+                    if (sendOk) {
                         noteLevel(
                             when (t) {
                                 Turn.Thinking -> max(rms * 0.7f, 0.04f)
@@ -1463,7 +1720,7 @@ object CompanionVoiceSession {
                     } else if (t != Turn.Speaking) {
                         noteLevel(rms * 0.08f)
                     }
-                    if (muted) continue
+                    if (!sendOk) continue
                     if (hasLocalPlaybackRemaining()) continue
                     // Soft gain so quiet mics still hit server VAD / ASR.
                     val boosted = GrokAssistantVoiceClient.softGainPcm16(chunk)

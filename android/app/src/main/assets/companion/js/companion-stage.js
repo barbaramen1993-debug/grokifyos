@@ -1,7 +1,11 @@
 /**
  * Companion VRM stage — offline Three.js + @pixiv/three-vrm + OrbitControls.
  * Host bridge: window.GrokifyCompanion.{onReady,onModelLoaded,onError,openVrm,readVrmBase64,closeVrm}
- * Stage API:   window.CompanionStage.{loadModel,setState,setMouth,playMotion}
+ * Stage API:   window.CompanionStage.{loadModel,setState,setMouth,playMotion,
+ *              playGesture,setHands,setLook,resetBody}
+ *
+ * Avatar is driven like a VRChat body: virtual HMD + left/right hand "controllers"
+ * with spring-damper + gravity. AI tools animate those targets (gestures / limbs).
  *
  * Android WebView cannot reliably fetch() file:// VRMs ("Failed to fetch").
  * Bytes are streamed from Kotlin via openVrm/readVrmBase64, then GLTFLoader.parse.
@@ -35,14 +39,22 @@
   var currentState = STATE_IDLE;
   var mouthValue = 0;
   var targetMouth = 0;
+  var mouthVelocity = 0;
+  var speechPhase = 0;
+  var visemeSmooth = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
   var usingFallback = false;
   var readyNotified = false;
   var animFrame = 0;
   var idleTime = 0;
   var lookTarget = { x: 0, y: 0 };
   var lookSmooth = { x: 0, y: 0 };
+  var lookWanderT = 0;
+  var lookHoldT = 0;
   var blinkNext = 2.5;
   var blinkT = -1;
+  var blinkDouble = false;
+  var exprPulse = { happy: 0, relaxed: 0, surprised: 0 };
+  var exprPulseT = 0;
   /** Monotonic load id — only the latest load may install into the scene. */
   var loadToken = 0;
   var orbitTarget = null;
@@ -59,11 +71,55 @@
   var poseVariant = 0;
   var poseVariantT = 0;
   var poseBlend = 0;
+  var gestureBurstT = 0;
+  var gestureBurstNext = 1.6;
+  var gestureBurst = 0;
+  /** Sparse agreement-nod pulse (listening only) — not a continuous head bob. */
+  var nodPulse = 0;
+  var nodNextT = 2.8;
   var statePose = null;
   var statePoseTarget = null;
   /** Pending orbit restore from host prefs (applied after model install). */
   var pendingOrbit = null;
   var orbitSaveTimer = 0;
+
+  /**
+   * VRChat-style trackers (avatar-local, hips origin): head + L/R hands.
+   * pos in meters-ish; free hands spring to rest under gravity.
+   */
+  var vr = {
+    head: { x: 0, y: 1.45, z: 0.05, locked: false },
+    left: {
+      x: -0.18,
+      y: 0.72,
+      z: 0.1,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      locked: false,
+      holdUntil: 0,
+    },
+    right: {
+      x: 0.18,
+      y: 0.72,
+      z: 0.1,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      locked: false,
+      holdUntil: 0,
+    },
+    restLeft: { x: -0.18, y: 0.72, z: 0.1 },
+    restRight: { x: 0.18, y: 0.72, z: 0.1 },
+    restHead: { x: 0, y: 1.45, z: 0.05 },
+    gravity: 4.2,
+    spring: 14,
+    damp: 7.5,
+  };
+  /** Active scripted gesture (null when idle VR physics owns hands). */
+  var activeGesture = null;
+  var floorMesh = null;
+  var floorRing = null;
 
   function hostCall(method) {
     try {
@@ -197,6 +253,7 @@
     poseVariant = 0;
     poseVariantT = 0;
     poseBlend = 0;
+    activeGesture = null;
   }
 
   function bone(name) {
@@ -210,8 +267,9 @@
   }
 
   /**
-   * Drop arms from bind T-pose into a natural standing rest pose.
-   * Uses normalized humanoid bones (VRM 0 + 1 via three-vrm).
+   * Soft hang rest (not T, not Y). Hands slightly forward/out so skirts clear;
+   * Z≈1.25–1.3 from T-bind (full hang ~1.45) — earlier 1.0 read as Y-pose.
+   * Capture bind first, apply hang *deltas* for VRM0/1 normalized bones.
    */
   function captureRestPose() {
     restBones = {
@@ -221,6 +279,7 @@
       upperChest: bone("upperChest"),
       neck: bone("neck"),
       head: bone("head"),
+      jaw: bone("jaw"),
       leftUpperArm: bone("leftUpperArm"),
       rightUpperArm: bone("rightUpperArm"),
       leftLowerArm: bone("leftLowerArm"),
@@ -233,25 +292,40 @@
       rightLowerLeg: bone("rightLowerLeg"),
     };
 
-    // Soft A-pose: arms hang with mild elbow bend, hands slightly forward.
-    setEuler(restBones.leftUpperArm, 0.18, 0.12, 1.05);
-    setEuler(restBones.rightUpperArm, 0.18, -0.12, -1.05);
-    setEuler(restBones.leftLowerArm, 0.42, 0.08, 0.12);
-    setEuler(restBones.rightLowerArm, 0.42, -0.08, -0.12);
-    setEuler(restBones.leftHand, 0.08, 0.05, 0.1);
-    setEuler(restBones.rightHand, 0.08, -0.05, -0.1);
-    // Contrapposto-ish stance (weight soft on one side).
-    setEuler(restBones.hips, 0.03, 0.04, 0.02);
-    setEuler(restBones.spine, 0.05, -0.03, -0.01);
-    setEuler(restBones.chest, 0.04, 0.02, 0);
-    setEuler(restBones.neck, -0.03, 0, 0);
-    setEuler(restBones.head, 0.03, 0, 0);
-    if (restBones.leftUpperLeg) setEuler(restBones.leftUpperLeg, 0.02, 0, 0.03);
-    if (restBones.rightUpperLeg) setEuler(restBones.rightUpperLeg, -0.01, 0, -0.02);
-    if (restBones.leftLowerLeg) setEuler(restBones.leftLowerLeg, -0.03, 0, 0);
-    if (restBones.rightLowerLeg) setEuler(restBones.rightLowerLeg, -0.01, 0, 0);
+    // Snapshot bind (T-pose / author rest) before we rewrite.
+    var bind = {};
+    Object.keys(restBones).forEach(function (k) {
+      var n = restBones[k];
+      if (!n || !n.rotation) return;
+      bind[k] = { x: n.rotation.x, y: n.rotation.y, z: n.rotation.z };
+    });
 
-    // Stash base rotations for idle overlays.
+    function hang(key, dx, dy, dz) {
+      var n = restBones[key];
+      var b = bind[key];
+      if (!n || !b) return;
+      setEuler(n, b.x + dx, b.y + dy, b.z + dz);
+    }
+
+    // Soft hang (~72° from T): relaxed sides, slight elbow bend, hands forward.
+    hang("leftUpperArm", 0.12, 0.08, 1.26);
+    hang("rightUpperArm", 0.12, -0.08, -1.26);
+    hang("leftLowerArm", 0.32, 0.06, 0.08);
+    hang("rightLowerArm", 0.32, -0.06, -0.08);
+    hang("leftHand", 0.06, 0.04, 0.08);
+    hang("rightHand", 0.06, -0.04, -0.08);
+    hang("hips", 0.01, 0.015, 0.008);
+    hang("spine", 0.018, -0.01, -0.006);
+    hang("chest", 0.012, 0.005, 0);
+    // Neutral head — no constant pitch bias (was reading as a permanent nod).
+    hang("neck", 0, 0, 0);
+    hang("head", 0, 0, 0);
+    hang("leftUpperLeg", 0.01, 0, 0.012);
+    hang("rightUpperLeg", -0.006, 0, -0.01);
+    hang("leftLowerLeg", -0.012, 0, 0);
+    hang("rightLowerLeg", -0.008, 0, 0);
+
+    // Stash base rotations for idle overlays / VR mapping.
     restBones.base = {};
     Object.keys(restBones).forEach(function (k) {
       if (k === "base") return;
@@ -264,12 +338,87 @@
       };
     });
 
+    // Seed VR controller rest targets from a typical humanoid proportions.
+    calibrateVrRestsFromBones();
+
     statePose = emptyPose();
     statePoseTarget = emptyPose();
     poseVariant = 0;
     poseVariantT = 0;
     poseBlend = 0;
+    nodPulse = 0;
+    nodNextT = 2.5 + Math.random() * 2;
+    activeGesture = null;
     pickStatePoseTarget(currentState || STATE_IDLE);
+    placeFloorUnderAvatar();
+  }
+
+  /** Estimate head/hand rest targets from current bone world positions (hips-local). */
+  function calibrateVrRestsFromBones() {
+    var L = getLibs();
+    if (!L || !L.THREE || !restBones) return;
+    var THREE = L.THREE;
+    var hips = restBones.hips;
+    if (!hips) return;
+    try {
+      hips.updateWorldMatrix(true, true);
+    } catch (_) {}
+    var hipsWorld = new THREE.Vector3();
+    try {
+      hips.getWorldPosition(hipsWorld);
+    } catch (_) {
+      return;
+    }
+    var inv = new THREE.Matrix4();
+    try {
+      inv.copy(hips.matrixWorld).invert();
+    } catch (_) {
+      try {
+        inv.getInverse(hips.matrixWorld);
+      } catch (_2) {
+        return;
+      }
+    }
+
+    function localOf(node, fallback) {
+      if (!node) return fallback;
+      try {
+        node.updateWorldMatrix(true, false);
+        var w = new THREE.Vector3();
+        node.getWorldPosition(w);
+        w.applyMatrix4(inv);
+        return { x: w.x, y: w.y, z: w.z };
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    var headL = localOf(restBones.head, vr.restHead);
+    var leftL = localOf(restBones.leftHand, vr.restLeft);
+    var rightL = localOf(restBones.rightHand, vr.restRight);
+    // Nudge hands slightly forward/out from pure bone tip so skirts stay clear.
+    // Keep y lower than chest height so rest is hang, not Y-pose.
+    leftL.x = Math.min(leftL.x, -0.14);
+    rightL.x = Math.max(rightL.x, 0.14);
+    leftL.z = Math.max(leftL.z, 0.06);
+    rightL.z = Math.max(rightL.z, 0.06);
+    leftL.y = Math.min(Math.max(leftL.y, 0.55), 0.92);
+    rightL.y = Math.min(Math.max(rightL.y, 0.55), 0.92);
+
+    vr.restHead = headL;
+    vr.restLeft = leftL;
+    vr.restRight = rightL;
+    vr.head.x = headL.x;
+    vr.head.y = headL.y;
+    vr.head.z = headL.z;
+    vr.left.x = leftL.x;
+    vr.left.y = leftL.y;
+    vr.left.z = leftL.z;
+    vr.left.vx = vr.left.vy = vr.left.vz = 0;
+    vr.right.x = rightL.x;
+    vr.right.y = rightL.y;
+    vr.right.z = rightL.z;
+    vr.right.vx = vr.right.vy = vr.right.vz = 0;
   }
 
   function emptyPose() {
@@ -309,50 +458,75 @@
     node.rotation.z = b.z + dz + p[2];
   }
 
-  /** State-specific posture targets (additive on rest). */
+  /**
+   * State posture is mostly body lean — arms are owned by the VR hand targets
+   * so tool gestures and physics stay consistent.
+   */
   function pickStatePoseTarget(state) {
     var p = emptyPose();
     if (state === STATE_LISTENING) {
-      // Lean in, attentive tilt, open hands slightly.
-      p.spine = [0.06, 0, 0];
-      p.chest = [0.05, 0, 0];
-      p.neck = [0.04, 0, 0];
-      p.head = [0.05, 0.02, 0];
-      p.leftUpperArm = [0.08, 0.05, -0.06];
-      p.rightUpperArm = [0.08, -0.05, 0.06];
-      p.leftLowerArm = [0.1, 0, 0];
-      p.rightLowerArm = [0.1, 0, 0];
+      p.spine = [0.02, 0, 0];
+      p.chest = [0.015, 0, 0];
+      // Tiny lean only — head motion comes from sparse nods / lookAt eyes.
+      p.neck = [0.004, 0, 0];
+      p.head = [0.002, 0, 0];
     } else if (state === STATE_THINKING) {
-      // Head tilt + right hand toward chin, weight shift.
-      p.hips = [0.02, -0.06, 0.04];
-      p.spine = [0.02, 0.08, 0.03];
-      p.chest = [0.03, 0.05, 0.02];
-      p.neck = [0.12, 0.18, 0.08];
-      p.head = [0.1, 0.22, 0.1];
-      p.rightUpperArm = [-0.35, -0.55, 0.55];
-      p.rightLowerArm = [1.1, 0.2, -0.15];
-      p.rightHand = [0.15, 0.1, -0.2];
-      p.leftUpperArm = [0.05, 0.1, 0.05];
-      p.leftLowerArm = [0.15, 0, 0.05];
+      p.hips = [0.008, -0.02, 0.012];
+      p.spine = [0.01, 0.025, 0.01];
+      p.chest = [0.01, 0.015, 0.006];
+      p.neck = [0.01, 0.03, 0.01];
+      p.head = [0.006, 0.04, 0.012];
     } else if (state === STATE_SPEAKING) {
-      // Open stance, slight forward lean, animated hands ready.
-      p.hips = [0.02, 0, 0];
-      p.spine = [0.04, 0, 0];
-      p.chest = [0.06, 0, 0];
-      p.neck = [0.02, 0, 0];
-      p.head = [0.03, 0, 0];
-      p.leftUpperArm = [0.12, 0.15, -0.12];
-      p.rightUpperArm = [0.12, -0.15, 0.12];
-      p.leftLowerArm = [0.35, 0.1, 0.08];
-      p.rightLowerArm = [0.35, -0.1, -0.08];
-      p.leftHand = [0.1, 0.05, 0.05];
-      p.rightHand = [0.1, -0.05, -0.05];
+      p.hips = [0.008, 0, 0];
+      p.spine = [0.014, 0, 0];
+      p.chest = [0.02, 0, 0];
+      p.neck = [0.002, 0, 0];
+      p.head = [0.001, 0, 0];
     } else {
-      // Idle: relaxed neutral (variant micro-offsets applied in motion).
-      p.spine = [0.01, 0, 0];
-      p.head = [0.01, 0, 0];
+      p.spine = [0.008, 0, 0];
     }
     statePoseTarget = p;
+
+    // Default VR hand intents per state (overridden by tools / gestures).
+    if (!activeGesture) {
+      if (state === STATE_THINKING) {
+        // Light chin-near pose — not a high Y-pose raise.
+        setHandTarget("right", 0.1, 1.05, 0.18, 2.0, true);
+      } else if (state === STATE_LISTENING) {
+        setHandTarget("left", vr.restLeft.x, vr.restLeft.y, vr.restLeft.z + 0.02, 0, false);
+        setHandTarget("right", vr.restRight.x, vr.restRight.y, vr.restRight.z + 0.02, 0, false);
+      } else if (state === STATE_SPEAKING) {
+        // Tiny ready raise; gravity returns to hang rest.
+        setHandTarget(
+          "right",
+          vr.restRight.x + 0.015,
+          vr.restRight.y + 0.03,
+          vr.restRight.z + 0.03,
+          0.6,
+          false
+        );
+      }
+    }
+  }
+
+  function setHandTarget(side, x, y, z, holdSec, locked) {
+    var h = side === "left" ? vr.left : vr.right;
+    if (!h) return;
+    h.x = x;
+    h.y = y;
+    h.z = z;
+    h.vx = 0;
+    h.vy = 0;
+    h.vz = 0;
+    h.locked = !!locked;
+    h.holdUntil = holdSec > 0 ? idleTime + holdSec : 0;
+  }
+
+  function setHeadTarget(x, y, z) {
+    vr.head.x = x;
+    vr.head.y = y;
+    vr.head.z = z;
+    vr.head.locked = true;
   }
 
   function blendStatePose(dt) {
@@ -367,150 +541,587 @@
     });
   }
 
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
   /**
-   * Procedural idle / state body motion on top of rest pose.
+   * Spring + gravity on free VR hands (controller dropped → falls back to rest).
+   * Locked hands hold until holdUntil, then unlock and fall under gravity.
+   */
+  function updateVrPhysics(dt) {
+    function stepHand(h, rest) {
+      if (h.holdUntil > 0 && idleTime >= h.holdUntil) {
+        h.holdUntil = 0;
+        h.locked = false;
+      }
+      if (h.locked) {
+        h.vx = h.vy = h.vz = 0;
+        return;
+      }
+      // Spring toward rest + gravity on Y (game-world feel).
+      var ax = (rest.x - h.x) * vr.spring - h.vx * vr.damp;
+      var ay = (rest.y - h.y) * vr.spring - h.vy * vr.damp - vr.gravity * 0.35;
+      var az = (rest.z - h.z) * vr.spring - h.vz * vr.damp;
+      h.vx += ax * dt;
+      h.vy += ay * dt;
+      h.vz += az * dt;
+      h.x += h.vx * dt;
+      h.y += h.vy * dt;
+      h.z += h.vz * dt;
+      // Soft bounds (reachable workspace; rest hang ~0.7–0.9, gestures up to chest).
+      h.x = clamp(h.x, -0.55, 0.55);
+      h.y = clamp(h.y, 0.45, 1.45);
+      h.z = clamp(h.z, -0.12, 0.5);
+    }
+    stepHand(vr.left, vr.restLeft);
+    stepHand(vr.right, vr.restRight);
+    if (!vr.head.locked) {
+      vr.head.x += (vr.restHead.x - vr.head.x) * Math.min(1, dt * 4);
+      vr.head.y += (vr.restHead.y - vr.head.y) * Math.min(1, dt * 4);
+      vr.head.z += (vr.restHead.z - vr.head.z) * Math.min(1, dt * 4);
+    }
+  }
+
+  /**
+   * Map chest-relative hand targets → arm eulers (fast approximate VR IK).
+   * Keeps arms clear of the torso: never pure hang through skirts.
+   */
+  function applyHandIk(side) {
+    var h = side === "left" ? vr.left : vr.right;
+    var rest = side === "left" ? vr.restLeft : vr.restRight;
+    var sign = side === "left" ? 1 : -1;
+    var upperKey = side === "left" ? "leftUpperArm" : "rightUpperArm";
+    var lowerKey = side === "left" ? "leftLowerArm" : "rightLowerArm";
+    var handKey = side === "left" ? "leftHand" : "rightHand";
+
+    var dx = h.x - rest.x;
+    var dy = h.y - rest.y;
+    var dz = h.z - rest.z;
+
+    // Raise / reach / open relative to soft hang rest (small deltas only at rest).
+    var raise = clamp(dy * 1.8, -0.25, 1.2);
+    var reach = clamp(dz * 1.4, -0.2, 0.95);
+    var open = clamp(dx * sign * -1.2, -0.4, 0.7);
+    // Tiny minimum open only when not raised — avoid Y-pose flare at idle.
+    if (open < 0.02 && raise < 0.2) open = 0.02;
+
+    var upperX = -raise * 0.7 - reach * 0.3;
+    var upperY = open * 0.45 * sign + reach * 0.06 * sign;
+    var upperZ = (raise * 0.1 - open * 0.15) * sign;
+    var lowerX = raise * 0.5 + reach * 0.4 + Math.abs(open) * 0.15;
+    var lowerY = open * 0.1 * sign;
+    var lowerZ = -reach * 0.06 * sign;
+    var handX = raise * 0.06 + reach * 0.04;
+    var handY = open * 0.08 * sign;
+    var handZ = -open * 0.06 * sign;
+
+    // Speaking micro-wiggle on free hands (controllers jitter).
+    if (currentState === STATE_SPEAKING && !h.locked && mouthValue > 0.04) {
+      var w = mouthValue * 0.04;
+      upperX += Math.sin(idleTime * 2.2 + (side === "left" ? 0 : 1)) * w;
+      lowerX += Math.abs(Math.sin(idleTime * 3.1)) * w * 0.6;
+    }
+
+    addEuler(restBones[upperKey], upperKey, upperX, upperY, upperZ);
+    addEuler(restBones[lowerKey], lowerKey, lowerX, lowerY, lowerZ);
+    addEuler(restBones[handKey], handKey, handX, handY, handZ);
+  }
+
+  /** Advance active tool gesture; returns true if a gesture owns the hands. */
+  function updateActiveGesture(dt) {
+    if (!activeGesture) return false;
+    activeGesture.t += dt;
+    var g = activeGesture;
+    var u = g.duration > 0 ? clamp(g.t / g.duration, 0, 1) : 1;
+    var ease = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    var inten = typeof g.intensity === "number" ? g.intensity : 1;
+
+    if (g.kind === "wave") {
+      var side = g.side === "left" ? "left" : "right";
+      var rest = side === "left" ? vr.restLeft : vr.restRight;
+      var sx = side === "left" ? -1 : 1;
+      var wx = rest.x + sx * 0.05;
+      var wy = rest.y + 0.42 * inten;
+      var wz = rest.z + 0.18;
+      var osc = Math.sin(g.t * 10) * 0.12 * inten;
+      setHandTarget(side, wx + osc, wy, wz, 0, true);
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "nod") {
+      var np = Math.sin(g.t * Math.PI * 2.2) * 0.07 * inten * (1 - u);
+      nodPulse = Math.max(nodPulse, Math.abs(np) * 12);
+      if (g.t > g.duration) activeGesture = null;
+      return false;
+    }
+    if (g.kind === "shake_head") {
+      lookTarget.x = Math.sin(g.t * 9) * 0.55 * inten * (1 - u * 0.5);
+      lookTarget.y = 0.02;
+      if (g.t > g.duration) activeGesture = null;
+      return false;
+    }
+    if (g.kind === "point") {
+      var ps = g.side === "left" ? "left" : "right";
+      var pr = ps === "left" ? vr.restLeft : vr.restRight;
+      var pSign = ps === "left" ? -1 : 1;
+      setHandTarget(
+        ps,
+        pr.x + pSign * 0.08,
+        pr.y + 0.28 * inten,
+        pr.z + 0.32 * inten,
+        0,
+        true
+      );
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "shrug") {
+      setHandTarget("left", vr.restLeft.x - 0.06, vr.restLeft.y + 0.28 * inten, vr.restLeft.z + 0.06, 0, true);
+      setHandTarget("right", vr.restRight.x + 0.06, vr.restRight.y + 0.28 * inten, vr.restRight.z + 0.06, 0, true);
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "think") {
+      setHandTarget("right", 0.1, 1.2, 0.24, 0, true);
+      lookTarget.x = 0.2;
+      lookTarget.y = 0.12;
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "clap") {
+      var c = Math.abs(Math.sin(g.t * 12));
+      setHandTarget("left", -0.08 - c * 0.02, 1.05, 0.28, 0, true);
+      setHandTarget("right", 0.08 + c * 0.02, 1.05, 0.28, 0, true);
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "cheer") {
+      setHandTarget("left", -0.18, 1.45 * (0.7 + 0.3 * ease) * inten, 0.1, 0, true);
+      setHandTarget("right", 0.18, 1.45 * (0.7 + 0.3 * ease) * inten, 0.1, 0, true);
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "bow") {
+      if (statePose) {
+        statePose.spine[0] = 0.35 * ease * inten;
+        statePose.chest[0] = 0.2 * ease * inten;
+        statePose.head[0] = 0.15 * ease * inten;
+      }
+      if (g.t > g.duration) activeGesture = null;
+      return false;
+    }
+    if (g.kind === "lean_in") {
+      if (statePose) {
+        statePose.spine[0] = 0.12 * ease * inten;
+        statePose.chest[0] = 0.1 * ease * inten;
+      }
+      if (g.t > g.duration) activeGesture = null;
+      return false;
+    }
+    if (g.kind === "hands_on_hips") {
+      setHandTarget("left", -0.22, 0.9, 0.06, 0, true);
+      setHandTarget("right", 0.22, 0.9, 0.06, 0, true);
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "crossed_arms") {
+      setHandTarget("left", 0.08, 1.05, 0.16, 0, true);
+      setHandTarget("right", -0.08, 1.0, 0.14, 0, true);
+      if (g.t > g.duration) activeGesture = null;
+      return true;
+    }
+    if (g.kind === "reset") {
+      resetBodyInternal();
+      activeGesture = null;
+      return false;
+    }
+    // Unknown — drop.
+    activeGesture = null;
+    return false;
+  }
+
+  function resetBodyInternal() {
+    activeGesture = null;
+    vr.left.locked = false;
+    vr.right.locked = false;
+    vr.head.locked = false;
+    vr.left.holdUntil = 0;
+    vr.right.holdUntil = 0;
+    vr.left.x = vr.restLeft.x;
+    vr.left.y = vr.restLeft.y;
+    vr.left.z = vr.restLeft.z;
+    vr.right.x = vr.restRight.x;
+    vr.right.y = vr.restRight.y;
+    vr.right.z = vr.restRight.z;
+    vr.left.vx = vr.left.vy = vr.left.vz = 0;
+    vr.right.vx = vr.right.vy = vr.right.vz = 0;
+    vr.head.x = vr.restHead.x;
+    vr.head.y = vr.restHead.y;
+    vr.head.z = vr.restHead.z;
+    nodPulse = 0;
+  }
+
+  /**
+   * VRChat-style body: physics on hand controllers → arm IK, head look,
+   * breath/sway on torso. Arms never use the old full-hang sine (skirt clip).
    */
   function applyBodyMotion(dt) {
     if (!vrm || !restBones || !restBones.base) return;
     var t = idleTime;
     posePhase += dt;
     poseVariantT += dt;
+    gestureBurstT += dt;
+    nodNextT -= dt;
 
-    // Alternate weight-shift variants every ~5–7s for less mechanical idle.
-    if (poseVariantT > 5.5 + (poseVariant % 3) * 0.7) {
+    if (poseVariantT > 4.2 + (poseVariant % 4) * 0.85) {
       poseVariantT = 0;
-      poseVariant = (poseVariant + 1) % 3;
+      poseVariant = (poseVariant + 1) % 4;
     }
-    var targetBlend = poseVariant === 0 ? 0 : poseVariant === 1 ? 1 : 0.45;
-    poseBlend += (targetBlend - poseBlend) * Math.min(1, dt * 0.55);
+    var targetBlend =
+      poseVariant === 0 ? 0 : poseVariant === 1 ? 1 : poseVariant === 2 ? 0.35 : 0.7;
+    poseBlend += (targetBlend - poseBlend) * Math.min(1, dt * 0.6);
+
+    if (currentState === STATE_SPEAKING) {
+      if (gestureBurstT > gestureBurstNext) {
+        gestureBurstT = 0;
+        gestureBurst = 0.4 + Math.random() * 0.35;
+        gestureBurstNext = 1.6 + Math.random() * 2.4;
+      }
+      gestureBurst += (0 - gestureBurst) * Math.min(1, dt * 1.1);
+    } else {
+      gestureBurst *= Math.max(0, 1 - dt * 3);
+    }
+
+    // Rare soft agreement nod while listening (not a continuous bob).
+    if (currentState === STATE_LISTENING && nodNextT <= 0 && nodPulse < 0.02 && !activeGesture) {
+      if (Math.random() < 0.35) nodPulse = 0.85;
+      nodNextT = 6 + Math.random() * 8;
+    }
+    if (nodPulse > 0) {
+      nodPulse = Math.max(0, nodPulse - dt * 2.0);
+    }
 
     blendStatePose(dt);
+    updateActiveGesture(dt);
+    updateVrPhysics(dt);
 
-    var breath = Math.sin(t * 1.65) * 0.018 + Math.sin(t * 0.4) * 0.006;
-    var sway = Math.sin(t * 0.55) * 0.028 + Math.sin(t * 1.15) * 0.01;
-    var weight = (poseBlend - 0.5) * 0.04 + Math.sin(t * 0.35) * 0.012;
-    var shoulder = Math.sin(t * 0.7) * 0.02;
+    var breath = Math.sin(t * 1.2) * 0.012 + Math.sin(t * 0.32) * 0.004;
+    var sway = Math.sin(t * 0.42) * 0.016 + Math.sin(t * 0.85) * 0.005;
+    var weight = (poseBlend - 0.5) * 0.03 + Math.sin(t * 0.28) * 0.008;
+    var shoulder = Math.sin(t * 0.55) * 0.012 + Math.sin(t * 1.4) * 0.003;
+    // Single clean nod arc — small amplitude (was stacking with lookAt → weird bob).
+    var nodAmt = nodPulse > 0 ? Math.sin((1 - nodPulse) * Math.PI) * 0.028 : 0;
 
     if (currentState === STATE_THINKING) {
-      sway = Math.sin(t * 0.45) * 0.018;
-      breath = Math.sin(t * 1.4) * 0.015;
+      sway = Math.sin(t * 0.35) * 0.01;
+      breath = Math.sin(t * 1.0) * 0.01;
     } else if (currentState === STATE_SPEAKING) {
-      sway = Math.sin(t * 0.9) * 0.032;
-      breath = Math.sin(t * 2.3) * 0.026 + mouthValue * 0.012;
-      // Talking hand gestures (right more active).
-      var gest = Math.sin(t * 2.4) * (0.08 + mouthValue * 0.12);
-      var gest2 = Math.sin(t * 1.7 + 1.1) * (0.05 + mouthValue * 0.08);
-      addEuler(
-        restBones.rightUpperArm,
-        "rightUpperArm",
-        gest * 0.9,
-        -gest2 * 0.5,
-        gest * 0.35
-      );
-      addEuler(
-        restBones.rightLowerArm,
-        "rightLowerArm",
-        Math.abs(gest) * 0.5,
-        gest2 * 0.2,
-        -gest * 0.15
-      );
-      addEuler(
-        restBones.leftUpperArm,
-        "leftUpperArm",
-        gest2 * 0.45,
-        gest * 0.2,
-        -gest2 * 0.2
-      );
-      addEuler(
-        restBones.head,
-        "head",
-        Math.sin(t * 2.1) * 0.02 + mouthValue * 0.015,
-        Math.sin(t * 1.3) * 0.03,
-        Math.sin(t * 0.8) * 0.015
-      );
+      sway = Math.sin(t * 0.65) * 0.014 + Math.sin(t * 1.15) * 0.004;
+      breath = Math.sin(t * 1.5) * 0.014 + mouthValue * 0.006;
     } else if (currentState === STATE_LISTENING) {
-      sway = Math.sin(t * 0.5) * 0.02;
-      // Soft attentive nod cycle.
-      addEuler(
-        restBones.head,
-        "head",
-        Math.sin(t * 0.65) * 0.025 + 0.01,
-        Math.sin(t * 0.35) * 0.04,
-        0
-      );
-    } else {
-      // Idle micro-gestures + occasional shoulder roll.
-      addEuler(
-        restBones.leftUpperArm,
-        "leftUpperArm",
-        Math.sin(t * 0.8) * 0.035 + poseBlend * 0.03,
-        Math.sin(t * 0.5) * 0.025,
-        Math.sin(t * 0.65) * 0.03 - poseBlend * 0.04
-      );
-      addEuler(
-        restBones.rightUpperArm,
-        "rightUpperArm",
-        Math.sin(t * 0.85 + 0.5) * 0.035 - poseBlend * 0.02,
-        Math.sin(t * 0.55 + 0.3) * 0.025,
-        Math.sin(t * 0.7 + 0.4) * 0.03 + poseBlend * 0.04
-      );
-      addEuler(
-        restBones.leftLowerArm,
-        "leftLowerArm",
-        Math.sin(t * 0.9) * 0.05,
-        0,
-        Math.sin(t * 0.6) * 0.025
-      );
-      addEuler(
-        restBones.rightLowerArm,
-        "rightLowerArm",
-        Math.sin(t * 0.95 + 0.6) * 0.05,
-        0,
-        Math.sin(t * 0.62 + 0.4) * 0.025
-      );
+      sway = Math.sin(t * 0.38) * 0.012;
     }
 
-    addEuler(restBones.hips, "hips", 0.012 + weight * 0.5, sway * 0.4 + weight * 0.8, weight * 0.35);
+    // Arms from VR controllers (IK mapping).
+    applyHandIk("left");
+    applyHandIk("right");
+
+    addEuler(restBones.hips, "hips", 0.008 + weight * 0.35, sway * 0.3 + weight * 0.55, weight * 0.2);
     addEuler(
       restBones.spine,
       "spine",
-      0.02 + breath * 0.7,
-      sway * 0.5 - weight * 0.4,
-      sway * 0.12 + shoulder * 0.3
+      0.01 + breath * 0.55,
+      sway * 0.32 - weight * 0.22,
+      sway * 0.08 + shoulder * 0.18
     );
     if (restBones.chest) {
-      addEuler(restBones.chest, "chest", breath * 1.05, sway * 0.35, shoulder * 0.5);
+      addEuler(restBones.chest, "chest", breath * 0.7, sway * 0.2, shoulder * 0.28);
     }
     if (restBones.upperChest) {
-      addEuler(restBones.upperChest, "upperChest", breath * 0.55, sway * 0.18, 0);
-    }
-    addEuler(restBones.neck, "neck", -0.015 + breath * 0.12, sway * 0.55, shoulder * 0.2);
-    // Head always gets look + gentle idle unless speaking/listening already wrote extras.
-    if (currentState !== STATE_SPEAKING && currentState !== STATE_LISTENING) {
-      addEuler(
-        restBones.head,
-        "head",
-        0.02 + Math.sin(t * 0.75) * 0.018,
-        sway * 0.75 + lookSmooth.x * 0.28,
-        lookSmooth.x * 0.1 + Math.sin(t * 0.4) * 0.012
-      );
-    } else {
-      // Still apply look offset on top of state motion via neck.
-      addEuler(restBones.neck, "neck", lookSmooth.y * 0.08, lookSmooth.x * 0.15, 0);
+      addEuler(restBones.upperChest, "upperChest", breath * 0.35, sway * 0.1, shoulder * 0.08);
     }
 
-    // Weight shift legs.
+    // Neck/head: yaw only from look + tiny nod pulse. Pitch wander is NOT applied
+    // on bones (vrm.lookAt drives eyes) — dual pitch was the weird continuous nod.
+    var lookYaw = lookSmooth.x * 0.18;
+    var lookRoll = lookSmooth.x * 0.03;
+    var headDx = (vr.head.x - vr.restHead.x) * 0.2;
+    addEuler(
+      restBones.neck,
+      "neck",
+      nodAmt * 0.4 + breath * 0.04,
+      lookYaw * 0.45 + sway * 0.06 + headDx * 0.35,
+      lookRoll * 0.3 + shoulder * 0.04
+    );
+    addEuler(
+      restBones.head,
+      "head",
+      nodAmt * 0.6,
+      lookYaw * 0.55 + sway * 0.05 + headDx * 0.45,
+      lookRoll * 0.4
+    );
+
     if (restBones.leftUpperLeg) {
-      addEuler(restBones.leftUpperLeg, "leftUpperLeg", weight * 0.55, 0, weight * 0.25);
+      addEuler(restBones.leftUpperLeg, "leftUpperLeg", weight * 0.5, 0, weight * 0.22);
     }
     if (restBones.rightUpperLeg) {
-      addEuler(restBones.rightUpperLeg, "rightUpperLeg", -weight * 0.55, 0, -weight * 0.25);
+      addEuler(restBones.rightUpperLeg, "rightUpperLeg", -weight * 0.5, 0, -weight * 0.22);
     }
     if (restBones.leftLowerLeg) {
-      addEuler(restBones.leftLowerLeg, "leftLowerLeg", -weight * 0.3, 0, 0);
+      addEuler(restBones.leftLowerLeg, "leftLowerLeg", -weight * 0.28, 0, 0);
     }
     if (restBones.rightLowerLeg) {
-      addEuler(restBones.rightLowerLeg, "rightLowerLeg", weight * 0.3, 0, 0);
+      addEuler(restBones.rightLowerLeg, "rightLowerLeg", weight * 0.28, 0, 0);
+    }
+  }
+
+  function playGesture(name, opts) {
+    opts = opts || {};
+    var n = String(name || "")
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_");
+    var intensity =
+      typeof opts.intensity === "number" ? clamp(opts.intensity, 0.2, 1.5) : 1;
+    var side = String(opts.side || "right").toLowerCase();
+    if (side !== "left" && side !== "right" && side !== "both") side = "right";
+
+    if (n === "reset" || n === "reset_body" || n === "idle") {
+      resetBodyInternal();
+      return true;
+    }
+
+    var table = {
+      wave: { kind: "wave", duration: 1.8, side: side === "both" ? "right" : side },
+      nod: { kind: "nod", duration: 0.9 },
+      shake_head: { kind: "shake_head", duration: 1.1 },
+      no: { kind: "shake_head", duration: 1.1 },
+      point: { kind: "point", duration: 1.6, side: side === "both" ? "right" : side },
+      shrug: { kind: "shrug", duration: 1.4 },
+      think: { kind: "think", duration: 2.2 },
+      clap: { kind: "clap", duration: 1.2 },
+      cheer: { kind: "cheer", duration: 1.5 },
+      bow: { kind: "bow", duration: 1.6 },
+      lean_in: { kind: "lean_in", duration: 1.4 },
+      hands_on_hips: { kind: "hands_on_hips", duration: 2.0 },
+      crossed_arms: { kind: "crossed_arms", duration: 2.2 },
+      celebrate: { kind: "cheer", duration: 1.5 },
+      hello: { kind: "wave", duration: 1.8, side: "right" },
+      yes: { kind: "nod", duration: 0.9 },
+    };
+    var spec = table[n];
+    if (!spec) {
+      try {
+        console.warn("[CompanionStage] unknown gesture", n);
+      } catch (_) {}
+      return false;
+    }
+    activeGesture = {
+      kind: spec.kind,
+      t: 0,
+      duration: spec.duration,
+      intensity: intensity,
+      side: spec.side || side,
+    };
+    return true;
+  }
+
+  function setHands(jsonOrObj) {
+    var o = jsonOrObj;
+    if (typeof o === "string") {
+      try {
+        o = JSON.parse(o);
+      } catch (_) {
+        return false;
+      }
+    }
+    if (!o || typeof o !== "object") return false;
+    var hold =
+      typeof o.hold_sec === "number"
+        ? o.hold_sec
+        : typeof o.holdSec === "number"
+          ? o.holdSec
+          : 2.5;
+    var locked = o.locked !== false;
+    function num(v, fallback) {
+      return typeof v === "number" && isFinite(v) ? v : fallback;
+    }
+    if (o.left && typeof o.left === "object") {
+      setHandTarget(
+        "left",
+        num(o.left.x, vr.restLeft.x),
+        num(o.left.y, vr.restLeft.y),
+        num(o.left.z, vr.restLeft.z),
+        hold,
+        locked
+      );
+    }
+    if (o.right && typeof o.right === "object") {
+      setHandTarget(
+        "right",
+        num(o.right.x, vr.restRight.x),
+        num(o.right.y, vr.restRight.y),
+        num(o.right.z, vr.restRight.z),
+        hold,
+        locked
+      );
+    }
+    // Single-hand form: { hand, x, y, z }
+    if (o.hand === "left" || o.hand === "right") {
+      var restH = o.hand === "left" ? vr.restLeft : vr.restRight;
+      setHandTarget(
+        o.hand,
+        num(o.x, restH.x),
+        num(o.y, restH.y),
+        num(o.z, restH.z),
+        hold,
+        locked
+      );
+    }
+    activeGesture = null;
+    return true;
+  }
+
+  function setLook(jsonOrObj) {
+    var o = jsonOrObj;
+    if (typeof o === "string") {
+      try {
+        o = JSON.parse(o);
+      } catch (_) {
+        return false;
+      }
+    }
+    if (!o || typeof o !== "object") return false;
+    if (typeof o.x === "number") lookTarget.x = clamp(o.x, -1, 1);
+    if (typeof o.y === "number") lookTarget.y = clamp(o.y, -1, 1);
+    return true;
+  }
+
+  function resetBody() {
+    resetBodyInternal();
+    return true;
+  }
+
+  function ensureFloor(THREE) {
+    if (floorMesh) return;
+    try {
+      var geo = new THREE.CircleGeometry(2.2, 48);
+      var mat = new THREE.MeshStandardMaterial({
+        color: 0x141a28,
+        roughness: 0.92,
+        metalness: 0.04,
+        transparent: true,
+        opacity: 0.88,
+      });
+      floorMesh = new THREE.Mesh(geo, mat);
+      floorMesh.rotation.x = -Math.PI / 2;
+      floorMesh.position.y = 0;
+      floorMesh.name = "companion-floor";
+      scene.add(floorMesh);
+
+      var ringGeo = new THREE.RingGeometry(0.35, 0.42, 48);
+      var ringMat = new THREE.MeshBasicMaterial({
+        color: 0x6ea8ff,
+        transparent: true,
+        opacity: 0.35,
+        side: THREE.DoubleSide,
+      });
+      floorRing = new THREE.Mesh(ringGeo, ringMat);
+      floorRing.rotation.x = -Math.PI / 2;
+      floorRing.position.y = 0.005;
+      scene.add(floorRing);
+    } catch (_) {}
+  }
+
+  function placeFloorUnderAvatar() {
+    if (!floorMesh || !vrm || !vrm.scene) return;
+    try {
+      var L = getLibs();
+      if (!L || !L.THREE) return;
+      var box = new L.THREE.Box3().setFromObject(vrm.scene);
+      if (!isFinite(box.min.y)) return;
+      var y = box.min.y;
+      floorMesh.position.y = y;
+      if (floorRing) floorRing.position.y = y + 0.006;
+    } catch (_) {}
+  }
+
+  /** Idle gaze wander + state-based look targets (mostly horizontal; tiny pitch). */
+  function updateLookWander(dt) {
+    lookWanderT -= dt;
+    lookHoldT -= dt;
+    if (lookWanderT > 0) return;
+    lookWanderT = 2.4 + Math.random() * 3.6;
+    var baseX = 0;
+    var baseY = 0;
+    if (currentState === STATE_THINKING) {
+      baseX = 0.2 + Math.random() * 0.18;
+      baseY = 0.04 + Math.random() * 0.06;
+    } else if (currentState === STATE_LISTENING) {
+      baseX = (Math.random() - 0.5) * 0.12;
+      baseY = Math.random() * 0.04;
+    } else if (currentState === STATE_SPEAKING) {
+      baseX = (Math.random() - 0.5) * 0.08;
+      baseY = Math.random() * 0.03;
+    } else {
+      // Idle: occasional side glance (eyes via lookAt; keep pitch near zero).
+      if (Math.random() < 0.4) {
+        baseX = (Math.random() - 0.5) * 0.4;
+        baseY = (Math.random() - 0.5) * 0.08;
+        lookWanderT = 1.2 + Math.random() * 1.6;
+      } else {
+        baseX = (Math.random() - 0.5) * 0.08;
+        baseY = (Math.random() - 0.5) * 0.03;
+      }
+    }
+    lookTarget.x = baseX;
+    lookTarget.y = baseY;
+  }
+
+  /** Subtle mood expression drift on top of state baselines. */
+  function updateMicroExpressions(dt) {
+    exprPulseT -= dt;
+    if (exprPulseT <= 0) {
+      exprPulseT = 2.5 + Math.random() * 4.5;
+      if (currentState === STATE_SPEAKING) {
+        exprPulse.happy = 0.15 + Math.random() * 0.25;
+        exprPulse.relaxed = 0.05 + Math.random() * 0.1;
+        exprPulse.surprised = Math.random() < 0.12 ? 0.08 + Math.random() * 0.1 : 0;
+      } else if (currentState === STATE_LISTENING) {
+        exprPulse.happy = 0.1 + Math.random() * 0.2;
+        exprPulse.relaxed = 0.08 + Math.random() * 0.12;
+        exprPulse.surprised = 0;
+      } else if (currentState === STATE_THINKING) {
+        exprPulse.happy = 0;
+        exprPulse.relaxed = 0.1 + Math.random() * 0.15;
+        exprPulse.surprised = 0;
+      } else {
+        exprPulse.happy = Math.random() < 0.35 ? 0.08 + Math.random() * 0.12 : 0;
+        exprPulse.relaxed = 0.08 + Math.random() * 0.1;
+        exprPulse.surprised = 0;
+      }
+    }
+    // Ease toward pulse targets (state baseline reapplied slowly underneath).
+    var rate = Math.min(1, dt * 1.8);
+    var baseHappy =
+      currentState === STATE_LISTENING
+        ? 0.32
+        : currentState === STATE_SPEAKING
+          ? 0.22
+          : 0;
+    var baseRelaxed =
+      currentState === STATE_THINKING
+        ? 0.14
+        : currentState === STATE_IDLE
+          ? 0.12
+          : currentState === STATE_LISTENING
+            ? 0.18
+            : 0.05;
+    setExpression("happy", baseHappy + exprPulse.happy * 0.85);
+    setExpression("relaxed", baseRelaxed + exprPulse.relaxed * 0.7);
+    if (exprPulse.surprised > 0.02) {
+      setExpression("surprised", exprPulse.surprised);
+      exprPulse.surprised *= Math.max(0, 1 - dt * 2.2);
     }
   }
 
@@ -690,11 +1301,24 @@
   }
 
   function clearTalkExpressions() {
-    ["aa", "ih", "ou", "ee", "oh"].forEach(function (n) {
+    ["aa", "ih", "ou", "ee", "oh", "jawOpen"].forEach(function (n) {
       setExpression(n, 0);
     });
+    visemeSmooth.aa = 0;
+    visemeSmooth.ih = 0;
+    visemeSmooth.ou = 0;
+    visemeSmooth.ee = 0;
+    visemeSmooth.oh = 0;
+    if (restBones && restBones.jaw && restBones.base && restBones.base.jaw) {
+      var b = restBones.base.jaw;
+      setEuler(restBones.jaw, b.x, b.y, b.z);
+    }
   }
 
+  /**
+   * Lip-sync from host amplitude envelope.
+   * Primary: aa + jawOpen track open tightly. Light secondary only.
+   */
   function applyMouth(v) {
     var open = Math.max(0, Math.min(1, Number(v) || 0));
     mouthValue = open;
@@ -703,10 +1327,44 @@
       return;
     }
     if (!vrm) return;
-    clearTalkExpressions();
-    if (open > 0.01) {
-      setExpression("aa", open);
-      setExpression("oh", open * 0.25);
+
+    if (open < 0.01) {
+      clearTalkExpressions();
+      return;
+    }
+
+    var vel = Math.max(0, Math.min(1, Math.abs(mouthVelocity) * 2.2));
+    // Boost mid-range so quiet speech still opens lips visibly.
+    var drive = Math.min(1, open * 1.15 + vel * 0.08);
+    var wAa = drive * (0.85 + vel * 0.1);
+    var wOh = drive * (0.12 + (drive > 0.5 ? 0.1 : 0));
+    var wOu = drive < 0.3 ? drive * 0.22 : drive * 0.08;
+    var wIh = drive * 0.08 * (0.3 + vel);
+    var wEe = drive * 0.05 * vel;
+
+    // Near-instant follow on attack; quick close on release.
+    var s = drive > visemeSmooth.aa ? 0.88 : 0.7;
+    visemeSmooth.aa += (wAa - visemeSmooth.aa) * s;
+    visemeSmooth.ih += (wIh - visemeSmooth.ih) * s;
+    visemeSmooth.ou += (wOu - visemeSmooth.ou) * s;
+    visemeSmooth.ee += (wEe - visemeSmooth.ee) * s;
+    visemeSmooth.oh += (wOh - visemeSmooth.oh) * s;
+
+    setExpression("aa", visemeSmooth.aa);
+    setExpression("ih", visemeSmooth.ih);
+    setExpression("ou", visemeSmooth.ou);
+    setExpression("ee", visemeSmooth.ee);
+    setExpression("oh", visemeSmooth.oh);
+    setExpression("jawOpen", drive * 0.95 + vel * 0.05);
+
+    if (restBones && restBones.jaw && restBones.base && restBones.base.jaw) {
+      var jb = restBones.base.jaw;
+      setEuler(
+        restBones.jaw,
+        jb.x + drive * 0.32 + vel * 0.04,
+        jb.y,
+        jb.z
+      );
     }
   }
 
@@ -717,28 +1375,37 @@
         vrm.expressionManager.setValue(n, 0);
       } catch (_) {}
     });
+    exprPulse.happy = 0;
+    exprPulse.relaxed = 0;
+    exprPulse.surprised = 0;
+    exprPulseT = 0.4 + Math.random() * 0.8;
     switch (state) {
       case STATE_LISTENING:
         setExpression("happy", 0.35);
         setExpression("relaxed", 0.2);
         lookTarget.x = 0;
         lookTarget.y = 0.05;
+        lookWanderT = 0.6;
         break;
       case STATE_THINKING:
         setExpression("relaxed", 0.15);
-        lookTarget.x = 0.35;
-        lookTarget.y = 0.2;
+        lookTarget.x = 0.32;
+        lookTarget.y = 0.18;
+        lookWanderT = 0.8;
         break;
       case STATE_SPEAKING:
         setExpression("happy", 0.25);
         lookTarget.x = 0;
         lookTarget.y = 0.02;
+        lookWanderT = 1.2;
+        gestureBurstT = 0.3;
         break;
       case STATE_IDLE:
       default:
         setExpression("relaxed", 0.12);
         lookTarget.x = 0;
         lookTarget.y = 0;
+        lookWanderT = 1.5 + Math.random();
         break;
     }
   }
@@ -829,17 +1496,21 @@
       } catch (_) {}
     }
 
-    var amb = new THREE.AmbientLight(0xffffff, 0.7);
+    var amb = new THREE.AmbientLight(0xffffff, 0.62);
     scene.add(amb);
-    var key = new THREE.DirectionalLight(0xffffff, 1.15);
-    key.position.set(1.2, 1.8, 1.5);
+    var key = new THREE.DirectionalLight(0xffffff, 1.2);
+    key.position.set(1.2, 2.2, 1.5);
     scene.add(key);
-    var fill = new THREE.DirectionalLight(0xa8c0ff, 0.5);
+    var fill = new THREE.DirectionalLight(0xa8c0ff, 0.48);
     fill.position.set(-1.4, 1.0, -0.6);
     scene.add(fill);
-    var rim = new THREE.DirectionalLight(0xffe0c0, 0.3);
+    var rim = new THREE.DirectionalLight(0xffe0c0, 0.35);
     rim.position.set(0, 1.2, -1.5);
     scene.add(rim);
+    // Soft "game room" up-light so the floor reads as a stage pad.
+    var hemi = new THREE.HemisphereLight(0x9eb6ff, 0x1a1520, 0.35);
+    scene.add(hemi);
+    ensureFloor(THREE);
 
     // Double-tap resets framing — but multi-touch pan/zoom finger-ups must NOT.
     var lastTap = 0;
@@ -910,25 +1581,40 @@
       if (dt > 0.1) dt = 0.05;
       idleTime += dt;
 
+      // Track host envelope tightly — no fake micro-wobble (that desynced lips).
+      var prevMouth = mouthValue;
       var mouthDelta = targetMouth - mouthValue;
-      if (Math.abs(mouthDelta) > 0.001) {
-        mouthValue += mouthDelta * Math.min(1, dt * 18);
-        if (!usingFallback) applyMouth(mouthValue);
+      var mouthRate = mouthDelta > 0 ? 38 : 22;
+      if (Math.abs(mouthDelta) > 0.0005) {
+        mouthValue += mouthDelta * Math.min(1, dt * mouthRate);
+      }
+      if (currentState === STATE_SPEAKING || targetMouth > 0.03) {
+        speechPhase += dt * (3.2 + targetMouth * 2.5);
+      } else {
+        speechPhase *= 0.88;
+      }
+      mouthVelocity = (mouthValue - prevMouth) / Math.max(dt, 0.001);
+      if (!usingFallback && (currentState === STATE_SPEAKING || targetMouth > 0.015 || mouthValue > 0.015)) {
+        applyMouth(mouthValue);
+      } else if (!usingFallback && mouthValue <= 0.015 && targetMouth <= 0.015) {
+        if (visemeSmooth.aa > 0.001) clearTalkExpressions();
       }
 
       if (vrm && !usingFallback) {
         applyBodyMotion(dt);
+        updateLookWander(dt);
+        updateMicroExpressions(dt);
 
-        lookSmooth.x += (lookTarget.x - lookSmooth.x) * Math.min(1, dt * 3);
-        lookSmooth.y += (lookTarget.y - lookSmooth.y) * Math.min(1, dt * 3);
+        lookSmooth.x += (lookTarget.x - lookSmooth.x) * Math.min(1, dt * 3.4);
+        lookSmooth.y += (lookTarget.y - lookSmooth.y) * Math.min(1, dt * 3.4);
         if (vrm.lookAt) {
           try {
             if (typeof vrm.lookAt.lookAt === "function" && camera) {
               var THREE2 = getLibs().THREE;
-              // Gaze toward camera with slight state offset.
+              // Eyes only toward camera + horizontal wander (tiny vertical offset).
               var target = new THREE2.Vector3(
-                camera.position.x + lookSmooth.x * 0.15,
-                camera.position.y + lookSmooth.y * 0.1,
+                camera.position.x + lookSmooth.x * 0.18,
+                camera.position.y + lookSmooth.y * 0.06,
                 camera.position.z
               );
               vrm.lookAt.lookAt(target);
@@ -940,28 +1626,33 @@
         if (blinkT >= 0) {
           blinkT += dt;
           var b =
-            blinkT < 0.06
-              ? blinkT / 0.06
-              : blinkT < 0.12
+            blinkT < 0.05
+              ? blinkT / 0.05
+              : blinkT < 0.1
                 ? 1
-                : 1 - (blinkT - 0.12) / 0.08;
+                : 1 - (blinkT - 0.1) / 0.07;
           if (b < 0) {
             blinkT = -1;
             b = 0;
-            blinkNext = 2.2 + Math.random() * 3.5;
+            if (blinkDouble) {
+              blinkDouble = false;
+              blinkNext = 0.12 + Math.random() * 0.1;
+            } else {
+              blinkNext = 1.8 + Math.random() * 3.8;
+              // Occasional double-blink.
+              if (Math.random() < 0.18) blinkDouble = true;
+            }
           }
           setExpression("blink", Math.max(0, Math.min(1, b)));
         } else if (blinkNext <= 0) {
           blinkT = 0;
         }
 
-        if (currentState === STATE_SPEAKING || targetMouth > 0.02) {
-          applyMouth(mouthValue);
-        }
-
         try {
           vrm.update(dt);
         } catch (_) {}
+      } else if (usingFallback) {
+        setFallbackMouth(mouthValue);
       }
 
       if (controls) {
@@ -1039,11 +1730,15 @@
     modelRoot.add(vrm.scene);
 
     // Natural standing pose + idle baseline (not bind T-pose).
+    // Keep host-driven state (listening/thinking/speaking) across reloads so a
+    // mid-session model swap does not snap the avatar back to idle.
+    var keepState = currentState || STATE_IDLE;
     captureRestPose();
 
-    currentState = STATE_IDLE;
-    applyStateExpressions(STATE_IDLE);
-    applyMouth(0);
+    currentState = keepState;
+    pickStatePoseTarget(keepState);
+    applyStateExpressions(keepState);
+    applyMouth(targetMouth || mouthValue || 0);
     usingFallback = false;
     showFallback(false);
     // Frame once on install; prefer last-run orbit from host prefs.
@@ -1327,12 +2022,13 @@
   function setMouth(v) {
     targetMouth = Math.max(0, Math.min(1, Number(v) || 0));
     if (usingFallback) {
-      mouthValue = targetMouth;
+      mouthValue = mouthValue * 0.25 + targetMouth * 0.75;
       setFallbackMouth(mouthValue);
       return;
     }
-    if (Math.abs(targetMouth - mouthValue) > 0.2) {
-      mouthValue = mouthValue + (targetMouth - mouthValue) * 0.5;
+    // Snap hard on onsets/closures so lips land with the audio peak.
+    if (Math.abs(targetMouth - mouthValue) > 0.08) {
+      mouthValue = mouthValue + (targetMouth - mouthValue) * 0.78;
     }
     applyMouth(mouthValue);
   }
@@ -1340,10 +2036,24 @@
   function playMotion(name) {
     if (!name) return;
     var n = String(name).toLowerCase();
-    if (n.indexOf("happy") >= 0) setExpression("happy", 0.7);
-    else if (n.indexOf("sad") >= 0) setExpression("sad", 0.6);
-    else if (n.indexOf("angry") >= 0) setExpression("angry", 0.6);
-    else if (n.indexOf("surprise") >= 0) setExpression("surprised", 0.7);
+    if (n.indexOf("happy") >= 0) {
+      setExpression("happy", 0.7);
+      return;
+    }
+    if (n.indexOf("sad") >= 0) {
+      setExpression("sad", 0.6);
+      return;
+    }
+    if (n.indexOf("angry") >= 0) {
+      setExpression("angry", 0.6);
+      return;
+    }
+    if (n.indexOf("surprise") >= 0) {
+      setExpression("surprised", 0.7);
+      return;
+    }
+    // Body gestures (wave, nod, shrug, …) via VR hand targets.
+    playGesture(n, { intensity: 1 });
   }
 
   function resetCamera() {
@@ -1374,6 +2084,10 @@
     setState: setState,
     setMouth: setMouth,
     playMotion: playMotion,
+    playGesture: playGesture,
+    setHands: setHands,
+    setLook: setLook,
+    resetBody: resetBody,
     resetCamera: resetCamera,
     setOrbit: setOrbit,
     getOrbit: getOrbit,

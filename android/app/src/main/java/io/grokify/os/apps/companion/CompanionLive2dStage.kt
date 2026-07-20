@@ -92,12 +92,13 @@ fun CompanionLive2dStage(
 
     DisposableEffect(Unit) {
         onDispose {
-            webView?.apply {
-                stopLoading()
-                (parent as? ViewGroup)?.removeView(this)
-                loadUrl("about:blank")
-                removeJavascriptInterface("GrokifyCompanion")
-                destroy()
+            webView?.let { wv ->
+                CompanionStageHost.detach(wv)
+                wv.stopLoading()
+                (wv.parent as? ViewGroup)?.removeView(wv)
+                wv.loadUrl("about:blank")
+                wv.removeJavascriptInterface("GrokifyCompanion")
+                wv.destroy()
             }
             webView = null
             stageReady = false
@@ -117,7 +118,7 @@ fun CompanionLive2dStage(
         pushState(wv, avatarState)
     }
 
-    // Throttle mouth updates: push if delta > 0.03 or at most ~30 fps (every 33ms).
+    // Throttle mouth: push on meaningful delta or ~50 fps so lips track PCM envelope.
     LaunchedEffect(mouth, stageReady) {
         val wv = webView ?: return@LaunchedEffect
         if (!stageReady) return@LaunchedEffect
@@ -125,7 +126,8 @@ fun CompanionLive2dStage(
         val now = SystemClock.uptimeMillis()
         val delta = if (lastPushedMouth.isNaN()) 1f else abs(clamped - lastPushedMouth)
         val elapsed = now - lastMouthPushMs
-        if (!lastPushedMouth.isNaN() && delta <= 0.03f && elapsed < 33L) {
+        // Push often — lips desync when small envelope edges are dropped.
+        if (!lastPushedMouth.isNaN() && delta <= 0.008f && elapsed < 12L) {
             return@LaunchedEffect
         }
         lastPushedMouth = clamped
@@ -211,6 +213,16 @@ fun CompanionLive2dStage(
                         onModelLoaded = { detail ->
                             android.util.Log.d(TAG, "model loaded: $detail")
                             mainHandler.post {
+                                // Re-apply host state/mouth: install used to force idle and
+                                // left Listening/Speaking stuck until the next turn change.
+                                val wv = webView
+                                if (wv != null) {
+                                    pushState(wv, avatarStateLatest.value)
+                                    val m = mouthLatest.value.coerceIn(0f, 1f)
+                                    lastPushedMouth = m
+                                    lastMouthPushMs = SystemClock.uptimeMillis()
+                                    pushMouth(wv, m)
+                                }
                                 onModelLoadedLatest.value(detail)
                             }
                         },
@@ -290,10 +302,12 @@ fun CompanionLive2dStage(
                 // Cache-bust query so WebView cannot keep a pre-VRM stage document.
                 loadUrl(ASSET_URL)
                 webView = this
+                CompanionStageHost.attach(this)
             }
         },
         update = { view ->
             webView = view
+            CompanionStageHost.attach(view)
             if (view.layoutParams == null ||
                 view.layoutParams.width != ViewGroup.LayoutParams.MATCH_PARENT ||
                 view.layoutParams.height != ViewGroup.LayoutParams.MATCH_PARENT
@@ -311,7 +325,7 @@ fun CompanionLive2dStage(
 private const val TAG = "CompanionVrm"
 // Version bump forces a fresh document after Live2D → VRM migrations.
 private const val ASSET_URL =
-    "file:///android_asset/companion/index.html?stage=vrm6&v=204"
+    "file:///android_asset/companion/index.html?stage=vrm7&v=212"
 
 /**
  * Host bridge for the offline VRM stage.
@@ -657,19 +671,19 @@ private fun pushLoadModel(
     webView: WebView,
     source: String,
     path: String,
-    bundledPath: String?,
+    // Readiness gate in Compose LaunchedEffect (re-run after extract); bridge re-extracts.
+    @Suppress("UNUSED_PARAMETER") bundledPath: String?,
 ) {
-    val src = source.ifBlank { CompanionStore.SOURCE_BUNDLED }
+    val rawSrc = source.ifBlank { CompanionStore.SOURCE_BUNDLED }
     // Stage reads bytes via Kotlin bridge only (no file:// fetch).
-    // For bundled, pass the alias "bundled" so the bridge always materializes
-    // Seed-san from assets — avoids stale absolute paths / symlink mismatches.
-    val effectivePath = when {
-        src == CompanionStore.SOURCE_USER && path.isNotBlank() -> path
-        // Prefer absolute only as a hint; openVrm falls back to re-extract.
-        !bundledPath.isNullOrBlank() -> "bundled"
-        else -> "bundled"
-    }
-    val sourceJs = JSONObject.quote(src)
+    // User source without a path used to pass source=user path=bundled and load
+    // Seed-san while the store still claimed "user".
+    val useUser = rawSrc == CompanionStore.SOURCE_USER && path.isNotBlank()
+    val effectiveSource = if (useUser) CompanionStore.SOURCE_USER else CompanionStore.SOURCE_BUNDLED
+    // For bundled, pass alias "bundled" so the bridge materializes Seed-san
+    // (avoids stale absolute paths / symlink mismatches).
+    val effectivePath = if (useUser) path else "bundled"
+    val sourceJs = JSONObject.quote(effectiveSource)
     val pathJs = JSONObject.quote(effectivePath)
     webView.evaluateJavascript(
         "window.CompanionStage && window.CompanionStage.loadModel($sourceJs, $pathJs);",

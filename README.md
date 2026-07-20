@@ -156,6 +156,8 @@ Open the Android app → **Apps** tab. Every app is a **native host module** com
 | **Wi‑Fi Scanner** | Scan nearby networks; GPS pins, distance, times seen; alerts (SSID/MAC watch, unseen, strong nearby); Mapbox map of hits | Nearby Wi‑Fi, Location | **Mapbox** `pk.…` for maps |
 | **Bluetooth Tracker** | BLE + classic discovery; GPS pins, distance, times seen; watch/unseen/strong alerts; map | Bluetooth, Location, Notifications | **Mapbox** for maps |
 | **Place Notes** | Pin notes to GPS spots; on enter: notify, open an app, or show an image; list + map + area monitoring | Location, Notifications | **Mapbox** for maps |
+| **Companion** | Offline **VRM** stage (Three.js + three-vrm) + **xAI Voice Agent** realtime chat; soft-hang rest, lip-sync, body gestures (`body_gesture` / hands / look); import your own `.vrm`; text + voice with TTS fallback | Microphone, network; optional camera later | **SpaceXAI API key** (`spacexai_api_key`) for Voice Agent |
+| **Grok Assistant** | Floating mini overlay / system assist entry; wake listen; Voice Agent tools for the main chat surface | Microphone, notifications, network | **SpaceXAI API key** for voice |
 | **Spotify** | Lockscreen / media controls; **Live AI DJ** booth (banter, queue chat); research/build/edit playlists via host Grok Build; optional Grok Voice TTS | Notifications, Media session, mic (voice), network | **Spotify Client ID** (+ optional secret); **SpaceXAI API key** for Grok Voice (device TTS works without it) |
 | **SpaceXAI API Usage Analyzer** | Prepaid credit balance, period spend, soft/hard limits, 7‑day usage by model, balance history | Network | **SpaceXAI Management key** vault id `spacexai_management_key` (billing read on [management-api.x.ai](https://management-api.x.ai)) |
 
@@ -313,6 +315,39 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 ## Changelog
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
+
+### 0.1.212 — Companion: soft hang, calmer head, tighter lip-sync, first-reply audio
+
+- **Rest pose**: soft arm hang (~72° from T), lower hand rests, less idle flare — no permanent Y-pose.
+- **Head**: stopped stacking bone pitch + `lookAt` (that read as a constant nod); gaze is eyes-first; rare soft nod only while listening.
+- **Lip-sync**: faster envelope + stronger mid-range open; mouth level published from PCM *write* path (what leaves the speaker), not only socket receive time.
+- **First spoken reply**: flush/re-prime `AudioTrack` per response + short silence pad so cold OEM tracks do not drop the first PCM; session instructions force **spoken audio first** (body tools optional garnish, never instead of speech).
+- **Body tools**: on-device `body_gesture` / `set_hands` / `look_at` / `reset_body` (VRChat-style head + hands with gravity) via `CompanionBodyTools` + stage host bridge.
+- **Audit fixes (0.1.206–0.1.211)**: atomic VRM import (staging dir, never wipe previous on failed copy); synchronized chat history append; text send stops active voice session; status toast auto-dismiss; preserve avatar state across model reload; normalize user vs bundled load source; `stopInternal` publishes final Idle before clearing listener (no stuck Connecting); Thinking keeps mic open until `response.created` (half-duplex after commit) and **never** clears `input_audio_buffer` on `speech_stopped` / mute into Thinking; thinking nudge + empty-turn recovery before hard timeout; loudspeaker / media usage priming.
+
+### 0.1.203–0.1.205 — Companion: poses, orbit camera, voice connect
+
+- **0.1.205**: stop wiping user audio on `speech_stopped` / mute-into-Thinking (same class of bug as Grok Assistant); wait for `session.created` before `session.update`; retry WS open with API key / without stale `conversation_id`.
+- **0.1.204**: persist orbit camera framing across restarts (double-tap clears); align Voice Agent handshake with xAI docs; hard-fail Connecting on WS/config errors; persist `conversation_id` for resume.
+- **0.1.203**: life-like rest + blended listen/think/speak postures; fix pan/zoom snap-back (multi-touch finger-up was treated as double-tap reset); wait for real WS `onOpen` before session update; parallel audio prep + tighter connect timeouts.
+
+### 0.1.195–0.1.202 — Companion inner app (VRM stage + Voice Agent)
+
+- **New Apps hub module**: offline Three.js + `@pixiv/three-vrm` stage (bundled Seed-san), durable chat turns, xAI Voice Agent realtime + HostAiClient TTS fallback.
+- VRM load via Kotlin bridge (`openVrm` / base64 read) — no `file://` fetch; cancel/dispose superseded loads so models do not stack.
+- OrbitControls rotate/pan/pinch-zoom; canvas no longer opens chat or starts voice by itself.
+- Earlier half-duplex / first-turn speech hardening and selectable Cubism packs on the Live2D experiment path (stage later standardized on VRM).
+
+### 0.1.161–0.1.172 — Grok Assistant + wake (highlights)
+
+| Version | Notes |
+|---------|--------|
+| **0.1.172** | Unstick Voice Agent thinking UX |
+| **0.1.167** | Ephemeral assistant overlay + wake listen handoff |
+| **0.1.165** | Hey Grok wake word + system assist / BT / Auto entry |
+| **0.1.163–0.1.164** | Floating mini overlay, bottom-center layout, Look-at-screen crop |
+| **0.1.162** | Grok Assistant MVP inner app |
+| **0.1.161** | Chat auto-scroll stick-to-bottom fix |
 
 ### 0.1.160 — Chat stick-to-bottom unlock
 

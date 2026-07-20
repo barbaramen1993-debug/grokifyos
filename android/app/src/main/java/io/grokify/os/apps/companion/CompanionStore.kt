@@ -5,6 +5,8 @@ import android.content.Context
 class CompanionStore(ctx: Context) {
     private val appCtx = ctx.applicationContext
     private val prefs = appCtx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    /** Serializes history read-modify-write so voice + text commits cannot drop turns. */
+    private val historyLock = Any()
 
     var systemPrompt: String
         get() = prefs.getString(KEY_PROMPT, null)?.let {
@@ -57,22 +59,31 @@ class CompanionStore(ctx: Context) {
         prefs.edit().remove(KEY_VOICE_CONV).apply()
     }
 
-    fun history(): List<CompanionMessage> =
+    fun history(): List<CompanionMessage> = synchronized(historyLock) {
         CompanionPrompts.decodeHistory(prefs.getString(KEY_HISTORY, null))
+    }
 
     fun saveHistory(messages: List<CompanionMessage>) {
         val capped = CompanionPrompts.capHistory(messages)
-        prefs.edit().putString(KEY_HISTORY, CompanionPrompts.encodeHistory(capped)).apply()
+        synchronized(historyLock) {
+            prefs.edit().putString(KEY_HISTORY, CompanionPrompts.encodeHistory(capped)).apply()
+        }
     }
 
     fun appendMessage(msg: CompanionMessage): List<CompanionMessage> {
-        val next = CompanionPrompts.capHistory(history() + msg)
-        saveHistory(next)
-        return next
+        synchronized(historyLock) {
+            val next = CompanionPrompts.capHistory(
+                CompanionPrompts.decodeHistory(prefs.getString(KEY_HISTORY, null)) + msg,
+            )
+            prefs.edit().putString(KEY_HISTORY, CompanionPrompts.encodeHistory(next)).apply()
+            return next
+        }
     }
 
     fun clearHistory() {
-        prefs.edit().remove(KEY_HISTORY).apply()
+        synchronized(historyLock) {
+            prefs.edit().remove(KEY_HISTORY).apply()
+        }
     }
 
     companion object {

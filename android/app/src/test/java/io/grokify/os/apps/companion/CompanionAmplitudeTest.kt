@@ -3,7 +3,6 @@ package io.grokify.os.apps.companion
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import kotlin.math.abs
 
 class CompanionAmplitudeTest {
     @Test
@@ -23,16 +22,57 @@ class CompanionAmplitudeTest {
     }
 
     @Test
+    fun peak_tracks_max_sample() {
+        val pcm = ShortArray(64) { 0 }
+        pcm[10] = 16000
+        val peak = CompanionAmplitude.peakPcm16(pcm, pcm.size)
+        assertTrue(peak in 0.48f..0.5f)
+    }
+
+    @Test
+    fun zero_crossing_higher_for_alternating() {
+        val flat = ShortArray(100) { 1000 }
+        val alt = ShortArray(100) { if (it % 2 == 0) 1000 else -1000 }
+        assertTrue(
+            CompanionAmplitude.zeroCrossingRate(alt, alt.size) >
+                CompanionAmplitude.zeroCrossingRate(flat, flat.size),
+        )
+    }
+
+    @Test
     fun mouth_clamps_and_smooths() {
         val s = CompanionAmplitude.MouthSmoother(attack = 0.6f, release = 0.25f)
         val a = s.next(0f)
         assertEquals(0f, a, 0.001f)
-        val b = s.next(1f)
+        val b = s.next(1f, 1f)
         assertTrue(b in 0.01f..1f)
-        val c = s.next(0f)
+        val c = s.next(0f, 0f)
         assertTrue(c < b)
-        assertTrue(s.next(2f) <= 1f)
-        assertTrue(s.next(-1f) >= 0f)
+        assertTrue(s.next(2f, 2f) <= 1f)
+        assertTrue(s.next(-1f, 0f) >= 0f)
+    }
+
+    @Test
+    fun mouth_peak_boosts_onset() {
+        val s = CompanionAmplitude.MouthSmoother()
+        // Same RMS, higher peak should open more (consonant punch).
+        val lowPeak = s.next(0.05f, 0.05f)
+        s.reset()
+        val highPeak = s.next(0.05f, 0.25f)
+        assertTrue(highPeak >= lowPeak)
+    }
+
+    @Test
+    fun viseme_weights_closed_when_shut() {
+        val w = CompanionAmplitude.visemeWeights(0f, 0f, 0f)
+        assertTrue(w.all { it == 0f })
+    }
+
+    @Test
+    fun viseme_weights_open_has_energy() {
+        val w = CompanionAmplitude.visemeWeights(0.2f, 0.1f, 0.6f)
+        assertTrue(w.sum() > 0.1f)
+        assertTrue(w.all { it in 0f..1f })
     }
 
     @Test
