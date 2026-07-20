@@ -119,6 +119,7 @@ fun GrokAssistantPane(onBack: () -> Unit) {
     var overlayEnabled by remember { mutableStateOf(store.overlayEnabled) }
     var wakeWordEnabled by remember { mutableStateOf(store.wakeWordEnabled) }
     var voiceRealtimeEnabled by remember { mutableStateOf(store.voiceRealtimeEnabled) }
+    var voiceDeepThink by remember { mutableStateOf(store.voiceDeepThink) }
     var voiceLive by remember { mutableStateOf(GrokAssistantVoiceSession.isLive) }
     var voiceStatus by remember { mutableStateOf<String?>(null) }
     var voiceTurn by remember {
@@ -261,6 +262,7 @@ fun GrokAssistantPane(onBack: () -> Unit) {
         overlayEnabled = store.overlayEnabled
         wakeWordEnabled = store.wakeWordEnabled
         voiceRealtimeEnabled = store.voiceRealtimeEnabled
+        voiceDeepThink = store.voiceDeepThink
         hasXaiKey = !HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank()
         canDrawOverlays = GrokAssistantOverlayService.canDrawOverlays(appCtx)
         hasMic = androidx.core.content.ContextCompat.checkSelfPermission(
@@ -548,6 +550,16 @@ fun GrokAssistantPane(onBack: () -> Unit) {
                         "Realtime Voice on — speak via mic; Build CLI used as a tool"
                     } else {
                         "Realtime Voice off — STT → Build → TTS path"
+                    }
+                },
+                voiceDeepThink = voiceDeepThink,
+                onVoiceDeepThinkChange = { on ->
+                    voiceDeepThink = on
+                    store.voiceDeepThink = on
+                    statusMsg = if (on) {
+                        "Deep think on — Voice Agent reasoning.effort=high (slower)"
+                    } else {
+                        "Deep think off — snappy Voice Agent (effort=none)"
                     }
                 },
                 hasXaiKey = hasXaiKey,
@@ -931,7 +943,15 @@ private fun AssistantChatTab(
                                 streaming = true,
                             )
                         }
-                    } else if (busy || (voiceLive && voiceTurn != GrokAssistantVoiceSession.Turn.UserSpeaking)) {
+                    } else if (
+                        busy ||
+                        (voiceLive && voiceTurn in setOf(
+                            GrokAssistantVoiceSession.Turn.Connecting,
+                            GrokAssistantVoiceSession.Turn.Thinking,
+                            GrokAssistantVoiceSession.Turn.ToolBusy,
+                            GrokAssistantVoiceSession.Turn.GrokSpeaking,
+                        ))
+                    ) {
                         item(key = "_busy") {
                             Row(
                                 Modifier.padding(vertical = 8.dp),
@@ -950,7 +970,7 @@ private fun AssistantChatTab(
                                 Text(
                                     when {
                                         voiceLive -> voiceStatus ?: assistantTurnLabel(voiceTurn)
-                                        else -> "Thinking…"
+                                        else -> "Grok Build · thinking…"
                                     },
                                     color = GrokifyColors.TextDim,
                                     fontSize = 12.sp,
@@ -1183,12 +1203,12 @@ private fun loadImageUriAsJpeg(
 
 internal fun assistantTurnLabel(turn: GrokAssistantVoiceSession.Turn): String = when (turn) {
     GrokAssistantVoiceSession.Turn.Idle -> "Idle"
-    GrokAssistantVoiceSession.Turn.Connecting -> "Connecting…"
-    GrokAssistantVoiceSession.Turn.Listening -> "Listening…"
+    GrokAssistantVoiceSession.Turn.Connecting -> "Connecting Voice Agent…"
+    GrokAssistantVoiceSession.Turn.Listening -> "Voice Agent · listening"
     GrokAssistantVoiceSession.Turn.UserSpeaking -> "Hearing you…"
-    GrokAssistantVoiceSession.Turn.Thinking -> "Thinking…"
-    GrokAssistantVoiceSession.Turn.GrokSpeaking -> "Grok speaking…"
-    GrokAssistantVoiceSession.Turn.ToolBusy -> "Grok Build…"
+    GrokAssistantVoiceSession.Turn.Thinking -> "Voice Agent · thinking"
+    GrokAssistantVoiceSession.Turn.GrokSpeaking -> "Voice Agent · speaking"
+    GrokAssistantVoiceSession.Turn.ToolBusy -> "Grok Build (host CLI)"
     GrokAssistantVoiceSession.Turn.Error -> "Error"
 }
 
@@ -1248,12 +1268,12 @@ internal fun VoiceReactiveStrip(
     val padV = if (compact) 6.dp else 10.dp
     val corner = if (compact) 12.dp else 16.dp
     val label = assistantTurnLabel(turn)
-    val mutedHint = if (micMuted && turn == GrokAssistantVoiceSession.Turn.GrokSpeaking) {
-        "Mic muted · Grok talking"
-    } else if (micMuted && turn == GrokAssistantVoiceSession.Turn.Thinking) {
-        "Mic muted · thinking"
-    } else {
-        null
+    val mutedHint = when {
+        micMuted && turn == GrokAssistantVoiceSession.Turn.GrokSpeaking ->
+            "Mic muted · Grok talking"
+        micMuted && turn == GrokAssistantVoiceSession.Turn.ToolBusy ->
+            "Mic muted · tool running"
+        else -> null
     }
     val sub = mutedHint ?: status?.takeIf { it.isNotBlank() && it != label }
 
@@ -1468,6 +1488,8 @@ private fun AssistantSetupTab(
     onSpeakRepliesChange: (Boolean) -> Unit,
     voiceRealtimeEnabled: Boolean,
     onVoiceRealtimeChange: (Boolean) -> Unit,
+    voiceDeepThink: Boolean,
+    onVoiceDeepThinkChange: (Boolean) -> Unit,
     hasXaiKey: Boolean,
     voicePreviewMsg: String?,
     onPreviewVoice: () -> Unit,
@@ -1636,10 +1658,10 @@ private fun AssistantSetupTab(
         Spacer(Modifier.height(20.dp))
         SetupSectionLabel("REALTIME VOICE", GrokifyColors.GlowMint)
         Text(
-            "xAI Voice Agent (speech-to-speech, under 1s first audio). Server tools: web_search, " +
-                "x_search. Client tool: prompt_grok_build → host Grok Build for deep research / " +
-                "coding (especially Dev mode). Typed chat still uses Build directly. Needs " +
-                "SpaceXAI API key (about $0.05/min while live).",
+            "xAI Voice Agent (speech-to-speech). Status shows “Voice Agent · …” while live so " +
+                "you can tell it from host Grok Build. Server tools: web_search, x_search. " +
+                "Client tool: prompt_grok_build → Build CLI for deep research/coding. " +
+                "Typed chat still uses Build. Needs SpaceXAI key (~$0.05/min while live).",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
         )
@@ -1657,6 +1679,21 @@ private fun AssistantSetupTab(
                 onCheckedChange = onVoiceRealtimeChange,
                 enabled = hasXaiKey || voiceRealtimeEnabled,
                 colors = switchColors(GrokifyColors.GlowMint),
+            )
+        }
+        SetupRow(
+            title = "Deep think",
+            subtitle = if (voiceDeepThink) {
+                "reasoning.effort=high · slower, deeper"
+            } else {
+                "Off (default) · effort=none · snappy replies"
+            },
+        ) {
+            Switch(
+                checked = voiceDeepThink,
+                onCheckedChange = onVoiceDeepThinkChange,
+                enabled = voiceRealtimeEnabled,
+                colors = switchColors(GrokifyColors.GlowRose),
             )
         }
         if (!hasXaiKey) {

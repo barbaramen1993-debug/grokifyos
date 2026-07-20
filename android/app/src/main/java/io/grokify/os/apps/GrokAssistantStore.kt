@@ -40,6 +40,23 @@ class GrokAssistantStore(ctx: Context) {
         get() = prefs.getBoolean(KEY_WAKE, false)
         set(v) = prefs.edit().putBoolean(KEY_WAKE, v).apply()
 
+    /**
+     * Prefer xAI Voice Agent (Realtime WebSocket) for spoken turns.
+     * Needs vault `spacexai_api_key`. Typed chat still uses Grok Build.
+     * Voice Agent can call [GrokAssistantVoiceTools.TOOL_PROMPT_BUILD] for deep work.
+     */
+    var voiceRealtimeEnabled: Boolean
+        get() = prefs.getBoolean(KEY_VOICE_REALTIME, true)
+        set(v) = prefs.edit().putBoolean(KEY_VOICE_REALTIME, v).apply()
+
+    /**
+     * When true, Voice Agent uses reasoning.effort=high (slower, deeper).
+     * Default false (effort=none) so spoken turns stay snappy.
+     */
+    var voiceDeepThink: Boolean
+        get() = prefs.getBoolean(KEY_VOICE_DEEP_THINK, false)
+        set(v) = prefs.edit().putBoolean(KEY_VOICE_DEEP_THINK, v).apply()
+
     fun templates(): List<AssistantPromptTemplate> {
         val saved = AssistantPromptCodec.decode(prefs.getString(KEY_PROMPTS, null))
         return AssistantPromptCodec.mergeWithDefaults(saved)
@@ -276,6 +293,8 @@ class GrokAssistantStore(ctx: Context) {
         private const val KEY_SPEAK = "speak_replies"
         private const val KEY_OVERLAY = "overlay_enabled"
         private const val KEY_WAKE = "wake_word_enabled"
+        private const val KEY_VOICE_REALTIME = "voice_realtime_enabled"
+        private const val KEY_VOICE_DEEP_THINK = "voice_deep_think"
         private const val KEY_PROMPTS = "prompt_templates_v1"
         private const val KEY_TRANSCRIPT = "transcript_v1" // legacy
         private const val KEY_SESSIONS = "sessions_v2"

@@ -125,6 +125,11 @@ class GrokAssistantVoiceClient(
         tools: JSONArray,
         sampleRate: Int = SAMPLE_RATE,
         useBinaryAudio: Boolean = true,
+        /**
+         * xAI default is "high" (long silent reasoning). Pass "none" for snappy voice.
+         * Supported on grok-voice-latest / grok-voice-think-fast-1.0.
+         */
+        reasoningEffort: String = "none",
     ): Boolean {
         val audio = JSONObject()
             .put(
@@ -162,10 +167,14 @@ class GrokAssistantVoiceClient(
                     )
                     .put("transport", if (useBinaryAudio) "binary" else "json"),
             )
+        val effort = reasoningEffort.trim().lowercase().let {
+            if (it == "high") "high" else "none"
+        }
         val session = JSONObject()
             .put("instructions", instructions)
             .put("voice", voice.ifBlank { "eve" })
             .put("tools", tools)
+            .put("reasoning", JSONObject().put("effort", effort))
             .put(
                 "turn_detection",
                 JSONObject()

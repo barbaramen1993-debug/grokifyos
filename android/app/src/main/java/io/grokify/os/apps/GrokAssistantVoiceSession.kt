@@ -86,6 +86,12 @@ object GrokAssistantVoiceSession {
     private const val LEVEL_PUBLISH_MS = 40L
     /** Keep mic muted briefly after last TTS chunk so the AudioTrack tail can't loop back. */
     private const val PLAYBACK_MUTE_HOLD_MS = 700L
+    /** How often to refresh elapsed status / check stalls. */
+    private const val WATCHDOG_MS = 1_000L
+    /** No server progress while Thinking → surface “still working”. */
+    private const val THINKING_STALL_MS = 8_000L
+    /** Hard cancel stuck Thinking (not Build tools). */
+    private const val THINKING_TIMEOUT_MS = 75_000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val listeners = ConcurrentLinkedQueue<Listener>()
@@ -114,9 +120,24 @@ object GrokAssistantVoiceSession {
     private val pendingResponseAfterTools = AtomicBoolean(false)
     private val inFlightTools = AtomicInteger(0)
 
+    /** Wall clock when current Thinking/ToolBusy phase began. */
+    private val phaseStartedMs = AtomicLong(0L)
+    /** Last WebSocket event received (for stall detection). */
+    private val lastEventMs = AtomicLong(0L)
+    private val lastEventType = AtomicReference<String?>(null)
+    /** Short phase key for status: processing | thinking | web_search | x_search | build | … */
+    private val phaseKey = AtomicReference("idle")
+    private val deepThink = AtomicBoolean(false)
+
     private var appCtx: Context? = null
     private var conversationId: String? = null
-
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!running.get()) return
+            tickWatchdog()
+            mainHandler.postDelayed(this, WATCHDOG_MS)
+        }
+    }
     val isLive: Boolean
         get() {
             val s = state.get()
@@ -179,8 +200,10 @@ object GrokAssistantVoiceSession {
             return
         }
 
+        deepThink.set(store.voiceDeepThink)
         setState(State.Connecting, Turn.Connecting, "Connecting Voice Agent…")
         GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Voice)
+        startWatchdog()
 
         scope.launch {
             try {
@@ -229,22 +252,27 @@ object GrokAssistantVoiceSession {
                 val tools = GrokAssistantVoiceTools.sessionTools(
                     devMode = store.mode == AssistantMode.Dev,
                 )
+                // Default effort=none — xAI high reasoning is what made "Thinking…" feel frozen.
+                val effort = if (store.voiceDeepThink) "high" else "none"
                 client.sessionUpdate(
                     instructions = instructions,
                     voice = store.voiceId,
                     tools = tools,
                     sampleRate = GrokAssistantVoiceClient.SAMPLE_RATE,
                     useBinaryAudio = true,
+                    reasoningEffort = effort,
                 )
                 useBinary.set(true)
                 ensurePlaybackTrack()
 
-                setState(State.Live, Turn.Listening, "Listening…")
+                setPhase("live", Turn.Listening, "Voice Agent · listening")
+                setState(State.Live, Turn.Listening, statusLine.get())
 
                 val seed = seedUserText?.trim().orEmpty()
                 if (seed.isNotEmpty()) {
                     store.appendMessage("user", seed)
                     notifyTranscript("user", seed)
+                    setPhase("thinking", Turn.Thinking, phaseStatus("thinking"))
                     client.createUserText(seed)
                 }
 
@@ -275,11 +303,15 @@ object GrokAssistantVoiceSession {
 
     private fun stopInternal(releaseMic: Boolean) {
         running.set(false)
+        stopWatchdog()
         pendingResponseAfterTools.set(false)
         inFlightTools.set(0)
         assistantCommittedThisResponse.set(false)
         micMuted.set(false)
         lastPlaybackActivityMs.set(0L)
+        phaseStartedMs.set(0L)
+        phaseKey.set("idle")
+        lastEventType.set(null)
         micJob.getAndSet(null)?.cancel()
         runCatching { audioRecordRef.getAndSet(null)?.release() }
         runCatching {
@@ -300,14 +332,116 @@ object GrokAssistantVoiceSession {
         setState(State.Idle, Turn.Idle, null)
     }
 
+    private fun startWatchdog() {
+        mainHandler.removeCallbacks(watchdogRunnable)
+        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_MS)
+    }
+
+    private fun stopWatchdog() {
+        mainHandler.removeCallbacks(watchdogRunnable)
+    }
+
+    private fun setPhase(key: String, t: Turn? = null, line: String? = null) {
+        phaseKey.set(key)
+        phaseStartedMs.set(SystemClock.uptimeMillis())
+        if (t != null) turn.set(t)
+        if (line != null) statusLine.set(line)
+        applyMicMutePolicy(clientRef.get())
+        publish()
+    }
+
+    private fun phaseElapsedSec(): Int {
+        val start = phaseStartedMs.get()
+        if (start <= 0L) return 0
+        return ((SystemClock.uptimeMillis() - start) / 1000L).toInt().coerceAtLeast(0)
+    }
+
+    private fun phaseStatus(key: String = phaseKey.get(), elapsed: Int = phaseElapsedSec()): String {
+        val base = when (key) {
+            "processing" -> "Voice Agent · processing"
+            "thinking" -> if (deepThink.get()) {
+                "Voice Agent · deep think"
+            } else {
+                "Voice Agent · thinking"
+            }
+            "web_search" -> "Voice Agent · web search"
+            "x_search" -> "Voice Agent · X search"
+            "build" -> "Grok Build (host CLI)"
+            "tool" -> "Voice Agent · tool"
+            "speaking" -> "Voice Agent · speaking"
+            "live" -> "Voice Agent · listening"
+            else -> "Voice Agent · $key"
+        }
+        return if (elapsed > 0 && key != "live" && key != "speaking") {
+            "$base · ${elapsed}s"
+        } else {
+            base
+        }
+    }
+
+    private fun noteServerEvent(type: String) {
+        lastEventMs.set(SystemClock.uptimeMillis())
+        lastEventType.set(type)
+    }
+
+    private fun tickWatchdog() {
+        if (!running.get()) return
+        val t = turn.get()
+        val key = phaseKey.get()
+        when (t) {
+            Turn.Thinking -> {
+                val elapsed = phaseElapsedSec()
+                val lastEv = lastEventMs.get()
+                val sinceEvent = if (lastEv > 0L) SystemClock.uptimeMillis() - lastEv else elapsed * 1000L
+                // Refresh elapsed label so UI doesn't look frozen.
+                val line = when {
+                    elapsed >= THINKING_TIMEOUT_MS / 1000 -> null // handled below
+                    sinceEvent >= THINKING_STALL_MS && elapsed >= 3 ->
+                        "${phaseStatus(key, elapsed)} · still working…"
+                    else -> phaseStatus(key, elapsed)
+                }
+                if (line != null && statusLine.get() != line) {
+                    statusLine.set(line)
+                    applyMicMutePolicy(clientRef.get())
+                    publish()
+                }
+                if (elapsed * 1000L >= THINKING_TIMEOUT_MS) {
+                    Log.w(
+                        TAG,
+                        "Thinking timeout ${elapsed}s lastEvent=${lastEventType.get()}",
+                    )
+                    clientRef.get()?.cancelResponse()
+                    setPhase("live", Turn.Listening, "Timed out · Voice Agent listening")
+                    setState(State.Live, Turn.Listening, statusLine.get())
+                    mainHandler.post {
+                        listeners.forEach {
+                            it.onError("Voice Agent timed out after ${elapsed}s (still connected)")
+                        }
+                    }
+                }
+            }
+            Turn.ToolBusy -> {
+                val line = phaseStatus(key, phaseElapsedSec())
+                if (statusLine.get() != line) {
+                    statusLine.set(line)
+                    publish()
+                }
+            }
+            else -> Unit
+        }
+    }
+
     /**
      * Mic should not stream while Grok is talking (or still draining TTS),
      * so the model never hears itself.
+     *
+     * Mic **is** allowed during Thinking so barge-in works and the session
+     * doesn't feel frozen/muted while the model reasons or searches.
      */
     private fun isMicSendAllowed(): Boolean {
         when (turn.get()) {
-            Turn.GrokSpeaking, Turn.Thinking, Turn.ToolBusy, Turn.Idle, Turn.Error -> return false
-            Turn.Connecting, Turn.Listening, Turn.UserSpeaking -> Unit
+            Turn.GrokSpeaking, Turn.ToolBusy, Turn.Idle, Turn.Error -> return false
+            Turn.Thinking, Turn.Connecting, Turn.Listening, Turn.UserSpeaking -> Unit
         }
         val lastPlay = lastPlaybackActivityMs.get()
         if (lastPlay > 0L) {
@@ -445,7 +579,9 @@ object GrokAssistantVoiceSession {
 
     private fun handleEvent(app: Context, event: JSONObject) {
         if (!running.get()) return
-        when (event.optString("type")) {
+        val type = event.optString("type")
+        noteServerEvent(type)
+        when (type) {
             "conversation.created" -> {
                 conversationId = event.optJSONObject("conversation")
                     ?.optString("id")
@@ -470,10 +606,11 @@ object GrokAssistantVoiceSession {
                 partialUser.set("")
                 partialAssistant.set(null)
                 assistantCommittedThisResponse.set(false)
-                setTurn(Turn.UserSpeaking, "Hearing you…")
+                setPhase("hearing", Turn.UserSpeaking, "Hearing you…")
             }
             "input_audio_buffer.speech_stopped" -> {
-                setTurn(Turn.Thinking, "Thinking…")
+                // Still on Voice Agent — waiting for model/tools/audio.
+                setPhase("processing", Turn.Thinking, phaseStatus("processing"))
             }
             "conversation.item.input_audio_transcription.updated" -> {
                 // Cumulative live caption while user speaks
@@ -495,8 +632,8 @@ object GrokAssistantVoiceSession {
                     partialUser.set(null)
                     GrokAssistantStore(app).appendMessage("user", text)
                     notifyTranscript("user", text)
-                    if (turn.get() == Turn.UserSpeaking) {
-                        setTurn(Turn.Thinking, "Thinking…")
+                    if (turn.get() == Turn.UserSpeaking || turn.get() == Turn.Thinking) {
+                        setPhase("thinking", Turn.Thinking, phaseStatus("thinking"))
                     } else {
                         publish()
                     }
@@ -506,7 +643,22 @@ object GrokAssistantVoiceSession {
                 assistantCommittedThisResponse.set(false)
                 partialAssistant.set("")
                 if (state.get() != State.ToolBusy) {
-                    setTurn(Turn.Thinking, "Grok is thinking…")
+                    setPhase("thinking", Turn.Thinking, phaseStatus("thinking"))
+                }
+            }
+            "response.output_item.added",
+            "response.output_item.done",
+            -> {
+                val item = event.optJSONObject("item")
+                val itemType = item?.optString("type").orEmpty()
+                val name = item?.optString("name").orEmpty()
+                    .ifBlank { event.optString("name", "") }
+                val toolKey = toolPhaseKey(itemType, name)
+                if (toolKey != null && state.get() != State.ToolBusy) {
+                    // Server-side tools (web_search / x_search) stay on Voice Agent path.
+                    setPhase(toolKey, Turn.Thinking, phaseStatus(toolKey))
+                } else {
+                    publish()
                 }
             }
             "response.output_audio_transcript.delta",
@@ -516,10 +668,10 @@ object GrokAssistantVoiceSession {
                 if (d.isNotEmpty()) {
                     partialAssistant.updateAndGet { (it ?: "") + d }
                     if (turn.get() != Turn.GrokSpeaking && state.get() != State.ToolBusy) {
-                        turn.set(Turn.GrokSpeaking)
-                        statusLine.set("Grok speaking…")
+                        setPhase("speaking", Turn.GrokSpeaking, phaseStatus("speaking"))
+                    } else {
+                        publish()
                     }
-                    publish()
                 }
             }
             "response.output_text.delta",
@@ -528,6 +680,10 @@ object GrokAssistantVoiceSession {
                 val d = event.optString("delta", "")
                 if (d.isNotEmpty()) {
                     partialAssistant.updateAndGet { (it ?: "") + d }
+                    if (turn.get() == Turn.Thinking && state.get() != State.ToolBusy) {
+                        // Text-only progress still counts as activity
+                        statusLine.set(phaseStatus("thinking"))
+                    }
                     publish()
                 }
             }
@@ -553,7 +709,10 @@ object GrokAssistantVoiceSession {
             "response.function_call_arguments.done" -> {
                 val call = GrokAssistantVoiceTools.parseFunctionCallEvent(event) ?: return
                 inFlightTools.incrementAndGet()
-                setState(State.ToolBusy, Turn.ToolBusy, "Grok Build…")
+                val isBuild = call.name == GrokAssistantVoiceTools.TOOL_PROMPT_BUILD
+                val key = if (isBuild) "build" else "tool"
+                setPhase(key, Turn.ToolBusy, phaseStatus(key))
+                setState(State.ToolBusy, Turn.ToolBusy, statusLine.get())
                 scope.launch {
                     val store = GrokAssistantStore(app)
                     val result = try {
@@ -581,7 +740,8 @@ object GrokAssistantVoiceSession {
                         delaySoft(350)
                         if (running.get() && pendingResponseAfterTools.getAndSet(false)) {
                             clientRef.get()?.responseCreate()
-                            setState(State.Live, Turn.Thinking, "Thinking…")
+                            setState(State.Live, Turn.Thinking, null)
+                            setPhase("thinking", Turn.Thinking, phaseStatus("thinking"))
                         }
                     }
                 }
@@ -591,21 +751,36 @@ object GrokAssistantVoiceSession {
                 commitAssistantIfNeeded(app, leftover)
                 partialAssistant.set(null)
                 if (state.get() != State.ToolBusy) {
-                    setState(State.Live, Turn.Listening, "Listening…")
+                    setPhase("live", Turn.Listening, "Voice Agent · listening")
+                    setState(State.Live, Turn.Listening, statusLine.get())
                 }
-            }
-            "response.output_item.done" -> {
-                // Prefer transcript.done / response.done for commits.
-                // Still surface partials if present for UI consistency.
-                publish()
             }
             "session.updated",
             "session.created",
             -> {
                 if (state.get() == State.Connecting) {
-                    setState(State.Live, Turn.Listening, "Listening…")
+                    setPhase("live", Turn.Listening, "Voice Agent · listening")
+                    setState(State.Live, Turn.Listening, statusLine.get())
                 }
             }
+            else -> {
+                // Keep lastEvent for stall diagnostics; ignore noise.
+                Log.d(TAG, "voice event: $type")
+            }
+        }
+    }
+
+    /** Map server item / function names to a short UI phase key, or null if not a tool. */
+    private fun toolPhaseKey(itemType: String, name: String): String? {
+        val n = name.lowercase()
+        val t = itemType.lowercase()
+        return when {
+            n.contains("web_search") || t.contains("web_search") -> "web_search"
+            n.contains("x_search") || t.contains("x_search") -> "x_search"
+            n == GrokAssistantVoiceTools.TOOL_PROMPT_BUILD || n.contains("grok_build") -> "build"
+            // Only treat explicit function_call items as tools (not message/audio items).
+            t == "function_call" || t == "function" || t == "custom_tool_call" -> "tool"
+            else -> null
         }
     }
 
@@ -660,10 +835,7 @@ object GrokAssistantVoiceSession {
         val rms = pcmRms(pcm)
         if (state.get() != State.ToolBusy) {
             if (turn.get() != Turn.GrokSpeaking) {
-                turn.set(Turn.GrokSpeaking)
-                statusLine.set("Grok speaking…")
-                applyMicMutePolicy(clientRef.get())
-                publish()
+                setPhase("speaking", Turn.GrokSpeaking, phaseStatus("speaking"))
             }
         }
         noteLevel(rms)
@@ -726,11 +898,18 @@ object GrokAssistantVoiceSession {
                     val muted = micMuted.get() || !isMicSendAllowed()
                     val t = turn.get()
                     if (!muted &&
-                        (t == Turn.UserSpeaking || t == Turn.Listening || t == Turn.Connecting)
+                        (t == Turn.UserSpeaking || t == Turn.Listening ||
+                            t == Turn.Connecting || t == Turn.Thinking)
                     ) {
-                        noteLevel(if (t == Turn.UserSpeaking) max(rms, 0.08f) else rms * 0.55f)
+                        noteLevel(
+                            when (t) {
+                                Turn.UserSpeaking -> max(rms, 0.08f)
+                                Turn.Thinking -> rms * 0.35f
+                                else -> rms * 0.55f
+                            },
+                        )
                     } else if (t != Turn.GrokSpeaking) {
-                        // Soft idle when thinking / tools / muted listening
+                        // Soft idle when tools / muted listening
                         noteLevel(rms * 0.08f)
                     }
                     // Never stream mic while Grok is talking (or hold-after-TTS).
