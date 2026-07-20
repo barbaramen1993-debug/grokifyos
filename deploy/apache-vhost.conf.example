@@ -13,6 +13,7 @@
 
     Alias /api /var/www/grokifyos/web/api
     Alias /assets /var/www/grokifyos/web/assets
+    Alias /uploads /var/www/grokifyos/uploads
 
     Alias /.well-known/acme-challenge /var/www/html/.well-known/acme-challenge
     <Directory /var/www/html/.well-known/acme-challenge>
@@ -43,6 +44,11 @@
         </IfModule>
     </Directory>
     <Directory /var/www/grokifyos/web/assets>
+        Options -Indexes +FollowSymLinks
+        AllowOverride None
+        Require all granted
+    </Directory>
+    <Directory /var/www/grokifyos/uploads>
         Options -Indexes +FollowSymLinks
         AllowOverride None
         Require all granted

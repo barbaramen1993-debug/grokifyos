@@ -1730,11 +1730,11 @@ function processGrokEvent(agent, json) {
                                 media._emitted = true;
                                 const mevt = {
                                     type: 'media',
-                                    kind: media.kind,
+                                    kind: media.kind || 'image',
                                     url: media.url,
-                                    name: media.name,
-                                    tool: toolName,
+                                    name: media.name || (media.kind === 'video' ? 'Video' : 'Image'),
                                 };
+                                if (toolName) mevt.tool = toolName;
                                 agent.events.push(mevt);
                                 sendToClient(agent, mevt);
                             }
@@ -1745,11 +1745,11 @@ function processGrokEvent(agent, json) {
                             media._emitted = true;
                             const mevt = {
                                 type: 'media',
-                                kind: media.kind,
+                                kind: media.kind || 'image',
                                 url: media.url,
-                                name: media.name,
-                                tool: toolName,
+                                name: media.name || (media.kind === 'video' ? 'Video' : 'Image'),
                             };
+                            if (toolName) mevt.tool = toolName;
                             agent.events.push(mevt);
                             sendToClient(agent, mevt);
                         }

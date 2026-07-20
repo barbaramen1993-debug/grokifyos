@@ -20,6 +20,10 @@ const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp']);
 const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v']);
 const MEDIA_EXTS = new Set([...IMAGE_EXTS, ...VIDEO_EXTS]);
 
+/** Hosts that serve HTML docs / app shells — never treat bare links as media. */
+const NON_MEDIA_HOST_RE =
+    /^(?:docs|console|accounts|auth|login|blog|help|support|status|community)\./i;
+
 const IMAGINE_TOOLS = new Set([
     'image_gen',
     'image_edit',
@@ -69,6 +73,76 @@ function createMediaIngest({ workspace, log }) {
         return MEDIA_EXTS.has(ext);
     }
 
+    /**
+     * Sniff image/video from magic bytes. Rejects HTML/JSON error pages saved as .jpg.
+     * @returns {'image'|'video'|null}
+     */
+    function sniffMediaKind(buf) {
+        if (!buf || buf.length < 12) return null;
+        // JPEG
+        if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image';
+        // PNG
+        if (
+            buf[0] === 0x89 &&
+            buf[1] === 0x50 &&
+            buf[2] === 0x4e &&
+            buf[3] === 0x47
+        ) {
+            return 'image';
+        }
+        // GIF
+        if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image';
+        // BMP
+        if (buf[0] === 0x42 && buf[1] === 0x4d) return 'image';
+        // WEBP (RIFF....WEBP)
+        if (
+            buf.slice(0, 4).toString('ascii') === 'RIFF' &&
+            buf.slice(8, 12).toString('ascii') === 'WEBP'
+        ) {
+            return 'image';
+        }
+        // MP4 / MOV (ftyp box)
+        if (buf.slice(4, 8).toString('ascii') === 'ftyp') return 'video';
+        // WebM / Matroska
+        if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) {
+            return 'video';
+        }
+        // Obvious non-media
+        const head = buf.slice(0, 64).toString('utf8').toLowerCase().trimStart();
+        if (
+            head.startsWith('<!doctype') ||
+            head.startsWith('<html') ||
+            head.startsWith('{') ||
+            head.startsWith('[')
+        ) {
+            return null;
+        }
+        return null;
+    }
+
+    function sniffMediaFile(absPath) {
+        try {
+            const fd = fs.openSync(absPath, 'r');
+            const buf = Buffer.alloc(64);
+            const n = fs.readSync(fd, buf, 0, 64, 0);
+            fs.closeSync(fd);
+            return sniffMediaKind(buf.slice(0, n));
+        } catch {
+            return null;
+        }
+    }
+
+    function extForKind(kind, preferred) {
+        const p = (preferred || '').toLowerCase();
+        if (kind === 'video') {
+            if (VIDEO_EXTS.has(p)) return p;
+            return '.mp4';
+        }
+        if (IMAGE_EXTS.has(p)) return p;
+        if (p === '.jpeg') return '.jpg';
+        return '.jpg';
+    }
+
     function publicUrl(sessionId, fileName) {
         return `/uploads/system-chat/${sessionId}/${fileName}`;
     }
@@ -79,6 +153,34 @@ function createMediaIngest({ workspace, log }) {
             fs.chmodSync(destAbs, 0o644);
             fs.chownSync(destAbs, 33, 33);
         } catch (_) {}
+    }
+
+    function isHarvestableHttpUrl(url) {
+        let parsed;
+        try {
+            parsed = new URL(url);
+        } catch {
+            return false;
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+        const host = parsed.hostname || '';
+        if (NON_MEDIA_HOST_RE.test(host)) return false;
+        // docs.x.ai etc. without subdomain prefix
+        if (/^docs\./i.test(host) || host === 'docs.x.ai') return false;
+        const ext = path.extname(parsed.pathname).toLowerCase();
+        if (MEDIA_EXTS.has(ext)) return true;
+        // Extension-less CDN / asset hosts only (not generic x.ai page links)
+        if (
+            /(?:^|\.)(?:assets|cdn|media|files|static|imagine)\./i.test(host) ||
+            /imagine/i.test(host)
+        ) {
+            return true;
+        }
+        // Known short-lived Grok/xAI media CDNs without classic extensions
+        if (/\.x\.ai$/i.test(host) && /\/(?:assets|files|media|v1|o)\//i.test(parsed.pathname)) {
+            return true;
+        }
+        return false;
     }
 
     function downloadUrl(url, destAbs, timeoutMs = 120000) {
@@ -122,18 +224,51 @@ function createMediaIngest({ workspace, log }) {
                         res.resume();
                         return finish(new Error(`HTTP ${res.statusCode}`));
                     }
+                    const ct = String(res.headers['content-type'] || '').toLowerCase();
+                    if (
+                        ct &&
+                        !ct.startsWith('image/') &&
+                        !ct.startsWith('video/') &&
+                        !ct.startsWith('application/octet-stream') &&
+                        !ct.startsWith('binary/')
+                    ) {
+                        res.resume();
+                        return finish(new Error(`non-media content-type: ${ct.split(';')[0]}`));
+                    }
                     const tmp = destAbs + '.part';
                     const out = fs.createWriteStream(tmp);
                     res.pipe(out);
                     out.on('finish', () => {
                         try {
-                            fs.renameSync(tmp, destAbs);
+                            const kind = sniffMediaFile(tmp);
+                            if (!kind) {
+                                try {
+                                    fs.unlinkSync(tmp);
+                                } catch (_) {}
+                                return finish(new Error('downloaded body is not image/video'));
+                            }
+                            // Align extension with sniffed kind when we guessed wrong
+                            let finalAbs = destAbs;
+                            const wantExt = extForKind(kind, path.extname(destAbs));
+                            if (path.extname(destAbs).toLowerCase() !== wantExt) {
+                                finalAbs = destAbs.replace(/\.[^.]+$/, '') + wantExt;
+                            }
+                            if (fs.existsSync(finalAbs)) {
+                                try {
+                                    fs.unlinkSync(tmp);
+                                } catch (_) {}
+                            } else {
+                                fs.renameSync(tmp, finalAbs);
+                            }
                             try {
-                                fs.chmodSync(destAbs, 0o644);
-                                fs.chownSync(destAbs, 33, 33);
+                                fs.chmodSync(finalAbs, 0o644);
+                                fs.chownSync(finalAbs, 33, 33);
                             } catch (_) {}
-                            finish(null, destAbs);
+                            finish(null, finalAbs);
                         } catch (e) {
+                            try {
+                                fs.unlinkSync(tmp);
+                            } catch (_) {}
                             finish(e);
                         }
                     });
@@ -208,12 +343,13 @@ function createMediaIngest({ workspace, log }) {
     function emitMedia(agent, media, sendToClient) {
         const evt = {
             type: 'media',
-            kind: media.kind,
+            kind: media.kind || 'image',
             url: media.url,
-            name: media.name,
-            tool: media.tool || null,
+            name: media.name || (media.kind === 'video' ? 'Video' : 'Image'),
             source: media.source || null,
         };
+        // Omit null tool — Android JSONObject.optString turns JSON null into the string "null"
+        if (media.tool) evt.tool = media.tool;
         agent.events.push(evt);
         // Insert into timeline after last tool segment when possible
         sendToClient(agent, evt);
@@ -303,13 +439,25 @@ function createMediaIngest({ workspace, log }) {
             }
             // Prefer content hash for dedupe name
             const buf = fs.readFileSync(abs);
+            const sniffed = sniffMediaKind(buf);
+            if (!sniffed) {
+                if (typeof log === 'function') {
+                    log('debug', 'media', 'Skip non-media local file', {
+                        session_id: agent.sessionId?.substring(0, 8),
+                        source: String(source).substring(0, 120),
+                    });
+                }
+                agent._mediaIngested.add(key);
+                return null;
+            }
+            kind = sniffed;
+            ext = extForKind(kind, kindFromPath(abs) ? path.extname(abs).toLowerCase() : ext);
             const contentHash = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 20);
             const stableName = `${contentHash}${ext}`;
             const stableAbs = path.join(destDir, stableName);
             if (!fs.existsSync(stableAbs)) {
                 safeCopyLocal(abs, stableAbs);
             }
-            kind = kindFromPath(abs) || kind;
             const url = publicUrl(agent.sessionId, stableName);
             const existing = agent.media.find((m) => m.url === url);
             if (existing) {
@@ -318,10 +466,11 @@ function createMediaIngest({ workspace, log }) {
                 if (opts.tool && !existing.tool) existing.tool = opts.tool;
                 return existing;
             }
+            const baseName = path.basename(abs);
             const media = {
                 kind,
                 url,
-                name: path.basename(abs),
+                name: baseName && baseName !== 'null' ? baseName : kind === 'video' ? 'Video' : 'Image',
                 tool: opts.tool || null,
                 source: key,
                 absPath: stableAbs,
@@ -353,6 +502,10 @@ function createMediaIngest({ workspace, log }) {
         if (agent._mediaIngested.has(key)) {
             return agent._mediaBySource.get(key) || null;
         }
+        if (!isHarvestableHttpUrl(key)) {
+            agent._mediaIngested.add(key);
+            return null;
+        }
         let parsed;
         try {
             parsed = new URL(key);
@@ -369,20 +522,39 @@ function createMediaIngest({ workspace, log }) {
         const tmpName = `dl_${crypto.randomBytes(8).toString('hex')}${ext}`;
         const tmpAbs = path.join(destDir, tmpName);
         try {
-            await downloadUrl(url, tmpAbs);
-            const buf = fs.readFileSync(tmpAbs);
+            const downloadedAbs = await downloadUrl(url, tmpAbs);
+            const buf = fs.readFileSync(downloadedAbs);
+            const sniffed = sniffMediaKind(buf);
+            if (!sniffed) {
+                try {
+                    fs.unlinkSync(downloadedAbs);
+                } catch (_) {}
+                agent._mediaIngested.add(key);
+                return null;
+            }
+            kind = sniffed;
+            ext = extForKind(kind, path.extname(downloadedAbs).toLowerCase() || ext);
             const contentHash = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 20);
             const stableName = `${contentHash}${ext}`;
             const stableAbs = path.join(destDir, stableName);
-            if (stableAbs !== tmpAbs) {
-                if (!fs.existsSync(stableAbs)) fs.renameSync(tmpAbs, stableAbs);
-                else fs.unlinkSync(tmpAbs);
+            if (stableAbs !== downloadedAbs) {
+                if (!fs.existsSync(stableAbs)) fs.renameSync(downloadedAbs, stableAbs);
+                else fs.unlinkSync(downloadedAbs);
             }
-            kind = kindFromPath(stableName) || kind;
+            const baseFromUrl = path.basename(parsed.pathname);
+            const prettyName =
+                (opts.name && opts.name !== 'null' ? opts.name : '') ||
+                (baseFromUrl &&
+                baseFromUrl !== '/' &&
+                baseFromUrl !== 'null' &&
+                MEDIA_EXTS.has(path.extname(baseFromUrl).toLowerCase())
+                    ? baseFromUrl
+                    : '') ||
+                (kind === 'video' ? 'Video' : 'Image');
             const media = {
                 kind,
                 url: publicUrl(agent.sessionId, stableName),
-                name: opts.name || path.basename(parsed.pathname) || stableName,
+                name: prettyName,
                 tool: opts.tool || null,
                 source: key,
                 absPath: stableAbs,
@@ -394,7 +566,9 @@ function createMediaIngest({ workspace, log }) {
         } catch (err) {
             try {
                 if (fs.existsSync(tmpAbs)) fs.unlinkSync(tmpAbs);
+                if (fs.existsSync(tmpAbs + '.part')) fs.unlinkSync(tmpAbs + '.part');
             } catch (_) {}
+            agent._mediaIngested.add(key);
             if (typeof log === 'function') {
                 log('warning', 'media', `URL download failed: ${err.message}`, {
                     session_id: agent.sessionId?.substring(0, 8),
@@ -442,23 +616,29 @@ function createMediaIngest({ workspace, log }) {
         if (!text) return [];
         const s = String(text);
         const found = [];
+        const push = (u) => {
+            if (!u || found.includes(u)) return;
+            // Strip trailing punctuation from markdown/prose
+            const cleaned = u.replace(/[),.;]+$/g, '');
+            if (cleaned) found.push(cleaned);
+        };
         // absolute session paths
         const absRe =
             /\/root\/\.grok\/sessions\/[^\s"'\\]+\.(?:jpg|jpeg|png|webp|gif|mp4|webm|mov)/gi;
         let m;
-        while ((m = absRe.exec(s))) found.push(m[0]);
+        while ((m = absRe.exec(s))) push(m[0]);
         // short relative
         const relRe = /\b((?:images|videos)\/[0-9a-zA-Z._-]+\.(?:jpg|jpeg|png|webp|gif|mp4|webm|mov))\b/gi;
-        while ((m = relRe.exec(s))) found.push(m[1]);
-        // http(s) media-ish
+        while ((m = relRe.exec(s))) push(m[1]);
+        // http(s) with media extension
         const urlRe =
-            /https?:\/\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp|gif|mp4|webm|mov)(?:\?[^\s"'<>]*)?/gi;
-        while ((m = urlRe.exec(s))) found.push(m[0]);
-        // generic temp CDN without extension (x.ai / assets)
+            /https?:\/\/[^\s"'<>]+\.(?:jpg|jpeg|png|webp|gif|bmp|mp4|webm|mov|m4v)(?:\?[^\s"'<>]*)?/gi;
+        while ((m = urlRe.exec(s))) push(m[0]);
+        // Extension-less asset CDNs only (not docs.x.ai / console pages)
         const tempRe =
-            /https?:\/\/(?:[a-z0-9.-]+\.)?(?:x\.ai|grok\.com|imagine)[^\s"'<>]+/gi;
+            /https?:\/\/(?:assets|cdn|media|files|static|imagine)[a-z0-9.-]*\.[^\s"'<>]+/gi;
         while ((m = tempRe.exec(s))) {
-            if (!found.includes(m[0])) found.push(m[0]);
+            if (isHarvestableHttpUrl(m[0])) push(m[0]);
         }
         return found;
     }
@@ -739,12 +919,15 @@ function createMediaIngest({ workspace, log }) {
 
     function mediaForMetadata(agent) {
         if (!agent?.media?.length) return null;
-        return agent.media.map((m) => ({
-            kind: m.kind,
-            url: m.url,
-            name: m.name,
-            tool: m.tool || null,
-        }));
+        return agent.media.map((m) => {
+            const row = {
+                kind: m.kind || 'image',
+                url: m.url,
+                name: m.name || (m.kind === 'video' ? 'Video' : 'Image'),
+            };
+            if (m.tool) row.tool = m.tool;
+            return row;
+        });
     }
 
     return {
@@ -760,6 +943,8 @@ function createMediaIngest({ workspace, log }) {
         extractPathsFromText,
         kindFromPath,
         isMediaPath,
+        sniffMediaKind,
+        isHarvestableHttpUrl,
     };
 }
 

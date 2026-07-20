@@ -458,8 +458,10 @@
     const url = seg.url || '';
     if (!url) return '';
     const kind = seg.kind === 'video' ? 'video' : 'image';
-    const name = esc(seg.name || (kind === 'video' ? 'Video' : 'Image'));
-    const tool = seg.tool ? '<span class="sc-media-tool">' + esc(seg.tool) + '</span>' : '';
+    const rawName = seg.name == null || seg.name === 'null' ? '' : String(seg.name);
+    const name = esc(rawName || (kind === 'video' ? 'Video' : 'Image'));
+    const rawTool = seg.tool && seg.tool !== 'null' ? String(seg.tool) : '';
+    const tool = rawTool ? '<span class="sc-media-tool">' + esc(rawTool) + '</span>' : '';
     if (kind === 'video') {
       return (
         '<div class="sc-media-card sc-media-video">' +
@@ -532,8 +534,10 @@
       } else if (seg.type === 'media') {
         copy.kind = seg.kind || 'image';
         copy.url = seg.url || '';
-        copy.name = seg.name || '';
-        copy.tool = seg.tool || null;
+        // Avoid literal "null" from JSON null / stringified null
+        const nm = seg.name == null || seg.name === 'null' ? '' : String(seg.name);
+        copy.name = nm || (copy.kind === 'video' ? 'Video' : 'Image');
+        copy.tool = seg.tool && seg.tool !== 'null' ? seg.tool : '';
       }
       return copy;
     });

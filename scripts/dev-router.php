@@ -29,6 +29,38 @@ if (str_starts_with($uri, '/assets/')) {
     }
 }
 
+// Imagine media + system-chat uploads live outside web/
+if (str_starts_with($uri, '/uploads/')) {
+    $file = dirname(__DIR__) . $uri;
+    if (is_file($file) && is_readable($file)) {
+        $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+        $types = [
+            'jpg' => 'image/jpeg',
+            'jpeg' => 'image/jpeg',
+            'png' => 'image/png',
+            'gif' => 'image/gif',
+            'webp' => 'image/webp',
+            'bmp' => 'image/bmp',
+            'mp4' => 'video/mp4',
+            'webm' => 'video/webm',
+            'mov' => 'video/quicktime',
+            'm4v' => 'video/x-m4v',
+            'json' => 'application/json',
+        ];
+        if (isset($types[$ext])) {
+            header('Content-Type: ' . $types[$ext]);
+            header('Content-Length: ' . (string) filesize($file));
+            header('Cache-Control: public, max-age=86400');
+            readfile($file);
+            return true;
+        }
+        return false;
+    }
+    http_response_code(404);
+    echo 'Not found';
+    return true;
+}
+
 if ($uri === '/' || $uri === '') {
     require $root . '/public/index.php';
     return true;
