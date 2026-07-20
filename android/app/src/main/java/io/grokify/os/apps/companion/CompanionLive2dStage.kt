@@ -310,7 +310,7 @@ fun CompanionLive2dStage(
 private const val TAG = "CompanionVrm"
 // Version bump forces a fresh document after Live2D → VRM migrations.
 private const val ASSET_URL =
-    "file:///android_asset/companion/index.html?stage=vrm4&v=200"
+    "file:///android_asset/companion/index.html?stage=vrm5&v=201"
 
 /**
  * Host bridge for the offline VRM stage.
@@ -355,7 +355,12 @@ private class CompanionJsBridge(
     /**
      * Open a VRM for chunked base64 reads.
      * @param path absolute filesystem path, `bundled`, or empty (= bundled)
-     * @return byte length, or negative on error
+     * @return byte length, or negative on error:
+     *   -1 unreadable / outside app storage / resolve failed
+     *   -2 missing or empty
+     *   -3 too large
+     *   -4 I/O exception
+     *   -5 not a glTF/VRM binary
      */
     @JavascriptInterface
     fun openVrm(path: String?): Int {
@@ -364,7 +369,10 @@ private class CompanionJsBridge(
             return try {
                 val file = resolveReadableVrm(path)
                     ?: run {
-                        android.util.Log.w(TAG, "openVrm: unreadable path=$path")
+                        android.util.Log.w(
+                            TAG,
+                            "openVrm: unreadable path=$path filesDir=${ctx.filesDir.absolutePath}",
+                        )
                         return -1
                     }
                 if (!file.isFile || file.length() < 64L) {
@@ -376,14 +384,20 @@ private class CompanionJsBridge(
                     android.util.Log.w(TAG, "openVrm: too large ${file.length()}")
                     return -3
                 }
+                if (!CompanionModelAssets.looksLikeGltfBinary(file)) {
+                    android.util.Log.w(TAG, "openVrm: bad magic ${file.absolutePath}")
+                    return -5
+                }
+                // Prefer FileInputStream path via RandomAccessFile for seekable chunks.
                 val raf = RandomAccessFile(file, "r")
                 openFile = raf
                 openLength = file.length()
                 openLabel = file.name
                 android.util.Log.i(TAG, "openVrm ${file.absolutePath} (${openLength} bytes)")
+                // Length fits Int for our size cap (80MB).
                 openLength.toInt()
             } catch (e: Exception) {
-                android.util.Log.e(TAG, "openVrm failed", e)
+                android.util.Log.e(TAG, "openVrm failed path=$path", e)
                 closeVrmLocked()
                 -4
             }
@@ -436,26 +450,36 @@ private class CompanionJsBridge(
         openLabel = ""
     }
 
+    /**
+     * Resolve a path the stage may open. Handles:
+     * - blank / "bundled" → extracted Seed-san
+     * - file:// or absolute paths under app files/cache
+     * - /data/user/N vs /data/data symlink mismatch via canonical roots
+     * - re-extract when a stale bundled path is missing
+     */
     private fun resolveReadableVrm(path: String?): File? {
         val raw = path?.trim().orEmpty()
-        val filesRoot = ctx.filesDir.absolutePath
-        val cacheRoot = ctx.cacheDir.absolutePath
 
-        fun underAppStorage(f: File): Boolean {
-            val p = try {
-                f.canonicalPath
-            } catch (_: Exception) {
-                f.absolutePath
+        fun accept(f: File?): File? {
+            if (f == null) return null
+            if (!f.isFile || f.length() < 64L) return null
+            if (!isUnderAppStorage(f)) {
+                android.util.Log.w(
+                    TAG,
+                    "reject outside app storage: abs=${f.absolutePath} " +
+                        "canon=${runCatching { f.canonicalPath }.getOrNull()} " +
+                        "files=${ctx.filesDir.absolutePath}",
+                )
+                return null
             }
-            return p.startsWith(filesRoot) || p.startsWith(cacheRoot)
+            return f
         }
 
+        // Bundled alias → always materialize from assets (authoritative).
         if (raw.isBlank() || raw.equals("bundled", ignoreCase = true)) {
-            val extracted = resolveBundledPath()
-                ?: CompanionModelAssets.ensureBundledVrmFile(ctx)
-                ?: return null
-            val f = File(extracted)
-            return if (underAppStorage(f)) f else null
+            // Prefer already-extracted path from Compose, then force ensure.
+            accept(resolveBundledPath()?.let { File(it) })?.let { return it }
+            return accept(CompanionModelAssets.ensureBundledVrmFile(ctx)?.let { File(it) })
         }
 
         val abs = when {
@@ -467,8 +491,61 @@ private class CompanionJsBridge(
             }
             else -> raw
         }
-        val f = File(abs)
-        return if (underAppStorage(f) && f.isFile) f else null
+        val candidate = File(abs)
+        accept(candidate)?.let { return it }
+
+        // Stale/missing bundled extract path — re-materialize from APK assets.
+        val looksBundled =
+            abs.contains("/companion/bundled/") ||
+                abs.endsWith("Seed-san.vrm", ignoreCase = true) ||
+                abs.contains("Seed-san", ignoreCase = true)
+        if (looksBundled) {
+            android.util.Log.i(TAG, "re-extracting bundled VRM after failed open of $abs")
+            return accept(CompanionModelAssets.ensureBundledVrmFile(ctx)?.let { File(it) })
+        }
+
+        android.util.Log.w(
+            TAG,
+            "resolveReadableVrm failed path=$abs exists=${candidate.exists()} " +
+                "isFile=${candidate.isFile} len=${candidate.length()} " +
+                "under=${isUnderAppStorage(candidate)}",
+        )
+        return null
+    }
+
+    /**
+     * True if [file] lives under the app's private files/cache trees.
+     * Compares both absolute and canonical forms so `/data/user/0/...` and
+     * `/data/data/...` (symlink) both match.
+     */
+    private fun isUnderAppStorage(file: File): Boolean {
+        val filePaths = buildList {
+            add(file.absolutePath)
+            try {
+                add(file.canonicalPath)
+            } catch (_: Exception) {
+            }
+        }
+        val roots = buildList {
+            val dirs = listOfNotNull(
+                ctx.filesDir,
+                ctx.cacheDir,
+                ctx.noBackupFilesDir,
+            )
+            for (dir in dirs) {
+                add(dir.absolutePath)
+                try {
+                    add(dir.canonicalPath)
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return filePaths.any { path ->
+            roots.any { root ->
+                val r = root.trimEnd('/')
+                path == r || path.startsWith("$r/")
+            }
+        }
     }
 }
 
@@ -561,10 +638,13 @@ private fun pushLoadModel(
     bundledPath: String?,
 ) {
     val src = source.ifBlank { CompanionStore.SOURCE_BUNDLED }
-    // Absolute filesystem path (or "bundled") — stage reads via Kotlin bridge.
+    // Stage reads bytes via Kotlin bridge only (no file:// fetch).
+    // For bundled, pass the alias "bundled" so the bridge always materializes
+    // Seed-san from assets — avoids stale absolute paths / symlink mismatches.
     val effectivePath = when {
         src == CompanionStore.SOURCE_USER && path.isNotBlank() -> path
-        !bundledPath.isNullOrBlank() -> bundledPath
+        // Prefer absolute only as a hint; openVrm falls back to re-extract.
+        !bundledPath.isNullOrBlank() -> "bundled"
         else -> "bundled"
     }
     val sourceJs = JSONObject.quote(src)
