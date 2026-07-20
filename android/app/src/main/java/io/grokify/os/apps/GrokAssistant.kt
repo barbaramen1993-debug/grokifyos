@@ -4,9 +4,12 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -1223,7 +1226,8 @@ internal fun VoiceReactiveStrip(
     compact: Boolean = false,
     micMuted: Boolean = false,
 ) {
-    val accent = when (turn) {
+    // Target colors — animate so listen→speak doesn't hard-cut the strip.
+    val accentTarget = when (turn) {
         GrokAssistantVoiceSession.Turn.UserSpeaking -> GrokifyColors.GlowViolet
         GrokAssistantVoiceSession.Turn.GrokSpeaking -> GrokifyColors.GlowMint
         GrokAssistantVoiceSession.Turn.ToolBusy -> GrokifyColors.GlowCyan
@@ -1232,22 +1236,19 @@ internal fun VoiceReactiveStrip(
         GrokAssistantVoiceSession.Turn.Error -> GrokifyColors.GlowAmber
         else -> GrokifyColors.GlowMint.copy(alpha = 0.75f)
     }
+    val accent by animateColorAsState(
+        targetValue = accentTarget,
+        animationSpec = tween(320, easing = FastOutSlowInEasing),
+        label = "voiceAccent",
+    )
+    // Fixed pulse period — changing tween duration on turn used to restart the
+    // infinite animation and make listen/speak handoffs look glitchy.
     val pulse = rememberInfiniteTransition(label = "voicePulse")
     val breathe by pulse.animateFloat(
-        initialValue = 0.88f,
-        targetValue = 1.12f,
+        initialValue = 0.90f,
+        targetValue = 1.10f,
         animationSpec = infiniteRepeatable(
-            animation = tween(
-                durationMillis = when (turn) {
-                    GrokAssistantVoiceSession.Turn.UserSpeaking -> 420
-                    GrokAssistantVoiceSession.Turn.GrokSpeaking -> 560
-                    GrokAssistantVoiceSession.Turn.Thinking,
-                    GrokAssistantVoiceSession.Turn.ToolBusy,
-                    -> 900
-                    else -> 1400
-                },
-                easing = LinearEasing,
-            ),
+            animation = tween(900, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse,
         ),
         label = "breathe",
@@ -1260,6 +1261,38 @@ internal fun VoiceReactiveStrip(
             repeatMode = RepeatMode.Restart,
         ),
         label = "spin",
+    )
+    // Energy scale by turn (smooth), not by restarting the infinite loop.
+    val energyTarget = when (turn) {
+        GrokAssistantVoiceSession.Turn.UserSpeaking -> 1.18f
+        GrokAssistantVoiceSession.Turn.GrokSpeaking -> 1.12f
+        GrokAssistantVoiceSession.Turn.Thinking,
+        GrokAssistantVoiceSession.Turn.ToolBusy,
+        -> 1.04f
+        GrokAssistantVoiceSession.Turn.Connecting -> 1.0f
+        else -> 0.94f
+    }
+    val energy by animateFloatAsState(
+        targetValue = energyTarget,
+        animationSpec = tween(380, easing = FastOutSlowInEasing),
+        label = "voiceEnergy",
+    )
+    val arcAlpha by animateFloatAsState(
+        targetValue = when (turn) {
+            GrokAssistantVoiceSession.Turn.GrokSpeaking,
+            GrokAssistantVoiceSession.Turn.Thinking,
+            GrokAssistantVoiceSession.Turn.ToolBusy,
+            GrokAssistantVoiceSession.Turn.Connecting,
+            -> 0.85f
+            else -> 0f
+        },
+        animationSpec = tween(280, easing = FastOutSlowInEasing),
+        label = "arcAlpha",
+    )
+    val rayAlpha by animateFloatAsState(
+        targetValue = if (turn == GrokAssistantVoiceSession.Turn.UserSpeaking) 1f else 0f,
+        animationSpec = tween(240, easing = FastOutSlowInEasing),
+        label = "rayAlpha",
     )
 
     val orbSize = if (compact) 40.dp else 56.dp
@@ -1295,7 +1328,7 @@ internal fun VoiceReactiveStrip(
                 val cy = size.height / 2f
                 val base = size.minDimension * 0.28f
                 val live = level.coerceIn(0f, 1f)
-                val r = base * (0.85f + live * 0.75f) * breathe
+                val r = base * (0.85f + live * 0.75f) * breathe * energy
                 // Outer glow rings
                 drawCircle(
                     color = accent.copy(alpha = 0.10f + live * 0.22f),
@@ -1321,15 +1354,11 @@ internal fun VoiceReactiveStrip(
                     radius = r,
                     center = Offset(cx, cy),
                 )
-                // Rotating arc (Grok / thinking)
-                if (turn == GrokAssistantVoiceSession.Turn.GrokSpeaking ||
-                    turn == GrokAssistantVoiceSession.Turn.Thinking ||
-                    turn == GrokAssistantVoiceSession.Turn.ToolBusy ||
-                    turn == GrokAssistantVoiceSession.Turn.Connecting
-                ) {
+                // Rotating arc (Grok / thinking) — fade in/out instead of hard cut
+                if (arcAlpha > 0.02f) {
                     val sweep = 70f + live * 90f
                     drawArc(
-                        color = accent.copy(alpha = 0.85f),
+                        color = accent.copy(alpha = 0.85f * arcAlpha),
                         startAngle = spin - 90f,
                         sweepAngle = sweep,
                         useCenter = false,
@@ -1338,15 +1367,15 @@ internal fun VoiceReactiveStrip(
                         style = Stroke(width = if (compact) 2.6f else 3.2f, cap = StrokeCap.Round),
                     )
                 }
-                // Mic rays when user speaking
-                if (turn == GrokAssistantVoiceSession.Turn.UserSpeaking) {
+                // Mic rays when user speaking — fade rather than pop
+                if (rayAlpha > 0.02f) {
                     val rays = if (compact) 8 else 10
                     for (i in 0 until rays) {
                         val a = (i / rays.toFloat()) * 2f * PI.toFloat() + spin * 0.01f
                         val inner = r * 1.05f
                         val outer = r * (1.25f + live * 0.55f + (i % 3) * 0.04f)
                         drawLine(
-                            color = accent.copy(alpha = 0.35f + live * 0.45f),
+                            color = accent.copy(alpha = (0.35f + live * 0.45f) * rayAlpha),
                             start = Offset(cx + cos(a) * inner, cy + sin(a) * inner),
                             end = Offset(cx + cos(a) * outer, cy + sin(a) * outer),
                             strokeWidth = if (compact) 2f else 2.4f,
@@ -1384,15 +1413,26 @@ internal fun VoiceReactiveStrip(
                 val gap = if (compact) 1.8f else 2.5f
                 val barW = ((size.width - gap * (n - 1)) / n).coerceAtLeast(2f)
                 val midY = size.height / 2f
+                val idleish = turn == GrokAssistantVoiceSession.Turn.Listening ||
+                    turn == GrokAssistantVoiceSession.Turn.Idle
+                val speaking = turn == GrokAssistantVoiceSession.Turn.UserSpeaking ||
+                    turn == GrokAssistantVoiceSession.Turn.GrokSpeaking
                 for (i in 0 until n) {
                     val v = bars.getOrElse(i) { 0f }.coerceIn(0.04f, 1f)
                     // Soft idle motion so bars never look frozen
                     val idle = 0.08f + 0.04f * sin((spin + i * 18f) * (PI.toFloat() / 180f))
-                    val h = size.height * (if (level < 0.03f && turn == GrokAssistantVoiceSession.Turn.Listening) {
+                    // Live turns always get a continuous wobble so sparse PCM/mic
+                    // updates never leave a static bar strip mid-utterance.
+                    val phase = (spin * (if (speaking) 2.4f else 1f) + i * 28f) *
+                        (PI.toFloat() / 180f)
+                    val wobble = 1f + 0.22f * sin(phase) *
+                        max(0.35f, max(level, v))
+                    val base = if (level < 0.03f && idleish) {
                         idle
                     } else {
-                        0.12f + v * 0.88f
-                    })
+                        (0.12f + v * 0.88f) * wobble.coerceIn(0.55f, 1.4f)
+                    }
+                    val h = size.height * base.coerceIn(0.06f, 1f)
                     val x = i * (barW + gap)
                     val color = when {
                         i > n * 0.72f -> accent
@@ -1748,7 +1788,8 @@ private fun AssistantSetupTab(
             "Primary: Okay Grok / Ok Grok (also Hey/Hi/Yo). " +
                 "Punctuation is ignored (“Okay, Grok!”). " +
                 "STT near-misses of Grok also count (Brock, Rock, Crock, Flock, Jock, Truck, Quack…). " +
-                "Uses on-device speech recognition (battery + mic).",
+                "Media-safe: passive mic (no audio focus) so Spotify/other apps keep playing — " +
+                "not Google’s privileged DSP hotword. Needs SpaceXAI key for wake STT.",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
         )
@@ -1758,7 +1799,7 @@ private fun AssistantSetupTab(
             subtitle = when {
                 !enabled -> "Enable assistant first"
                 !hasMic -> "Microphone permission needed"
-                wakeWordEnabled -> "Listening for “Okay Grok”"
+                wakeWordEnabled -> "Media-safe listen · “Okay Grok”"
                 else -> "Off"
             },
         ) {
@@ -1976,7 +2017,7 @@ private fun AssistantSetupTab(
         Spacer(Modifier.height(20.dp))
         SetupSectionLabel("LATER", GrokifyColors.TextDim)
         ComingSoonRow("Dev mode real host tools / file edit")
-        ComingSoonRow("DSP keyword engine (lower battery)")
+        ComingSoonRow("On-device keyword model (offline, lower data)")
         Spacer(Modifier.height(24.dp))
     }
 }

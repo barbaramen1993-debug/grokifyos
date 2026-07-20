@@ -114,12 +114,66 @@ class GrokAssistantWakeTest {
     fun mic_overlayPreemptsWake() {
         GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
         GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+        GrokAssistantMic.release(GrokAssistantMic.Owner.Voice)
         assertTrue(GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Wake))
         assertTrue(GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Wake)) // same owner re-entrant
         assertTrue(GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Overlay)) // preempt
         assertFalse(GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Wake))
-        GrokAssistantMic.release(GrokAssistantMic.Owner.Overlay)
+        assertTrue(GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Voice)) // preempt overlay
+        assertFalse(GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Wake))
+        GrokAssistantMic.release(GrokAssistantMic.Owner.Voice)
         assertTrue(GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Wake))
         GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
+    }
+
+    @Test
+    fun stt_parseTranscript_textField() {
+        assertEquals("okay grok", GrokAssistantWakeStt.parseTranscript("""{"text":"okay grok"}"""))
+        assertEquals("hey grok", GrokAssistantWakeStt.parseTranscript("""{"transcript":"hey grok"}"""))
+    }
+
+    @Test
+    fun stt_pcmToWav_hasRiffHeaderAndSize() {
+        val pcm = ByteArray(3200) // 100ms @ 16k mono s16
+        val wav = GrokAssistantWakeStt.pcmToWav(pcm, sampleRate = 16_000)
+        assertEquals(44 + pcm.size, wav.size)
+        assertEquals('R'.code.toByte(), wav[0])
+        assertEquals('I'.code.toByte(), wav[1])
+        assertEquals('F'.code.toByte(), wav[2])
+        assertEquals('F'.code.toByte(), wav[3])
+        assertEquals('W'.code.toByte(), wav[8])
+        assertEquals('A'.code.toByte(), wav[9])
+        assertEquals('V'.code.toByte(), wav[10])
+        assertEquals('E'.code.toByte(), wav[11])
+    }
+
+    @Test
+    fun vad_emitsUtteranceAfterSpeechThenSilence() {
+        val vad = GrokAssistantWakeVad()
+        val frameBytes = vad.frameBytes
+        // Quiet frames to settle floor
+        val quiet = ByteArray(frameBytes)
+        repeat(30) { assertNull(vad.accept(quiet)) }
+        // Loud speech-like frames (square-ish s16)
+        val loud = ByteArray(frameBytes)
+        var i = 0
+        while (i + 1 < loud.size) {
+            loud[i] = 0
+            loud[i + 1] = 0x30 // ~12288 amplitude
+            i += 2
+        }
+        var got: GrokAssistantWakeVad.Utterance? = null
+        // ~500ms speech + silence to end
+        repeat(30) {
+            val u = vad.accept(loud)
+            if (u != null) got = u
+        }
+        repeat(40) {
+            val u = vad.accept(quiet)
+            if (u != null) got = u
+        }
+        assertNotNull("VAD should emit an utterance", got)
+        assertTrue(got!!.durationMs >= GrokAssistantWakeVad.MIN_UTTER_MS)
+        assertTrue(got.pcm.isNotEmpty())
     }
 }

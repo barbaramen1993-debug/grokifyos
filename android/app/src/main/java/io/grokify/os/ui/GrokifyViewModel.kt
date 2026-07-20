@@ -1517,8 +1517,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                                 if (url.isNotBlank()) {
                                     out += ChatLine(
                                         role = ChatRole.Media,
-                                        text = seg.optString("name"),
-                                        toolName = seg.optString("tool"),
+                                        text = jsonNonNullString(seg, "name"),
+                                        toolName = jsonNonNullString(seg, "tool"),
                                         mediaUrl = url,
                                         mediaKind = if (seg.optString("kind") == "video") "video" else "image",
                                         serverMsgId = serverId,
@@ -1663,6 +1663,18 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         return if (u.startsWith("/")) base + u else "$base/$u"
     }
 
+    /**
+     * [JSONObject.optString] turns JSON `null` into the literal string `"null"`.
+     * Use this for optional media/tool labels so the UI never shows "null · title".
+     */
+    private fun jsonNonNullString(obj: JSONObject, key: String): String {
+        if (!obj.has(key) || obj.isNull(key)) return ""
+        val raw = obj.opt(key) ?: return ""
+        if (raw === JSONObject.NULL) return ""
+        val s = raw.toString().trim()
+        return if (s.isEmpty() || s.equals("null", ignoreCase = true)) "" else s
+    }
+
     private fun appendMediaFromMeta(
         out: MutableList<ChatLine>,
         meta: JSONObject?,
@@ -1678,8 +1690,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             if (url.isBlank() || existing.contains(url)) continue
             out += ChatLine(
                 role = ChatRole.Media,
-                text = m.optString("name"),
-                toolName = m.optString("tool"),
+                text = jsonNonNullString(m, "name"),
+                toolName = jsonNonNullString(m, "tool"),
                 createdAtMs = createdAtMs,
                 mediaUrl = url,
                 mediaKind = if (m.optString("kind") == "video") "video" else "image",
@@ -2277,8 +2289,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                         else st.copy(
                             messages = st.messages + ChatLine(
                                 role = ChatRole.Media,
-                                text = evt.optString("name"),
-                                toolName = evt.optString("tool"),
+                                text = jsonNonNullString(evt, "name"),
+                                toolName = jsonNonNullString(evt, "tool"),
                                 mediaUrl = url,
                                 mediaKind = if (evt.optString("kind") == "video") "video" else "image",
                             )

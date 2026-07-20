@@ -7,13 +7,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
-import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -24,27 +20,31 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.util.Locale
 
 /**
  * Background “Okay Grok” listener.
  *
- * Uses [SpeechRecognizer] in a restart loop (not a dedicated DSP hotword engine).
+ * **Media-safe path:** [GrokAssistantWakeListenEngine] uses [android.media.AudioRecord]
+ * with **no audio focus** so Spotify and other players keep playing. Short speech
+ * snippets are transcribed via xAI STT and matched for the wake phrase.
+ *
+ * This is the third-party equivalent of “Okay Google”: Google’s DSP hotword still
+ * requires system/assistant privileges; we cannot use that HAL from a normal app.
+ *
  * When a wake phrase is heard, expands the floating overlay and either:
  * - sends remainder text as the query, or
- * - starts a short command-listen window for the next utterance.
+ * - starts Voice Agent / overlay free-listen for the command.
  */
 class GrokAssistantWakeService : Service() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    private var speech: SpeechRecognizer? = null
+    private var engine: GrokAssistantWakeListenEngine? = null
     private var running = false
-    private var listening = false
-    /** After wake with no remainder — next final result is the command. */
+
+    /** After wake with no remainder — next utterance is the command. */
     private var awaitingCommand = false
-    private var restartScheduled = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -60,12 +60,12 @@ class GrokAssistantWakeService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_PAUSE -> {
-                // Soft pause while overlay uses the mic
-                cancelListening()
+                // Soft pause while overlay / voice uses the mic
+                stopEngine()
                 return START_STICKY
             }
             ACTION_RESUME -> {
-                scheduleRestart(delayMs = 400L)
+                if (running) startEngine()
                 return START_STICKY
             }
         }
@@ -76,23 +76,18 @@ class GrokAssistantWakeService : Service() {
         }
         if (!hasMicPermission()) {
             startAsForeground(status = "Mic permission needed")
-            scheduleRestart(delayMs = 8_000L)
-            return START_STICKY
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            startAsForeground(status = "Speech recognition unavailable")
             return START_STICKY
         }
         running = true
         startAsForeground(status = "Listening for “${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY}”")
-        scheduleRestart(delayMs = 200L)
+        startEngine()
         return START_STICKY
     }
 
     override fun onDestroy() {
         running = false
         mainHandler.removeCallbacksAndMessages(null)
-        destroySpeech()
+        stopEngine()
         GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
         if (instance === this) instance = null
         scope.cancel()
@@ -102,7 +97,7 @@ class GrokAssistantWakeService : Service() {
     private fun stopSelfSafely() {
         running = false
         mainHandler.removeCallbacksAndMessages(null)
-        destroySpeech()
+        stopEngine()
         GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -111,6 +106,35 @@ class GrokAssistantWakeService : Service() {
     private fun hasMicPermission(): Boolean =
         ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
+
+    private fun startEngine() {
+        if (!running) return
+        if (!hasMicPermission()) {
+            startAsForeground(status = "Mic permission needed")
+            return
+        }
+        if (engine?.isRunning == true) return
+        stopEngine()
+        val eng = GrokAssistantWakeListenEngine(
+            appCtx = applicationContext,
+            onUtteranceText = { text ->
+                mainHandler.post { handleHeard(listOf(text)) }
+            },
+            onStatus = { status ->
+                mainHandler.post {
+                    if (running) startAsForeground(status = status)
+                }
+            },
+        )
+        engine = eng
+        eng.start()
+    }
+
+    private fun stopEngine() {
+        engine?.stop()
+        engine = null
+        GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
+    }
 
     private fun startAsForeground(status: String) {
         val openApp = PendingIntent.getActivity(
@@ -159,159 +183,6 @@ class GrokAssistantWakeService : Service() {
         }
     }
 
-    private fun scheduleRestart(delayMs: Long) {
-        if (!running) return
-        if (restartScheduled) return
-        restartScheduled = true
-        mainHandler.postDelayed({
-            restartScheduled = false
-            if (!running) return@postDelayed
-            tryStartListening()
-        }, delayMs)
-    }
-
-    private fun tryStartListening() {
-        if (!running) return
-        val store = GrokAssistantStore(this)
-        if (!store.enabled || !store.wakeWordEnabled) {
-            stopSelfSafely()
-            return
-        }
-        if (!hasMicPermission()) {
-            startAsForeground(status = "Mic permission needed")
-            scheduleRestart(delayMs = 8_000L)
-            return
-        }
-        if (GrokAssistantMic.isQuietNow()) {
-            scheduleRestart(delayMs = 600L)
-            return
-        }
-        if (GrokAssistantSession.isBusy) {
-            scheduleRestart(delayMs = 1_200L)
-            return
-        }
-        if (GrokAssistantMic.current() == GrokAssistantMic.Owner.Overlay ||
-            GrokAssistantOverlayService.isRunning()
-        ) {
-            // Overlay session owns the mic — stay quiet.
-            scheduleRestart(delayMs = 1_500L)
-            return
-        }
-        if (!GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Wake)) {
-            scheduleRestart(delayMs = 900L)
-            return
-        }
-        if (listening) return
-        val sr = ensureSpeech() ?: run {
-            GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
-            scheduleRestart(delayMs = 3_000L)
-            return
-        }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            // Prefer longer sessions when possible (OEM-dependent).
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
-        }
-        runCatching {
-            sr.startListening(intent)
-            listening = true
-            val label = if (awaitingCommand) {
-                "Say your request…"
-            } else {
-                "Listening for “${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY}”"
-            }
-            startAsForeground(status = label)
-        }.onFailure {
-            Log.w(TAG, "startListening: ${it.message}")
-            listening = false
-            GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
-            scheduleRestart(delayMs = 2_000L)
-        }
-    }
-
-    private fun cancelListening() {
-        listening = false
-        runCatching {
-            speech?.stopListening()
-            speech?.cancel()
-        }
-        GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
-    }
-
-    private fun destroySpeech() {
-        cancelListening()
-        runCatching { speech?.destroy() }
-        speech = null
-    }
-
-    private fun ensureSpeech(): SpeechRecognizer? {
-        if (speech != null) return speech
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) return null
-        val sr = SpeechRecognizer.createSpeechRecognizer(this)
-        sr.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                listening = true
-            }
-
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {
-                listening = false
-            }
-
-            override fun onError(error: Int) {
-                listening = false
-                GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
-                // Benign timeouts / no-match — just re-arm.
-                val delay = when (error) {
-                    SpeechRecognizer.ERROR_NO_MATCH,
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
-                    SpeechRecognizer.ERROR_CLIENT,
-                    -> 350L
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 1_500L
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> 8_000L
-                    else -> 900L
-                }
-                if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                    startAsForeground(status = "Mic permission needed")
-                }
-                // Don't drop awaitingCommand on a single timeout — user may still speak.
-                scheduleRestart(delayMs = delay)
-            }
-
-            override fun onResults(results: Bundle?) {
-                listening = false
-                GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
-                val texts = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    .orEmpty()
-                handleHeard(texts)
-            }
-
-            override fun onPartialResults(partialResults: Bundle?) {
-                // Optional: early wake on partial — only when not awaiting command
-                if (awaitingCommand) return
-                val texts = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    .orEmpty()
-                val joined = texts.firstOrNull() ?: return
-                val m = GrokAssistantWake.match(joined) ?: return
-                // Don't act on partial alone if remainder empty (wait for final).
-                if (m.remainder.isNotBlank()) {
-                    // Let final results handle to avoid double-fire.
-                }
-            }
-
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-        speech = sr
-        return sr
-    }
-
     private fun handleHeard(candidates: List<String>) {
         if (!running) return
         val store = GrokAssistantStore(this)
@@ -324,7 +195,6 @@ class GrokAssistantWakeService : Service() {
             val cmd = candidates.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
             awaitingCommand = false
             if (cmd.isNotBlank()) {
-                // Avoid re-triggering on wake phrase alone as the command.
                 val m = GrokAssistantWake.match(cmd)
                 val text = when {
                     m == null -> cmd
@@ -333,56 +203,60 @@ class GrokAssistantWakeService : Service() {
                 }
                 if (text.isNotBlank()) {
                     onCommand(text)
-                    scheduleRestart(delayMs = 1_500L)
                     return
                 }
             }
             startAsForeground(
                 status = "Didn't catch a request — say ${GrokAssistantWake.PRIMARY_PHRASE_DISPLAY} again",
             )
-            scheduleRestart(delayMs = 800L)
             return
         }
 
-        // Normal wake scan — try each recognition alternative (STT n-best).
         var hit: GrokAssistantWake.Match? = null
         for (c in candidates) {
             hit = GrokAssistantWake.match(c)
             if (hit != null) break
         }
         if (hit == null) {
-            scheduleRestart(delayMs = 250L)
+            // Non-wake speech — ignore (media keeps playing; no focus taken).
             return
         }
 
         Log.i(TAG, "wake: phrase='${hit.phrase}' rem='${hit.remainder}' raw='${hit.raw}'")
 
         if (hit.remainder.isNotBlank() && !GrokAssistantWake.isWakeOnly(hit)) {
-            // Phrase + command in one utterance — show ephemeral overlay and send.
             activateUi(listen = false)
             onCommand(hit.remainder)
-            scheduleRestart(delayMs = 2_000L)
         } else {
-            // Wake alone — stop our STT, hand mic to ephemeral overlay for free-listen.
             awaitingCommand = false
-            cancelListening()
+            // Stop passive listen while Voice / overlay owns the mic.
+            stopEngine()
             GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
-            activateUi(listen = true)
-            startAsForeground(status = "Yes? Overlay listening…")
-            // Stay quiet long enough for overlay STT to start; do not re-arm immediately.
-            GrokAssistantMic.quietFor(2_500L)
-            scheduleRestart(delayMs = 4_000L)
+            val useVoice = store.voiceRealtimeEnabled &&
+                !io.grokify.os.apps.plugin.HostApiKeyStore
+                    .getValue(this, io.grokify.os.data.ApiKeyIds.SPACEXAI)
+                    .isNullOrBlank()
+            if (useVoice) {
+                activateUi(listen = false)
+                GrokAssistantVoiceSession.start(this, seedUserText = null, openMic = true)
+                startAsForeground(status = "Yes? Voice Agent live…")
+                GrokAssistantMic.quietFor(2_500L)
+                mainHandler.postDelayed({ if (running) startEngine() }, 4_000L)
+            } else {
+                activateUi(listen = true)
+                startAsForeground(status = "Yes? Overlay listening…")
+                GrokAssistantMic.quietFor(2_500L)
+                mainHandler.postDelayed({ if (running) startEngine() }, 4_000L)
+            }
         }
     }
 
     /**
      * Show ephemeral floating overlay when permitted; otherwise open the full app.
-     * Does not force a permanent “always show bubble” preference.
      */
     private fun activateUi(listen: Boolean = false) {
         if (GrokAssistantOverlayService.canDrawOverlays(this)) {
             val store = GrokAssistantStore(this)
-            // Allow wake→overlay without requiring the Setup toggle; still ephemeral.
             if (!store.overlayEnabled) {
                 store.overlayEnabled = true
             }
@@ -402,7 +276,6 @@ class GrokAssistantWakeService : Service() {
             this,
             io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
         )
-        // PendingIntent is more reliable from a background FGS than startActivity alone.
         val pi = PendingIntent.getActivity(
             this,
             77,
@@ -415,7 +288,6 @@ class GrokAssistantWakeService : Service() {
                     startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                 }
             }
-        // Ensure Compose nav picks up the plugin even if activity was already resumed.
         io.grokify.os.widgets.WidgetNav.openPlugin(
             io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
         )
@@ -426,8 +298,27 @@ class GrokAssistantWakeService : Service() {
         if (trimmed.isEmpty()) return
         startAsForeground(status = "Heard: ${trimmed.take(48)}")
         activateUi(listen = false)
-        // Quiet while we process + speak so TTS doesn't re-trigger wake.
+        stopEngine()
         GrokAssistantMic.quietFor(1_500L)
+        val store = GrokAssistantStore(applicationContext)
+        val useVoice = store.voiceRealtimeEnabled &&
+            !io.grokify.os.apps.plugin.HostApiKeyStore
+                .getValue(applicationContext, io.grokify.os.data.ApiKeyIds.SPACEXAI)
+                .isNullOrBlank()
+        if (useVoice) {
+            GrokAssistantVoiceSession.start(
+                applicationContext,
+                seedUserText = trimmed,
+                openMic = true,
+            )
+            GrokAssistantMic.quietFor(4_000L)
+            mainHandler.post {
+                GrokAssistantOverlayService.bumpTranscript(applicationContext)
+                startAsForeground(status = "Voice Agent · ${trimmed.take(36)}")
+            }
+            mainHandler.postDelayed({ if (running) startEngine() }, 6_000L)
+            return
+        }
         scope.launch(Dispatchers.IO) {
             val result = GrokAssistantSession.send(applicationContext, trimmed)
             val quietMs = if (GrokAssistantStore(applicationContext).speakReplies) 5_000L else 900L
@@ -441,6 +332,7 @@ class GrokAssistantWakeService : Service() {
                         (result.errorText ?: "Error").take(60)
                     },
                 )
+                if (running) startEngine()
             }
         }
     }

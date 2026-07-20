@@ -106,6 +106,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -204,28 +205,34 @@ internal val SPOTIFY_PACKAGES = listOf(
 /**
  * Coil model for Control-tab art.
  *
- * Prefer **on-disk** bytes, then the **original** CDN / session URI. Do **not**
- * switch Coil to a host media-cache URL until that file is on disk — otherwise
- * the first successful CDN paint is replaced by a 404 host URL and the card
- * goes blank (the flash-then-empty bug).
+ * Prefer **on-disk** bytes (session mirror first, then CDN mirror). Never bind
+ * Coil to ephemeral `content://` media-session URIs — they paint once then die
+ * (flash-then-empty). Do **not** switch Coil to a host media-cache URL until
+ * that file is on disk — otherwise a 404 host URL blanks the card.
  */
 private fun controlArtModel(context: Context, sourceUrl: String?, trackUri: String = ""): Any? {
-    val src = sourceUrl?.trim().orEmpty()
-    if (src.isNotBlank()) {
-        SpotifyArtMirror.localFile(context, src)?.let { return it }
-        val preferred = SpotifyArtMirror.preferredUrl(context, src)
-        if (preferred.isNotBlank() && preferred != src) {
-            SpotifyArtMirror.localFile(context, preferred)?.let { return it }
-        }
-        // Kick mirror in background; keep loading the original until disk is ready.
-        if (SpotifyArtMirror.isSpotifyCdn(src) || src.startsWith("http", ignoreCase = true)) {
-            SpotifyArtMirror.mirrorAsync(context, src, onDone = null)
-        }
-        return src
-    }
+    // Session bitmap mirror is the most durable key we control.
     if (trackUri.isNotBlank()) {
-        val sessionKey = "session:$trackUri"
-        SpotifyArtMirror.localFile(context, sessionKey)?.let { return it }
+        SpotifyArtMirror.localFile(context, "session:$trackUri")?.let { return it }
+    }
+    val src = sourceUrl?.trim().orEmpty()
+    if (src.isBlank()) return null
+    // Spotify often exposes a temporary content:// provider URI that works for
+    // one frame then becomes unreadable — never use those as the Coil model.
+    if (src.startsWith("content:", ignoreCase = true) ||
+        src.startsWith("android.resource:", ignoreCase = true)
+    ) {
+        return null
+    }
+    SpotifyArtMirror.localFile(context, src)?.let { return it }
+    val preferred = SpotifyArtMirror.preferredUrl(context, src)
+    if (preferred.isNotBlank() && preferred != src) {
+        SpotifyArtMirror.localFile(context, preferred)?.let { return it }
+    }
+    // Kick mirror in background; keep loading the original until disk is ready.
+    if (SpotifyArtMirror.isSpotifyCdn(src) || src.startsWith("http", ignoreCase = true)) {
+        SpotifyArtMirror.mirrorAsync(context, src, onDone = null)
+        return src
     }
     return null
 }
@@ -2004,6 +2011,69 @@ fun SpotifyControllerPane(
 
     /** Pending multi-select dislike modal target (Control transport or chat bubble). */
     var dislikeTarget by remember { mutableStateOf<DislikeTarget?>(null) }
+    /** Bumps when a dislike is saved so chat bubble thumbs re-tint. */
+    var dislikeRevision by remember { mutableStateOf(0) }
+
+    // Sticky art models live above the tab switcher so Control re-entry keeps cover.
+    var stickyAlbumArt by remember { mutableStateOf<Any?>(null) }
+    var stickyArtistArt by remember { mutableStateOf<Any?>(null) }
+    var stickyArtTrackKey by remember { mutableStateOf("") }
+    val trackArtKey = now.trackUri.ifBlank { "${now.title}|${now.artist}" }
+    LaunchedEffect(now.albumArtUrl, now.artistArtUrl, trackArtKey, now.hasSession, now.isPlaying) {
+        // Always pin media-session bitmap to disk — URL-less sessions (and dying
+        // content:// URIs) otherwise flash once then leave the card empty.
+        if (now.hasSession && now.trackUri.isNotBlank()) {
+            val sessionKey = "session:${now.trackUri}"
+            if (SpotifyArtMirror.localFile(appCtx, sessionKey) == null) {
+                withContext(Dispatchers.IO) {
+                    readSessionAlbumArtBitmap(appCtx, maxEdge = 512)?.let { bmp ->
+                        SpotifyArtMirror.mirrorBitmap(appCtx, sessionKey, bmp)
+                    }
+                }
+            }
+        }
+        val albumModel = controlArtModel(appCtx, now.albumArtUrl, now.trackUri)
+        val artistModel = controlArtModel(
+            appCtx,
+            now.artistArtUrl.ifBlank { now.albumArtUrl },
+            now.trackUri,
+        )
+        if (trackArtKey != stickyArtTrackKey) {
+            val prevKey = stickyArtTrackKey
+            stickyArtTrackKey = trackArtKey
+            // title|artist → spotify:track:… is the same cut; only wipe when two
+            // concrete track URIs disagree (skip / next).
+            val differentTrackUris =
+                prevKey.startsWith("spotify:track:") &&
+                    trackArtKey.startsWith("spotify:track:") &&
+                    prevKey != trackArtKey
+            if (albumModel != null) {
+                stickyAlbumArt = albumModel
+            } else if (differentTrackUris) {
+                stickyAlbumArt = null
+            }
+            if (artistModel != null) {
+                stickyArtistArt = artistModel
+            } else if (differentTrackUris) {
+                stickyArtistArt = null
+            }
+        } else {
+            // Same track: only upgrade, never wipe on a blank poll / dead content://.
+            if (albumModel != null) stickyAlbumArt = albumModel
+            if (artistModel != null) stickyArtistArt = artistModel
+        }
+        // If still blank, re-check after mirror (CDN / session) may have landed.
+        if (stickyAlbumArt == null && now.trackUri.isNotBlank() && now.hasSession) {
+            withContext(Dispatchers.IO) {
+                readSessionAlbumArtBitmap(appCtx, maxEdge = 512)?.let { bmp ->
+                    SpotifyArtMirror.mirrorBitmap(appCtx, "session:${now.trackUri}", bmp)
+                }
+            }
+            controlArtModel(appCtx, now.albumArtUrl, now.trackUri)?.let {
+                stickyAlbumArt = it
+            }
+        }
+    }
 
     // Clear sticky "Finding more like this…" / dislike pending once the service finishes.
     LaunchedEffect(djState.status, djState.messages.lastOrNull()?.id) {
@@ -2379,39 +2449,6 @@ fun SpotifyControllerPane(
 
                 Spacer(Modifier.height(12.dp))
 
-                // Sticky art models: keep last good cover for the same track so a
-                // blank poll / failed host URL cannot wipe the card after a flash.
-                var stickyAlbumArt by remember { mutableStateOf<Any?>(null) }
-                var stickyArtistArt by remember { mutableStateOf<Any?>(null) }
-                var stickyArtTrackKey by remember { mutableStateOf("") }
-                val trackArtKey = now.trackUri.ifBlank { "${now.title}|${now.artist}" }
-                LaunchedEffect(now.albumArtUrl, now.artistArtUrl, trackArtKey) {
-                    val albumModel = controlArtModel(appCtx, now.albumArtUrl, now.trackUri)
-                    val artistModel = controlArtModel(
-                        appCtx,
-                        now.artistArtUrl.ifBlank { now.albumArtUrl },
-                        now.trackUri,
-                    )
-                    if (trackArtKey != stickyArtTrackKey) {
-                        stickyArtTrackKey = trackArtKey
-                        stickyAlbumArt = albumModel
-                        stickyArtistArt = artistModel
-                    } else {
-                        if (albumModel != null) stickyAlbumArt = albumModel
-                        if (artistModel != null) stickyArtistArt = artistModel
-                    }
-                    // Session-only bitmap (no URL): mirror once so later polls have a File.
-                    if (albumModel == null && now.trackUri.isNotBlank() && now.hasSession) {
-                        withContext(Dispatchers.IO) {
-                            readSessionAlbumArtBitmap(appCtx, maxEdge = 512)?.let { bmp ->
-                                SpotifyArtMirror.mirrorBitmap(appCtx, "session:${now.trackUri}", bmp)
-                            }
-                        }
-                        controlArtModel(appCtx, now.albumArtUrl, now.trackUri)?.let {
-                            stickyAlbumArt = it
-                        }
-                    }
-                }
                 val albumArtModel = stickyAlbumArt
                 val artistArtModel = stickyArtistArt
                 Box(
@@ -2420,7 +2457,7 @@ fun SpotifyControllerPane(
                         .clip(RoundedCornerShape(14.dp))
                         .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp)),
                 ) {
-                    // Album art as full-card background
+                    // Album art as full-card background (sticky model survives blank polls)
                     if (albumArtModel != null) {
                         AsyncImage(
                             model = albumArtModel,
@@ -3031,7 +3068,7 @@ fun SpotifyControllerPane(
             }
 
             1 -> Column(Modifier.weight(1f, fill = true).fillMaxWidth()) {
-                // Slim console header — ON AIR chip + mono status
+                // Slim console header — title + mono status (no ON AIR chip)
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -3050,29 +3087,6 @@ fun SpotifyControllerPane(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     val liveOn = djState.enabled || djStore.enabled
-                    Box(
-                        Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(
-                                if (liveOn) GrokifyColors.GlowMint.copy(alpha = 0.14f)
-                                else GrokifyColors.PanelSoft,
-                            )
-                            .border(
-                                1.dp,
-                                if (liveOn) GrokifyColors.GlowMint.copy(alpha = 0.4f)
-                                else GrokifyColors.PanelBorder,
-                                RoundedCornerShape(6.dp),
-                            )
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
-                    ) {
-                        Text(
-                            if (liveOn) "ON AIR" else "BOOTH",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (liveOn) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                    Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
                         Text(
                             "LIVE DJ",
@@ -3281,6 +3295,20 @@ fun SpotifyControllerPane(
                                 }
                                 val msgLikeBusy = msgUri.isNotBlank() &&
                                     (likeBusyUri == msgUri || (msg.isNowPlaying && trackLikedBusy))
+                                val msgDisliked = remember(
+                                    msgUri,
+                                    msg.trackArtists,
+                                    msg.artistUri,
+                                    dislikeRevision,
+                                ) {
+                                    msg.role == DjChatRole.Track &&
+                                        (msgUri.isNotBlank() || !msg.trackArtists.isNullOrBlank()) &&
+                                        djStore.isDisliked(
+                                            uri = msgUri,
+                                            artists = msg.trackArtists.orEmpty(),
+                                            artistUri = msg.artistUri.orEmpty(),
+                                        )
+                                }
                                 DjChatBubble(
                                     msg = msg,
                                     onPrev = { spotifyLiveDjPrevious(appCtx) },
@@ -3288,6 +3316,7 @@ fun SpotifyControllerPane(
                                     onSkip = { spotifyLiveDjSkip(appCtx, forceTalk = false) },
                                     liked = msgLiked,
                                     likeBusy = msgLikeBusy,
+                                    disliked = msgDisliked,
                                     onLikeToggle = if (
                                         msg.role == DjChatRole.Track &&
                                         (msgUri.isNotBlank() || (msg.isNowPlaying && now.trackUri.isNotBlank()))
@@ -4283,6 +4312,7 @@ fun SpotifyControllerPane(
                     reasons = reasons,
                     skipIfPlaying = pendingDislike.skipIfPlaying,
                 )
+                dislikeRevision += 1
             },
         )
     }
@@ -4501,6 +4531,7 @@ private fun DjChatBubble(
     onSkip: () -> Unit,
     liked: Boolean = false,
     likeBusy: Boolean = false,
+    disliked: Boolean = false,
     onLikeToggle: (() -> Unit)? = null,
     onPlayTrack: (DjChatMessage) -> Unit = {},
     onMoreLikeThis: (DjChatMessage) -> Unit = {},
@@ -4823,7 +4854,7 @@ private fun DjChatBubble(
                                     tint = GrokifyColors.GlowCyan,
                                 )
                             }
-                            // Dislike — multi-select reasons; keeps cut/artist out of queue
+                            // Dislike — white when not disliked, yellow when blocked/tired
                             IconButton(
                                 onClick = { onDislike(msg) },
                                 enabled = !msg.trackUri.isNullOrBlank() ||
@@ -4832,8 +4863,12 @@ private fun DjChatBubble(
                             ) {
                                 Icon(
                                     Icons.Default.ThumbDown,
-                                    contentDescription = "Dislike — keep out of Live DJ queue",
-                                    tint = GrokifyColors.GlowAmber,
+                                    contentDescription = if (disliked) {
+                                        "Disliked — blocked from Live DJ queue"
+                                    } else {
+                                        "Dislike — keep out of Live DJ queue"
+                                    },
+                                    tint = if (disliked) GrokifyColors.GlowAmber else Color.White,
                                 )
                             }
                         }
@@ -4877,8 +4912,12 @@ private fun DjChatBubble(
                             IconButton(onClick = { onDislike(msg) }) {
                                 Icon(
                                     Icons.Default.ThumbDown,
-                                    contentDescription = "Dislike — keep out of Live DJ queue",
-                                    tint = GrokifyColors.GlowAmber,
+                                    contentDescription = if (disliked) {
+                                        "Disliked — blocked from Live DJ queue"
+                                    } else {
+                                        "Dislike — keep out of Live DJ queue"
+                                    },
+                                    tint = if (disliked) GrokifyColors.GlowAmber else Color.White,
                                     modifier = Modifier.size(18.dp),
                                 )
                             }

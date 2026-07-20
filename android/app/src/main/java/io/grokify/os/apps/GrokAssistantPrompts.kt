@@ -409,6 +409,84 @@ object AssistantTranscript {
 
     const val DUPLICATE_WINDOW_MS = 5_000L
 
+    /**
+     * How long consecutive **user** voice segments may be merged into one bubble.
+     * Server VAD ends a turn on silence and emits a new transcription item; mid-thought
+     * pauses therefore look like several user messages. Merge while no assistant
+     * reply has landed yet (last bubble is still user).
+     */
+    const val USER_MERGE_WINDOW_MS = 14_000L
+
+    /**
+     * True when a new user line should update [last] instead of creating another bubble.
+     * Only consecutive user→user within [windowMs]; assistant/error breaks the chain.
+     */
+    fun shouldMergeUserUtterance(
+        last: AssistantChatMessage?,
+        role: String,
+        text: String,
+        nowMs: Long,
+        windowMs: Long = USER_MERGE_WINDOW_MS,
+    ): Boolean {
+        if (last == null) return false
+        if (!role.equals("user", ignoreCase = true)) return false
+        if (!last.role.equals("user", ignoreCase = true)) return false
+        val body = text.trim()
+        if (body.isEmpty()) return false
+        // Exact twins handled by shouldSkipDuplicate.
+        if (last.text.trim().equals(body, ignoreCase = true)) return false
+        if (last.ts > 0L && nowMs - last.ts >= windowMs) return false
+        // Legacy zero-ts: still allow merge (voice path always sets ts now).
+        return true
+    }
+
+    /**
+     * Combine two user ASR fragments from the same spoken thought.
+     * Prefers cumulative supersession, then suffix/prefix overlap, then space-join.
+     */
+    fun mergeUserUtteranceText(prev: String, next: String): String {
+        val a = prev.trim()
+        val b = next.trim()
+        if (a.isEmpty()) return b
+        if (b.isEmpty()) return a
+        if (a.equals(b, ignoreCase = true)) return a
+        // Cumulative / revised ASR for the same segment.
+        if (b.startsWith(a, ignoreCase = true)) return b
+        if (a.startsWith(b, ignoreCase = true)) return a
+        val aNorm = a.lowercase()
+        val bNorm = b.lowercase()
+        if (bNorm.contains(aNorm) && b.length > a.length) return b
+        if (aNorm.contains(bNorm) && a.length > b.length) return a
+        // Avoid "hello world hello world today" when the second fragment restates the first.
+        val maxOverlap = minOf(a.length, b.length)
+        var overlap = 0
+        // Meaningful word-ish overlap only (skip 1–2 letter noise).
+        val minOverlap = 4
+        for (n in maxOverlap downTo minOverlap) {
+            if (a.regionMatches(a.length - n, b, 0, n, ignoreCase = true)) {
+                // Prefer overlaps that land on a boundary (space / start).
+                val boundary =
+                    n == a.length ||
+                        a[a.length - n - 1].isWhitespace() ||
+                        b.getOrNull(n)?.isWhitespace() == true ||
+                        n == b.length
+                if (boundary || n >= 8) {
+                    overlap = n
+                    break
+                }
+            }
+        }
+        if (overlap > 0) {
+            return (a + b.substring(overlap)).replace(Regex("\\s+"), " ").trim()
+        }
+        val joiner = when {
+            a.endsWith("-") -> ""
+            a.last().isWhitespace() || b.first().isWhitespace() -> ""
+            else -> " "
+        }
+        return (a + joiner + b).replace(Regex("\\s+"), " ").trim()
+    }
+
     /** Last N user/assistant messages for model context (not error/system). */
     fun historyWindow(list: List<AssistantChatMessage>): List<AssistantChatMessage> {
         val filtered = list.filter { it.role == "user" || it.role == "assistant" }
@@ -429,6 +507,24 @@ object AssistantTranscript {
         return window.joinToString("\n") { m ->
             val who = if (m.role == "user") "User" else "Assistant"
             "$who: ${m.text}"
+        }
+    }
+
+    /**
+     * Block appended to Voice Agent session.instructions so a new WebSocket still
+     * knows prior chat (text + earlier voice turns). Keeps the model from re-greeting
+     * and losing continuity when resumption is unavailable.
+     */
+    fun formatHistoryForVoiceInstructions(list: List<AssistantChatMessage>): String {
+        val window = historyWindow(list)
+        val body = formatHistoryForPrompt(window)
+        if (body.isBlank()) return ""
+        return buildString {
+            append(
+                "Recent conversation context (already said — continue naturally; " +
+                    "do not re-introduce yourself or restate this block):\n",
+            )
+            append(body)
         }
     }
 }

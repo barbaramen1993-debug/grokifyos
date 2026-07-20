@@ -147,10 +147,13 @@ object GrokAssistantWake {
 }
 
 /**
- * Shared mic arbitration so wake loop and overlay hold-to-talk never fight.
+ * Shared mic arbitration so wake loop, overlay STT, and Realtime Voice never fight.
+ *
+ * Priority: [Owner.Voice] / [Owner.Overlay] preempt [Owner.Wake];
+ * Voice and Overlay preempt each other (last acquirer wins).
  */
 object GrokAssistantMic {
-    enum class Owner { None, Wake, Overlay }
+    enum class Owner { None, Wake, Overlay, Voice }
 
     @Volatile
     private var owner: Owner = Owner.None
@@ -167,9 +170,9 @@ object GrokAssistantMic {
             owner = who
             return true
         }
-        // Overlay can preempt wake; wake cannot preempt overlay.
-        if (who == Owner.Overlay) {
-            owner = Owner.Overlay
+        // Overlay / Voice can preempt Wake; also each other (exclusive mic path).
+        if (who == Owner.Overlay || who == Owner.Voice) {
+            owner = who
             return true
         }
         return false

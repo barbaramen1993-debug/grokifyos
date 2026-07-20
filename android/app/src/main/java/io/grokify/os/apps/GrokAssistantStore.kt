@@ -161,6 +161,16 @@ class GrokAssistantStore(ctx: Context) {
         if (AssistantTranscript.shouldSkipDuplicate(last, role, text, now)) {
             return last!!
         }
+        // Server VAD often splits one spoken thought into several user items when the
+        // speaker pauses mid-sentence. Fold those into a single bubble so chat + turn
+        // state stay aligned (groups of user messages → model thrash).
+        if (AssistantTranscript.shouldMergeUserUtterance(last, role, text, now)) {
+            val mergedText = AssistantTranscript.mergeUserUtteranceText(last!!.text, text)
+            if (mergedText == last.text) return last
+            val updated = last.copy(text = mergedText, ts = now)
+            saveTranscript(current.dropLast(1) + updated)
+            return updated
+        }
         val msg = AssistantChatMessage(
             id = UUID.randomUUID().toString(),
             role = role,
@@ -174,6 +184,7 @@ class GrokAssistantStore(ctx: Context) {
     fun clearTranscript() {
         val id = activeSessionId
         val existing = conversations().firstOrNull { it.id == id }
+        clearVoiceResumeId(id)
         upsertConversation(
             AssistantConversation(
                 id = id,
@@ -204,6 +215,47 @@ class GrokAssistantStore(ctx: Context) {
         return conv
     }
 
+    /**
+     * xAI Voice Agent conversation id for [Session Resumption] (30 min server TTL).
+     * Keyed by local chat session so reconnect/re-open keeps multi-turn context.
+     */
+    fun voiceResumeId(sessionId: String = activeSessionId): String? {
+        val sid = sessionId.trim().ifBlank { return null }
+        val id = prefs.getString(voiceResumeKey(sid), null)?.trim().orEmpty()
+        if (id.isBlank()) return null
+        val savedAt = prefs.getLong(voiceResumeAtKey(sid), 0L)
+        if (savedAt <= 0L) return null
+        if (System.currentTimeMillis() - savedAt > VOICE_RESUME_TTL_MS) {
+            clearVoiceResumeId(sid)
+            return null
+        }
+        return id
+    }
+
+    fun setVoiceResumeId(conversationId: String?, sessionId: String = activeSessionId) {
+        val sid = sessionId.trim().ifBlank { return }
+        val cid = conversationId?.trim().orEmpty()
+        val ed = prefs.edit()
+        if (cid.isBlank()) {
+            ed.remove(voiceResumeKey(sid)).remove(voiceResumeAtKey(sid))
+        } else {
+            ed.putString(voiceResumeKey(sid), cid)
+                .putLong(voiceResumeAtKey(sid), System.currentTimeMillis())
+        }
+        ed.apply()
+    }
+
+    fun clearVoiceResumeId(sessionId: String = activeSessionId) {
+        val sid = sessionId.trim().ifBlank { return }
+        prefs.edit()
+            .remove(voiceResumeKey(sid))
+            .remove(voiceResumeAtKey(sid))
+            .apply()
+    }
+
+    private fun voiceResumeKey(sessionId: String) = "${KEY_VOICE_RESUME_PREFIX}$sessionId"
+    private fun voiceResumeAtKey(sessionId: String) = "${KEY_VOICE_RESUME_AT_PREFIX}$sessionId"
+
     fun selectSession(id: String): Boolean {
         val found = conversations().any { it.id == id }
         if (!found) return false
@@ -214,6 +266,7 @@ class GrokAssistantStore(ctx: Context) {
     fun deleteSession(id: String): Boolean {
         val all = conversations()
         if (all.none { it.id == id }) return false
+        clearVoiceResumeId(id)
         val next = all.filter { it.id != id }
         if (next.isEmpty()) {
             val fresh = AssistantConversation(
@@ -309,5 +362,9 @@ class GrokAssistantStore(ctx: Context) {
         private const val KEY_SESSIONS = "sessions_v2"
         private const val KEY_ACTIVE_SESSION = "active_session_id"
         private const val KEY_SESSIONS_MIGRATED = "sessions_migrated_v2"
+        private const val KEY_VOICE_RESUME_PREFIX = "voice_resume_id_"
+        private const val KEY_VOICE_RESUME_AT_PREFIX = "voice_resume_at_"
+        /** Match xAI server resumption cache (30 min inactivity). */
+        private const val VOICE_RESUME_TTL_MS = 30L * 60L * 1000L
     }
 }

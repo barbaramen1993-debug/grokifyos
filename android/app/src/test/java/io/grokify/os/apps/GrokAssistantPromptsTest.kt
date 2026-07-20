@@ -52,6 +52,31 @@ class GrokAssistantPromptsTest {
     }
 
     @Test
+    fun formatHistoryForVoiceInstructions_includesContinuityBlock() {
+        val msgs = listOf(
+            AssistantChatMessage("1", "user", "my name is Sam", 1L),
+            AssistantChatMessage("2", "assistant", "Hi Sam!", 2L),
+            AssistantChatMessage("3", "error", "ignored", 3L),
+        )
+        val block = AssistantTranscript.formatHistoryForVoiceInstructions(msgs)
+        assertTrue(block.contains("Recent conversation context"))
+        assertTrue(block.contains("User: my name is Sam"))
+        assertTrue(block.contains("Assistant: Hi Sam!"))
+        assertTrue(!block.contains("ignored"))
+    }
+
+    @Test
+    fun formatHistoryForVoiceInstructions_emptyWhenNoChat() {
+        assertEquals("", AssistantTranscript.formatHistoryForVoiceInstructions(emptyList()))
+        assertEquals(
+            "",
+            AssistantTranscript.formatHistoryForVoiceInstructions(
+                listOf(AssistantChatMessage("e", "error", "x", 1L)),
+            ),
+        )
+    }
+
+    @Test
     fun codec_roundTrip() {
         val list = AssistantPromptDefaults.all()
         val decoded = AssistantPromptCodec.decode(AssistantPromptCodec.encode(list))

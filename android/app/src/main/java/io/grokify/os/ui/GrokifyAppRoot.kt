@@ -4077,11 +4077,17 @@ private fun MediaCard(msg: ChatLine) {
             .border(1.dp, GrokifyColors.GlowCyan.copy(alpha = 0.28f), RoundedCornerShape(12.dp))
             .padding(8.dp)
     ) {
+        val toolLabel = msg.toolName.trim().takeUnless {
+            it.isEmpty() || it.equals("null", ignoreCase = true)
+        }.orEmpty()
+        val nameLabel = msg.text.trim().takeUnless {
+            it.isEmpty() || it.equals("null", ignoreCase = true)
+        }.orEmpty()
         val label = buildString {
-            if (msg.toolName.isNotBlank()) append(msg.toolName)
-            if (msg.text.isNotBlank()) {
+            if (toolLabel.isNotEmpty()) append(toolLabel)
+            if (nameLabel.isNotEmpty()) {
                 if (isNotEmpty()) append(" · ")
-                append(msg.text)
+                append(nameLabel)
             }
             if (isEmpty()) append(if (msg.mediaKind == "video") "Video" else "Image")
         }

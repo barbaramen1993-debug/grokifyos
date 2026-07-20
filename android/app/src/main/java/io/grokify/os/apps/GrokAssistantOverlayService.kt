@@ -22,6 +22,7 @@ import io.grokify.os.apps.plugin.HostApiKeyStore
 import io.grokify.os.data.ApiKeyIds
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -39,6 +40,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.OpenInFull
@@ -129,12 +131,17 @@ class GrokAssistantOverlayService : Service() {
     private var autoListenActive = false
     /** When expanding to the full app, keep the Voice Agent session alive. */
     private var preserveVoiceOnDestroy = false
+    /** Last voice turn — used to clear stale bubbles when a new utterance starts. */
+    private var lastVoiceTurn: GrokAssistantVoiceSession.Turn = GrokAssistantVoiceSession.Turn.Idle
+    /** True after first drag — layout uses TOP|START absolute coords. */
+    private var overlayPositionAbsolute = false
 
     private val voiceListener = object : GrokAssistantVoiceSession.Listener {
         override fun onSnapshot(snap: GrokAssistantVoiceSession.Snapshot) {
             voiceLiveState.value = snap.state == GrokAssistantVoiceSession.State.Live ||
                 snap.state == GrokAssistantVoiceSession.State.Connecting ||
                 snap.state == GrokAssistantVoiceSession.State.ToolBusy
+            val prevTurn = lastVoiceTurn
             voiceTurnState.value = snap.turn
             voiceLevelState.floatValue = snap.level
             voiceBarsState.value = snap.bars
@@ -142,12 +149,44 @@ class GrokAssistantOverlayService : Service() {
             voiceMicMutedState.value = snap.micMuted
             voicePartialUserState.value = snap.partialUser
             voicePartialAsstState.value = snap.partialAssistant
-            if (snap.partialUser?.isNotBlank() == true) {
-                turnUserState.value = snap.partialUser
+
+            // Keep overlay turn bubbles in lockstep with the live session.
+            when (snap.turn) {
+                GrokAssistantVoiceSession.Turn.UserSpeaking -> {
+                    // New utterance: drop the previous answer immediately.
+                    if (prevTurn != GrokAssistantVoiceSession.Turn.UserSpeaking) {
+                        turnReplyState.value = null
+                    }
+                    val u = snap.partialUser?.trim().orEmpty()
+                    if (u.isNotEmpty()) turnUserState.value = u
+                }
+                GrokAssistantVoiceSession.Turn.Thinking,
+                GrokAssistantVoiceSession.Turn.ToolBusy,
+                -> {
+                    val u = snap.partialUser?.trim().orEmpty()
+                    if (u.isNotEmpty()) turnUserState.value = u
+                    // response.created sets partialAssistant to "" — clear old reply.
+                    when {
+                        snap.partialAssistant == null -> Unit
+                        snap.partialAssistant.isEmpty() -> turnReplyState.value = null
+                        else -> turnReplyState.value = snap.partialAssistant.take(400)
+                    }
+                }
+                GrokAssistantVoiceSession.Turn.GrokSpeaking -> {
+                    when {
+                        snap.partialAssistant == null -> Unit
+                        snap.partialAssistant.isEmpty() -> turnReplyState.value = null
+                        else -> turnReplyState.value = snap.partialAssistant.take(400)
+                    }
+                }
+                GrokAssistantVoiceSession.Turn.Listening,
+                GrokAssistantVoiceSession.Turn.Idle,
+                -> {
+                    // Keep last committed bubbles; don't re-apply blank partials.
+                }
+                else -> Unit
             }
-            if (snap.partialAssistant?.isNotBlank() == true) {
-                turnReplyState.value = snap.partialAssistant?.take(400)
-            }
+            lastVoiceTurn = snap.turn
             if (voiceLiveState.value) {
                 statusState.value = snap.statusLine
             }
@@ -157,7 +196,11 @@ class GrokAssistantOverlayService : Service() {
             val body = text.trim()
             if (body.isEmpty()) return
             when (role) {
-                "user" -> turnUserState.value = body
+                "user" -> {
+                    // New user turn → clear previous assistant so UI stays in sync.
+                    turnUserState.value = body
+                    turnReplyState.value = null
+                }
                 "assistant" -> turnReplyState.value = body.take(400)
             }
         }
@@ -321,6 +364,7 @@ class GrokAssistantOverlayService : Service() {
             }
         }
         layoutParams = lp
+        overlayPositionAbsolute = false
         val view = ComposeView(this).apply {
             setViewTreeLifecycleOwner(owner)
             setViewTreeViewModelStoreOwner(owner)
@@ -341,6 +385,35 @@ class GrokAssistantOverlayService : Service() {
         }
     }
 
+    /**
+     * Switch gravity to TOP|START using the view's current screen position so
+     * subsequent drag deltas map to absolute [LayoutParams.x]/[LayoutParams.y].
+     */
+    private fun ensureAbsoluteOverlayGravity() {
+        if (overlayPositionAbsolute) return
+        val view = composeView ?: return
+        val lp = layoutParams ?: return
+        val loc = IntArray(2)
+        view.getLocationOnScreen(loc)
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = loc[0].coerceAtLeast(0)
+        lp.y = loc[1].coerceAtLeast(0)
+        overlayPositionAbsolute = true
+        runCatching { windowManager?.updateViewLayout(view, lp) }
+    }
+
+    private fun dragOverlayBy(dx: Float, dy: Float) {
+        val view = composeView ?: return
+        val lp = layoutParams ?: return
+        ensureAbsoluteOverlayGravity()
+        val dm = resources.displayMetrics
+        val maxX = (dm.widthPixels - view.width).coerceAtLeast(0)
+        val maxY = (dm.heightPixels - view.height).coerceAtLeast(0)
+        lp.x = (lp.x + dx.toInt()).coerceIn(0, maxX)
+        lp.y = (lp.y + dy.toInt()).coerceIn(0, maxY)
+        runCatching { windowManager?.updateViewLayout(view, lp) }
+    }
+
     /** Hide the floating window so MediaProjection does not capture our chrome. */
     fun hideForScreenCapture() {
         val wm = windowManager ?: return
@@ -358,10 +431,13 @@ class GrokAssistantOverlayService : Service() {
             return
         }
         if (view.parent == null) {
-            val density = resources.displayMetrics.density
-            lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            lp.x = 0
-            lp.y = (24 * density).toInt()
+            // Keep drag position if user moved the panel; otherwise default bottom-center.
+            if (!overlayPositionAbsolute) {
+                val density = resources.displayMetrics.density
+                lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                lp.x = 0
+                lp.y = (24 * density).toInt()
+            }
             runCatching { wm.addView(view, lp) }
                 .onFailure { e ->
                     Log.e(TAG, "re-add overlay failed", e)
@@ -661,8 +737,19 @@ class GrokAssistantOverlayService : Service() {
                 GrokAssistantVoiceSession.stop()
                 voiceLiveState.value = false
                 statusState.value = null
+                turnUserState.value = null
+                turnReplyState.value = null
+                voicePartialUserState.value = null
+                voicePartialAsstState.value = null
+                lastVoiceTurn = GrokAssistantVoiceSession.Turn.Idle
                 GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
             } else {
+                // Fresh session — clear previous turn bubbles so overlay matches chat.
+                turnUserState.value = null
+                turnReplyState.value = null
+                voicePartialUserState.value = null
+                voicePartialAsstState.value = null
+                lastVoiceTurn = GrokAssistantVoiceSession.Turn.Idle
                 destroySpeech(resumeWake = false)
                 GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Voice)
                 statusState.value = "Connecting Voice…"
@@ -705,9 +792,24 @@ class GrokAssistantOverlayService : Service() {
                 .padding(horizontal = 10.dp, vertical = 8.dp),
         ) {
             Row(
-                Modifier.fillMaxWidth(),
+                Modifier
+                    .fillMaxWidth()
+                    // Drag the title bar to reposition the floating window.
+                    .pointerInput(Unit) {
+                        detectDragGestures { change, dragAmount ->
+                            change.consume()
+                            dragOverlayBy(dragAmount.x, dragAmount.y)
+                        }
+                    },
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                Icon(
+                    Icons.Default.DragHandle,
+                    contentDescription = "Drag to move",
+                    tint = GrokifyColors.TextDim,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(4.dp))
                 Text(
                     if (voiceLive) "Grok · live" else "Grok",
                     color = GrokifyColors.TextPrimary,
