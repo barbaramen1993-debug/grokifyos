@@ -311,7 +311,7 @@ fun CompanionLive2dStage(
 private const val TAG = "CompanionVrm"
 // Version bump forces a fresh document after Live2D → VRM migrations.
 private const val ASSET_URL =
-    "file:///android_asset/companion/index.html?stage=vrm6&v=202"
+    "file:///android_asset/companion/index.html?stage=vrm6&v=204"
 
 /**
  * Host bridge for the offline VRM stage.
@@ -351,6 +351,27 @@ private class CompanionJsBridge(
     @JavascriptInterface
     fun onAvatarTapped() {
         onAvatarTapped.invoke()
+    }
+
+    /** Persist last camera/orbit framing (called from OrbitControls end). */
+    @JavascriptInterface
+    fun saveOrbit(json: String?) {
+        val raw = json?.trim().orEmpty()
+        if (raw.isEmpty() || raw.length > 2_000) return
+        runCatching {
+            CompanionStore(ctx).lastOrbitJson = raw
+        }
+    }
+
+    @JavascriptInterface
+    fun clearOrbit() {
+        runCatching { CompanionStore(ctx).clearLastOrbit() }
+    }
+
+    /** Sync read for JS restore after model install. */
+    @JavascriptInterface
+    fun getSavedOrbit(): String {
+        return runCatching { CompanionStore(ctx).lastOrbitJson }.getOrDefault("")
     }
 
     /**

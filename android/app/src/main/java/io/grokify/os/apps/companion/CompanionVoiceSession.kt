@@ -203,6 +203,8 @@ object CompanionVoiceSession {
 
         val voice = sessionVoiceId.get().ifBlank { "eve" }
         val system = instructions.ifBlank { CompanionPrompts.DEFAULT_SYSTEM }
+        val resumeId = storePrefs?.voiceConversationId?.trim().orEmpty()
+            .ifBlank { null }
 
         scope.launch {
             try {
@@ -221,25 +223,41 @@ object CompanionVoiceSession {
                     }
                 }
 
+                // Docs: ephemeral token via POST /v1/realtime/client_secrets (or API key Bearer).
                 setTurn(Turn.Connecting, "Minting voice session…")
-                val token = GrokAssistantVoiceClient.mintAuthToken(apiKey)
+                val minted = GrokAssistantVoiceClient.mintAuthToken(apiKey)
                 if (!stillThisStart()) return@launch
+                val token = minted.ifBlank { apiKey }
                 if (token.isBlank()) {
                     fail("Could not mint voice session token")
                     return@launch
                 }
+                val usedMinted = minted.isNotBlank() && minted != apiKey
+                Log.i(
+                    TAG,
+                    "auth ready minted=$usedMinted tokenLen=${token.length} " +
+                        "resume=${!resumeId.isNullOrBlank()}",
+                )
 
                 setTurn(Turn.Connecting, "Opening voice socket…")
+                // Disconnect mid-connect must hard-fail the session (not leave "Connecting").
+                val disconnectDetail = AtomicReference<String?>(null)
                 val client = GrokAssistantVoiceClient(
                     onEvent = { event -> handleEvent(event) },
                     onBinaryAudio = { pcm -> playPcm(pcm) },
                     onState = { connected, detail ->
                         if (!connected && running.get() && startGeneration.get() == gen) {
-                            val msg = detail ?: "disconnected"
-                            val listener = listenerRef.get()
-                            setTurn(Turn.Error, msg)
-                            mainHandler.post { listener?.onError(msg) }
-                            stopInternal()
+                            val msg = detail?.take(160)?.ifBlank { null } ?: "Voice socket closed"
+                            disconnectDetail.set(msg)
+                            // If still handshaking, fail() so UI leaves Connecting immediately.
+                            if (turn.get() == Turn.Connecting) {
+                                fail(msg)
+                            } else {
+                                val listener = listenerRef.get()
+                                setTurn(Turn.Error, msg)
+                                mainHandler.post { listener?.onError(msg) }
+                                stopInternal()
+                            }
                         }
                     },
                 )
@@ -248,23 +266,54 @@ object CompanionVoiceSession {
                     return@launch
                 }
                 clientRef.set(client)
-                client.connect(token)
+                // Docs: wss://api.x.ai/v1/realtime?model=grok-voice-latest
+                // Optional ?conversation_id= for Session Resumption.
+                client.connect(
+                    authToken = token,
+                    conversationId = resumeId,
+                )
 
                 // Wait for real onOpen (socket object alone is not open yet).
                 var waits = 0
-                while (stillThisStart() && !client.isOpen && waits < 80) {
+                while (stillThisStart() && !client.isOpen && waits < 100) {
+                    val drop = disconnectDetail.get()
+                    if (drop != null) {
+                        // fail() already called from onState when Connecting.
+                        return@launch
+                    }
                     Thread.sleep(50)
                     waits++
                 }
                 if (!stillThisStart()) return@launch
                 if (!client.isOpen) {
-                    fail("Voice WebSocket connect timeout — check network / API key")
+                    // Retry once with raw API key if mint path produced a bad secret.
+                    if (usedMinted) {
+                        Log.w(TAG, "WS open failed with mint — retrying with API key")
+                        setTurn(Turn.Connecting, "Retrying voice socket…")
+                        disconnectDetail.set(null)
+                        client.connect(authToken = apiKey, conversationId = resumeId)
+                        waits = 0
+                        while (stillThisStart() && !client.isOpen && waits < 80) {
+                            if (disconnectDetail.get() != null) return@launch
+                            Thread.sleep(50)
+                            waits++
+                        }
+                    }
+                }
+                if (!stillThisStart()) return@launch
+                if (!client.isOpen) {
+                    fail(
+                        disconnectDetail.get()
+                            ?: "Voice WebSocket connect timeout — check network / API key",
+                    )
                     return@launch
                 }
 
+                // Docs flow: session.created (server) → session.update (client) → session.updated.
+                // Do NOT treat session.created as ready; only session.updated means configured.
                 setTurn(Turn.Connecting, "Configuring Companion voice…")
-                // JSON transport = docs default + official cookbook (audible output).
-                var updated = client.sessionUpdate(
+                useBinary.set(false)
+                var sent = client.sessionUpdate(
                     instructions = system,
                     voice = voice,
                     tools = JSONArray(),
@@ -272,11 +321,10 @@ object CompanionVoiceSession {
                     useBinaryAudio = false,
                     reasoningEffort = "none",
                 )
-                if (!updated) {
-                    // Rare race: open just flipped; retry once.
-                    Thread.sleep(80)
+                if (!sent) {
+                    Thread.sleep(100)
                     if (stillThisStart() && client.isOpen) {
-                        updated = client.sessionUpdate(
+                        sent = client.sessionUpdate(
                             instructions = system,
                             voice = voice,
                             tools = JSONArray(),
@@ -286,22 +334,24 @@ object CompanionVoiceSession {
                         )
                     }
                 }
-                if (!updated) {
-                    Log.w(TAG, "sessionUpdate send failed — will still wait briefly")
+                if (!sent) {
+                    fail("Could not send session.update — socket not writable")
+                    return@launch
                 }
-                useBinary.set(false)
 
                 // Cookbook: wait for session.updated before mic — audio sent earlier
                 // can drop the first TTS reply entirely.
                 waits = 0
-                while (stillThisStart() && !client.isSessionReady && waits < 60) {
+                while (stillThisStart() && !client.isSessionReady && waits < 80) {
+                    if (disconnectDetail.get() != null) return@launch
+                    // Hard fail if server rejected config while Connecting.
+                    if (turn.get() == Turn.Error) return@launch
                     Thread.sleep(50)
                     waits++
                 }
                 if (!stillThisStart()) return@launch
                 if (!client.isSessionReady) {
-                    Log.w(TAG, "session.updated not seen — continuing (socket open)")
-                    // One more configure attempt if first send was lost.
+                    Log.w(TAG, "session.updated not seen — one more session.update")
                     if (client.isOpen) {
                         client.sessionUpdate(
                             instructions = system,
@@ -312,11 +362,22 @@ object CompanionVoiceSession {
                             reasoningEffort = "none",
                         )
                         waits = 0
-                        while (stillThisStart() && !client.isSessionReady && waits < 30) {
+                        while (stillThisStart() && !client.isSessionReady && waits < 40) {
+                            if (disconnectDetail.get() != null) return@launch
                             Thread.sleep(50)
                             waits++
                         }
                     }
+                }
+                if (!stillThisStart()) return@launch
+                if (!client.isOpen) {
+                    fail(disconnectDetail.get() ?: "Voice socket closed during configure")
+                    return@launch
+                }
+                if (!client.isSessionReady) {
+                    // Socket is open; continue so the user can still talk (server may
+                    // accept audio with defaults). Surface a soft note in status.
+                    Log.w(TAG, "proceeding without session.updated ack")
                 }
 
                 // Drop any pre-ready mic/ambient that never should have been committed.
@@ -328,6 +389,7 @@ object CompanionVoiceSession {
                 listenOpenUntilMs.set(SystemClock.uptimeMillis() + LISTEN_OPEN_SETTLE_MS)
                 markPhase(Turn.Listening, "Companion · listening")
                 startMicCapture(client)
+                Log.i(TAG, "Companion voice live (sessionReady=${client.isSessionReady})")
             } catch (e: Exception) {
                 if (startGeneration.get() != gen) return@launch
                 Log.e(TAG, "start failed", e)
@@ -888,6 +950,11 @@ object CompanionVoiceSession {
                     return
                 }
                 Log.e(TAG, "server error: $msg")
+                // Config / auth faults during handshake must leave Connecting immediately.
+                if (turn.get() == Turn.Connecting) {
+                    fail("Voice config error: ${msg.take(120)}")
+                    return
+                }
                 mainHandler.post { listenerRef.get()?.onError(msg) }
                 val speakingWithAudio = turn.get() == Turn.Speaking &&
                     (hasLocalPlaybackRemaining() || awaitingPlaybackDrain.get())
@@ -1103,11 +1170,28 @@ object CompanionVoiceSession {
                     markResponseAudioFinished()
                 }
             }
-            "session.updated",
-            "session.created",
-            -> {
+            // Docs: session.created is the pre-config default on open — not "ready".
+            // Only session.updated means our session.update applied (VoiceClient sets isSessionReady).
+            "session.created" -> {
+                Log.d(TAG, "session.created (awaiting session.updated)")
+            }
+            "conversation.created" -> {
+                val id = event.optJSONObject("conversation")?.optString("id").orEmpty()
+                    .ifBlank { event.optString("conversation_id", "") }
+                    .trim()
+                if (id.isNotEmpty()) {
+                    Log.i(TAG, "conversation.created id=${id.take(16)}…")
+                    appCtx?.let { ctx ->
+                        runCatching { CompanionStore(ctx).voiceConversationId = id }
+                    }
+                }
+            }
+            "session.updated" -> {
+                // Start coroutine advances to Listening + mic after isSessionReady;
+                // keep status honest if still handshaking.
                 if (turn.get() == Turn.Connecting) {
-                    markPhase(Turn.Listening, "Companion · listening")
+                    statusLine.set("Voice session ready…")
+                    publish()
                 }
             }
             else -> Log.d(TAG, "voice event: $type")

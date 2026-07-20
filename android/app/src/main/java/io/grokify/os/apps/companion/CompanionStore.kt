@@ -36,6 +36,27 @@ class CompanionStore(ctx: Context) {
         get() = prefs.getString(KEY_USER_MODEL, "") ?: ""
         set(v) = prefs.edit().putString(KEY_USER_MODEL, v).apply()
 
+    /**
+     * Last camera/orbit framing from the VRM stage (JSON).
+     * Restored on the next Companion open so framing survives app restarts.
+     */
+    var lastOrbitJson: String
+        get() = prefs.getString(KEY_ORBIT, "") ?: ""
+        set(v) = prefs.edit().putString(KEY_ORBIT, v).apply()
+
+    fun clearLastOrbit() {
+        prefs.edit().remove(KEY_ORBIT).apply()
+    }
+
+    /** xAI Voice Agent conversation id for session resumption (~30 min cache). */
+    var voiceConversationId: String
+        get() = prefs.getString(KEY_VOICE_CONV, "") ?: ""
+        set(v) = prefs.edit().putString(KEY_VOICE_CONV, v.trim()).apply()
+
+    fun clearVoiceConversationId() {
+        prefs.edit().remove(KEY_VOICE_CONV).apply()
+    }
+
     fun history(): List<CompanionMessage> =
         CompanionPrompts.decodeHistory(prefs.getString(KEY_HISTORY, null))
 
@@ -62,6 +83,8 @@ class CompanionStore(ctx: Context) {
         private const val KEY_MODEL_SOURCE = "model_source"
         private const val KEY_USER_MODEL = "user_model_path"
         private const val KEY_HISTORY = "chat_history_v1"
+        private const val KEY_ORBIT = "last_orbit_json_v1"
+        private const val KEY_VOICE_CONV = "voice_conversation_id"
 
         const val SOURCE_BUNDLED = "bundled"
         const val SOURCE_USER = "user"

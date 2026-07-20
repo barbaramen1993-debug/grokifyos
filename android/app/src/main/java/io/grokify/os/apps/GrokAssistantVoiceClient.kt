@@ -85,16 +85,26 @@ class GrokAssistantVoiceClient(
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     opened.set(true)
+                    Log.i(TAG, "WebSocket open code=${response.code}")
                     onState(true, null)
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     try {
                         val event = JSONObject(text)
-                        // Only session.updated means our session.update applied
-                        // (session.created is the pre-config default — do not treat as ready).
-                        if (event.optString("type") == "session.updated") {
+                        val type = event.optString("type")
+                        // Docs: session.created is pre-config; only session.updated is ready.
+                        if (type == "session.updated") {
                             sessionConfigured.set(true)
+                            Log.i(TAG, "session.updated — session ready")
+                        } else if (type == "session.created") {
+                            Log.d(TAG, "session.created (defaults; awaiting session.update)")
+                        } else if (type == "error") {
+                            val err = event.optJSONObject("error")?.optString("message")
+                                .orEmpty()
+                                .ifBlank { event.optString("error", "") }
+                                .ifBlank { event.optString("message", "error") }
+                            Log.e(TAG, "realtime error: ${err.take(200)}")
                         }
                         onEvent(event)
                     } catch (e: Exception) {
@@ -122,10 +132,17 @@ class GrokAssistantVoiceClient(
                     opened.set(false)
                     sessionConfigured.set(false)
                     if (intentionalClose.get()) return
+                    val bodyHint = runCatching {
+                        response?.body?.string()?.take(120)
+                    }.getOrNull().orEmpty()
                     val msg = when {
-                        response != null -> "HTTP ${response.code}: ${t.message ?: "failed"}"
+                        response != null && bodyHint.isNotBlank() ->
+                            "HTTP ${response.code}: ${bodyHint.take(80)}"
+                        response != null ->
+                            "HTTP ${response.code}: ${t.message ?: "failed"}"
                         else -> t.message ?: "connection failed"
                     }
+                    Log.e(TAG, "WebSocket failure: $msg", t)
                     onState(false, msg)
                 }
             },
@@ -393,13 +410,15 @@ class GrokAssistantVoiceClient(
         }
 
         /**
-         * Mint a short-lived client secret from a SpaceXAI / xAI API key.
-         * Falls back to returning the API key itself if minting fails (server-style auth).
+         * Mint a short-lived client secret (docs: POST /v1/realtime/client_secrets).
+         * Response: `{ "value": "xai-realtime-client-secret-…", "expires_at": … }`.
+         * Falls back to the API key itself for native Bearer auth if mint fails.
          */
         fun mintAuthToken(apiKey: String, http: OkHttpClient = defaultHttp()): String {
             val key = apiKey.trim()
             if (key.isEmpty()) return ""
             return try {
+                // Docs: expires_after.seconds max 3600; 300s is plenty for connect.
                 val body = JSONObject()
                     .put("expires_after", JSONObject().put("seconds", 300))
                     .toString()
@@ -413,21 +432,29 @@ class GrokAssistantVoiceClient(
                     val raw = resp.body?.string().orEmpty()
                     if (!resp.isSuccessful) {
                         Log.w(TAG, "client_secrets HTTP ${resp.code}: ${raw.take(200)}")
-                        return key // fallback: use API key on WS
+                        return key // fallback: use API key on WS (native/server-style)
                     }
                     val json = JSONObject(raw)
-                    // Response shapes: {value}, {client_secret:{value}}, {secret}
+                    // Canonical: { value, expires_at }. Also accept nested shapes.
                     val token = json.optString("value", "")
                         .ifBlank {
                             json.optJSONObject("client_secret")?.optString("value").orEmpty()
                         }
                         .ifBlank { json.optString("secret", "") }
-                        .ifBlank { json.optString("client_secret", "") }
+                        .ifBlank {
+                            val nested = json.opt("client_secret")
+                            if (nested is String) nested else ""
+                        }
                         .trim()
                     if (token.isBlank()) {
                         Log.w(TAG, "client_secrets missing value — using API key")
                         key
                     } else {
+                        Log.i(
+                            TAG,
+                            "minted client_secret len=${token.length} " +
+                                "expires_at=${json.optLong("expires_at", 0L)}",
+                        )
                         token
                     }
                 }

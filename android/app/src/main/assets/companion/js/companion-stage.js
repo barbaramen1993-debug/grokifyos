@@ -61,6 +61,9 @@
   var poseBlend = 0;
   var statePose = null;
   var statePoseTarget = null;
+  /** Pending orbit restore from host prefs (applied after model install). */
+  var pendingOrbit = null;
+  var orbitSaveTimer = 0;
 
   function hostCall(method) {
     try {
@@ -511,6 +514,105 @@
     }
   }
 
+  function captureOrbit() {
+    if (!camera) return null;
+    var t = controls && controls.target
+      ? { x: controls.target.x, y: controls.target.y, z: controls.target.z }
+      : orbitTarget
+        ? { x: orbitTarget.x, y: orbitTarget.y, z: orbitTarget.z }
+        : { x: 0, y: 1.2, z: 0 };
+    return {
+      px: camera.position.x,
+      py: camera.position.y,
+      pz: camera.position.z,
+      tx: t.x,
+      ty: t.y,
+      tz: t.z,
+      userFramed: !!userFramed,
+    };
+  }
+
+  function applyOrbit(o) {
+    if (!o || !camera) return false;
+    var px = Number(o.px);
+    var py = Number(o.py);
+    var pz = Number(o.pz);
+    var tx = Number(o.tx);
+    var ty = Number(o.ty);
+    var tz = Number(o.tz);
+    if (
+      !isFinite(px) ||
+      !isFinite(py) ||
+      !isFinite(pz) ||
+      !isFinite(tx) ||
+      !isFinite(ty) ||
+      !isFinite(tz)
+    ) {
+      return false;
+    }
+    // Sanity: reject absurd restores (corrupt prefs / wrong model scale).
+    var dist = Math.sqrt(
+      (px - tx) * (px - tx) + (py - ty) * (py - ty) + (pz - tz) * (pz - tz)
+    );
+    if (dist < 0.2 || dist > 20) return false;
+    camera.position.set(px, py, pz);
+    if (controls) {
+      controls.target.set(tx, ty, tz);
+      controls.update();
+      try {
+        if (typeof controls.saveState === "function") controls.saveState();
+      } catch (_) {}
+    } else {
+      camera.lookAt(tx, ty, tz);
+    }
+    orbitTarget = { x: tx, y: ty, z: tz, dist: dist };
+    userFramed = o.userFramed !== false;
+    return true;
+  }
+
+  function parseOrbitJson(raw) {
+    if (!raw) return null;
+    try {
+      var o = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!o || typeof o !== "object") return null;
+      return o;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function loadSavedOrbitFromHost() {
+    try {
+      var bridge = hostBridge();
+      if (!bridge || typeof bridge.getSavedOrbit !== "function") return null;
+      return parseOrbitJson(bridge.getSavedOrbit());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function persistOrbitNow() {
+    if (!userFramed || !camera) return;
+    var o = captureOrbit();
+    if (!o) return;
+    try {
+      hostCall("saveOrbit", JSON.stringify(o));
+    } catch (_) {}
+  }
+
+  function schedulePersistOrbit() {
+    if (!userFramed) return;
+    if (orbitSaveTimer) {
+      try {
+        clearTimeout(orbitSaveTimer);
+      } catch (_) {}
+    }
+    orbitSaveTimer = setTimeout(function () {
+      orbitSaveTimer = 0;
+      persistOrbitNow();
+    }, 280);
+  }
+
   function fitCamera(forceReset) {
     if (!camera || !renderer) return;
     var w = window.innerWidth || 1;
@@ -712,13 +814,14 @@
           };
         }
       } catch (_) {}
-      // Mark user framing so nothing re-centers mid-session.
+      // Mark user framing so nothing re-centers mid-session; persist last orbit.
       try {
         controls.addEventListener("start", function () {
           userFramed = true;
         });
         controls.addEventListener("end", function () {
           userFramed = true;
+          schedulePersistOrbit();
         });
         controls.addEventListener("change", function () {
           userFramed = true;
@@ -783,7 +886,11 @@
       var now = Date.now();
       if (now - lastTap < 320) {
         userFramed = false;
+        pendingOrbit = null;
         fitCamera(true);
+        try {
+          hostCall("clearOrbit");
+        } catch (_) {}
         lastTap = 0;
       } else {
         lastTap = now;
@@ -939,9 +1046,19 @@
     applyMouth(0);
     usingFallback = false;
     showFallback(false);
-    // Frame once on install only — never again unless double-tap / resetCamera.
+    // Frame once on install; prefer last-run orbit from host prefs.
     userFramed = false;
+    if (!pendingOrbit) {
+      pendingOrbit = loadSavedOrbitFromHost();
+    }
     fitCamera(true);
+    if (pendingOrbit) {
+      if (applyOrbit(pendingOrbit)) {
+        // Keep pending so resize does not steal framing; clear only on explicit reset.
+      } else {
+        pendingOrbit = null;
+      }
+    }
     return label || "VRM";
   }
 
@@ -1231,7 +1348,25 @@
 
   function resetCamera() {
     userFramed = false;
+    pendingOrbit = null;
     fitCamera(true);
+    try {
+      hostCall("clearOrbit");
+    } catch (_) {}
+  }
+
+  function setOrbit(jsonOrObj) {
+    var o = parseOrbitJson(jsonOrObj);
+    if (!o) return false;
+    pendingOrbit = o;
+    if (camera && (vrm || usingFallback)) {
+      return applyOrbit(o);
+    }
+    return true;
+  }
+
+  function getOrbit() {
+    return captureOrbit();
   }
 
   window.CompanionStage = {
@@ -1240,6 +1375,8 @@
     setMouth: setMouth,
     playMotion: playMotion,
     resetCamera: resetCamera,
+    setOrbit: setOrbit,
+    getOrbit: getOrbit,
     getState: function () {
       return currentState;
     },

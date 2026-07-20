@@ -1112,12 +1112,25 @@ private fun companionConnectionLabel(
     if (busy && avatarState == CompanionAvatarState.Speaking) return "Speaking"
     if (voiceActive) {
         val status = voiceStatus.orEmpty()
-        if (status.contains("Connecting", ignoreCase = true) ||
-            status.contains("Minting", ignoreCase = true) ||
-            status.contains("Opening", ignoreCase = true) ||
-            status.contains("Configuring", ignoreCase = true)
-        ) {
-            return "Connecting"
+        // Exact phase from VoiceSession (docs handshake) — show short label.
+        when {
+            status.contains("Minting", ignoreCase = true) -> return "Minting…"
+            status.contains("Retrying", ignoreCase = true) -> return "Retrying…"
+            status.contains("Opening", ignoreCase = true) -> return "Opening…"
+            status.contains("Configuring", ignoreCase = true) -> return "Configuring…"
+            status.contains("session ready", ignoreCase = true) -> return "Almost…"
+            status.contains("Connecting", ignoreCase = true) -> return "Connecting…"
+            status.contains("timed out", ignoreCase = true) ||
+                status.contains("config error", ignoreCase = true) ||
+                (
+                    status.contains("socket", ignoreCase = true) &&
+                        (
+                            status.contains("fail", ignoreCase = true) ||
+                                status.contains("closed", ignoreCase = true) ||
+                                status.contains("timeout", ignoreCase = true)
+                            )
+                    ) ->
+                return "Error"
         }
         return when (avatarState) {
             CompanionAvatarState.Listening -> "Listening"
