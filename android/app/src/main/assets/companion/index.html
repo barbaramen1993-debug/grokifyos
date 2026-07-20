@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="dark" />
+    <title>Grokify Companion Stage</title>
+    <link rel="stylesheet" href="css/stage.css" />
+  </head>
+  <body>
+    <div id="stage-root">
+      <canvas id="live2d-canvas"></canvas>
+      <div id="fallback" aria-hidden="true">
+        <div id="fallback-face">
+          <div id="fallback-mouth"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Offline vendors (no CDN at runtime). Order matters. -->
+    <script src="js/vendor/live2dcubismcore.min.js"></script>
+    <script src="js/vendor/pixi.min.js"></script>
+    <script src="js/vendor/cubism4.min.js"></script>
+    <script src="js/companion-stage.js"></script>
+  </body>
+</html>

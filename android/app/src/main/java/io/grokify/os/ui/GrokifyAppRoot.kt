@@ -94,6 +94,7 @@ import io.grokify.os.apps.LocationNotesPane
 import io.grokify.os.apps.SpaceXaiUsageAnalyzerPane
 import io.grokify.os.apps.SpotifyControllerPane
 import io.grokify.os.apps.WifiScannerPane
+import io.grokify.os.apps.companion.CompanionPane
 import io.grokify.os.apps.plugin.BuiltinPluginCatalog
 import io.grokify.os.apps.plugin.PluginAccent
 import io.grokify.os.apps.plugin.PluginIconKey
@@ -4368,6 +4369,9 @@ private fun AppsPane(
         BuiltinPluginCatalog.GROK_ASSISTANT, "grok_assistant" -> GrokAssistantPane(
             onBack = onBackToHub,
         )
+        BuiltinPluginCatalog.COMPANION, "companion" -> CompanionPane(
+            onBack = onBackToHub,
+        )
         else -> AppsHub(
             appOrder = appOrder,
             onOpenApp = onOpenApp,
@@ -4597,6 +4601,7 @@ private fun appsNavShortTitle(app: PluginManifest): String = when (app.id) {
     BuiltinPluginCatalog.SPOTIFY_CONTROLLER -> "Spotify"
     BuiltinPluginCatalog.SPACEXAI_USAGE -> "Usage"
     BuiltinPluginCatalog.GROK_ASSISTANT -> "Assistant"
+    BuiltinPluginCatalog.COMPANION -> "Companion"
     else -> app.title.take(12)
 }
 

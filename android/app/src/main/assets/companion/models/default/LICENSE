@@ -1,0 +1,49 @@
+Default bundled Live2D model: Wanko (Wankoromochi)
+==================================================
+
+Source
+------
+Live2D Cubism Web Samples
+  https://github.com/Live2D/CubismWebSamples
+  Path: Samples/Resources/Wanko/
+
+Character: Wankoromochi (Live2D Original Character / sample model)
+
+License
+-------
+This model is Live2D sample data subject to:
+
+1. Free Material License Agreement
+   https://www.live2d.com/eula/live2d-free-material-license-agreement_en.html
+
+2. Terms of Use for Live2D Cubism Sample Data
+   https://www.live2d.com/eula/live2d-sample-model-terms_en.html
+
+Key points (summary only — the official agreements control):
+- Live2D Original Characters may be used, altered, and Distributed in derivative
+  works (e.g. applications) under the Free Material License, subject to
+  General User / Small-Scale Enterprise rules (annual sales thresholds) for
+  commercial vs internal-only use. Larger enterprises need Live2D approval /
+  appropriate SDK release licensing.
+- Redistribution of the raw sample Material outside permitted use is restricted.
+- Individual term for Wankoromochi: respect the mochi theme when using this character.
+- Do not use sample materials with middleware that competes with Live2D.
+
+Copyright notice (required in derivative works that use this model)
+-------------------------------------------------------------------
+Where a longer description is possible (app about screen, README, etc.):
+
+  This content uses sample data owned and copyrighted by Live2D Inc.
+  The sample data are utilized in accordance with terms and conditions
+  set by Live2D Inc. This content itself is created at the author’s sole
+  discretion.
+
+Where space is limited:
+
+  This content uses sample data owned and copyrighted by Live2D Inc.
+
+Ownership
+---------
+Model data © Live2D Inc. All rights reserved by the copyright holder.
+Packaged here solely as the default Companion stage avatar for SDK/demo use
+within GrokifyOS, under the licenses above.

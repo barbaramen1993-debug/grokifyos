@@ -11,6 +11,7 @@ object BuiltinPluginCatalog {
     const val SPOTIFY_CONTROLLER = "spotify_controller"
     const val SPACEXAI_USAGE = "spacexai_usage_analyzer"
     const val GROK_ASSISTANT = "grok_assistant"
+    const val COMPANION = "companion"
 
     val all: List<PluginManifest> = listOf(
         PluginManifest(
@@ -117,6 +118,27 @@ object BuiltinPluginCatalog {
                     id = "spacexai_api_key",
                     label = "SpaceXAI API key",
                     description = "Optional — Grok Voice TTS for spoken replies. Device TTS works without it.",
+                    required = false,
+                ),
+            ),
+        ),
+        PluginManifest(
+            id = COMPANION,
+            title = "Companion",
+            subtitle = "Live2D avatar you can talk to — SpaceXAI voice, chat, custom personality.",
+            version = "1.0.0",
+            source = PluginSource.Builtin,
+            kind = PluginKind.HostModule,
+            hostModuleId = COMPANION,
+            capabilities = listOf("AI", "Voice", "Chat", "Avatar"),
+            accent = PluginAccent.Rose,
+            icon = PluginIconKey.Apps,
+            featured = true,
+            requiredKeys = listOf(
+                PluginRequiredKey(
+                    id = "spacexai_api_key",
+                    label = "SpaceXAI API key",
+                    description = "Voice Agent + TTS. Device TTS can cover text-path speak without it.",
                     required = false,
                 ),
             ),
