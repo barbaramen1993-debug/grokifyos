@@ -22,6 +22,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -84,14 +87,27 @@ object GrokAssistantVoiceSession {
 
     private const val BAR_COUNT = 28
     private const val LEVEL_PUBLISH_MS = 40L
-    /** Keep mic muted briefly after last TTS chunk so the AudioTrack tail can't loop back. */
-    private const val PLAYBACK_MUTE_HOLD_MS = 700L
-    /** How often to refresh elapsed status / check stalls. */
-    private const val WATCHDOG_MS = 1_000L
+    /**
+     * Minimum mic mute after the last PCM write. Real hold is max of this and
+     * estimated AudioTrack drain time — short hold was unmuting mid-tail → echo
+     * barge-in cut Grok mid-sentence.
+     */
+    private const val PLAYBACK_MUTE_HOLD_MS = 1_200L
+    /** Extra cushion after estimated drain before treating playback as idle. */
+    private const val PLAYBACK_DRAIN_PAD_MS = 250L
+    /** How often to refresh elapsed status / check stalls / drain. */
+    private const val WATCHDOG_MS = 250L
     /** No server progress while Thinking → surface “still working”. */
     private const val THINKING_STALL_MS = 8_000L
     /** Hard cancel stuck Thinking (not Build tools). */
     private const val THINKING_TIMEOUT_MS = 75_000L
+    /**
+     * Ignore server speech_started while assistant audio is still playing/queued.
+     * Speaker bleed + short mute hold used to flush AudioTrack mid-utterance.
+     */
+    private const val BARGE_IN_GUARD_MS = 400L
+    /** Local RMS must exceed this while unmuted to honor barge-in during playback. */
+    private const val BARGE_IN_LOCAL_RMS = 0.22f
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val listeners = ConcurrentLinkedQueue<Listener>()
@@ -105,6 +121,17 @@ object GrokAssistantVoiceSession {
     private val bars = FloatArray(BAR_COUNT)
     private val lastLevelPublishMs = AtomicLong(0L)
     private val lastPlaybackActivityMs = AtomicLong(0L)
+    /** Bytes accepted into the playback queue but not yet written to AudioTrack. */
+    private val queuedPcmBytes = AtomicInteger(0)
+    /**
+     * Wall-clock (uptimeMillis) when local speaker audio is expected to finish.
+     * Extended on every successful PCM write; used for mute hold + barge-in guard.
+     */
+    private val playbackDrainUntilMs = AtomicLong(0L)
+    /** True after response.done until local PCM has finished playing. */
+    private val awaitingPlaybackDrain = AtomicBoolean(false)
+    /** Most recent local mic RMS (even when muted) for barge-in confidence. */
+    private val lastLocalRms = AtomicReference(0f)
     /** Outbound mic muted — we still read AudioRecord (keep hardware warm) but send nothing. */
     private val micMuted = AtomicBoolean(false)
 
@@ -119,6 +146,13 @@ object GrokAssistantVoiceSession {
     /** Pending function outputs waiting for playback drain before response.create. */
     private val pendingResponseAfterTools = AtomicBoolean(false)
     private val inFlightTools = AtomicInteger(0)
+
+    /** Single-thread PCM pump so WebSocket callbacks never race AudioTrack.write. */
+    private val playbackQueue = LinkedBlockingQueue<ByteArray>(256)
+    private val playbackExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "GrokVoicePlayback").apply { isDaemon = true }
+    }
+    private val playbackWorkerStarted = AtomicBoolean(false)
 
     /** Wall clock when current Thinking/ToolBusy phase began. */
     private val phaseStartedMs = AtomicLong(0L)
@@ -307,11 +341,18 @@ object GrokAssistantVoiceSession {
         pendingResponseAfterTools.set(false)
         inFlightTools.set(0)
         assistantCommittedThisResponse.set(false)
+        awaitingPlaybackDrain.set(false)
         micMuted.set(false)
         lastPlaybackActivityMs.set(0L)
+        queuedPcmBytes.set(0)
+        playbackDrainUntilMs.set(0L)
+        lastLocalRms.set(0f)
         phaseStartedMs.set(0L)
         phaseKey.set("idle")
         lastEventType.set(null)
+        // Poison + drain the playback queue so the worker doesn't write after release.
+        playbackQueue.clear()
+        playbackQueue.offer(ByteArray(0))
         micJob.getAndSet(null)?.cancel()
         runCatching { audioRecordRef.getAndSet(null)?.release() }
         runCatching {
@@ -386,6 +427,9 @@ object GrokAssistantVoiceSession {
 
     private fun tickWatchdog() {
         if (!running.get()) return
+        tryFinishPlaybackDrain()
+        applyMicMutePolicy(clientRef.get())
+
         val t = turn.get()
         val key = phaseKey.get()
         when (t) {
@@ -420,6 +464,12 @@ object GrokAssistantVoiceSession {
                     }
                 }
             }
+            Turn.GrokSpeaking -> {
+                if (statusLine.get() != "Voice Agent · speaking") {
+                    statusLine.set("Voice Agent · speaking")
+                    publish()
+                }
+            }
             Turn.ToolBusy -> {
                 val line = phaseStatus(key, phaseElapsedSec())
                 if (statusLine.get() != line) {
@@ -436,19 +486,115 @@ object GrokAssistantVoiceSession {
      * so the model never hears itself.
      *
      * Mic **is** allowed during Thinking so barge-in works and the session
-     * doesn't feel frozen/muted while the model reasons or searches.
+     * doesn't feel frozen/muted while the model reasons or searches — but
+     * only after any prior TTS has fully drained.
      */
     private fun isMicSendAllowed(): Boolean {
         when (turn.get()) {
             Turn.GrokSpeaking, Turn.ToolBusy, Turn.Idle, Turn.Error -> return false
             Turn.Thinking, Turn.Connecting, Turn.Listening, Turn.UserSpeaking -> Unit
         }
+        if (awaitingPlaybackDrain.get()) return false
+        if (playbackRemainingMs() > 0L) return false
         val lastPlay = lastPlaybackActivityMs.get()
         if (lastPlay > 0L) {
             val age = SystemClock.uptimeMillis() - lastPlay
             if (age < PLAYBACK_MUTE_HOLD_MS) return false
         }
         return true
+    }
+
+    private fun pcmBytesToMs(bytes: Int): Long {
+        if (bytes <= 0) return 0L
+        val rate = GrokAssistantVoiceClient.SAMPLE_RATE
+        return (bytes.toLong() * 1000L) / (rate * 2L)
+    }
+
+    /** Approximate milliseconds of assistant audio still queued or in the speaker path. */
+    private fun playbackRemainingMs(): Long {
+        val now = SystemClock.uptimeMillis()
+        val until = playbackDrainUntilMs.get()
+        val hardwareLeft = (until - now).coerceAtLeast(0L)
+        val queuedLeft = pcmBytesToMs(queuedPcmBytes.get())
+        val left = max(hardwareLeft, queuedLeft)
+        return if (left > 0L) left + PLAYBACK_DRAIN_PAD_MS else 0L
+    }
+
+    private fun isPlaybackActive(): Boolean {
+        if (queuedPcmBytes.get() > 0) return true
+        if (playbackRemainingMs() > 0L) return true
+        if (awaitingPlaybackDrain.get()) return true
+        val lastPlay = lastPlaybackActivityMs.get()
+        if (lastPlay > 0L) {
+            val age = SystemClock.uptimeMillis() - lastPlay
+            if (age < BARGE_IN_GUARD_MS) return true
+        }
+        return turn.get() == Turn.GrokSpeaking
+    }
+
+    /**
+     * True only when we're confident the *user* is trying to interrupt —
+     * not speaker bleed while Grok is still talking.
+     */
+    private fun shouldHonorBargeIn(): Boolean {
+        if (!isPlaybackActive()) return true
+        // Mic was muted while we played — any speech_started is almost certainly echo
+        // or a stale server VAD edge. Do not flush the rest of the sentence.
+        if (micMuted.get()) return false
+        // User has an open mic and is loud enough locally.
+        return lastLocalRms.get() >= BARGE_IN_LOCAL_RMS
+    }
+
+    private fun flushPlayback(reason: String) {
+        Log.d(TAG, "flushPlayback: $reason")
+        playbackQueue.clear()
+        queuedPcmBytes.set(0)
+        playbackDrainUntilMs.set(0L)
+        awaitingPlaybackDrain.set(false)
+        lastPlaybackActivityMs.set(0L)
+        runCatching {
+            audioTrackRef.get()?.let {
+                it.pause()
+                it.flush()
+            }
+        }
+    }
+
+    private fun extendPlaybackDeadline(writtenBytes: Int) {
+        if (writtenBytes <= 0) return
+        val addMs = pcmBytesToMs(writtenBytes) + PLAYBACK_DRAIN_PAD_MS
+        val now = SystemClock.uptimeMillis()
+        while (true) {
+            val prev = playbackDrainUntilMs.get()
+            val base = max(now, prev)
+            if (playbackDrainUntilMs.compareAndSet(prev, base + addMs)) break
+        }
+        lastPlaybackActivityMs.set(now)
+    }
+
+    private fun markResponseAudioFinished() {
+        // Server is done generating; keep UI in "speaking" until local buffer drains.
+        awaitingPlaybackDrain.set(true)
+        if (turn.get() == Turn.GrokSpeaking || playbackRemainingMs() > 0L) {
+            setPhase("speaking", Turn.GrokSpeaking, phaseStatus("speaking"))
+        }
+        applyMicMutePolicy(clientRef.get())
+        tryFinishPlaybackDrain()
+    }
+
+    private fun tryFinishPlaybackDrain() {
+        if (!running.get()) return
+        if (!awaitingPlaybackDrain.get()) return
+        if (queuedPcmBytes.get() > 0) return
+        if (playbackRemainingMs() > 0L) return
+        if (!awaitingPlaybackDrain.compareAndSet(true, false)) return
+        if (state.get() == State.ToolBusy) {
+            applyMicMutePolicy(clientRef.get())
+            publish()
+            return
+        }
+        setPhase("live", Turn.Listening, "Voice Agent · listening")
+        setState(State.Live, Turn.Listening, statusLine.get())
     }
 
     /** Edge-triggered mute/unmute with buffer clear so residual echo never commits. */
@@ -598,11 +744,22 @@ object GrokAssistantVoiceSession {
                 publish()
             }
             "input_audio_buffer.speech_started" -> {
-                // Barge-in: flush playback
-                runCatching {
-                    audioTrackRef.get()?.pause()
-                    audioTrackRef.get()?.flush()
+                // Echo / VAD false-positive while Grok is still talking used to
+                // flush AudioTrack mid-sentence and the reply never finished.
+                if (!shouldHonorBargeIn()) {
+                    Log.d(
+                        TAG,
+                        "ignore speech_started during playback " +
+                            "(muted=${micMuted.get()} rms=${lastLocalRms.get()} " +
+                            "remMs=${playbackRemainingMs()})",
+                    )
+                    // Drop residual server buffer so it doesn't commit echo as a turn.
+                    if (micMuted.get()) {
+                        clientRef.get()?.clearInputAudioBuffer()
+                    }
+                    return
                 }
+                flushPlayback("barge-in")
                 partialUser.set("")
                 partialAssistant.set(null)
                 assistantCommittedThisResponse.set(false)
@@ -736,8 +893,9 @@ object GrokAssistantVoiceSession {
                     if (left <= 0) {
                         inFlightTools.set(0)
                         pendingResponseAfterTools.set(true)
-                        // Brief pause so any prior TTS finishes (docs recommendation)
-                        delaySoft(350)
+                        // Docs: wait until current TTS drains before response.create,
+                        // otherwise the next turn stomps the rest of the sentence.
+                        waitForPlaybackDrain(maxWaitMs = 45_000L)
                         if (running.get() && pendingResponseAfterTools.getAndSet(false)) {
                             clientRef.get()?.responseCreate()
                             setState(State.Live, Turn.Thinking, null)
@@ -749,10 +907,12 @@ object GrokAssistantVoiceSession {
             "response.done" -> {
                 val leftover = partialAssistant.get()
                 commitAssistantIfNeeded(app, leftover)
-                partialAssistant.set(null)
+                // Keep partialAssistant until drain so UI caption stays up mid-tail.
                 if (state.get() != State.ToolBusy) {
-                    setPhase("live", Turn.Listening, "Voice Agent · listening")
-                    setState(State.Live, Turn.Listening, statusLine.get())
+                    markResponseAudioFinished()
+                } else {
+                    // Tool turn may have spoken a lead-in; still drain before next create.
+                    markResponseAudioFinished()
                 }
             }
             "session.updated",
@@ -791,14 +951,48 @@ object GrokAssistantVoiceSession {
         }
     }
 
+    /** Block (IO thread) until local TTS has finished or [maxWaitMs] elapses. */
+    private fun waitForPlaybackDrain(maxWaitMs: Long) {
+        val deadline = SystemClock.uptimeMillis() + maxWaitMs
+        while (running.get() && SystemClock.uptimeMillis() < deadline) {
+            val stillPlaying = queuedPcmBytes.get() > 0 ||
+                playbackRemainingMs() > 0L ||
+                (turn.get() == Turn.GrokSpeaking && awaitingPlaybackDrain.get())
+            if (!stillPlaying) break
+            delaySoft(40)
+        }
+        // Final pad so the last samples leave the speaker before we unmute / create.
+        delaySoft(PLAYBACK_MUTE_HOLD_MS.coerceAtMost(400L))
+    }
+
+    private fun ensurePlaybackWorker() {
+        if (!playbackWorkerStarted.compareAndSet(false, true)) return
+        playbackExecutor.execute {
+            while (true) {
+                val pcm = try {
+                    playbackQueue.take()
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (pcm.isEmpty()) {
+                    // Poison pill from stop, or empty frame — keep worker alive for reuse
+                    if (!running.get()) continue
+                    continue
+                }
+                writePcmBlocking(pcm)
+            }
+        }
+    }
+
     private fun ensurePlaybackTrack() {
         if (audioTrackRef.get() != null) return
         val rate = GrokAssistantVoiceClient.SAMPLE_RATE
+        // ~500ms min floor so MODE_STREAM rarely underruns mid-sentence.
         val minBuf = AudioTrack.getMinBufferSize(
             rate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-        ).coerceAtLeast(rate / 5 * 2)
+        ).coerceAtLeast(rate / 2 * 2)
         val usage = if (Build.VERSION.SDK_INT >= 29) {
             AudioAttributes.USAGE_ASSISTANT
         } else {
@@ -818,7 +1012,8 @@ object GrokAssistantVoiceSession {
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build(),
             )
-            .setBufferSizeInBytes(minBuf * 2)
+            // 4× min (~2s) gives write() room without dropping frames on jitter.
+            .setBufferSizeInBytes(minBuf * 4)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
         track.play()
@@ -826,31 +1021,69 @@ object GrokAssistantVoiceSession {
     }
 
     private fun playPcm(pcm: ByteArray) {
-        if (pcm.isEmpty()) return
+        if (pcm.isEmpty() || !running.get()) return
+        ensurePlaybackWorker()
         ensurePlaybackTrack()
-        val track = audioTrackRef.get() ?: return
+        // Count queued bytes before offer so mute/drain math stays ahead of the speaker.
+        queuedPcmBytes.addAndGet(pcm.size)
         lastPlaybackActivityMs.set(SystemClock.uptimeMillis())
-        // Always mute outbound mic while Grok's audio is playing.
-        applyMicMutePolicy(clientRef.get())
-        val rms = pcmRms(pcm)
         if (state.get() != State.ToolBusy) {
             if (turn.get() != Turn.GrokSpeaking) {
                 setPhase("speaking", Turn.GrokSpeaking, phaseStatus("speaking"))
             }
         }
-        noteLevel(rms)
+        applyMicMutePolicy(clientRef.get())
+        noteLevel(pcmRms(pcm))
+        if (!playbackQueue.offer(pcm)) {
+            // Queue full — write inline as last resort (still serialized-ish)
+            Log.w(TAG, "playback queue full — writing inline")
+            writePcmBlocking(pcm)
+        }
+    }
+
+    private fun writePcmBlocking(pcm: ByteArray) {
+        if (!running.get()) {
+            queuedPcmBytes.updateAndGet { (it - pcm.size).coerceAtLeast(0) }
+            return
+        }
+        ensurePlaybackTrack()
+        val track = audioTrackRef.get() ?: run {
+            queuedPcmBytes.updateAndGet { (it - pcm.size).coerceAtLeast(0) }
+            return
+        }
         try {
             if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 track.play()
             }
             var offset = 0
-            while (offset < pcm.size) {
-                val written = track.write(pcm, offset, pcm.size - offset)
-                if (written <= 0) break
+            var writtenTotal = 0
+            while (offset < pcm.size && running.get()) {
+                val written = if (Build.VERSION.SDK_INT >= 23) {
+                    track.write(pcm, offset, pcm.size - offset, AudioTrack.WRITE_BLOCKING)
+                } else {
+                    track.write(pcm, offset, pcm.size - offset)
+                }
+                if (written < 0) {
+                    Log.w(TAG, "AudioTrack.write error $written")
+                    break
+                }
+                if (written == 0) {
+                    // Rare with WRITE_BLOCKING; yield briefly.
+                    delaySoft(5)
+                    continue
+                }
                 offset += written
+                writtenTotal += written
+            }
+            if (writtenTotal > 0) {
+                extendPlaybackDeadline(writtenTotal)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "playPcm: ${e.message}")
+            Log.w(TAG, "writePcm: ${e.message}")
+        } finally {
+            queuedPcmBytes.updateAndGet { (it - pcm.size).coerceAtLeast(0) }
+            applyMicMutePolicy(clientRef.get())
+            tryFinishPlaybackDrain()
         }
     }
 
@@ -893,6 +1126,7 @@ object GrokAssistantVoiceSession {
                     if (n <= 0) continue
                     val chunk = if (n == frame.size) frame else frame.copyOf(n)
                     val rms = pcmRms(chunk, n)
+                    lastLocalRms.set(rms)
                     // Re-evaluate mute each frame (covers post-TTS hold → unmute).
                     applyMicMutePolicy(client)
                     val muted = micMuted.get() || !isMicSendAllowed()
@@ -914,6 +1148,8 @@ object GrokAssistantVoiceSession {
                     }
                     // Never stream mic while Grok is talking (or hold-after-TTS).
                     if (muted) continue
+                    // Extra safety: if hardware still has TTS, don't feed the VAD.
+                    if (playbackRemainingMs() > 0L) continue
                     if (useBinary.get()) {
                         client.sendBinary(chunk)
                     } else {
