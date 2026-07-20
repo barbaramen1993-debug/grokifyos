@@ -66,6 +66,8 @@ object CompanionVoiceSession {
     private const val LEVEL_PUBLISH_MS = 40L
     private const val WATCHDOG_MS = 250L
     private const val THINKING_TIMEOUT_MS = 35_000L
+    /** Whole connect path (mint + WS + session.update) must finish by this. */
+    private const val CONNECTING_TIMEOUT_MS = 16_000L
     private const val PLAYBACK_MUTE_HOLD_MS = 900L
     private const val PLAYBACK_DRAIN_PAD_MS = 220L
     /** Ignore residual speaker / room echo right after TTS frames. */
@@ -77,7 +79,7 @@ object CompanionVoiceSession {
     /** During Thinking, ignore soft ambient (Spotify bleed) as barge-in. */
     private const val THINKING_BARGE_RMS = 0.06f
     /** After connect / return-to-listen: hold send so residual ambient is not turn #1. */
-    private const val LISTEN_OPEN_SETTLE_MS = 450L
+    private const val LISTEN_OPEN_SETTLE_MS = 280L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val listenerRef = AtomicReference<Listener?>(null)
@@ -188,6 +190,7 @@ object CompanionVoiceSession {
         val storePrefs = runCatching { CompanionStore(app) }.getOrNull()
         sessionVoiceId.set(voiceId.ifBlank { storePrefs?.voiceId ?: "eve" })
         sessionPreferDeviceTts.set(storePrefs?.preferDeviceTts == true)
+        phaseStartedMs.set(SystemClock.uptimeMillis())
         setTurn(Turn.Connecting, "Connecting Companion voice…")
         // Grab focus early so Spotify ducks before the first reply (not mid-PCM).
         requestPlaybackFocus()
@@ -207,6 +210,16 @@ object CompanionVoiceSession {
                     running.get() && startGeneration.get() == gen
 
                 if (!stillThisStart()) return@launch
+
+                // Prep speakers while minting so we do not add latency after the socket is up.
+                launch {
+                    if (stillThisStart()) {
+                        runCatching {
+                            ensurePlaybackTrack()
+                            primePlaybackTrack()
+                        }
+                    }
+                }
 
                 setTurn(Turn.Connecting, "Minting voice session…")
                 val token = GrokAssistantVoiceClient.mintAuthToken(apiKey)
@@ -237,22 +250,21 @@ object CompanionVoiceSession {
                 clientRef.set(client)
                 client.connect(token)
 
-                // isConnected is true as soon as the WS object is created — wait for
-                // onOpen via session.updated after sessionUpdate (isSessionReady).
+                // Wait for real onOpen (socket object alone is not open yet).
                 var waits = 0
-                while (stillThisStart() && !client.isConnected && waits < 50) {
-                    Thread.sleep(100)
+                while (stillThisStart() && !client.isOpen && waits < 80) {
+                    Thread.sleep(50)
                     waits++
                 }
                 if (!stillThisStart()) return@launch
-                if (!client.isConnected) {
-                    fail("Voice WebSocket connect timeout")
+                if (!client.isOpen) {
+                    fail("Voice WebSocket connect timeout — check network / API key")
                     return@launch
                 }
 
                 setTurn(Turn.Connecting, "Configuring Companion voice…")
                 // JSON transport = docs default + official cookbook (audible output).
-                val updated = client.sessionUpdate(
+                var updated = client.sessionUpdate(
                     instructions = system,
                     voice = voice,
                     tools = JSONArray(),
@@ -261,6 +273,20 @@ object CompanionVoiceSession {
                     reasoningEffort = "none",
                 )
                 if (!updated) {
+                    // Rare race: open just flipped; retry once.
+                    Thread.sleep(80)
+                    if (stillThisStart() && client.isOpen) {
+                        updated = client.sessionUpdate(
+                            instructions = system,
+                            voice = voice,
+                            tools = JSONArray(),
+                            sampleRate = GrokAssistantVoiceClient.SAMPLE_RATE,
+                            useBinaryAudio = false,
+                            reasoningEffort = "none",
+                        )
+                    }
+                }
+                if (!updated) {
                     Log.w(TAG, "sessionUpdate send failed — will still wait briefly")
                 }
                 useBinary.set(false)
@@ -268,13 +294,29 @@ object CompanionVoiceSession {
                 // Cookbook: wait for session.updated before mic — audio sent earlier
                 // can drop the first TTS reply entirely.
                 waits = 0
-                while (stillThisStart() && !client.isSessionReady && waits < 50) {
-                    Thread.sleep(100)
+                while (stillThisStart() && !client.isSessionReady && waits < 60) {
+                    Thread.sleep(50)
                     waits++
                 }
                 if (!stillThisStart()) return@launch
                 if (!client.isSessionReady) {
                     Log.w(TAG, "session.updated not seen — continuing (socket open)")
+                    // One more configure attempt if first send was lost.
+                    if (client.isOpen) {
+                        client.sessionUpdate(
+                            instructions = system,
+                            voice = voice,
+                            tools = JSONArray(),
+                            sampleRate = GrokAssistantVoiceClient.SAMPLE_RATE,
+                            useBinaryAudio = false,
+                            reasoningEffort = "none",
+                        )
+                        waits = 0
+                        while (stillThisStart() && !client.isSessionReady && waits < 30) {
+                            Thread.sleep(50)
+                            waits++
+                        }
+                    }
                 }
 
                 // Drop any pre-ready mic/ambient that never should have been committed.
@@ -421,6 +463,25 @@ object CompanionVoiceSession {
         applyMicMutePolicy(clientRef.get())
 
         when (turn.get()) {
+            Turn.Connecting -> {
+                val elapsed = phaseElapsedMs()
+                val sec = (elapsed / 1000L).toInt()
+                if (sec >= 3) {
+                    val base = statusLine.get().orEmpty()
+                        .substringBefore(" ·")
+                        .ifBlank { "Connecting Companion voice" }
+                    val line = "$base · ${sec}s"
+                    if (statusLine.get() != line) {
+                        statusLine.set(line)
+                        publish()
+                    }
+                }
+                if (elapsed >= CONNECTING_TIMEOUT_MS) {
+                    Log.w(TAG, "Connecting timeout ${sec}s")
+                    fail("Voice connect timed out (${sec}s) — tap mic to retry")
+                    return
+                }
+            }
             Turn.Thinking -> {
                 val elapsed = phaseElapsedMs()
                 val sec = (elapsed / 1000L).toInt()

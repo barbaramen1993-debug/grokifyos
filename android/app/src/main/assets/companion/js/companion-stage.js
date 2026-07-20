@@ -47,6 +47,20 @@
   var loadToken = 0;
   var orbitTarget = null;
   var restBones = null;
+  /** User has framed the camera — never auto-reset after this unless double-tap. */
+  var userFramed = false;
+  /** Active pointers (multi-touch must not count as double-tap). */
+  var activePointers = 0;
+  var pointerMoved = false;
+  var pointerDownX = 0;
+  var pointerDownY = 0;
+  /** Blended pose layer for life-like idle / state postures. */
+  var posePhase = 0;
+  var poseVariant = 0;
+  var poseVariantT = 0;
+  var poseBlend = 0;
+  var statePose = null;
+  var statePoseTarget = null;
 
   function hostCall(method) {
     try {
@@ -175,6 +189,11 @@
     }
     vrm = null;
     restBones = null;
+    statePose = null;
+    statePoseTarget = null;
+    poseVariant = 0;
+    poseVariantT = 0;
+    poseBlend = 0;
   }
 
   function bone(name) {
@@ -211,19 +230,23 @@
       rightLowerLeg: bone("rightLowerLeg"),
     };
 
-    // Arms down (~65°) + slight forward, mild elbow bend.
-    setEuler(restBones.leftUpperArm, 0.12, 0.05, 1.15);
-    setEuler(restBones.rightUpperArm, 0.12, -0.05, -1.15);
-    setEuler(restBones.leftLowerArm, 0.25, 0.0, 0.08);
-    setEuler(restBones.rightLowerArm, 0.25, 0.0, -0.08);
-    setEuler(restBones.leftHand, 0.05, 0.0, 0.05);
-    setEuler(restBones.rightHand, 0.05, 0.0, -0.05);
-    // Soft spine/hips natural stance.
-    setEuler(restBones.hips, 0.02, 0, 0);
-    setEuler(restBones.spine, 0.04, 0, 0);
-    setEuler(restBones.chest, 0.03, 0, 0);
-    setEuler(restBones.neck, -0.02, 0, 0);
-    setEuler(restBones.head, 0.02, 0, 0);
+    // Soft A-pose: arms hang with mild elbow bend, hands slightly forward.
+    setEuler(restBones.leftUpperArm, 0.18, 0.12, 1.05);
+    setEuler(restBones.rightUpperArm, 0.18, -0.12, -1.05);
+    setEuler(restBones.leftLowerArm, 0.42, 0.08, 0.12);
+    setEuler(restBones.rightLowerArm, 0.42, -0.08, -0.12);
+    setEuler(restBones.leftHand, 0.08, 0.05, 0.1);
+    setEuler(restBones.rightHand, 0.08, -0.05, -0.1);
+    // Contrapposto-ish stance (weight soft on one side).
+    setEuler(restBones.hips, 0.03, 0.04, 0.02);
+    setEuler(restBones.spine, 0.05, -0.03, -0.01);
+    setEuler(restBones.chest, 0.04, 0.02, 0);
+    setEuler(restBones.neck, -0.03, 0, 0);
+    setEuler(restBones.head, 0.03, 0, 0);
+    if (restBones.leftUpperLeg) setEuler(restBones.leftUpperLeg, 0.02, 0, 0.03);
+    if (restBones.rightUpperLeg) setEuler(restBones.rightUpperLeg, -0.01, 0, -0.02);
+    if (restBones.leftLowerLeg) setEuler(restBones.leftLowerLeg, -0.03, 0, 0);
+    if (restBones.rightLowerLeg) setEuler(restBones.rightLowerLeg, -0.01, 0, 0);
 
     // Stash base rotations for idle overlays.
     restBones.base = {};
@@ -237,6 +260,34 @@
         z: n.rotation.z,
       };
     });
+
+    statePose = emptyPose();
+    statePoseTarget = emptyPose();
+    poseVariant = 0;
+    poseVariantT = 0;
+    poseBlend = 0;
+    pickStatePoseTarget(currentState || STATE_IDLE);
+  }
+
+  function emptyPose() {
+    return {
+      hips: [0, 0, 0],
+      spine: [0, 0, 0],
+      chest: [0, 0, 0],
+      upperChest: [0, 0, 0],
+      neck: [0, 0, 0],
+      head: [0, 0, 0],
+      leftUpperArm: [0, 0, 0],
+      rightUpperArm: [0, 0, 0],
+      leftLowerArm: [0, 0, 0],
+      rightLowerArm: [0, 0, 0],
+      leftHand: [0, 0, 0],
+      rightHand: [0, 0, 0],
+      leftUpperLeg: [0, 0, 0],
+      rightUpperLeg: [0, 0, 0],
+      leftLowerLeg: [0, 0, 0],
+      rightLowerLeg: [0, 0, 0],
+    };
   }
 
   function setEuler(node, x, y, z) {
@@ -249,9 +300,68 @@
   function addEuler(node, key, dx, dy, dz) {
     if (!node || !node.rotation || !restBones || !restBones.base || !restBones.base[key]) return;
     var b = restBones.base[key];
-    node.rotation.x = b.x + dx;
-    node.rotation.y = b.y + dy;
-    node.rotation.z = b.z + dz;
+    var p = statePose && statePose[key] ? statePose[key] : [0, 0, 0];
+    node.rotation.x = b.x + dx + p[0];
+    node.rotation.y = b.y + dy + p[1];
+    node.rotation.z = b.z + dz + p[2];
+  }
+
+  /** State-specific posture targets (additive on rest). */
+  function pickStatePoseTarget(state) {
+    var p = emptyPose();
+    if (state === STATE_LISTENING) {
+      // Lean in, attentive tilt, open hands slightly.
+      p.spine = [0.06, 0, 0];
+      p.chest = [0.05, 0, 0];
+      p.neck = [0.04, 0, 0];
+      p.head = [0.05, 0.02, 0];
+      p.leftUpperArm = [0.08, 0.05, -0.06];
+      p.rightUpperArm = [0.08, -0.05, 0.06];
+      p.leftLowerArm = [0.1, 0, 0];
+      p.rightLowerArm = [0.1, 0, 0];
+    } else if (state === STATE_THINKING) {
+      // Head tilt + right hand toward chin, weight shift.
+      p.hips = [0.02, -0.06, 0.04];
+      p.spine = [0.02, 0.08, 0.03];
+      p.chest = [0.03, 0.05, 0.02];
+      p.neck = [0.12, 0.18, 0.08];
+      p.head = [0.1, 0.22, 0.1];
+      p.rightUpperArm = [-0.35, -0.55, 0.55];
+      p.rightLowerArm = [1.1, 0.2, -0.15];
+      p.rightHand = [0.15, 0.1, -0.2];
+      p.leftUpperArm = [0.05, 0.1, 0.05];
+      p.leftLowerArm = [0.15, 0, 0.05];
+    } else if (state === STATE_SPEAKING) {
+      // Open stance, slight forward lean, animated hands ready.
+      p.hips = [0.02, 0, 0];
+      p.spine = [0.04, 0, 0];
+      p.chest = [0.06, 0, 0];
+      p.neck = [0.02, 0, 0];
+      p.head = [0.03, 0, 0];
+      p.leftUpperArm = [0.12, 0.15, -0.12];
+      p.rightUpperArm = [0.12, -0.15, 0.12];
+      p.leftLowerArm = [0.35, 0.1, 0.08];
+      p.rightLowerArm = [0.35, -0.1, -0.08];
+      p.leftHand = [0.1, 0.05, 0.05];
+      p.rightHand = [0.1, -0.05, -0.05];
+    } else {
+      // Idle: relaxed neutral (variant micro-offsets applied in motion).
+      p.spine = [0.01, 0, 0];
+      p.head = [0.01, 0, 0];
+    }
+    statePoseTarget = p;
+  }
+
+  function blendStatePose(dt) {
+    if (!statePose || !statePoseTarget) return;
+    var rate = Math.min(1, dt * 2.4);
+    Object.keys(statePose).forEach(function (k) {
+      var a = statePose[k];
+      var b = statePoseTarget[k] || [0, 0, 0];
+      a[0] += (b[0] - a[0]) * rate;
+      a[1] += (b[1] - a[1]) * rate;
+      a[2] += (b[2] - a[2]) * rate;
+    });
   }
 
   /**
@@ -260,73 +370,144 @@
   function applyBodyMotion(dt) {
     if (!vrm || !restBones || !restBones.base) return;
     var t = idleTime;
-    var sway = Math.sin(t * 0.85) * 0.035;
-    var breath = Math.sin(t * 2.1) * 0.02;
-    var weight = Math.sin(t * 0.55) * 0.015;
+    posePhase += dt;
+    poseVariantT += dt;
+
+    // Alternate weight-shift variants every ~5–7s for less mechanical idle.
+    if (poseVariantT > 5.5 + (poseVariant % 3) * 0.7) {
+      poseVariantT = 0;
+      poseVariant = (poseVariant + 1) % 3;
+    }
+    var targetBlend = poseVariant === 0 ? 0 : poseVariant === 1 ? 1 : 0.45;
+    poseBlend += (targetBlend - poseBlend) * Math.min(1, dt * 0.55);
+
+    blendStatePose(dt);
+
+    var breath = Math.sin(t * 1.65) * 0.018 + Math.sin(t * 0.4) * 0.006;
+    var sway = Math.sin(t * 0.55) * 0.028 + Math.sin(t * 1.15) * 0.01;
+    var weight = (poseBlend - 0.5) * 0.04 + Math.sin(t * 0.35) * 0.012;
+    var shoulder = Math.sin(t * 0.7) * 0.02;
 
     if (currentState === STATE_THINKING) {
-      sway = Math.sin(t * 1.2) * 0.05;
-      weight = Math.sin(t * 0.7) * 0.02;
+      sway = Math.sin(t * 0.45) * 0.018;
+      breath = Math.sin(t * 1.4) * 0.015;
     } else if (currentState === STATE_SPEAKING) {
-      sway = Math.sin(t * 1.05) * 0.04;
-      breath = Math.sin(t * 2.6) * 0.028;
+      sway = Math.sin(t * 0.9) * 0.032;
+      breath = Math.sin(t * 2.3) * 0.026 + mouthValue * 0.012;
+      // Talking hand gestures (right more active).
+      var gest = Math.sin(t * 2.4) * (0.08 + mouthValue * 0.12);
+      var gest2 = Math.sin(t * 1.7 + 1.1) * (0.05 + mouthValue * 0.08);
+      addEuler(
+        restBones.rightUpperArm,
+        "rightUpperArm",
+        gest * 0.9,
+        -gest2 * 0.5,
+        gest * 0.35
+      );
+      addEuler(
+        restBones.rightLowerArm,
+        "rightLowerArm",
+        Math.abs(gest) * 0.5,
+        gest2 * 0.2,
+        -gest * 0.15
+      );
+      addEuler(
+        restBones.leftUpperArm,
+        "leftUpperArm",
+        gest2 * 0.45,
+        gest * 0.2,
+        -gest2 * 0.2
+      );
+      addEuler(
+        restBones.head,
+        "head",
+        Math.sin(t * 2.1) * 0.02 + mouthValue * 0.015,
+        Math.sin(t * 1.3) * 0.03,
+        Math.sin(t * 0.8) * 0.015
+      );
     } else if (currentState === STATE_LISTENING) {
-      sway = Math.sin(t * 0.7) * 0.025;
+      sway = Math.sin(t * 0.5) * 0.02;
+      // Soft attentive nod cycle.
+      addEuler(
+        restBones.head,
+        "head",
+        Math.sin(t * 0.65) * 0.025 + 0.01,
+        Math.sin(t * 0.35) * 0.04,
+        0
+      );
+    } else {
+      // Idle micro-gestures + occasional shoulder roll.
+      addEuler(
+        restBones.leftUpperArm,
+        "leftUpperArm",
+        Math.sin(t * 0.8) * 0.035 + poseBlend * 0.03,
+        Math.sin(t * 0.5) * 0.025,
+        Math.sin(t * 0.65) * 0.03 - poseBlend * 0.04
+      );
+      addEuler(
+        restBones.rightUpperArm,
+        "rightUpperArm",
+        Math.sin(t * 0.85 + 0.5) * 0.035 - poseBlend * 0.02,
+        Math.sin(t * 0.55 + 0.3) * 0.025,
+        Math.sin(t * 0.7 + 0.4) * 0.03 + poseBlend * 0.04
+      );
+      addEuler(
+        restBones.leftLowerArm,
+        "leftLowerArm",
+        Math.sin(t * 0.9) * 0.05,
+        0,
+        Math.sin(t * 0.6) * 0.025
+      );
+      addEuler(
+        restBones.rightLowerArm,
+        "rightLowerArm",
+        Math.sin(t * 0.95 + 0.6) * 0.05,
+        0,
+        Math.sin(t * 0.62 + 0.4) * 0.025
+      );
     }
 
-    addEuler(restBones.hips, "hips", 0.01 + weight, sway * 0.35, 0);
-    addEuler(restBones.spine, "spine", 0.02 + breath * 0.6, sway * 0.55, sway * 0.15);
+    addEuler(restBones.hips, "hips", 0.012 + weight * 0.5, sway * 0.4 + weight * 0.8, weight * 0.35);
+    addEuler(
+      restBones.spine,
+      "spine",
+      0.02 + breath * 0.7,
+      sway * 0.5 - weight * 0.4,
+      sway * 0.12 + shoulder * 0.3
+    );
     if (restBones.chest) {
-      addEuler(restBones.chest, "chest", breath * 0.9, sway * 0.4, 0);
+      addEuler(restBones.chest, "chest", breath * 1.05, sway * 0.35, shoulder * 0.5);
     }
     if (restBones.upperChest) {
-      addEuler(restBones.upperChest, "upperChest", breath * 0.5, sway * 0.2, 0);
+      addEuler(restBones.upperChest, "upperChest", breath * 0.55, sway * 0.18, 0);
     }
-    addEuler(restBones.neck, "neck", -0.02 + breath * 0.15, sway * 0.6, 0);
-    addEuler(
-      restBones.head,
-      "head",
-      0.02 + Math.sin(t * 0.9) * 0.015,
-      sway * 0.85 + lookSmooth.x * 0.25,
-      lookSmooth.x * 0.08
-    );
+    addEuler(restBones.neck, "neck", -0.015 + breath * 0.12, sway * 0.55, shoulder * 0.2);
+    // Head always gets look + gentle idle unless speaking/listening already wrote extras.
+    if (currentState !== STATE_SPEAKING && currentState !== STATE_LISTENING) {
+      addEuler(
+        restBones.head,
+        "head",
+        0.02 + Math.sin(t * 0.75) * 0.018,
+        sway * 0.75 + lookSmooth.x * 0.28,
+        lookSmooth.x * 0.1 + Math.sin(t * 0.4) * 0.012
+      );
+    } else {
+      // Still apply look offset on top of state motion via neck.
+      addEuler(restBones.neck, "neck", lookSmooth.y * 0.08, lookSmooth.x * 0.15, 0);
+    }
 
-    // Subtle arm drift so they don't look frozen.
-    addEuler(
-      restBones.leftUpperArm,
-      "leftUpperArm",
-      Math.sin(t * 0.9) * 0.03,
-      Math.sin(t * 0.6) * 0.02,
-      Math.sin(t * 0.75) * 0.025
-    );
-    addEuler(
-      restBones.rightUpperArm,
-      "rightUpperArm",
-      Math.sin(t * 0.95 + 0.4) * 0.03,
-      Math.sin(t * 0.65 + 0.3) * 0.02,
-      Math.sin(t * 0.8 + 0.5) * 0.025
-    );
-    addEuler(
-      restBones.leftLowerArm,
-      "leftLowerArm",
-      Math.sin(t * 1.1) * 0.04,
-      0,
-      Math.sin(t * 0.7) * 0.02
-    );
-    addEuler(
-      restBones.rightLowerArm,
-      "rightLowerArm",
-      Math.sin(t * 1.05 + 0.6) * 0.04,
-      0,
-      Math.sin(t * 0.72 + 0.4) * 0.02
-    );
-
-    // Weight shift in legs.
+    // Weight shift legs.
     if (restBones.leftUpperLeg) {
-      addEuler(restBones.leftUpperLeg, "leftUpperLeg", weight * 0.4, 0, weight * 0.2);
+      addEuler(restBones.leftUpperLeg, "leftUpperLeg", weight * 0.55, 0, weight * 0.25);
     }
     if (restBones.rightUpperLeg) {
-      addEuler(restBones.rightUpperLeg, "rightUpperLeg", -weight * 0.4, 0, -weight * 0.2);
+      addEuler(restBones.rightUpperLeg, "rightUpperLeg", -weight * 0.55, 0, -weight * 0.25);
+    }
+    if (restBones.leftLowerLeg) {
+      addEuler(restBones.leftLowerLeg, "leftLowerLeg", -weight * 0.3, 0, 0);
+    }
+    if (restBones.rightLowerLeg) {
+      addEuler(restBones.rightLowerLeg, "rightLowerLeg", weight * 0.3, 0, 0);
     }
   }
 
@@ -338,8 +519,12 @@
     camera.updateProjectionMatrix();
     renderer.setSize(w, h, false);
 
-    if (!forceReset && controls && orbitTarget) {
+    // Never steal framing after the user orbits — only resize the viewport.
+    if (!forceReset && (userFramed || orbitTarget) && controls) {
       controls.update();
+      return;
+    }
+    if (!forceReset && !controls && orbitTarget) {
       return;
     }
 
@@ -363,10 +548,14 @@
               controls.minDistance = Math.max(0.45, dist * 0.35);
               controls.maxDistance = dist * 3.2;
               controls.update();
+              try {
+                if (typeof controls.saveState === "function") controls.saveState();
+              } catch (_) {}
             } else {
               camera.lookAt(center.x, lookY, center.z);
             }
             orbitTarget = { x: center.x, y: lookY, z: center.z, dist: dist };
+            userFramed = false;
             return;
           }
         }
@@ -381,10 +570,14 @@
       controls.minDistance = 0.6;
       controls.maxDistance = 6;
       controls.update();
+      try {
+        if (typeof controls.saveState === "function") controls.saveState();
+      } catch (_) {}
     } else {
       camera.lookAt(0, ty, 0);
     }
     orbitTarget = { x: 0, y: ty, z: 0, dist: tz };
+    userFramed = false;
   }
 
   function setExpression(name, value) {
@@ -489,7 +682,7 @@
     if (typeof L.OrbitControls === "function") {
       controls = new L.OrbitControls(camera, canvas);
       controls.enableDamping = true;
-      controls.dampingFactor = 0.08;
+      controls.dampingFactor = 0.12;
       controls.enablePan = true;
       controls.screenSpacePanning = true;
       controls.rotateSpeed = 0.7;
@@ -499,6 +692,8 @@
       controls.maxPolarAngle = Math.PI * 0.92;
       controls.minDistance = 0.5;
       controls.maxDistance = 8;
+      // Keep last orbit after finger lift (do not auto-revert).
+      controls.enableZoom = true;
       // One finger rotate, two finger pinch-zoom + pan (mobile-friendly).
       try {
         if (THREE.TOUCH) {
@@ -517,6 +712,18 @@
           };
         }
       } catch (_) {}
+      // Mark user framing so nothing re-centers mid-session.
+      try {
+        controls.addEventListener("start", function () {
+          userFramed = true;
+        });
+        controls.addEventListener("end", function () {
+          userFramed = true;
+        });
+        controls.addEventListener("change", function () {
+          userFramed = true;
+        });
+      } catch (_) {}
     }
 
     var amb = new THREE.AmbientLight(0xffffff, 0.7);
@@ -531,22 +738,59 @@
     rim.position.set(0, 1.2, -1.5);
     scene.add(rim);
 
-    // Double-tap resets camera framing (no chat/voice).
+    // Double-tap resets framing — but multi-touch pan/zoom finger-ups must NOT.
     var lastTap = 0;
+    var sawMultiTouch = false;
+    activePointers = 0;
     canvas.addEventListener(
-      "pointerup",
+      "pointerdown",
       function (ev) {
-        if (ev.pointerType === "mouse" && ev.button !== 0) return;
-        var now = Date.now();
-        if (now - lastTap < 320) {
-          fitCamera(true);
-          lastTap = 0;
-        } else {
-          lastTap = now;
-        }
+        activePointers += 1;
+        if (activePointers >= 2) sawMultiTouch = true;
+        pointerMoved = false;
+        pointerDownX = ev.clientX || 0;
+        pointerDownY = ev.clientY || 0;
       },
       { passive: true }
     );
+    canvas.addEventListener(
+      "pointermove",
+      function (ev) {
+        if (activePointers < 1) return;
+        var dx = (ev.clientX || 0) - pointerDownX;
+        var dy = (ev.clientY || 0) - pointerDownY;
+        if (dx * dx + dy * dy > 100) pointerMoved = true;
+      },
+      { passive: true }
+    );
+    function onPointerEnd(ev) {
+      if (activePointers > 0) activePointers -= 1;
+      if (ev.pointerType === "mouse" && ev.button !== 0) {
+        if (activePointers === 0) sawMultiTouch = false;
+        return;
+      }
+      // Only a clean single-finger tap counts toward double-tap reset.
+      var isTap =
+        !sawMultiTouch &&
+        !pointerMoved &&
+        activePointers === 0 &&
+        !(ev.pointerType === "mouse" && ev.button !== 0);
+      if (activePointers === 0) sawMultiTouch = false;
+      if (!isTap) {
+        lastTap = 0;
+        return;
+      }
+      var now = Date.now();
+      if (now - lastTap < 320) {
+        userFramed = false;
+        fitCamera(true);
+        lastTap = 0;
+      } else {
+        lastTap = now;
+      }
+    }
+    canvas.addEventListener("pointerup", onPointerEnd, { passive: true });
+    canvas.addEventListener("pointercancel", onPointerEnd, { passive: true });
 
     window.addEventListener("resize", function () {
       fitCamera(false);
@@ -695,10 +939,9 @@
     applyMouth(0);
     usingFallback = false;
     showFallback(false);
+    // Frame once on install only — never again unless double-tap / resetCamera.
+    userFramed = false;
     fitCamera(true);
-    requestAnimationFrame(function () {
-      if (token === loadToken) fitCamera(true);
-    });
     return label || "VRM";
   }
 
@@ -951,9 +1194,13 @@
     ) {
       s = STATE_IDLE;
     }
+    var prev = currentState;
     currentState = s;
     setFallbackState(s);
     if (usingFallback || !vrm) return;
+    if (prev !== s) {
+      pickStatePoseTarget(s);
+    }
     applyStateExpressions(s);
     if (s !== STATE_SPEAKING && targetMouth < 0.02) {
       clearTalkExpressions();
@@ -983,6 +1230,7 @@
   }
 
   function resetCamera() {
+    userFramed = false;
     fitCamera(true);
   }
 

@@ -31,15 +31,23 @@ class GrokAssistantVoiceClient(
     private val client = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .connectTimeout(20, TimeUnit.SECONDS)
+        // Faster fail on bad networks — Companion shows "retry" sooner.
+        .connectTimeout(12, TimeUnit.SECONDS)
         .build()
 
     private val socket = AtomicReference<WebSocket?>(null)
     private val intentionalClose = AtomicBoolean(false)
     private val sessionConfigured = AtomicBoolean(false)
+    /** True only after WebSocket onOpen — [socket] is set earlier and is not enough. */
+    private val opened = AtomicBoolean(false)
 
+    /** Socket object exists (may still be handshaking). */
     val isConnected: Boolean get() = socket.get() != null
-    val isSessionReady: Boolean get() = sessionConfigured.get() && isConnected
+
+    /** Handshake finished — safe to send session.update. */
+    val isOpen: Boolean get() = opened.get() && socket.get() != null
+
+    val isSessionReady: Boolean get() = sessionConfigured.get() && isOpen
 
     /**
      * @param conversationId optional xAI conversation id for [Session Resumption]
@@ -54,6 +62,7 @@ class GrokAssistantVoiceClient(
         socket.getAndSet(null)?.close(1000, "reconnect")
         intentionalClose.set(false)
         sessionConfigured.set(false)
+        opened.set(false)
 
         val modelQ = model.trim().ifBlank { DEFAULT_MODEL }
         val resume = conversationId?.trim().orEmpty()
@@ -75,6 +84,7 @@ class GrokAssistantVoiceClient(
             req,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
+                    opened.set(true)
                     onState(true, null)
                 }
 
@@ -101,6 +111,7 @@ class GrokAssistantVoiceClient(
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    opened.set(false)
                     sessionConfigured.set(false)
                     if (!intentionalClose.get()) {
                         onState(false, "Closed $code${if (reason.isNotBlank()) ": $reason" else ""}")
@@ -108,6 +119,7 @@ class GrokAssistantVoiceClient(
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    opened.set(false)
                     sessionConfigured.set(false)
                     if (intentionalClose.get()) return
                     val msg = when {
@@ -123,6 +135,7 @@ class GrokAssistantVoiceClient(
 
     fun disconnect() {
         intentionalClose.set(true)
+        opened.set(false)
         sessionConfigured.set(false)
         socket.getAndSet(null)?.close(1000, "bye")
         onState(false, null)
@@ -432,8 +445,10 @@ class GrokAssistantVoiceClient(
 
         private fun defaultHttp(): OkHttpClient =
             OkHttpClient.Builder()
-                .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
+                // Mint is a short POST — don't burn 20–30s before falling back to API key.
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .callTimeout(12, TimeUnit.SECONDS)
                 .build()
     }
 }

@@ -347,14 +347,13 @@ object GrokAssistantVoiceSession {
                     Log.i(TAG, "resuming voice conversation_id=${resumeId.take(12)}…")
                 }
 
-                // Wait for WebSocket open (docs: session.created / conversation.created
-                // arrive first; we configure after open like the xAI cookbook).
+                // Wait for real onOpen (socket object alone is not open yet).
                 var waits = 0
-                while (running.get() && !client.isConnected && waits < 50) {
-                    Thread.sleep(100)
+                while (running.get() && !client.isOpen && waits < 80) {
+                    Thread.sleep(50)
                     waits++
                 }
-                if (!client.isConnected) {
+                if (!client.isOpen) {
                     fail("Voice WebSocket connect timeout")
                     return@launch
                 }
