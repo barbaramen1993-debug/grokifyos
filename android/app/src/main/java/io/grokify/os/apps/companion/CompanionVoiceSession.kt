@@ -76,6 +76,8 @@ object CompanionVoiceSession {
     private const val POST_SPEAK_BARGE_RMS = 0.07f
     /** During Thinking, ignore soft ambient (Spotify bleed) as barge-in. */
     private const val THINKING_BARGE_RMS = 0.06f
+    /** After connect / return-to-listen: hold send so residual ambient is not turn #1. */
+    private const val LISTEN_OPEN_SETTLE_MS = 450L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val listenerRef = AtomicReference<Listener?>(null)
@@ -122,6 +124,8 @@ object CompanionVoiceSession {
     private val lastUserCommitText = AtomicReference<String?>(null)
     private val lastUserCommitElapsedMs = AtomicLong(0L)
     private val postSpeakCooldownUntilMs = AtomicLong(0L)
+    /** Wall-clock until which mic frames must not be sent (settle / post-connect). */
+    private val listenOpenUntilMs = AtomicLong(0L)
     /** Session voice for HostAiClient TTS fallback when realtime audio is missing. */
     private val sessionVoiceId = AtomicReference("eve")
     private val sessionPreferDeviceTts = AtomicBoolean(false)
@@ -179,11 +183,14 @@ object CompanionVoiceSession {
         mouth.set(0f)
         level.set(0f)
         postSpeakCooldownUntilMs.set(0L)
+        listenOpenUntilMs.set(0L)
         firstAudioLogged.set(false)
         val storePrefs = runCatching { CompanionStore(app) }.getOrNull()
         sessionVoiceId.set(voiceId.ifBlank { storePrefs?.voiceId ?: "eve" })
         sessionPreferDeviceTts.set(storePrefs?.preferDeviceTts == true)
         setTurn(Turn.Connecting, "Connecting Companion voice…")
+        // Grab focus early so Spotify ducks before the first reply (not mid-PCM).
+        requestPlaybackFocus()
         // Preempt wake loop so Companion can open the mic on first start.
         if (!GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Voice)) {
             GrokAssistantMic.release(GrokAssistantMic.Owner.Wake)
@@ -270,8 +277,13 @@ object CompanionVoiceSession {
                     Log.w(TAG, "session.updated not seen — continuing (socket open)")
                 }
 
+                // Drop any pre-ready mic/ambient that never should have been committed.
+                client.clearInputAudioBuffer()
                 ensurePlaybackTrack()
+                primePlaybackTrack()
                 if (!stillThisStart()) return@launch
+                // Settle before first listen so open-room / Spotify is not "user turn #1".
+                listenOpenUntilMs.set(SystemClock.uptimeMillis() + LISTEN_OPEN_SETTLE_MS)
                 markPhase(Turn.Listening, "Companion · listening")
                 startMicCapture(client)
             } catch (e: Exception) {
@@ -324,6 +336,7 @@ object CompanionVoiceSession {
         lastUserCommitText.set(null)
         lastUserCommitElapsedMs.set(0L)
         postSpeakCooldownUntilMs.set(0L)
+        listenOpenUntilMs.set(0L)
         firstAudioLogged.set(false)
         awaitingPlaybackDrain.set(false)
         micMuted.set(false)
@@ -440,13 +453,11 @@ object CompanionVoiceSession {
     }
 
     private fun isMicSendAllowed(): Boolean {
-        when (turn.get()) {
-            Turn.Listening, Turn.Thinking -> Unit
-            Turn.Speaking, Turn.Idle, Turn.Error, Turn.Connecting -> return false
-        }
-        // Half-duplex for the *whole* assistant turn: keep the mic silent from
-        // response.created until done/cancelled. Ambient Spotify bleed was firing
-        // server VAD mid-thinking, cancelling TTS before the first audio delta.
+        // Strict half-duplex: only stream mic while Listening. Thinking used to
+        // still send ambient (Spotify bleed) *before* response.created, which
+        // cancelled the first assistant turn — second turn often "worked" after
+        // the room/buffer settled. Interrupt button covers barge-in.
+        if (turn.get() != Turn.Listening) return false
         if (serverResponseActive.get()) return false
         if (awaitingPlaybackDrain.get()) return false
         if (hasLocalPlaybackRemaining()) return false
@@ -456,6 +467,8 @@ object CompanionVoiceSession {
             if (age < PLAYBACK_MUTE_HOLD_MS) return false
         }
         if (SystemClock.uptimeMillis() < postSpeakCooldownUntilMs.get()) return false
+        // Brief settle after socket ready so open-mic ambient is not the first "turn".
+        if (SystemClock.uptimeMillis() < listenOpenUntilMs.get()) return false
         return true
     }
 
@@ -560,8 +573,11 @@ object CompanionVoiceSession {
         awaitingPlaybackDrain.set(false)
         partialAssistant.set(null)
         // Brief cooldown so speaker ring-out does not open a phantom user turn.
-        postSpeakCooldownUntilMs.set(SystemClock.uptimeMillis() + POST_SPEAK_COOLDOWN_MS)
-        abandonPlaybackFocus()
+        val now = SystemClock.uptimeMillis()
+        postSpeakCooldownUntilMs.set(now + POST_SPEAK_COOLDOWN_MS)
+        // Keep focus a bit longer so turn 2 TTS is not racing Spotify unduck.
+        // (Full abandon happens on stop; mid-session we re-request on playPcm.)
+        clientRef.get()?.clearInputAudioBuffer()
         mouthSmoother.reset()
         mouth.set(0f)
         markPhase(Turn.Listening, "Companion · listening")
@@ -647,9 +663,13 @@ object CompanionVoiceSession {
         val wasMuted = micMuted.getAndSet(wantMute)
         if (wantMute && !wasMuted) {
             val t = turn.get()
+            // Clear server input on Thinking/Speaking so ambient already buffered
+            // cannot cancel the in-flight first reply.
             val safeToClear = t == Turn.Speaking ||
+                t == Turn.Thinking ||
                 awaitingPlaybackDrain.get() ||
-                hasLocalPlaybackRemaining()
+                hasLocalPlaybackRemaining() ||
+                serverResponseActive.get()
             if (safeToClear) client?.clearInputAudioBuffer()
             Log.d(TAG, "mic muted (turn=$t clear=$safeToClear)")
         } else if (!wantMute && wasMuted) {
@@ -884,7 +904,10 @@ object CompanionVoiceSession {
                 markPhase(Turn.Listening, "Hearing you…")
             }
             "input_audio_buffer.speech_stopped" -> {
+                // Mute + clear immediately so ambient after the user stops talking
+                // cannot open a cancel race before response.created.
                 markPhase(Turn.Thinking, "Companion · thinking")
+                clientRef.get()?.clearInputAudioBuffer()
             }
             "conversation.item.input_audio_transcription.updated" -> {
                 val text = extractTranscript(event)
@@ -1125,6 +1148,24 @@ object CompanionVoiceSession {
         track.play()
         audioTrackRef.set(track)
         Log.d(TAG, "AudioTrack started rate=$rate buf=${minBuf * 4}")
+    }
+
+    /** Write a short silence burst so the first real PCM is not lost to cold start. */
+    private fun primePlaybackTrack() {
+        val track = audioTrackRef.get() ?: return
+        val rate = GrokAssistantVoiceClient.SAMPLE_RATE
+        // ~40ms of zeros at 24k mono PCM16.
+        val silence = ByteArray((rate / 25) * 2)
+        runCatching {
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+            if (Build.VERSION.SDK_INT >= 23) {
+                track.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
+            } else {
+                track.write(silence, 0, silence.size)
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "primePlaybackTrack: ${e.message}")
+        }
     }
 
     private fun playPcm(pcm: ByteArray) {

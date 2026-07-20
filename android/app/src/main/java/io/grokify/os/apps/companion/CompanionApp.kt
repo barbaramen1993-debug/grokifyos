@@ -1001,7 +1001,10 @@ private fun CompanionSettingsSheet(
             Text("Load model pack…")
         }
         Text(
-            "Pick a folder with a .model3.json Cubism pack. Copied into app storage.",
+            "Pick a folder with a Cubism 3/4 pack (*.model3.json + .moc3 + textures). " +
+                "Live2D free samples (Akari, Hiyori, …) work if you download them from " +
+                "live2d.com — most GitHub “avatar” repos do not ship model binaries (license). " +
+                "Copied into app storage and selectable as User pack.",
             color = GrokifyColors.TextDim,
             fontSize = 11.sp,
             modifier = Modifier.padding(top = 4.dp),
