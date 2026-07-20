@@ -18,6 +18,8 @@ import android.speech.SpeechRecognizer
 import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
+import io.grokify.os.apps.plugin.HostApiKeyStore
+import io.grokify.os.data.ApiKeyIds
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -38,6 +40,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.ScreenshotMonitor
 import androidx.compose.material3.CircularProgressIndicator
@@ -50,9 +53,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -108,10 +113,60 @@ class GrokAssistantOverlayService : Service() {
     private val turnReplyState = mutableStateOf<String?>(null)
     private val sessionTick = mutableStateOf(0)
 
+    // Live Voice Agent state (shared session with the full app).
+    private val voiceLiveState = mutableStateOf(GrokAssistantVoiceSession.isLive)
+    private val voiceTurnState = mutableStateOf(GrokAssistantVoiceSession.Turn.Idle)
+    private val voiceLevelState = mutableFloatStateOf(0f)
+    private val voiceBarsState = mutableStateOf(FloatArray(28))
+    private val voiceStatusState = mutableStateOf<String?>(null)
+    private val voiceMicMutedState = mutableStateOf(false)
+    private val voicePartialUserState = mutableStateOf<String?>(null)
+    private val voicePartialAsstState = mutableStateOf<String?>(null)
+
     private var speech: SpeechRecognizer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     /** Auto-listen (wake / assist) vs manual hold-to-talk. */
     private var autoListenActive = false
+    /** When expanding to the full app, keep the Voice Agent session alive. */
+    private var preserveVoiceOnDestroy = false
+
+    private val voiceListener = object : GrokAssistantVoiceSession.Listener {
+        override fun onSnapshot(snap: GrokAssistantVoiceSession.Snapshot) {
+            voiceLiveState.value = snap.state == GrokAssistantVoiceSession.State.Live ||
+                snap.state == GrokAssistantVoiceSession.State.Connecting ||
+                snap.state == GrokAssistantVoiceSession.State.ToolBusy
+            voiceTurnState.value = snap.turn
+            voiceLevelState.floatValue = snap.level
+            voiceBarsState.value = snap.bars
+            voiceStatusState.value = snap.statusLine
+            voiceMicMutedState.value = snap.micMuted
+            voicePartialUserState.value = snap.partialUser
+            voicePartialAsstState.value = snap.partialAssistant
+            if (snap.partialUser?.isNotBlank() == true) {
+                turnUserState.value = snap.partialUser
+            }
+            if (snap.partialAssistant?.isNotBlank() == true) {
+                turnReplyState.value = snap.partialAssistant?.take(400)
+            }
+            if (voiceLiveState.value) {
+                statusState.value = snap.statusLine
+            }
+        }
+
+        override fun onTranscriptCommitted(role: String, text: String) {
+            val body = text.trim()
+            if (body.isEmpty()) return
+            when (role) {
+                "user" -> turnUserState.value = body
+                "assistant" -> turnReplyState.value = body.take(400)
+            }
+        }
+
+        override fun onError(message: String) {
+            voiceLiveState.value = false
+            statusState.value = message.take(80)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -119,6 +174,7 @@ class GrokAssistantOverlayService : Service() {
         super.onCreate()
         instance = this
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        GrokAssistantVoiceSession.addListener(voiceListener)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -173,6 +229,11 @@ class GrokAssistantOverlayService : Service() {
 
     override fun onDestroy() {
         if (instance === this) instance = null
+        GrokAssistantVoiceSession.removeListener(voiceListener)
+        if (!preserveVoiceOnDestroy) {
+            runCatching { GrokAssistantVoiceSession.stop() }
+        }
+        preserveVoiceOnDestroy = false
         detachOverlay()
         destroySpeech()
         super.onDestroy()
@@ -326,6 +387,7 @@ class GrokAssistantOverlayService : Service() {
     private fun stopSelfSafely() {
         mainHandler.removeCallbacksAndMessages(null)
         autoListenActive = false
+        runCatching { GrokAssistantVoiceSession.stop() }
         detachOverlay()
         destroySpeech(resumeWake = true)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -524,8 +586,20 @@ class GrokAssistantOverlayService : Service() {
         val turnUser by turnUserState
         val turnReply by turnReplyState
         val tick by sessionTick
+        val voiceLive by voiceLiveState
+        val voiceTurn by voiceTurnState
+        val voiceLevel by voiceLevelState
+        val voiceBars by voiceBarsState
+        val voiceStatus by voiceStatusState
+        val voiceMicMuted by voiceMicMutedState
+        val liveUser by voicePartialUserState
+        val liveAsst by voicePartialAsstState
         val store = remember { GrokAssistantStore(applicationContext) }
         val enabled = store.enabled
+        val hasXaiKey = remember {
+            !HostApiKeyStore.getValue(applicationContext, ApiKeyIds.SPACEXAI).isNullOrBlank()
+        }
+        val voiceRealtime = store.voiceRealtimeEnabled
         val scope = rememberCoroutineScope()
 
         fun sendText(text: String) {
@@ -534,6 +608,32 @@ class GrokAssistantOverlayService : Service() {
             draftState.value = ""
             turnUserState.value = trimmed
             turnReplyState.value = null
+            val useVoice = store.voiceRealtimeEnabled &&
+                !HostApiKeyStore.getValue(applicationContext, ApiKeyIds.SPACEXAI).isNullOrBlank()
+            if (useVoice) {
+                // Realtime path: stream speech; overlay shows seed text + live status.
+                destroySpeech(resumeWake = false)
+                GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Voice)
+                busyState.value = true
+                statusState.value = "Voice Agent…"
+                if (GrokAssistantVoiceSession.isLive) {
+                    GrokAssistantVoiceSession.sendText(trimmed)
+                } else {
+                    GrokAssistantVoiceSession.start(
+                        applicationContext,
+                        seedUserText = trimmed,
+                        openMic = true,
+                    )
+                }
+                // Free busy flag after a beat so UI can show listening; session is independent.
+                scope.launch {
+                    kotlinx.coroutines.delay(600)
+                    busyState.value = false
+                    statusState.value = "Voice live · tap ✕ to close"
+                    GrokAssistantMic.quietFor(3_000L)
+                }
+                return
+            }
             busyState.value = true
             statusState.value = "Thinking…"
             scope.launch {
@@ -552,6 +652,26 @@ class GrokAssistantOverlayService : Service() {
                     statusState.value = (result.errorText ?: "Error").take(80)
                 }
                 GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
+            }
+        }
+
+        fun toggleVoiceLive() {
+            if (!enabled || !voiceRealtime || !hasXaiKey) return
+            if (GrokAssistantVoiceSession.isLive) {
+                GrokAssistantVoiceSession.stop()
+                voiceLiveState.value = false
+                statusState.value = null
+                GrokAssistantWakeService.resume(this@GrokAssistantOverlayService)
+            } else {
+                destroySpeech(resumeWake = false)
+                GrokAssistantMic.tryAcquire(GrokAssistantMic.Owner.Voice)
+                statusState.value = "Connecting Voice…"
+                GrokAssistantVoiceSession.start(
+                    applicationContext,
+                    seedUserText = null,
+                    openMic = true,
+                )
+                GrokAssistantMic.quietFor(3_000L)
             }
         }
 
@@ -578,7 +698,7 @@ class GrokAssistantOverlayService : Service() {
         val shape = RoundedCornerShape(16.dp)
         Column(
             Modifier
-                .width(280.dp)
+                .width(if (voiceLive) 300.dp else 280.dp)
                 .clip(shape)
                 .background(GrokifyColors.VoidElevated.copy(alpha = 0.97f))
                 .border(1.dp, GrokifyColors.GlowViolet.copy(alpha = 0.45f), shape)
@@ -589,7 +709,7 @@ class GrokAssistantOverlayService : Service() {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "Grok",
+                    if (voiceLive) "Grok · live" else "Grok",
                     color = GrokifyColors.TextPrimary,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
@@ -619,10 +739,27 @@ class GrokAssistantOverlayService : Service() {
                 }
             }
 
-            // Current turn only — no history list.
-            if (!turnUser.isNullOrBlank()) {
+            // Same sound-reactive strip as the full app (compact for the bubble).
+            if (voiceLive) {
+                VoiceReactiveStrip(
+                    turn = voiceTurn,
+                    level = voiceLevel,
+                    bars = voiceBars,
+                    status = voiceStatus,
+                    compact = true,
+                    micMuted = voiceMicMuted,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp),
+                )
+            }
+
+            // Current turn only — no history list. Prefer live captions while streaming.
+            val displayUser = liveUser?.takeIf { it.isNotBlank() } ?: turnUser
+            val displayReply = liveAsst?.takeIf { it.isNotBlank() } ?: turnReply
+            if (!displayUser.isNullOrBlank()) {
                 Text(
-                    turnUser.orEmpty(),
+                    displayUser,
                     color = GrokifyColors.TextPrimary,
                     fontSize = 12.sp,
                     maxLines = 3,
@@ -635,9 +772,9 @@ class GrokAssistantOverlayService : Service() {
                 )
                 Spacer(Modifier.height(4.dp))
             }
-            if (!turnReply.isNullOrBlank()) {
+            if (!displayReply.isNullOrBlank()) {
                 Text(
-                    turnReply.orEmpty(),
+                    displayReply,
                     color = GrokifyColors.TextPrimary,
                     fontSize = 12.sp,
                     maxLines = 5,
@@ -649,7 +786,13 @@ class GrokAssistantOverlayService : Service() {
                         .padding(horizontal = 8.dp, vertical = 5.dp),
                 )
                 Spacer(Modifier.height(4.dp))
-            } else if (turnUser.isNullOrBlank() && !listening && status.isNullOrBlank() && !busy) {
+            } else if (
+                displayUser.isNullOrBlank() &&
+                !listening &&
+                !voiceLive &&
+                status.isNullOrBlank() &&
+                !busy
+            ) {
                 Text(
                     if (!enabled) "Enable assistant in Setup."
                     else "Say something or type…",
@@ -659,7 +802,7 @@ class GrokAssistantOverlayService : Service() {
                 )
             }
 
-            if (!status.isNullOrBlank() || !partial.isNullOrBlank()) {
+            if (!voiceLive && (!status.isNullOrBlank() || !partial.isNullOrBlank())) {
                 Text(
                     partial?.let { "…$it" } ?: status.orEmpty(),
                     color = if (listening) GrokifyColors.GlowMint else GrokifyColors.TextMuted,
@@ -683,12 +826,16 @@ class GrokAssistantOverlayService : Service() {
                         .heightIn(min = 40.dp, max = 72.dp),
                     placeholder = {
                         Text(
-                            if (!enabled) "Off" else "Message…",
+                            when {
+                                !enabled -> "Off"
+                                voiceLive -> "Talk or type…"
+                                else -> "Message…"
+                            },
                             fontSize = 12.sp,
                             color = GrokifyColors.TextDim,
                         )
                     },
-                    enabled = enabled && !busy,
+                    enabled = enabled && !busy && !voiceLive,
                     maxLines = 2,
                     textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
                     colors = OutlinedTextFieldDefaults.colors(
@@ -704,7 +851,7 @@ class GrokAssistantOverlayService : Service() {
                 )
                 IconButton(
                     onClick = {
-                        if (!enabled || busy) return@IconButton
+                        if (!enabled || busy || voiceLive) return@IconButton
                         val q = draftState.value.trim()
                         GrokAssistantScreenLookActivity.start(
                             this@GrokAssistantOverlayService,
@@ -712,50 +859,71 @@ class GrokAssistantOverlayService : Service() {
                             hideOverlayFirst = true,
                         )
                     },
-                    enabled = enabled && !busy,
+                    enabled = enabled && !busy && !voiceLive,
                     modifier = Modifier.size(36.dp),
                 ) {
                     Icon(
                         Icons.Default.ScreenshotMonitor,
                         contentDescription = "Look at my screen",
-                        tint = if (enabled && !busy) GrokifyColors.GlowCyan else GrokifyColors.TextDim,
+                        tint = if (enabled && !busy && !voiceLive) {
+                            GrokifyColors.GlowCyan
+                        } else {
+                            GrokifyColors.TextDim
+                        },
                         modifier = Modifier.size(19.dp),
                     )
                 }
-                // Tap to start/stop free-listen (wake uses the same path).
+                // Realtime Voice toggle when enabled; otherwise classic STT listen.
                 Box(
                     Modifier
                         .size(36.dp)
                         .clip(CircleShape)
                         .background(
-                            if (listening) GrokifyColors.GlowMint.copy(alpha = 0.35f)
-                            else GrokifyColors.PanelSoft,
+                            when {
+                                voiceLive -> GrokifyColors.GlowMint.copy(alpha = 0.35f)
+                                listening -> GrokifyColors.GlowMint.copy(alpha = 0.35f)
+                                else -> GrokifyColors.PanelSoft
+                            },
                         )
                         .border(
                             1.dp,
-                            if (listening) GrokifyColors.GlowMint else GrokifyColors.PanelBorder,
+                            when {
+                                voiceLive -> GrokifyColors.GlowMint
+                                listening -> GrokifyColors.GlowMint
+                                else -> GrokifyColors.PanelBorder
+                            },
                             CircleShape,
                         )
-                        .pointerInput(enabled, busy) {
+                        .pointerInput(enabled, busy, voiceRealtime, hasXaiKey, voiceLive) {
                             detectTapGestures(
                                 onTap = {
                                     if (!enabled || busy) return@detectTapGestures
-                                    if (listening) stopListening() else startListening(auto = true)
+                                    if (voiceRealtime && hasXaiKey) {
+                                        toggleVoiceLive()
+                                    } else {
+                                        if (listening) stopListening() else startListening(auto = true)
+                                    }
                                 },
                             )
                         },
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        Icons.Default.Mic,
-                        contentDescription = "Listen",
-                        tint = if (listening) GrokifyColors.GlowMint else GrokifyColors.TextPrimary,
+                        when {
+                            voiceLive -> Icons.Default.MicOff
+                            else -> Icons.Default.Mic
+                        },
+                        contentDescription = if (voiceLive) "Stop voice" else "Listen",
+                        tint = when {
+                            voiceLive || listening -> GrokifyColors.GlowMint
+                            else -> GrokifyColors.TextPrimary
+                        },
                         modifier = Modifier.size(19.dp),
                     )
                 }
                 IconButton(
                     onClick = { sendText(draftState.value) },
-                    enabled = enabled && !busy && draft.isNotBlank(),
+                    enabled = enabled && !busy && draft.isNotBlank() && !voiceLive,
                     modifier = Modifier.size(36.dp),
                 ) {
                     if (busy) {
@@ -768,8 +936,11 @@ class GrokAssistantOverlayService : Service() {
                         Icon(
                             Icons.AutoMirrored.Filled.Send,
                             contentDescription = "Send",
-                            tint = if (enabled && draft.isNotBlank()) GrokifyColors.GlowViolet
-                            else GrokifyColors.TextDim,
+                            tint = if (enabled && draft.isNotBlank() && !voiceLive) {
+                                GrokifyColors.GlowViolet
+                            } else {
+                                GrokifyColors.TextDim
+                            },
                             modifier = Modifier.size(19.dp),
                         )
                     }
@@ -780,6 +951,8 @@ class GrokAssistantOverlayService : Service() {
 
     /** Open full Assistant and dismiss this overlay so it does not stay on top. */
     private fun openFullAssistantApp() {
+        // Hand off live Voice Agent to the full app — don't tear the session down.
+        preserveVoiceOnDestroy = true
         val intent = io.grokify.os.widgets.WidgetNav.openPluginIntent(
             this,
             io.grokify.os.apps.plugin.BuiltinPluginCatalog.GROK_ASSISTANT,
