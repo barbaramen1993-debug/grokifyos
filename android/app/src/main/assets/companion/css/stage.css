@@ -1,4 +1,4 @@
-/* Companion Live2D stage — full viewport, no chrome */
+/* Companion VRM stage — full viewport, no chrome */
 html,
 body {
   margin: 0;
@@ -22,6 +22,7 @@ body {
   background: transparent;
 }
 
+#vrm-canvas,
 #live2d-canvas {
   display: block;
   width: 100%;
@@ -29,7 +30,7 @@ body {
   touch-action: none;
 }
 
-/* Fallback silhouette (shown when Live2D model fails to load) */
+/* Fallback silhouette (shown when VRM model fails to load) */
 #fallback {
   position: absolute;
   inset: 0;
@@ -42,6 +43,39 @@ body {
 
 #fallback.visible {
   display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+#stage-hud {
+  position: absolute;
+  left: 50%;
+  bottom: 10%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font: 600 12px/1.2 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  color: #e8f0ff;
+  background: rgba(12, 16, 28, 0.72);
+  border: 1px solid rgba(140, 170, 255, 0.35);
+  pointer-events: none;
+  white-space: nowrap;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#stage-hud.visible {
+  display: block;
+}
+
+#fallback-label {
+  font: 600 13px/1.2 system-ui, -apple-system, sans-serif;
+  color: rgba(200, 210, 235, 0.85);
+  letter-spacing: 0.03em;
 }
 
 #fallback-face {
