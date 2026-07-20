@@ -51,4 +51,32 @@ class GrokAssistantSessionsTest {
         assertTrue(capped.any { it.id == "id50" })
         assertTrue(capped.none { it.id == "id1" })
     }
+
+    @Test
+    fun shouldSkipDuplicate_collapsesSameUserWithinWindow() {
+        val last = AssistantChatMessage("1", "user", "hello there", ts = 1_000L)
+        assertTrue(
+            AssistantTranscript.shouldSkipDuplicate(last, "user", "hello there", nowMs = 2_000L),
+        )
+        assertTrue(
+            !AssistantTranscript.shouldSkipDuplicate(
+                last,
+                "user",
+                "hello there",
+                nowMs = 1_000L + AssistantTranscript.DUPLICATE_WINDOW_MS + 1,
+            ),
+        )
+        assertTrue(
+            !AssistantTranscript.shouldSkipDuplicate(last, "user", "different", nowMs = 1_500L),
+        )
+        assertTrue(
+            !AssistantTranscript.shouldSkipDuplicate(last, "assistant", "hello there", nowMs = 1_500L),
+        )
+    }
+
+    @Test
+    fun shouldSkipDuplicate_legacyZeroTsStillCollapses() {
+        val last = AssistantChatMessage("1", "user", "hey", ts = 0L)
+        assertTrue(AssistantTranscript.shouldSkipDuplicate(last, "user", "hey", nowMs = 99_000L))
+    }
 }

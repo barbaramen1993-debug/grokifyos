@@ -153,12 +153,21 @@ class GrokAssistantStore(ctx: Context) {
     }
 
     fun appendMessage(role: String, text: String): AssistantChatMessage {
+        val now = System.currentTimeMillis()
+        val current = transcript()
+        val last = current.lastOrNull()
+        // Voice path can fire transcription.completed + .done (and seed/send) for the
+        // same utterance — collapse consecutive identical role+text within a short window.
+        if (AssistantTranscript.shouldSkipDuplicate(last, role, text, now)) {
+            return last!!
+        }
         val msg = AssistantChatMessage(
             id = UUID.randomUUID().toString(),
             role = role,
             text = text,
+            ts = now,
         )
-        saveTranscript(transcript() + msg)
+        saveTranscript(current + msg)
         return msg
     }
 

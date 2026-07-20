@@ -387,6 +387,28 @@ object AssistantTranscript {
         return list.sortedByDescending { it.updatedAt }.take(MAX_SESSIONS)
     }
 
+    /**
+     * True when [role]+[text] would re-append the same bubble as [last] within [windowMs].
+     * Voice Agent often emits both transcription.completed and .done for one utterance.
+     */
+    fun shouldSkipDuplicate(
+        last: AssistantChatMessage?,
+        role: String,
+        text: String,
+        nowMs: Long,
+        windowMs: Long = DUPLICATE_WINDOW_MS,
+    ): Boolean {
+        if (last == null) return false
+        if (!last.role.equals(role, ignoreCase = true)) return false
+        if (last.text.trim() != text.trim()) return false
+        if (text.trim().isEmpty()) return false
+        // Legacy messages without ts: still collapse exact consecutive twins.
+        if (last.ts <= 0L) return true
+        return nowMs - last.ts in 0 until windowMs
+    }
+
+    const val DUPLICATE_WINDOW_MS = 5_000L
+
     /** Last N user/assistant messages for model context (not error/system). */
     fun historyWindow(list: List<AssistantChatMessage>): List<AssistantChatMessage> {
         val filtered = list.filter { it.role == "user" || it.role == "assistant" }

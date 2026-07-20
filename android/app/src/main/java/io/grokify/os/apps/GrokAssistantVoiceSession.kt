@@ -142,6 +142,10 @@ object GrokAssistantVoiceSession {
     private val running = AtomicBoolean(false)
     private val useBinary = AtomicBoolean(true)
     private val assistantCommittedThisResponse = AtomicBoolean(false)
+    /** Dedup user transcript commits (server may send both .completed and .done). */
+    private val lastUserCommitItemId = AtomicReference<String?>(null)
+    private val lastUserCommitText = AtomicReference<String?>(null)
+    private val lastUserCommitElapsedMs = AtomicLong(0L)
 
     /** Pending function outputs waiting for playback drain before response.create. */
     private val pendingResponseAfterTools = AtomicBoolean(false)
@@ -228,8 +232,7 @@ object GrokAssistantVoiceSession {
             val seed = seedUserText?.trim().orEmpty()
             if (seed.isNotEmpty()) {
                 scope.launch { clientRef.get()?.createUserText(seed) }
-                store.appendMessage("user", seed)
-                notifyTranscript("user", seed)
+                commitUserIfNeeded(app, seed)
             }
             return
         }
@@ -304,8 +307,7 @@ object GrokAssistantVoiceSession {
 
                 val seed = seedUserText?.trim().orEmpty()
                 if (seed.isNotEmpty()) {
-                    store.appendMessage("user", seed)
-                    notifyTranscript("user", seed)
+                    commitUserIfNeeded(app, seed)
                     setPhase("thinking", Turn.Thinking, phaseStatus("thinking"))
                     client.createUserText(seed)
                 }
@@ -330,8 +332,7 @@ object GrokAssistantVoiceSession {
         if (t.isEmpty()) return
         val app = appCtx ?: return
         val client = clientRef.get() ?: return
-        GrokAssistantStore(app).appendMessage("user", t)
-        notifyTranscript("user", t)
+        commitUserIfNeeded(app, t)
         scope.launch { client.createUserText(t) }
     }
 
@@ -341,6 +342,9 @@ object GrokAssistantVoiceSession {
         pendingResponseAfterTools.set(false)
         inFlightTools.set(0)
         assistantCommittedThisResponse.set(false)
+        lastUserCommitItemId.set(null)
+        lastUserCommitText.set(null)
+        lastUserCommitElapsedMs.set(0L)
         awaitingPlaybackDrain.set(false)
         micMuted.set(false)
         lastPlaybackActivityMs.set(0L)
@@ -723,6 +727,55 @@ object GrokAssistantVoiceSession {
         publish()
     }
 
+    /**
+     * Commit a user line once per utterance. Server may emit both
+     * `input_audio_transcription.completed` and `.done` (same item_id / text).
+     * Seed / sendText also go through here so a later caption of the same line
+     * does not create a second bubble.
+     */
+    private fun commitUserIfNeeded(
+        app: Context,
+        text: String?,
+        itemId: String? = null,
+    ): Boolean {
+        val body = text?.trim().orEmpty()
+        if (body.isEmpty()) return false
+        val id = itemId?.trim().orEmpty()
+        if (id.isNotEmpty() && id == lastUserCommitItemId.get()) {
+            return false
+        }
+        val prevText = lastUserCommitText.get()
+        val prevAt = lastUserCommitElapsedMs.get()
+        val now = SystemClock.elapsedRealtime()
+        if (prevText != null &&
+            prevText.equals(body, ignoreCase = true) &&
+            now - prevAt < 5_000L
+        ) {
+            return false
+        }
+        if (id.isNotEmpty()) lastUserCommitItemId.set(id)
+        lastUserCommitText.set(body)
+        lastUserCommitElapsedMs.set(now)
+        partialUser.set(null)
+        val before = GrokAssistantStore(app).transcript().size
+        GrokAssistantStore(app).appendMessage("user", body)
+        val after = GrokAssistantStore(app).transcript().size
+        // Store may also collapse dups — only notify when something was actually added.
+        if (after > before) {
+            notifyTranscript("user", body)
+        } else {
+            publish()
+        }
+        return after > before
+    }
+
+    private fun extractUserItemId(event: JSONObject): String? {
+        val direct = event.optString("item_id", "").trim()
+        if (direct.isNotEmpty()) return direct
+        val item = event.optJSONObject("item") ?: return null
+        return item.optString("id", "").trim().ifEmpty { null }
+    }
+
     private fun handleEvent(app: Context, event: JSONObject) {
         if (!running.get()) return
         val type = event.optString("type")
@@ -763,6 +816,10 @@ object GrokAssistantVoiceSession {
                 partialUser.set("")
                 partialAssistant.set(null)
                 assistantCommittedThisResponse.set(false)
+                // New utterance — allow a fresh user commit; same-item twin still blocked by id/text set on first commit.
+                lastUserCommitItemId.set(null)
+                lastUserCommitText.set(null)
+                lastUserCommitElapsedMs.set(0L)
                 setPhase("hearing", Turn.UserSpeaking, "Hearing you…")
             }
             "input_audio_buffer.speech_stopped" -> {
@@ -786,9 +843,7 @@ object GrokAssistantVoiceSession {
             -> {
                 val text = extractTranscript(event)
                 if (text.isNotEmpty()) {
-                    partialUser.set(null)
-                    GrokAssistantStore(app).appendMessage("user", text)
-                    notifyTranscript("user", text)
+                    commitUserIfNeeded(app, text, itemId = extractUserItemId(event))
                     if (turn.get() == Turn.UserSpeaking || turn.get() == Turn.Thinking) {
                         setPhase("thinking", Turn.Thinking, phaseStatus("thinking"))
                     } else {
