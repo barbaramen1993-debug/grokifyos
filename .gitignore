@@ -22,3 +22,6 @@
 
 # Optional local Mapbox override (never commit real tokens)
 **/mapbox_access_token.local.xml
+
+# Git worktrees (local isolation)
+.worktrees/
