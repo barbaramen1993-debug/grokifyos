@@ -179,10 +179,10 @@ class GrokAssistantVoiceClient(
                 "turn_detection",
                 JSONObject()
                     .put("type", "server_vad")
-                    // Higher = less echo/self-trigger while speaker is hot.
-                    .put("threshold", 0.9)
-                    // Slightly longer silence so natural pauses don't end the turn early.
-                    .put("silence_duration_ms", 900)
+                    // Half-duplex mute owns echo now — 0.9 was too deaf to quiet speech.
+                    // Default-ish 0.55 + longer silence keeps natural pauses.
+                    .put("threshold", 0.55)
+                    .put("silence_duration_ms", 700)
                     .put("prefix_padding_ms", 300),
             )
             .put("audio", audio)

@@ -101,8 +101,8 @@ object GrokAssistantVoiceSession {
     private const val WATCHDOG_MS = 200L
     /** No server progress while Thinking → surface “still working”. */
     private const val THINKING_STALL_MS = 8_000L
-    /** Hard cancel stuck Thinking (not Build tools). */
-    private const val THINKING_TIMEOUT_MS = 75_000L
+    /** Hard cancel stuck Thinking (not Build tools). Empty commits used to hang forever. */
+    private const val THINKING_TIMEOUT_MS = 35_000L
     /**
      * Ignore server speech_started while assistant audio is still playing/queued.
      * Speaker bleed + short mute hold used to flush AudioTrack mid-utterance.
@@ -661,13 +661,28 @@ object GrokAssistantVoiceSession {
         returnToListening(reason = "speaking idle timeout")
     }
 
-    /** Edge-triggered mute/unmute with buffer clear so residual echo never commits. */
+    /**
+     * Edge-triggered mute/unmute. Stop streaming immediately on mute.
+     *
+     * **Do not** clear the server input buffer on speech_stopped → Thinking:
+     * server_vad commits that buffer to create the response. Clearing it here
+     * discards the user's just-finished utterance → stuck "thinking" with no
+     * audio/text. Only clear residual/echo after Grok is already speaking
+     * (or tools/drain), or when ignoring echo barge-in.
+     */
     private fun applyMicMutePolicy(client: GrokAssistantVoiceClient?) {
         val wantMute = !isMicSendAllowed()
         val wasMuted = micMuted.getAndSet(wantMute)
         if (wantMute && !wasMuted) {
-            client?.clearInputAudioBuffer()
-            Log.d(TAG, "mic muted (turn=${turn.get()})")
+            val t = turn.get()
+            val safeToClear = t == Turn.GrokSpeaking ||
+                t == Turn.ToolBusy ||
+                awaitingPlaybackDrain.get() ||
+                hasLocalPlaybackRemaining()
+            if (safeToClear) {
+                client?.clearInputAudioBuffer()
+            }
+            Log.d(TAG, "mic muted (turn=$t clear=$safeToClear)")
         } else if (!wantMute && wasMuted) {
             Log.d(TAG, "mic unmuted (turn=${turn.get()})")
         }
@@ -853,8 +868,27 @@ object GrokAssistantVoiceSession {
                     .ifBlank { event.optString("message", "voice_error") }
                 Log.e(TAG, "server error: $msg")
                 mainHandler.post { listeners.forEach { it.onError(msg) } }
-                statusLine.set(msg.take(120))
-                publish()
+                // Don't leave the UI stuck on Thinking after a soft server error.
+                if (turn.get() == Turn.Thinking || turn.get() == Turn.GrokSpeaking) {
+                    returnToListening(reason = "server error: ${msg.take(80)}")
+                } else {
+                    statusLine.set(msg.take(120))
+                    publish()
+                }
+            }
+            "response.cancelled",
+            "response.canceled",
+            -> {
+                Log.d(TAG, "response cancelled — return to listening")
+                flushPlayback("response cancelled")
+                partialAssistant.set(null)
+                responsePcmBytes.set(0)
+                awaitingPlaybackDrain.set(false)
+                if (state.get() != State.ToolBusy) {
+                    returnToListening(reason = "response cancelled")
+                } else {
+                    publish()
+                }
             }
             "input_audio_buffer.speech_started" -> {
                 // Half-duplex + mute: any speech_started while we are thinking/speaking
@@ -884,9 +918,11 @@ object GrokAssistantVoiceSession {
                 setPhase("hearing", Turn.UserSpeaking, "Hearing you…")
             }
             "input_audio_buffer.speech_stopped" -> {
-                // Mute immediately so room noise / echo cannot cancel the upcoming reply.
+                // Mute outbound mic so room noise can't barge-in-cancel the reply,
+                // but NEVER clearInputAudioBuffer here — server_vad is about to
+                // commit that buffer and create the response. Clearing wiped the
+                // user utterance and left the UI stuck on "thinking" with no output.
                 setPhase("processing", Turn.Thinking, phaseStatus("processing"))
-                clientRef.get()?.clearInputAudioBuffer()
             }
             "conversation.item.input_audio_transcription.updated" -> {
                 // Cumulative live caption while user speaks
