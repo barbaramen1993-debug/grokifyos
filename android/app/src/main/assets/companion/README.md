@@ -16,9 +16,12 @@ companion/
   css/stage.css
   js/companion-stage.js
   js/vendor/
-    companion-vrm-libs.min.js   # three@0.170 + @pixiv/three-vrm@3.3.2 (esbuild IIFE)
+    companion-vrm-libs.min.js   # three + three-vrm + three-vrm-animation (esbuild IIFE)
   models/default/
     Seed-san.vrm
+    LICENSE
+  animations/                   # portable VRMA clips (any VRM humanoid)
+    goodbye.vrma, clapping.vrma, thinking.vrma, …
     LICENSE
   README.md
 ```
@@ -27,7 +30,7 @@ companion/
 
 | File | Package / source | Version | License | Notes |
 |------|------------------|---------|---------|-------|
-| `js/vendor/companion-vrm-libs.min.js` | [three.js](https://github.com/mrdoob/three.js) + [@pixiv/three-vrm](https://github.com/pixiv/three-vrm) | **three 0.170.0**, **three-vrm 3.3.2** | MIT | Browser IIFE exposing `window.CompanionVrmLibs` |
+| `js/vendor/companion-vrm-libs.min.js` | [three.js](https://github.com/mrdoob/three.js) + [@pixiv/three-vrm](https://github.com/pixiv/three-vrm) + [@pixiv/three-vrm-animation](https://github.com/pixiv/three-vrm) | **three 0.170.0**, **three-vrm 3.3.2**, **three-vrm-animation 3.3.2** | MIT | IIFE → `window.CompanionVrmLibs` |
 
 ### Refresh vendors
 
@@ -35,18 +38,46 @@ companion/
 WORKDIR=/tmp/companion-vrm-vendor
 mkdir -p "$WORKDIR" && cd "$WORKDIR"
 npm init -y
-npm install three@0.170.0 @pixiv/three-vrm@3.3.2 esbuild
+npm install three@0.170.0 @pixiv/three-vrm@3.3.2 @pixiv/three-vrm-animation@3.3.2 esbuild
 cat > entry.js << 'EOF'
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName } from '@pixiv/three-vrm';
-window.CompanionVrmLibs = { THREE, GLTFLoader, VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName };
+import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
+window.CompanionVrmLibs = {
+  THREE, GLTFLoader, OrbitControls, VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName,
+  VRMAnimationLoaderPlugin, createVRMAnimationClip,
+};
 EOF
 npx esbuild entry.js --bundle --format=iife --platform=browser --target=es2020 --minify \
   --outfile=companion-vrm-libs.min.js
 cp companion-vrm-libs.min.js \
   /path/to/android/app/src/main/assets/companion/js/vendor/
 ```
+
+## Bundled VRMA animations
+
+Portable [VRM Animation](https://vrm.dev/en/vrma/) clips — **one file, any VRM 1.0 humanoid**.
+
+| Clip | Gesture aliases | Source |
+|------|-----------------|--------|
+| `goodbye` | wave, hello, bye | [tk256ailab/vrm-viewer](https://github.com/tk256ailab/vrm-viewer) (MIT) |
+| `clapping` | clap | same |
+| `thinking` | think | same |
+| `jump` | cheer, celebrate | same |
+| `relax` | shrug, idle | same |
+| `lookaround` | look_around | same |
+| `angry` / `sad` / `sleepy` / `surprised` / `blush` | emotion poses | same |
+| `test` | sample | [@pixiv/three-vrm-animation](https://github.com/pixiv/three-vrm) (MIT) |
+
+Host materializes clips to app files; stage loads via bridge `openVrm("anim:goodbye")`.
+While a VRMA plays, soft-hang IK is suspended so the mixer owns the skeleton.
+
+**Expanding the pack:** drop more `.vrma` under `animations/`, add the id to
+`CompanionModelAssets.BUNDLED_VRMA_IDS` and `VRMA_GESTURE_MAP` / `VRMA_CATALOG` in
+`companion-stage.js`. Convert Mixamo/Quaternius FBX via [bvh2vrma](https://vrm-c.github.io/bvh2vrma/)
+or [fbx2vrma-converter](https://github.com/tk256ailab/fbx2vrma-converter).
 
 ## Default model
 
@@ -82,16 +113,20 @@ CompanionStage.loadModel("user", "/absolute/or/file/url/MyAvatar.vrm");
 | `loadModel(source, path?)` | `source`: `"bundled"` \| `"user"`. For `"user"`, `path` is a file URL or absolute path to a `.vrm`. |
 | `setState(state)` | `"idle"` \| `"listening"` \| `"thinking"` \| `"speaking"` — mood expressions + look drift. |
 | `setMouth(v)` | Mouth open `0..1` → multi-viseme blend (`aa`/`ih`/`ou`/`ee`/`oh` + `jawOpen`) with speech-phase modulation. |
-| `playMotion(name)` | Soft expression flash for names containing happy/sad/angry/surprise. |
-| `playGesture(name, opts?)` | VR wrist-controller gesture (`wave`, `nod`, `point`, …). |
+| `playMotion(name)` | Expression flash + VRMA when name maps to a clip. |
+| `playGesture(name, opts?)` | Named move; prefers VRMA (`wave`→goodbye), else scripted IK. |
+| `playTemplate(name, opts?)` | Same catalog; used by `body_pose` tools. |
+| `playVrma(id, opts?)` | Play bundled `.vrma` by id on the current VRM. |
+| `stopVrma()` | Stop mixer + return to soft hang. |
+| `listVrma()` | Catalog of bundled clips + gesture map. |
 | `setHands(json)` | Place L/R wrist targets (hips-local); arms two-bone IK + gravity. |
-| `exportBodyState()` | Live VR snapshot: joints/chains, bones (id+name), joint_labels, named_joints, hang rest, camera, gesture peaks, control schema. |
+| `exportBodyState()` | Live snapshot: joints, VRMA catalog, motion library, hang rest, camera, control schema. |
 | `setJointLabel(id, name)` | Custom display name for a bone/controller (persisted via host). Empty clears. |
 | `setJointLabels(map)` | Bulk load custom labels. |
 | `getJointLabels()` | Current custom label map. |
 | `setDebugSkeleton(bool)` | SkeletonHelper wireframe + joint spheres + VR hand/HMD controller markers. |
 | `setLook({x,y,direction?,hold_sec?})` | Virtual HMD gaze; `x=-1` left, `x=1` right. |
-| `resetBody()` | Unlock controllers, clear gesture, soft hang rest. |
+| `resetBody()` | Stop VRMA, unlock controllers, soft hang rest. |
 
 Host callbacks on `window.GrokifyCompanion` (Android `@JavascriptInterface`):
 

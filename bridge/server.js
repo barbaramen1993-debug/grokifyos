@@ -1195,6 +1195,78 @@ function buildPromptWithHistory(prompt, history, notes) {
     return ctx;
 }
 
+/** Max user-attached images per turn (Android chat media button). */
+const MAX_USER_IMAGES = 4;
+/** ~4.5MB base64 ≈ ~3.3MB binary — phone photos after client compress. */
+const MAX_IMAGE_B64_CHARS = 6_000_000;
+
+/**
+ * Normalize client image attachments into ACP content blocks for --prompt-file.
+ * Accepts [{ data|base64, mimeType|mime }] (raw base64 or data-URL).
+ * @returns {{ type: 'image', data: string, mimeType: string }[]}
+ */
+function normalizeUserImages(raw) {
+    if (!Array.isArray(raw) || raw.length === 0) return [];
+    const out = [];
+    for (const item of raw.slice(0, MAX_USER_IMAGES)) {
+        if (!item || typeof item !== 'object') continue;
+        let data = String(item.data || item.base64 || item.bytes || '');
+        if (!data) continue;
+        if (data.includes(',')) {
+            // data:image/jpeg;base64,....
+            const head = data.slice(0, data.indexOf(','));
+            data = data.slice(data.indexOf(',') + 1);
+            if (!item.mimeType && !item.mime && /data:([^;]+)/i.test(head)) {
+                item.mimeType = head.match(/data:([^;]+)/i)[1];
+            }
+        }
+        data = data.replace(/\s+/g, '');
+        if (!data || data.length > MAX_IMAGE_B64_CHARS) continue;
+        let mime = String(item.mimeType || item.mime || item.content_type || 'image/jpeg')
+            .trim()
+            .toLowerCase();
+        if (!mime.startsWith('image/')) mime = 'image/jpeg';
+        // Accept only common image mimes
+        if (!/^image\/(jpeg|jpg|png|webp|gif|bmp)$/.test(mime)) mime = 'image/jpeg';
+        if (mime === 'image/jpg') mime = 'image/jpeg';
+        try {
+            const buf = Buffer.from(data, 'base64');
+            // Grok drops images under 512 total pixels; still allow small attaches
+            // but reject tiny garbage / empty decode.
+            if (!buf.length || buf.length < 64 || buf.length > 4_500_000) continue;
+            out.push({ type: 'image', data, mimeType: mime });
+        } catch (_) {
+            /* skip bad base64 */
+        }
+    }
+    return out;
+}
+
+/**
+ * Write ACP content blocks (text + images) for grok --prompt-file.
+ * Returns absolute path or null.
+ */
+function writePromptBlocksFile(sessionId, fullPromptText, images) {
+    const dir = path.join(WORKSPACE, 'storage', 'bridge-runtime', sessionId);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `prompt-${Date.now()}.json`);
+    const blocks = [
+        { type: 'text', text: String(fullPromptText || '') },
+        ...images,
+    ];
+    fs.writeFileSync(filePath, JSON.stringify(blocks), { mode: 0o600 });
+    return filePath;
+}
+
+function cleanupPromptFile(agent) {
+    const p = agent && agent._promptFile;
+    if (!p) return;
+    agent._promptFile = null;
+    try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+    } catch (_) {}
+}
+
 function sendToClient(agent, obj) {
     if (agent?._suppressSend) return;
     try {
@@ -1495,6 +1567,7 @@ function cleanupAgent(sessionId, { killProcess = true } = {}) {
         try { agent._stopTail(); } catch (_) {}
     }
     if (agent.timeout) clearTimeout(agent.timeout);
+    cleanupPromptFile(agent);
     if (killProcess) {
         try { runtime.releaseClaim(sessionId); } catch (_) {}
     }
@@ -1838,6 +1911,8 @@ function finalizeAgentClose(agent, code) {
     if (agent._stopTail) {
         try { agent._stopTail(); } catch (_) {}
     }
+    // Prompt JSON (with base64 images) is only needed while the CLI is starting; drop ASAP.
+    cleanupPromptFile(agent);
 
     // Harvest Imagine assets from Grok session dir (local paths / temp URLs → durable uploads)
     try {
@@ -1973,7 +2048,7 @@ function startAgentWatchers(agent) {
     }, AGENT_TIMEOUT_MS);
 }
 
-async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId) {
+async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId, images = []) {
     const existing = agents.get(sessionId);
     if (existing && !existing.done) cleanupAgent(sessionId, { killProcess: true });
 
@@ -1986,12 +2061,37 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
 
     const resolved = resolveGrokModel(model);
     const realModel = grokRealModel(resolved);
+    const userImages = Array.isArray(images) ? images : [];
     let fullPrompt = buildPromptWithHistory(prompt, history, notes);
     if (Buffer.byteLength(fullPrompt) > MAX_PROMPT_BYTES) {
         fullPrompt = buildPromptWithHistory(prompt, (history || []).slice(-10), notes);
     }
+    if (userImages.length > 0) {
+        fullPrompt +=
+            `\n\n(The user attached ${userImages.length} image(s) inline for you to analyze visually.)`;
+    }
 
     const agentCwd = await getAgentCwd();
+
+    // Multimodal turns: write ACP content blocks to a file (avoids ARG_MAX) and use --prompt-file.
+    let promptFile = null;
+    if (userImages.length > 0) {
+        try {
+            promptFile = writePromptBlocksFile(sessionId, fullPrompt, userImages);
+        } catch (err) {
+            log('error', 'agent', `prompt-file write failed: ${err.message}`, {
+                session_id: sessionId,
+            });
+            try {
+                client.send(JSON.stringify({
+                    type: 'error',
+                    content: 'Could not prepare image attachment for the agent',
+                }));
+            } catch (_) {}
+            if (DETACH_AGENTS) runtime.releaseClaim(sessionId);
+            return;
+        }
+    }
 
     log('info', 'agent', 'Spawning Grok Build', {
         session_id: sessionId,
@@ -1999,6 +2099,7 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
         reasoning_effort: REASONING_EFFORT,
         user_id: userId,
         prompt_bytes: Buffer.byteLength(fullPrompt),
+        images: userImages.length,
         detach: DETACH_AGENTS,
         instance: INSTANCE_ID,
         cwd: agentCwd,
@@ -2009,8 +2110,12 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
         '--always-approve',
         '--reasoning-effort', REASONING_EFFORT,
         '-m', realModel,
-        '-p', fullPrompt,
     ];
+    if (promptFile) {
+        args.push('--prompt-file', promptFile);
+    } else {
+        args.push('-p', fullPrompt);
+    }
 
     const env = { ...process.env, HOME: process.env.HOME || '/root' };
     let proc = null;
@@ -2040,6 +2145,7 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
         pid,
         outPath,
         _fileOffset: 0,
+        _promptFile: promptFile,
         sessionId,
         userId,
         events: [],
@@ -2449,11 +2555,19 @@ wss.on('connection', (ws, req) => {
             return;
         }
 
-        const { prompt, model, session_id, history, notes } = data;
+        const images = normalizeUserImages(data.images);
+        let prompt = typeof data.prompt === 'string' ? data.prompt : '';
+        // Image-only turns: default ask-to-analyze prompt
+        if (!prompt.trim() && images.length > 0) {
+            prompt = images.length === 1
+                ? 'Please analyze the attached image and describe what you see.'
+                : `Please analyze the ${images.length} attached images and describe what you see.`;
+        }
         if (!prompt || typeof prompt !== 'string' || prompt.length > 50000) {
             ws.send(JSON.stringify({ type: 'error', content: 'Invalid prompt' }));
             return;
         }
+        const { model, session_id, history, notes } = data;
         const sessionId = session_id || '';
         if (!/^[a-f0-9]{32}$/.test(sessionId)) {
             ws.send(JSON.stringify({ type: 'error', content: 'Invalid session' }));
@@ -2470,9 +2584,10 @@ wss.on('connection', (ws, req) => {
             user_id: ws.userId,
             model: resolveGrokModel(model),
             prompt_len: prompt.length,
+            images: images.length,
         });
 
-        await spawnGrokBuild(sessionId, prompt, model, ws, history, notes, ws.userId);
+        await spawnGrokBuild(sessionId, prompt, model, ws, history, notes, ws.userId, images);
     });
 
     ws.on('close', () => {

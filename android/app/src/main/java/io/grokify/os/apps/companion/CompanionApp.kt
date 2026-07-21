@@ -104,6 +104,8 @@ fun CompanionPane(onBack: () -> Unit) {
     val appCtx = context.applicationContext
     val store = remember { CompanionStore(appCtx) }
     val scope = rememberCoroutineScope()
+    // Bridge CLI movement agent (tandem with voice / text).
+    remember { CompanionMovementAgent.attach(appCtx); true }
 
     var history by remember { mutableStateOf(store.history()) }
     var draft by remember { mutableStateOf("") }
@@ -372,6 +374,14 @@ fun CompanionPane(onBack: () -> Unit) {
         avatarState = CompanionAvatarState.Thinking
         mouth = 0f
         flashStatus(null)
+        // Tandem: text reply via bridge chat session + movement agent if intent is motion.
+        if (CompanionMovementAgent.wantsMotion(trimmed)) {
+            CompanionMovementAgent.requestAsync(
+                intent = "User (text) asked: ${trimmed.take(240)}",
+                userText = trimmed,
+                source = "text_chat",
+            )
+        }
         scope.launch {
             try {
                 val reply = withContext(Dispatchers.IO) {

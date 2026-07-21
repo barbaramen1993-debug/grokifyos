@@ -156,7 +156,7 @@ Open the Android app → **Apps** tab. Every app is a **native host module** com
 | **Wi‑Fi Scanner** | Scan nearby networks; GPS pins, distance, times seen; alerts (SSID/MAC watch, unseen, strong nearby); Mapbox map of hits | Nearby Wi‑Fi, Location | **Mapbox** `pk.…` for maps |
 | **Bluetooth Tracker** | BLE + classic discovery; GPS pins, distance, times seen; watch/unseen/strong alerts; map | Bluetooth, Location, Notifications | **Mapbox** for maps |
 | **Place Notes** | Pin notes to GPS spots; on enter: notify, open an app, or show an image; list + map + area monitoring | Location, Notifications | **Mapbox** for maps |
-| **Companion** | Offline **VRM** stage (Three.js + three-vrm) + **xAI Voice Agent** realtime chat; soft-hang rest, lip-sync, body gestures (`body_gesture` / hands / look); import your own `.vrm`; text + voice with TTS fallback | Microphone, network; optional camera later | **SpaceXAI API key** (`spacexai_api_key`) for Voice Agent |
+| **Companion** | Offline **VRM** stage (Three.js + three-vrm) + **xAI Voice Agent** + **bridge CLI movement agent** in tandem; soft-hang rest, lip-sync, AI-planned keyframes (`ai_move` / observe / look); import your own `.vrm`; text + voice with TTS fallback | Microphone, network; host bridge for motion planning | **SpaceXAI API key** (`spacexai_api_key`) for Voice Agent; device token + bridge for movement |
 | **Grok Assistant** | Floating mini overlay / system assist entry; wake listen; Voice Agent tools for the main chat surface | Microphone, notifications, network | **SpaceXAI API key** for voice |
 | **Spotify** | Lockscreen / media controls; **Live AI DJ** booth (banter, queue chat); research/build/edit playlists via host Grok Build; optional Grok Voice TTS | Notifications, Media session, mic (voice), network | **Spotify Client ID** (+ optional secret); **SpaceXAI API key** for Grok Voice (device TTS works without it) |
 | **SpaceXAI API Usage Analyzer** | Prepaid credit balance, period spend, soft/hard limits, 7‑day usage by model, balance history | Network | **SpaceXAI Management key** vault id `spacexai_management_key` (billing read on [management-api.x.ai](https://management-api.x.ai)) |
@@ -316,6 +316,15 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.233 — Main chat image attach + Companion VRMA / movement agent
+
+- **Main chat media button**: bottom-left attach control in the composer (Android Chat). Photo picker (up to 4 images), client JPEG compress, optional media-cache upload for durable history thumbs, and vision analysis via the bridge.
+- **Bridge multimodal prompts**: WebSocket `prompt` accepts optional `images` (`data` base64 + `mimeType`). Spawns Grok Build with `--prompt-file` ACP content blocks (text + image) so ARG_MAX stays safe; image-only turns get a default analyze prompt; temp prompt files cleaned on agent finalize.
+- **Android send path**: `BridgeClient.sendPrompt(…, images)`, `GrokifyApi.createMessage` metadata for user photos, `prepareChatImage` + user-bubble thumbnails.
+- **Companion movement agent** (`CompanionMovementAgent`): voice tools `body_pose` / `ai_move` / `body_gesture` prefer joint-XYZ + **bundled VRMA** templates rebuilt for the loaded avatar; bridge CLI plans only novel poses. Keyword fallback if the voice model skips tools.
+- **Bundled VRMA pack**: portable `.vrma` clips under `assets/companion/animations/` (wave/clap/think/jump/emotions, MIT). Stage gains `three-vrm-animation`, `playVrma` / mixer; soft-hang IK suspends while a clip owns the skeleton.
+- **Companion stage / body tools**: richer observe + gesture catalog, side inference for wave/point, tests for body tools + movement agent. Inner-app table documents bridge CLI motion planning.
+
 ### Bridge — default reasoning effort `high`
 
 - Headless Grok agents (web system chat, Android Chat, plugin / Live DJ host AI) spawn with `--reasoning-effort high`. Override with `GROKIFY_REASONING_EFFORT`. (`xhigh` was tried early but is not released yet.) Voice Agent realtime path is unchanged (`none` / deep-think `high`).
@@ -326,7 +335,7 @@ Android host versions (`versionName` / `versionCode` in `android/app/build.gradl
 - **Head**: stopped stacking bone pitch + `lookAt` (that read as a constant nod); gaze is eyes-first; rare soft nod only while listening.
 - **Lip-sync**: faster envelope + stronger mid-range open; mouth level published from PCM *write* path (what leaves the speaker), not only socket receive time.
 - **First spoken reply**: flush/re-prime `AudioTrack` per response + short silence pad so cold OEM tracks do not drop the first PCM; session instructions force **spoken audio first** (body tools optional garnish, never instead of speech).
-- **Body tools**: on-device `body_gesture` / `set_hands` / `look_at` / `reset_body` (VRChat-style head + hands with gravity) via `CompanionBodyTools` + stage host bridge.
+- **Body control**: voice agent tools (`ai_move`, `body_gesture`, `set_hands`, `look_at`, `reset_body`) hand off to **`CompanionMovementAgent`**, which plans wrist/look keyframes via the host **bridge CLI** (Grok Build) from live measured joints — works for any VRM. Stage applies frames with two-bone IK + soft hang.
 - **Audit fixes (0.1.206–0.1.211)**: atomic VRM import (staging dir, never wipe previous on failed copy); synchronized chat history append; text send stops active voice session; status toast auto-dismiss; preserve avatar state across model reload; normalize user vs bundled load source; `stopInternal` publishes final Idle before clearing listener (no stuck Connecting); Thinking keeps mic open until `response.created` (half-duplex after commit) and **never** clears `input_audio_buffer` on `speech_stopped` / mute into Thinking; thinking nudge + empty-turn recovery before hard timeout; loudspeaker / media usage priming.
 
 ### 0.1.203–0.1.205 — Companion: poses, orbit camera, voice connect

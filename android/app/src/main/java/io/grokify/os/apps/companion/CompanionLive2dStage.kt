@@ -89,7 +89,10 @@ fun CompanionLive2dStage(
 
     LaunchedEffect(Unit) {
         bundledVrmPath = withContext(Dispatchers.IO) {
-            CompanionModelAssets.ensureBundledVrmFile(appContext)
+            val path = CompanionModelAssets.ensureBundledVrmFile(appContext)
+            // Materialize portable VRMA clips for the stage player.
+            runCatching { CompanionModelAssets.ensureBundledAnimations(appContext) }
+            path
         }
     }
 
@@ -346,7 +349,7 @@ fun CompanionLive2dStage(
 private const val TAG = "CompanionVrm"
 // Version bump forces a fresh document after Live2D → VRM migrations.
 private const val ASSET_URL =
-    "file:///android_asset/companion/index.html?stage=vrm7&v=222"
+    "file:///android_asset/companion/index.html?stage=vrm8&v=231"
 
 /**
  * Host bridge for the offline VRM stage.
@@ -454,8 +457,9 @@ private class CompanionJsBridge(
     }
 
     /**
-     * Open a VRM for chunked base64 reads.
-     * @param path absolute filesystem path, `bundled`, or empty (= bundled)
+     * Open a VRM or VRMA for chunked base64 reads.
+     * @param path absolute filesystem path, `bundled`, empty (= bundled),
+     *   `anim:<id>` / `vrma:<id>` for a bundled animation clip
      * @return byte length, or negative on error:
      *   -1 unreadable / outside app storage / resolve failed
      *   -2 missing or empty
@@ -503,6 +507,13 @@ private class CompanionJsBridge(
                 -4
             }
         }
+    }
+
+    /** JSON list of bundled VRMA clip ids for the stage catalog. */
+    @JavascriptInterface
+    fun listVrmaClips(): String {
+        runCatching { CompanionModelAssets.ensureBundledAnimations(ctx) }
+        return org.json.JSONArray(CompanionModelAssets.BUNDLED_VRMA_IDS).toString()
     }
 
     @JavascriptInterface
@@ -554,6 +565,7 @@ private class CompanionJsBridge(
     /**
      * Resolve a path the stage may open. Handles:
      * - blank / "bundled" → extracted Seed-san
+     * - anim:<id> / vrma:<id> → bundled VRMA clip
      * - file:// or absolute paths under app files/cache
      * - /data/user/N vs /data/data symlink mismatch via canonical roots
      * - re-extract when a stale bundled path is missing
@@ -583,6 +595,19 @@ private class CompanionJsBridge(
             return accept(CompanionModelAssets.ensureBundledVrmFile(ctx)?.let { File(it) })
         }
 
+        // Bundled VRMA: anim:goodbye | vrma:clapping | goodbye.vrma (known id)
+        val animId = when {
+            raw.startsWith("anim:", ignoreCase = true) -> raw.substring(5)
+            raw.startsWith("vrma:", ignoreCase = true) -> raw.substring(5)
+            raw.endsWith(".vrma", ignoreCase = true) && !raw.contains("/") ->
+                raw.removeSuffix(".vrma").removeSuffix(".VRMA")
+            else -> null
+        }
+        if (animId != null) {
+            accept(CompanionModelAssets.ensureAnimationFile(ctx, animId)?.let { File(it) })
+                ?.let { return it }
+        }
+
         val abs = when {
             raw.startsWith("file://") -> {
                 // file:///data/... → /data/...
@@ -603,6 +628,13 @@ private class CompanionJsBridge(
         if (looksBundled) {
             android.util.Log.i(TAG, "re-extracting bundled VRM after failed open of $abs")
             return accept(CompanionModelAssets.ensureBundledVrmFile(ctx)?.let { File(it) })
+        }
+
+        // Absolute path under animations dir by basename.
+        if (abs.contains("/companion/animations/") || abs.endsWith(".vrma", ignoreCase = true)) {
+            val base = File(abs).nameWithoutExtension
+            accept(CompanionModelAssets.ensureAnimationFile(ctx, base)?.let { File(it) })
+                ?.let { return it }
         }
 
         android.util.Log.w(
@@ -713,7 +745,7 @@ private fun mimeForPath(path: String): String {
         p.endsWith(".js") -> "application/javascript"
         p.endsWith(".css") -> "text/css"
         p.endsWith(".json") -> "application/json"
-        p.endsWith(".vrm") || p.endsWith(".glb") -> "model/gltf-binary"
+        p.endsWith(".vrm") || p.endsWith(".glb") || p.endsWith(".vrma") -> "model/gltf-binary"
         p.endsWith(".gltf") -> "model/gltf+json"
         p.endsWith(".png") -> "image/png"
         p.endsWith(".jpg") || p.endsWith(".jpeg") -> "image/jpeg"

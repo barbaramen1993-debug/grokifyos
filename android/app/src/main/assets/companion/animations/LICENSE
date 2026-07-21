@@ -1,0 +1,10 @@
+Bundled VRMA clips:
+
+1) From https://github.com/tk256ailab/vrm-viewer (MIT)
+   angry, blush, clapping, goodbye, jump, lookaround, relax, sad, sleepy, surprised, thinking
+   Copyright (c) 2025 TK256
+
+2) From https://github.com/pixiv/three-vrm (MIT)
+   test.vrma — example clip from @pixiv/three-vrm-animation
+
+These are portable VRM Animation (.vrma) files playable on any VRM 1.0 humanoid.

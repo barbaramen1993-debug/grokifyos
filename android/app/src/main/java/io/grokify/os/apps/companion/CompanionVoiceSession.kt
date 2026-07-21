@@ -23,6 +23,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -42,6 +43,7 @@ import kotlin.math.min
  * Independent of [io.grokify.os.apps.GrokAssistantVoiceSession] so both panes
  * can exist without sharing that singleton. Uses [GrokAssistantVoiceClient]
  * for WebSocket + token mint; body tools ([CompanionBodyTools]); lip-sync via [CompanionAmplitude].
+ * Body motion is planned by [CompanionMovementAgent] (host bridge CLI) in tandem with speech.
  */
 object CompanionVoiceSession {
     private const val TAG = "CompanionVoiceSession"
@@ -187,6 +189,7 @@ object CompanionVoiceSession {
     ) {
         val app = ctx.applicationContext
         appCtx = app
+        CompanionMovementAgent.attach(app)
         listenerRef.set(listener)
 
         val apiKey = HostApiKeyStore.getValue(app, ApiKeyIds.SPACEXAI)
@@ -391,11 +394,26 @@ object CompanionVoiceSession {
                 }
 
                 useBinary.set(false)
+                val sessionTools = CompanionBodyTools.sessionTools()
+                val toolNames = buildList {
+                    for (i in 0 until sessionTools.length()) {
+                        add(sessionTools.getJSONObject(i).optString("name"))
+                    }
+                }
+                Log.i(TAG, "session tools (${toolNames.size}): ${toolNames.joinToString()}")
+                if (CompanionDebugLog.enabled) {
+                    CompanionDebugLog.append(
+                        CompanionDebugLog.Dir.Sys,
+                        "session",
+                        "tools · ${toolNames.joinToString()}",
+                        sessionTools.toString().take(6_000),
+                    )
+                }
                 fun sendConfig(): Boolean =
                     client.sessionUpdate(
                         instructions = system,
                         voice = voice,
-                        tools = CompanionBodyTools.sessionTools(),
+                        tools = sessionTools,
                         sampleRate = GrokAssistantVoiceClient.SAMPLE_RATE,
                         useBinaryAudio = false,
                         reasoningEffort = "none",
@@ -503,6 +521,7 @@ object CompanionVoiceSession {
     private fun stopInternal(clearListener: Boolean = true) {
         // Invalidate any in-flight start() so a late mint/connect cannot restart us.
         startGeneration.incrementAndGet()
+        CompanionMovementAgent.cancel()
         running.set(false)
         stopWatchdog()
         assistantCommittedThisResponse.set(false)
@@ -1083,6 +1102,7 @@ object CompanionVoiceSession {
         lastUserCommitText.set(body)
         lastUserCommitElapsedMs.set(now)
         partialUser.set(null)
+        CompanionBodyTools.noteUserTranscript(body)
         if (CompanionDebugLog.enabled) {
             CompanionDebugLog.append(
                 CompanionDebugLog.Dir.Out,
@@ -1093,7 +1113,28 @@ object CompanionVoiceSession {
         }
         notifyTranscript("user", body)
         publish()
+        // Tandem kick: if user asked for motion, start bridge movement agent soon
+        // even if voice tools are slow — tool path marks fired and cancels duplicates.
+        scheduleMotionAgentKick(body)
         return true
+    }
+
+    /**
+     * Voice + movement in tandem: after a short delay, if no body tool ran this turn
+     * and the transcript looks like a motion request, run [CompanionMovementAgent].
+     */
+    private fun scheduleMotionAgentKick(userText: String) {
+        if (!CompanionMovementAgent.wantsMotion(userText)) return
+        val gen = startGeneration.get()
+        scope.launch {
+            delay(700)
+            if (!running.get() || startGeneration.get() != gen) return@launch
+            if (CompanionBodyTools.gestureToolFiredThisTurn) return@launch
+            val ok = CompanionBodyTools.maybeKeywordWaveFallback(userText)
+            if (ok) {
+                Log.i(TAG, "tandem movement agent kicked for: ${userText.take(80)}")
+            }
+        }
     }
 
     private fun handleEvent(event: JSONObject) {
@@ -1326,7 +1367,40 @@ object CompanionVoiceSession {
                 commitAssistantIfNeeded(text)
             }
             "response.function_call_arguments.done" -> {
-                val call = GrokAssistantVoiceTools.parseFunctionCallEvent(event) ?: return
+                val rawName = event.optString("name", "").trim()
+                val rawArgs = when {
+                    event.has("arguments") && event.opt("arguments") is String ->
+                        event.optString("arguments", "{}")
+                    event.optJSONObject("arguments") != null ->
+                        event.optJSONObject("arguments")!!.toString()
+                    else -> "{}"
+                }
+                Log.i(
+                    TAG,
+                    "function_call_arguments.done name=$rawName " +
+                        "args=${rawArgs.take(300)} id=${event.optString("call_id").take(12)}",
+                )
+                if (CompanionDebugLog.enabled) {
+                    CompanionDebugLog.append(
+                        CompanionDebugLog.Dir.In,
+                        "fn_call",
+                        rawName.ifBlank { "(unnamed)" },
+                        rawArgs.take(4_000),
+                    )
+                }
+                val call = GrokAssistantVoiceTools.parseFunctionCallEvent(event)
+                if (call == null) {
+                    Log.w(TAG, "function_call parse failed name=$rawName args=${rawArgs.take(200)}")
+                    if (CompanionDebugLog.enabled) {
+                        CompanionDebugLog.append(
+                            CompanionDebugLog.Dir.Sys,
+                            "fn_call",
+                            "parse_failed $rawName",
+                            rawArgs.take(2_000),
+                        )
+                    }
+                    return
+                }
                 inFlightTools.incrementAndGet()
                 Log.i(TAG, "function_call name=${call.name} id=${call.callId.take(12)}")
                 // Body tools are instant; still mark thinking so UI doesn't look stuck idle.

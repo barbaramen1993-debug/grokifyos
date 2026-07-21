@@ -16,6 +16,8 @@ class CompanionBodyToolsTest {
                 add(tools.getJSONObject(i).optString("name"))
             }
         }
+        assertTrue(names.contains(CompanionBodyTools.TOOL_BODY_POSE))
+        assertTrue(names.contains(CompanionBodyTools.TOOL_AI_MOVE))
         assertTrue(names.contains(CompanionBodyTools.TOOL_OBSERVE))
         assertTrue(names.contains(CompanionBodyTools.TOOL_GESTURE))
         assertTrue(names.contains(CompanionBodyTools.TOOL_SET_HANDS))
@@ -24,10 +26,10 @@ class CompanionBodyToolsTest {
     }
 
     @Test
-    fun toolInstructions_mentionJointLabels() {
+    fun toolInstructions_mentionBodyPoseAndTemplates() {
         val t = CompanionBodyTools.toolInstructions()
-        assertTrue(t.contains("named_joints") || t.contains("joint_labels"))
-        assertTrue(t.contains("observe_environment"))
+        assertTrue(t.contains("body_pose"))
+        assertTrue(t.contains("JOINT-XYZ") || t.contains("joint") || t.contains("template"))
     }
 
     @Test
@@ -48,6 +50,8 @@ class CompanionBodyToolsTest {
 
     @Test
     fun isBodyTool_matchesKnownNames() {
+        assertTrue(CompanionBodyTools.isBodyTool("body_pose"))
+        assertTrue(CompanionBodyTools.isBodyTool("ai_move"))
         assertTrue(CompanionBodyTools.isBodyTool("observe_environment"))
         assertTrue(CompanionBodyTools.isBodyTool("body_gesture"))
         assertTrue(CompanionBodyTools.isBodyTool("set_hands"))
@@ -95,7 +99,7 @@ class CompanionBodyToolsTest {
     }
 
     @Test
-    fun execute_gesture_ok_evenWithoutStage() {
+    fun execute_gesture_playsJointXyzTemplate() {
         val call = GrokAssistantVoiceTools.FunctionCall(
             name = CompanionBodyTools.TOOL_GESTURE,
             callId = "c2",
@@ -105,8 +109,94 @@ class CompanionBodyToolsTest {
         val json = JSONObject(result.outputJson)
         assertTrue(json.optBoolean("ok"))
         assertEquals("wave", json.optString("gesture"))
-        // Stage may be null in unit tests.
+        // No WebView in unit tests → playTemplate false → movement_agent queue
+        assertTrue(
+            json.optString("mode") == "joint_xyz_template" ||
+                json.optString("mode") == "movement_agent",
+        )
         assertFalse(json.optBoolean("stage"))
+    }
+
+    @Test
+    fun execute_wave_missingSide_defaultsRight() {
+        CompanionBodyTools.noteUserTranscript("")
+        val call = GrokAssistantVoiceTools.FunctionCall(
+            name = CompanionBodyTools.TOOL_GESTURE,
+            callId = "c2b",
+            argumentsJson = """{"gesture":"wave","intensity":1}""",
+        )
+        val result = CompanionBodyTools.execute(call)
+        val json = JSONObject(result.outputJson)
+        assertTrue(json.optBoolean("ok"))
+        assertEquals("right", json.optString("side"))
+    }
+
+    @Test
+    fun execute_wave_missingSide_infersLeftFromUserText() {
+        CompanionBodyTools.noteUserTranscript("Can you wave your left hand?")
+        val call = GrokAssistantVoiceTools.FunctionCall(
+            name = CompanionBodyTools.TOOL_GESTURE,
+            callId = "c2c",
+            argumentsJson = """{"gesture":"wave","intensity":1}""",
+        )
+        val result = CompanionBodyTools.execute(call)
+        val json = JSONObject(result.outputJson)
+        assertTrue(json.optBoolean("ok"))
+        assertEquals("left", json.optString("side"))
+        assertEquals("user_text", json.optString("side_source"))
+    }
+
+    @Test
+    fun execute_bodyPose_waveRight() {
+        val call = GrokAssistantVoiceTools.FunctionCall(
+            name = CompanionBodyTools.TOOL_BODY_POSE,
+            callId = "bp1",
+            argumentsJson = """{"pose":"wave","side":"right"}""",
+        )
+        val result = CompanionBodyTools.execute(call)
+        val json = JSONObject(result.outputJson)
+        assertTrue(json.optBoolean("ok"))
+        assertEquals("wave", json.optString("pose"))
+        assertEquals("right", json.optString("side"))
+        assertTrue(
+            json.optString("mode") == "vrma_or_joint_xyz" ||
+                json.optString("mode") == "joint_xyz_template",
+        )
+    }
+
+    @Test
+    fun execute_aiMove_requiresIntent() {
+        val call = GrokAssistantVoiceTools.FunctionCall(
+            name = CompanionBodyTools.TOOL_AI_MOVE,
+            callId = "am0",
+            argumentsJson = "{}",
+        )
+        val result = CompanionBodyTools.execute(call)
+        assertEquals("missing_intent", JSONObject(result.outputJson).optString("error"))
+    }
+
+    @Test
+    fun execute_aiMove_queues() {
+        val call = GrokAssistantVoiceTools.FunctionCall(
+            name = CompanionBodyTools.TOOL_AI_MOVE,
+            callId = "am1",
+            argumentsJson = """{"intent":"wave left hand toward viewer","side":"left"}""",
+        )
+        val result = CompanionBodyTools.execute(call)
+        val json = JSONObject(result.outputJson)
+        assertTrue(json.optBoolean("ok"))
+        assertTrue(json.optBoolean("queued"))
+        assertEquals("movement_agent", json.optString("mode"))
+    }
+
+    @Test
+    fun inferWaveSideFromUserText_leftRightBoth() {
+        assertEquals("left", CompanionBodyTools.inferWaveSideFromUserText("wave your left hand"))
+        assertEquals("right", CompanionBodyTools.inferWaveSideFromUserText("Can you wave your right?"))
+        assertEquals("both", CompanionBodyTools.inferWaveSideFromUserText("wave both hands"))
+        assertEquals(null, CompanionBodyTools.inferWaveSideFromUserText("wave"))
+        assertEquals(null, CompanionBodyTools.inferWaveSideFromUserText("hello there"))
+        assertEquals("left", CompanionBodyTools.inferWaveSideFromUserText("hello with your left hand wave"))
     }
 
     @Test
@@ -149,13 +239,20 @@ class CompanionBodyToolsTest {
     @Test
     fun toolInstructions_mentionsVrAndGestures() {
         val t = CompanionBodyTools.toolInstructions()
-        assertTrue(t.contains("VRChat", ignoreCase = true) || t.contains("VR"))
-        assertTrue(t.contains("body_gesture") || t.contains("wave"))
+        assertTrue(
+            t.contains("VRChat", ignoreCase = true) ||
+                t.contains("VR") ||
+                t.contains("VRMA", ignoreCase = true) ||
+                t.contains("VRM", ignoreCase = true),
+        )
+        assertTrue(t.contains("body_gesture") || t.contains("wave") || t.contains("body_pose"))
         assertTrue(t.contains("look_at") || t.contains("LEFT", ignoreCase = true))
         assertTrue(
             t.contains("IK", ignoreCase = true) ||
                 t.contains("wrist") ||
-                t.contains("controller"),
+                t.contains("controller") ||
+                t.contains("joint", ignoreCase = true) ||
+                t.contains("VRMA", ignoreCase = true),
         )
         assertTrue(t.contains("observe_environment") || t.contains("CLOSED LOOP"))
     }

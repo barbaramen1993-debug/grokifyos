@@ -1,20 +1,25 @@
 /**
- * Companion VRM stage — offline Three.js + @pixiv/three-vrm + OrbitControls.
- * Host bridge: window.GrokifyCompanion.{onReady,onModelLoaded,onError,onDebugLog,onJointPicked,openVrm,readVrmBase64,closeVrm}
+ * Companion VRM stage — offline Three.js + @pixiv/three-vrm + three-vrm-animation.
+ * Host bridge: window.GrokifyCompanion.{onReady,onModelLoaded,onError,onDebugLog,onJointPicked,openVrm,readVrmBase64,closeVrm,listVrmaClips}
  * Stage API:   window.CompanionStage.{loadModel,setState,setMouth,playMotion,
- *              playGesture,setHands,setLook,resetBody,exportBodyState,setDebugSkeleton,
- *              setJointLabel,setJointLabels,getJointLabels,selectJoint}
+ *              playGesture,playTemplate,playVrma,stopVrma,listVrma,exportMotionLibrary,setHands,setLook,
+ *              playAiMotion,resetBody,exportBodyState,
+ *              setDebugSkeleton,setJointLabel,setJointLabels,getJointLabels,selectJoint}
  *
- * Avatar is driven like a VRChat body: virtual HMD + left/right wrist controllers
- * (spring-damper + gravity ragdoll). Arms use two-bone IK to those hand points.
+ * Motion layers (priority):
+ *  1) VRMA clips — portable humanoid animations (any VRM), via AnimationMixer
+ *  2) Joint-XYZ templates / scripted gestures — wrist IK rebuilt per avatar
+ *  3) Soft hang idle + spring VR controllers
  *
  * Android WebView cannot reliably fetch() file:// VRMs ("Failed to fetch").
  * Bytes are streamed from Kotlin via openVrm/readVrmBase64, then GLTFLoader.parse.
+ * VRMA uses path alias anim:<id> through the same bridge.
  *
  * Canvas gestures are orbit only (rotate / pan / pinch-zoom). Chat & voice stay on host UI buttons.
  *
  * Vendored libs: window.CompanionVrmLibs = {
- *   THREE, GLTFLoader, OrbitControls, VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName
+ *   THREE, GLTFLoader, OrbitControls, VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName,
+ *   VRMAnimationLoaderPlugin, createVRMAnimationClip
  * }
  */
 (function () {
@@ -129,6 +134,18 @@
   var restRecalibLeft = 0;
   /** Active scripted gesture (null when idle VR physics owns hands). */
   var activeGesture = null;
+  /**
+   * VRMA playback state. When active, bone IK/hang is suspended so the
+   * AnimationMixer fully owns humanoid joints (works on any VRM).
+   */
+  var vrmaMixer = null;
+  var vrmaAction = null;
+  var vrmaClipId = null;
+  var vrmaUntil = 0;
+  var vrmaLoop = false;
+  var vrmaRawCache = {};
+  var vrmaClipCache = {};
+  var vrmaLoadGen = 0;
   var floorMesh = null;
   var floorRing = null;
   /**
@@ -1168,6 +1185,9 @@
         } catch (_) {}
       });
     }
+    try {
+      destroyVrmaState();
+    } catch (_) {}
     vrm = null;
     restBones = null;
     armMeta.left = null;
@@ -1191,12 +1211,14 @@
   }
 
   /**
-   * Soft hang rest for the whole body. VRM normalized bones start in T-pose;
-   * pure geometric IK alone left arms stuck at shoulder height on many models.
+   * Soft hang rest for the whole body. VRM normalized bones start in T-pose.
    *
-   * Idle arms use soft A-pose eulers (Z ≈ ±1.26 ≈ 72° from T). Raised hands /
-   * gestures switch to two-bone IK from bind. Rest wrist targets are measured
-   * from the live hang pose so controllers match what you see.
+   * Idle arms prefer two-bone IK to *geometric* hang wrist targets (works on
+   * any VRM axis convention). Soft-hang eulers are auto-solved per avatar as
+   * a no-meta fallback and to seed base torso/leg pose.
+   *
+   * Hardcoded Z≈±1.26 was too shallow on many models → shoulder-high "Y pose"
+   * at load and again after VRMA handoff.
    */
   function captureRestPose() {
     restBones = {
@@ -1223,7 +1245,7 @@
     restBones.bindQ = {};
     var bind = {};
     Object.keys(restBones).forEach(function (k) {
-      if (k === "bindQ" || k === "base") return;
+      if (k === "bindQ" || k === "base" || k === "hangDeltas" || k === "bindEuler") return;
       var n = restBones[k];
       if (!n) return;
       if (n.quaternion) restBones.bindQ[k] = n.quaternion.clone();
@@ -1231,19 +1253,28 @@
     });
     restBones.bindEuler = bind;
 
-    function hang(key, dx, dy, dz) {
-      var n = restBones[key];
-      var b = bind[key];
-      if (!n || !b) return;
-      setEuler(n, b.x + dx, b.y + dy, b.z + dz);
-    }
+    // Arm lengths / local axes from BIND (straight T-pose reach) for IK.
+    try {
+      if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+    } catch (_) {}
+    measureArmMeta("left");
+    measureArmMeta("right");
 
-    applySoftHangEulers(hang);
+    // Per-avatar hang deltas (which local axis drops the hand) + apply.
+    restBones.hangDeltas = solveHangDeltas();
+    applySoftHangEulers();
 
-    // Base eulers = soft hang (idle path uses addEuler from these).
+    // Base eulers = soft hang (torso / idle fallback uses addEuler from these).
     restBones.base = {};
     Object.keys(restBones).forEach(function (k) {
-      if (k === "base" || k === "bindQ" || k === "bindEuler") return;
+      if (
+        k === "base" ||
+        k === "bindQ" ||
+        k === "bindEuler" ||
+        k === "hangDeltas"
+      ) {
+        return;
+      }
       var n = restBones[k];
       if (!n || !n.rotation) return;
       restBones.base[k] = {
@@ -1253,16 +1284,7 @@
       };
     });
 
-    // Arm lengths / local axes from BIND (straight T-pose reach) for raised IK.
-    restoreArmBindPose();
-    try {
-      if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
-    } catch (_) {}
-    measureArmMeta("left");
-    measureArmMeta("right");
-
-    // Re-apply hang so first frames aren't T-pose; then measure rest wrists.
-    applySoftHangEulers(hang);
+    // Geometric hang wrists (not "whatever the euler left us at") then snap.
     try {
       if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
     } catch (_) {}
@@ -1283,11 +1305,151 @@
   }
 
   /**
-   * Soft A-pose deltas from T-bind on VRM normalized bones.
-   * Z≈±1.26 (~72°) drops arms to the sides; slight elbow bend + hands forward.
-   * Full hang is ~1.45; lower values read as Y-pose (hands at shoulder height).
+   * Default soft-hang deltas from T-bind (full-ish hang, not shallow A/Y).
+   * Z≈±1.52 (~87°) drops arms to the sides; shallow ~1.0 looks like Y-pose.
+   */
+  function defaultHangDeltas() {
+    return {
+      leftUpperArm: [0.1, 0.06, 1.52],
+      rightUpperArm: [0.1, -0.06, -1.52],
+      leftLowerArm: [0.42, 0.05, 0.1],
+      rightLowerArm: [0.42, -0.05, -0.1],
+      leftHand: [0.08, 0.03, 0.06],
+      rightHand: [0.08, -0.03, -0.06],
+      hips: [0.01, 0.015, 0.008],
+      spine: [0.018, -0.01, -0.006],
+      chest: [0.012, 0.005, 0],
+      neck: [0, 0, 0],
+      head: [0, 0, 0],
+      leftUpperLeg: [0.01, 0, 0.012],
+      rightUpperLeg: [-0.006, 0, -0.01],
+      leftLowerLeg: [-0.012, 0, 0],
+      rightLowerLeg: [-0.008, 0, 0],
+    };
+  }
+
+  /**
+   * Probe which local upper-arm axis+sign drops the hand most from bind T-pose.
+   * Avoids fixed Z± hang that becomes a Y-pose on nonstandard normalized bones.
+   */
+  function solveHangDeltas() {
+    var deltas = defaultHangDeltas();
+    if (!restBones || !restBones.bindEuler) return deltas;
+
+    function trialUpper(side, axis, sign, amount) {
+      var upperKey = side === "left" ? "leftUpperArm" : "rightUpperArm";
+      var lowerKey = side === "left" ? "leftLowerArm" : "rightLowerArm";
+      var handKey = side === "left" ? "leftHand" : "rightHand";
+      var upper = restBones[upperKey];
+      var lower = restBones[lowerKey];
+      var hand = restBones[handKey];
+      var bU = restBones.bindEuler[upperKey];
+      var bL = restBones.bindEuler[lowerKey];
+      var bH = restBones.bindEuler[handKey];
+      if (!upper || !hand || !bU) return null;
+      // Restore bind for this arm.
+      if (restBones.bindQ[upperKey]) upper.quaternion.copy(restBones.bindQ[upperKey]);
+      if (lower && restBones.bindQ[lowerKey]) lower.quaternion.copy(restBones.bindQ[lowerKey]);
+      if (hand && restBones.bindQ[handKey]) hand.quaternion.copy(restBones.bindQ[handKey]);
+      var dx = axis === "x" ? sign * amount : 0;
+      var dy = axis === "y" ? sign * amount : 0;
+      var dz = axis === "z" ? sign * amount : 0;
+      setEuler(upper, bU.x + dx, bU.y + dy, bU.z + dz);
+      // Mild elbow bend so the trial isn't a locked straight stick.
+      if (lower && bL) {
+        setEuler(
+          lower,
+          bL.x + 0.35,
+          bL.y + (side === "left" ? 0.04 : -0.04),
+          bL.z + (side === "left" ? 0.08 : -0.08)
+        );
+      }
+      if (hand && bH) {
+        setEuler(hand, bH.x + 0.06, bH.y, bH.z);
+      }
+      try {
+        if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+        upper.updateWorldMatrix(true, true);
+        if (lower) lower.updateWorldMatrix(true, true);
+        hand.updateWorldMatrix(true, false);
+      } catch (_) {}
+      return hipsLocalOf(hand);
+    }
+
+    function solveSide(side) {
+      var best = null;
+      var axes = ["z", "x", "y"];
+      var signs = [1, -1];
+      var amounts = [1.52, 1.35, 1.15];
+      var i, j, k, pos, drop, score;
+      var sh =
+        hipsLocalOf(
+          restBones[side === "left" ? "leftUpperArm" : "rightUpperArm"]
+        ) || { x: 0, y: 1.2, z: 0 };
+      // Also score lateral separation (arms should hang slightly out, not across body).
+      for (i = 0; i < axes.length; i++) {
+        for (j = 0; j < signs.length; j++) {
+          for (k = 0; k < amounts.length; k++) {
+            pos = trialUpper(side, axes[i], signs[j], amounts[k]);
+            if (!pos) continue;
+            drop = sh.y - pos.y;
+            // Prefer lowest hand; small bonus for hanging slightly outward.
+            var out =
+              side === "left" ? sh.x - pos.x : pos.x - sh.x;
+            score = drop + Math.max(0, Math.min(out, 0.12)) * 0.35;
+            if (!best || score > best.score) {
+              best = {
+                score: score,
+                drop: drop,
+                axis: axes[i],
+                sign: signs[j],
+                amount: amounts[k],
+                pos: pos,
+              };
+            }
+          }
+        }
+      }
+      // Restore arm bind after probing.
+      restoreArmBindPose();
+      if (!best || best.drop < 0.12) return null;
+      var d = [0.1, side === "left" ? 0.06 : -0.06, 0];
+      if (best.axis === "x") d[0] = best.sign * best.amount;
+      if (best.axis === "y") d[1] = best.sign * best.amount;
+      if (best.axis === "z") d[2] = best.sign * best.amount;
+      // Keep a little lift/roll so it isn't a corpse hang.
+      if (best.axis !== "x") d[0] += 0.08;
+      return d;
+    }
+
+    try {
+      var lU = solveSide("left");
+      var rU = solveSide("right");
+      if (lU) deltas.leftUpperArm = lU;
+      if (rU) deltas.rightUpperArm = rU;
+      try {
+        console.log(
+          "[CompanionStage] hang solve",
+          "L=" + (lU ? lU.join(",") : "default"),
+          "R=" + (rU ? rU.join(",") : "default")
+        );
+      } catch (_) {}
+    } catch (e) {
+      try {
+        console.warn("[CompanionStage] hang solve failed", (e && e.message) || e);
+      } catch (_) {}
+    }
+    // Ensure bind restored.
+    restoreArmBindPose();
+    return deltas;
+  }
+
+  /**
+   * Apply soft hang from restBones.hangDeltas (or defaults) onto bind eulers.
    */
   function applySoftHangEulers(hangFn) {
+    var deltas =
+      (restBones && restBones.hangDeltas) || defaultHangDeltas();
     if (typeof hangFn !== "function") {
       if (!restBones || !restBones.bindEuler) return;
       hangFn = function (key, dx, dy, dz) {
@@ -1297,21 +1459,73 @@
         setEuler(n, b.x + dx, b.y + dy, b.z + dz);
       };
     }
-    hangFn("leftUpperArm", 0.12, 0.08, 1.26);
-    hangFn("rightUpperArm", 0.12, -0.08, -1.26);
-    hangFn("leftLowerArm", 0.32, 0.06, 0.08);
-    hangFn("rightLowerArm", 0.32, -0.06, -0.08);
-    hangFn("leftHand", 0.06, 0.04, 0.08);
-    hangFn("rightHand", 0.06, -0.04, -0.08);
-    hangFn("hips", 0.01, 0.015, 0.008);
-    hangFn("spine", 0.018, -0.01, -0.006);
-    hangFn("chest", 0.012, 0.005, 0);
-    hangFn("neck", 0, 0, 0);
-    hangFn("head", 0, 0, 0);
-    hangFn("leftUpperLeg", 0.01, 0, 0.012);
-    hangFn("rightUpperLeg", -0.006, 0, -0.01);
-    hangFn("leftLowerLeg", -0.012, 0, 0);
-    hangFn("rightLowerLeg", -0.008, 0, 0);
+    Object.keys(deltas).forEach(function (key) {
+      var d = deltas[key];
+      if (!d || d.length < 3) return;
+      hangFn(key, d[0], d[1], d[2]);
+    });
+  }
+
+  /** Re-capture base eulers from the current bone rotations (post-hang). */
+  function captureBaseFromBones() {
+    if (!restBones) return;
+    restBones.base = restBones.base || {};
+    Object.keys(restBones).forEach(function (k) {
+      if (
+        k === "base" ||
+        k === "bindQ" ||
+        k === "bindEuler" ||
+        k === "hangDeltas"
+      ) {
+        return;
+      }
+      var n = restBones[k];
+      if (!n || !n.rotation) return;
+      restBones.base[k] = {
+        x: n.rotation.x,
+        y: n.rotation.y,
+        z: n.rotation.z,
+      };
+    });
+  }
+
+  /**
+   * Force avatar back to measured soft hang (after VRMA / reset).
+   * Stops mixer influence, reapplies hang eulers, snaps VR wrists home.
+   */
+  function restoreHangPose(opts) {
+    opts = opts || {};
+    try {
+      if (vrmaMixer) {
+        vrmaMixer.stopAllAction();
+        // Advance once so bindings release last clip weights.
+        vrmaMixer.update(0);
+      }
+    } catch (_) {}
+    if (!restBones || !restBones.bindEuler) return;
+    try {
+      applySoftHangEulers();
+      if (opts.recaptureBase) captureBaseFromBones();
+      if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+      if (opts.recalibrate !== false) {
+        // Shoulders from current hang; wrists geometric if still high.
+        calibrateVrRestsFromBones();
+      } else {
+        // Snap free controllers to existing rest without remeasure.
+        if (!vr.left.locked) {
+          vr.left.x = vr.restLeft.x;
+          vr.left.y = vr.restLeft.y;
+          vr.left.z = vr.restLeft.z;
+          vr.left.vx = vr.left.vy = vr.left.vz = 0;
+        }
+        if (!vr.right.locked) {
+          vr.right.x = vr.restRight.x;
+          vr.right.y = vr.restRight.y;
+          vr.right.z = vr.restRight.z;
+          vr.right.vx = vr.right.vy = vr.right.vz = 0;
+        }
+      }
+    } catch (_) {}
   }
 
   function restoreArmBindPose() {
@@ -1494,10 +1708,12 @@
   }
 
   /**
-   * Rest wrist/head targets from LIVE hang-pose bones (hips-local).
-   * Call only after soft A-pose eulers are applied so hands are down the sides,
-   * not invented from shoulder + fraction (that drifted to shoulder height).
-   * Bounds are relative to measured shoulders/reach (works for short VRMs).
+   * Rest wrist/head targets in hips-local space.
+   *
+   * Prefer *geometric* hang: shoulder + down/out/forward scaled by arm reach.
+   * Measuring from live bones alone re-encoded shallow euler hang as a permanent
+   * Y-pose rest (start + post-gesture). Live hand samples only win when they
+   * clearly hang below the geometric target.
    */
   function calibrateVrRestsFromBones() {
     var headL = hipsLocalOf(restBones && restBones.head) || {
@@ -1517,18 +1733,8 @@
         y: 1.22,
         z: 0,
       };
-    var leftL =
-      hipsLocalOf(restBones && restBones.leftHand) || {
-        x: -0.18,
-        y: 0.72,
-        z: 0.1,
-      };
-    var rightL =
-      hipsLocalOf(restBones && restBones.rightHand) || {
-        x: 0.18,
-        y: 0.72,
-        z: 0.1,
-      };
+    var leftLive = hipsLocalOf(restBones && restBones.leftHand);
+    var rightLive = hipsLocalOf(restBones && restBones.rightHand);
 
     vr.shoulderLeft = { x: lSh.x, y: lSh.y, z: lSh.z };
     vr.shoulderRight = { x: rSh.x, y: rSh.y, z: rSh.z };
@@ -1537,29 +1743,61 @@
     var reachR = armReachLen("right");
     var shY = Math.min(lSh.y, rSh.y);
     // Scale-relative hang band: below chest, can hang near hips on short models.
-    var yCeil = shY - Math.min(0.12, Math.min(reachL, reachR) * 0.28);
+    var yCeil = shY - Math.min(0.14, Math.min(reachL, reachR) * 0.32);
     var yFloor = shY - Math.max(reachL, reachR) * 1.2;
 
-    // Nudge slightly out/forward; clamp Y below chest so rest never looks like T/Y.
-    leftL.x = Math.min(leftL.x, lSh.x - Math.min(0.06, reachL * 0.12));
-    rightL.x = Math.max(rightL.x, rSh.x + Math.min(0.06, reachR * 0.12));
-    leftL.z = Math.max(leftL.z, lSh.z + Math.min(0.04, reachL * 0.08));
-    rightL.z = Math.max(rightL.z, rSh.z + Math.min(0.04, reachR * 0.08));
+    // Nudge slightly out + toward the viewer (camera), not hard-coded +Z.
+    // Hips-local +Z is NOT always face-out on VRM normalized skeletons.
+    var fwdL = viewerForwardXZ(lSh);
+    var fwdR = viewerForwardXZ(rSh);
+    var rightLdir = bodyRightXZ(fwdL);
+    var rightRdir = bodyRightXZ(fwdR);
+
+    // Geometric soft hang — primary rest (arms down the sides, slight A-pose).
+    function geometricHang(sh, reach, fwd, rightDir, isLeft) {
+      var down = reach * 0.78;
+      var out = reach * 0.16;
+      var fwdAmt = reach * 0.08;
+      var side = isLeft ? -1 : 1;
+      return {
+        x: sh.x + rightDir.x * side * out + fwd.x * fwdAmt,
+        y: sh.y - down,
+        z: sh.z + rightDir.z * side * out + fwd.z * fwdAmt,
+      };
+    }
+
+    var leftGeo = geometricHang(lSh, reachL, fwdL, rightLdir, true);
+    var rightGeo = geometricHang(rSh, reachR, fwdR, rightRdir, false);
+
+    // Live sample wins only if it hangs at least as low as geo (euler hang worked).
+    function pickHang(live, geo, sh, reach) {
+      if (
+        live &&
+        typeof live.y === "number" &&
+        live.y <= geo.y + reach * 0.06 &&
+        live.y < sh.y - reach * 0.45
+      ) {
+        return { x: live.x, y: live.y, z: live.z };
+      }
+      return { x: geo.x, y: geo.y, z: geo.z };
+    }
+
+    var leftL = pickHang(leftLive, leftGeo, lSh, reachL);
+    var rightL = pickHang(rightLive, rightGeo, rSh, reachR);
+
     leftL.y = clamp(leftL.y, yFloor, yCeil);
     rightL.y = clamp(rightL.y, yFloor, yCeil);
-    // If measurement still looks shoulder-high (T-pose matrices), force soft hang.
-    if (leftL.y > lSh.y - reachL * 0.35) {
-      leftL.y = lSh.y - reachL * 0.72;
-      leftL.x = lSh.x - reachL * 0.18;
-      leftL.z = Math.max(lSh.z + reachL * 0.1, leftL.z);
+    // Hard floor: never accept shoulder-high rest (the old Y-pose).
+    if (leftL.y > lSh.y - reachL * 0.5) {
+      leftL.x = leftGeo.x;
+      leftL.y = clamp(leftGeo.y, yFloor, yCeil);
+      leftL.z = leftGeo.z;
     }
-    if (rightL.y > rSh.y - reachR * 0.35) {
-      rightL.y = rSh.y - reachR * 0.72;
-      rightL.x = rSh.x + reachR * 0.18;
-      rightL.z = Math.max(rSh.z + reachR * 0.1, rightL.z);
+    if (rightL.y > rSh.y - reachR * 0.5) {
+      rightL.x = rightGeo.x;
+      rightL.y = clamp(rightGeo.y, yFloor, yCeil);
+      rightL.z = rightGeo.z;
     }
-    leftL.y = clamp(leftL.y, yFloor, yCeil);
-    rightL.y = clamp(rightL.y, yFloor, yCeil);
 
     vr.restHead = headL;
     vr.restLeft = leftL;
@@ -1583,14 +1821,42 @@
   }
 
   /**
+   * Horizontal unit vector from a hips-local origin toward the orbit camera.
+   * Do NOT assume hips-local +Z is viewer-forward — many VRMs have hips yawed
+   * ~180° so +Z points into the scene (behind the body from the phone camera).
+   */
+  function viewerForwardXZ(origin) {
+    var ox = origin && typeof origin.x === "number" ? origin.x : 0;
+    var oz = origin && typeof origin.z === "number" ? origin.z : 0;
+    var cam = cameraHipsLocal();
+    if (cam) {
+      var dx = cam.x - ox;
+      var dz = cam.z - oz;
+      var len = Math.sqrt(dx * dx + dz * dz);
+      if (len > 1e-4) {
+        return { x: dx / len, z: dz / len, cam: cam };
+      }
+    }
+    // Last resort: hips-local +Z (documented face-out when hips face world).
+    return { x: 0, z: 1, cam: cam };
+  }
+
+  /**
+   * Body-right unit in hips XZ given a viewer-forward vector (up × forward).
+   */
+  function bodyRightXZ(fwd) {
+    // (0,1,0) × (fx,0,fz) = (fz, 0, -fx)
+    return { x: fwd.z, z: -fwd.x };
+  }
+
+  /**
    * Wave / point peaks relative to this avatar + camera (viewer).
    * Offsets use measured arm reach so short VRMs stay inside the workspace.
-   * Wave is shoulder-height + out, never straight overhead.
+   * Always place peaks toward the camera — never hardcode +Z as "forward".
    */
   function gesturePeak(kind, side, inten) {
     inten = typeof inten === "number" ? inten : 1;
     var isLeft = side === "left";
-    var sx = isLeft ? -1 : 1;
     var sh = isLeft ? vr.shoulderLeft : vr.shoulderRight;
     if (!sh) {
       sh = isLeft
@@ -1599,48 +1865,1040 @@
     }
     var headY = (vr.restHead && vr.restHead.y) || sh.y + 0.2;
     var reach = armReachLen(side);
-    var cam = cameraHipsLocal();
+    var fwd = viewerForwardXZ(sh);
+    var right = bodyRightXZ(fwd);
+    // Outward from torso for this hand (left = −body-right).
+    var outX = isLeft ? -right.x : right.x;
+    var outZ = isLeft ? -right.z : right.z;
     var peak = { x: sh.x, y: sh.y, z: sh.z };
 
     if (kind === "wave") {
-      // Friendly wave: slightly above shoulder, out, toward viewer — not arm-up.
-      peak.x = sh.x + sx * reach * (0.38 + 0.1 * inten);
-      peak.y = sh.y + reach * (0.22 + 0.08 * inten);
-      // Cap below head so short models don't invert min(sh+lift, head-0.18).
-      peak.y = Math.min(peak.y, headY - reach * 0.08);
-      peak.y = Math.max(peak.y, sh.y + reach * 0.06);
-      peak.z = sh.z + reach * (0.42 + 0.12 * inten);
+      // Classic "hi": hand near ear/crown height, out, clearly toward viewer.
+      // Previous peak was only ~0.2*reach above shoulder and used +Z as forward,
+      // which landed at shoulder height and behind the body on many VRMs.
+      peak.y = sh.y + reach * (0.48 + 0.1 * inten);
+      peak.y = Math.min(peak.y, headY + reach * 0.06);
+      peak.y = Math.max(peak.y, sh.y + reach * 0.32);
+      peak.x =
+        sh.x +
+        outX * reach * (0.3 + 0.08 * inten) +
+        fwd.x * reach * (0.5 + 0.1 * inten);
+      peak.z =
+        sh.z +
+        outZ * reach * (0.3 + 0.08 * inten) +
+        fwd.z * reach * (0.5 + 0.1 * inten);
     } else if (kind === "point") {
-      peak.x = sh.x + sx * reach * (0.18 + 0.06 * inten);
-      peak.y = sh.y + reach * 0.02;
-      peak.z = sh.z + reach * (0.62 + 0.12 * inten);
+      peak.y = sh.y + reach * 0.04;
+      peak.x =
+        sh.x +
+        outX * reach * (0.12 + 0.05 * inten) +
+        fwd.x * reach * (0.68 + 0.1 * inten);
+      peak.z =
+        sh.z +
+        outZ * reach * (0.12 + 0.05 * inten) +
+        fwd.z * reach * (0.68 + 0.1 * inten);
     } else if (kind === "cheer") {
-      peak.x = sh.x + sx * reach * 0.28;
-      peak.y = Math.min(headY + reach * 0.12, sh.y + reach * 0.72);
-      peak.z = sh.z + reach * 0.22;
+      peak.y = Math.min(headY + reach * 0.14, sh.y + reach * 0.78);
+      peak.x =
+        sh.x + outX * reach * 0.22 + fwd.x * reach * 0.28;
+      peak.z =
+        sh.z + outZ * reach * 0.22 + fwd.z * reach * 0.28;
     } else {
-      peak.x = sh.x + sx * reach * 0.28;
-      peak.y = sh.y + reach * 0.2;
-      peak.z = sh.z + reach * 0.28;
-    }
-
-    // Pull toward camera so wave/point face the viewer.
-    if (cam) {
-      var dx = cam.x - peak.x;
-      var dz = cam.z - peak.z;
-      var len = Math.sqrt(dx * dx + dz * dz) || 1;
-      var pull = reach * (kind === "point" ? 0.22 : 0.18);
-      peak.x += (dx / len) * pull * inten;
-      peak.z += (dz / len) * Math.min(reach * 0.35, pull + reach * 0.08 * inten);
-      // Mild height match toward camera eye level (not forced; never overhead).
-      if (kind === "wave") {
-        peak.y += clamp((cam.y - peak.y) * 0.06, -reach * 0.08, reach * 0.1);
-        peak.y = Math.min(peak.y, headY - reach * 0.05);
-      }
+      peak.y = sh.y + reach * 0.22;
+      peak.x =
+        sh.x + outX * reach * 0.24 + fwd.x * reach * 0.32;
+      peak.z =
+        sh.z + outZ * reach * 0.24 + fwd.z * reach * 0.32;
     }
 
     // Keep inside arm reach from shoulder (prevents locked-straight arm).
     return clampToArmReach(side, peak.x, peak.y, peak.z, 0.88);
+  }
+
+  /**
+   * Motion template library: joint-XYZ recipes for THIS VRM.
+   * Built from measured shoulders / rest wrists / arm reach / camera — not human-scale guesses.
+   * Voice agent plays named templates; frames are recomputed at play time so camera moves stay valid.
+   */
+  var motionLibraryMeta = null;
+
+  function round3lib(n) {
+    return typeof n === "number" && isFinite(n) ? Math.round(n * 1000) / 1000 : 0;
+  }
+
+  function handRestObj(side) {
+    var r = side === "left" ? vr.restLeft : vr.restRight;
+    if (!r) return { rest: true };
+    return { x: round3lib(r.x), y: round3lib(r.y), z: round3lib(r.z) };
+  }
+
+  function handPeakObj(kind, side, inten) {
+    var p = gesturePeak(kind, side, inten || 1);
+    return { x: round3lib(p.x), y: round3lib(p.y), z: round3lib(p.z) };
+  }
+
+  /** Lateral flap offset in camera-facing plane (for wave). */
+  function waveFlapOffset(side, sign, inten) {
+    var isLeft = side === "left";
+    var sh = isLeft ? vr.shoulderLeft : vr.shoulderRight;
+    if (!sh) sh = { x: 0, y: 1, z: 0 };
+    var reach = armReachLen(side);
+    var fwd = viewerForwardXZ(sh);
+    var right = bodyRightXZ(fwd);
+    var amp = reach * (0.1 + 0.04 * (inten || 1));
+    return {
+      x: right.x * amp * sign,
+      y: 0,
+      z: right.z * amp * sign,
+    };
+  }
+
+  function lookCameraObj() {
+    var cam = cameraHipsLocal();
+    var head = (vr && vr.restHead) || { x: 0, y: 1.4, z: 0 };
+    if (!cam) return { x: 0, y: 0.05, hold_sec: 2.5 };
+    var dx = cam.x - head.x;
+    var dy = cam.y - head.y;
+    var dz = cam.z - head.z;
+    var horiz = Math.sqrt(dx * dx + dz * dz) || 1;
+    return {
+      x: round3lib(clamp(dx / Math.max(horiz, 0.4) * 0.55, -1, 1)),
+      y: round3lib(clamp(dy / Math.max(horiz, 0.4) * 0.45, -1, 1)),
+      hold_sec: 2.8,
+    };
+  }
+
+  /**
+   * Build absolute keyframe plan for a named template from LIVE joint XYZ.
+   * Returns { ok, id, intent, look?, frames[] } for playAiMotion.
+   */
+  function buildTemplatePlan(name, opts) {
+    opts = opts || {};
+    var n = String(name || "")
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_");
+    var inten =
+      typeof opts.intensity === "number" ? clamp(opts.intensity, 0.2, 1.5) : 1;
+    var sideRaw = opts.side != null ? String(opts.side).toLowerCase().trim() : "";
+    if (sideRaw === "l") sideRaw = "left";
+    if (sideRaw === "r") sideRaw = "right";
+    if (sideRaw === "all") sideRaw = "both";
+
+    // Resolve aliases
+    if (n === "hello") n = "wave";
+    if (n === "yes") n = "nod";
+    if (n === "no") n = "shake_head";
+    if (n === "celebrate") n = "cheer";
+    if (n === "reset" || n === "reset_body" || n === "idle") n = "rest";
+
+    // wave / point / cheer with side suffix or opts.side
+    var side = sideRaw;
+    var m = n.match(/^(wave|point|cheer)_(left|right|both)$/);
+    if (m) {
+      n = m[1];
+      side = m[2];
+    }
+    if ((n === "wave" || n === "point" || n === "cheer") && !side) {
+      side = "right";
+    }
+    if (side !== "left" && side !== "right" && side !== "both") {
+      side = n === "cheer" ? "both" : "right";
+    }
+
+    var look = lookCameraObj();
+    var frames = [];
+    var planId = n === "wave" || n === "point" ? n + "_" + side : n;
+
+    function addFrame(at, left, right, hold, lookFr) {
+      var fr = { at_ms: at, hold_sec: hold != null ? hold : 0.4 };
+      if (left) fr.left = left;
+      if (right) fr.right = right;
+      if (lookFr) fr.look = lookFr;
+      frames.push(fr);
+    }
+
+    if (n === "rest") {
+      addFrame(0, handRestObj("left"), handRestObj("right"), 0.25);
+      return {
+        ok: true,
+        id: "rest",
+        intent: "rest",
+        source: "joint_xyz_template",
+        look: { x: look.x, y: look.y, hold_sec: 1.2 },
+        frames: frames,
+      };
+    }
+
+    if (n === "nod") {
+      return {
+        ok: true,
+        id: "nod",
+        intent: "nod",
+        source: "joint_xyz_template",
+        look: { x: look.x, y: 0.35, hold_sec: 0.35 },
+        frames: [
+          {
+            at_ms: 0,
+            look: { x: look.x, y: 0.35, hold_sec: 0.28 },
+            hold_sec: 0.28,
+          },
+          {
+            at_ms: 280,
+            look: { x: look.x, y: -0.12, hold_sec: 0.22 },
+            hold_sec: 0.22,
+          },
+          {
+            at_ms: 520,
+            look: { x: look.x, y: look.y, hold_sec: 1.2 },
+            hold_sec: 0.3,
+          },
+        ],
+      };
+    }
+
+    if (n === "shake_head") {
+      return {
+        ok: true,
+        id: "shake_head",
+        intent: "shake_head",
+        source: "joint_xyz_template",
+        look: { x: -0.55, y: look.y, hold_sec: 0.25 },
+        frames: [
+          { at_ms: 0, look: { x: -0.55, y: look.y, hold_sec: 0.22 }, hold_sec: 0.22 },
+          { at_ms: 240, look: { x: 0.55, y: look.y, hold_sec: 0.22 }, hold_sec: 0.22 },
+          { at_ms: 480, look: { x: -0.4, y: look.y, hold_sec: 0.2 }, hold_sec: 0.2 },
+          { at_ms: 700, look: { x: look.x, y: look.y, hold_sec: 1.2 }, hold_sec: 0.3 },
+        ],
+      };
+    }
+
+    if (n === "wave") {
+      var sides = side === "both" ? ["left", "right"] : [side];
+      // Raise
+      var raiseL = sides.indexOf("left") >= 0 ? handPeakObj("wave", "left", inten) : null;
+      var raiseR = sides.indexOf("right") >= 0 ? handPeakObj("wave", "right", inten) : null;
+      addFrame(0, raiseL, raiseR, 0.35, look);
+      // Flap 3 times using camera-plane offsets from live peak
+      var flaps = [1, -1, 1, -0.4];
+      for (var fi = 0; fi < flaps.length; fi++) {
+        var sign = flaps[fi];
+        var lH = null;
+        var rH = null;
+        if (raiseL) {
+          var fL = waveFlapOffset("left", sign, inten);
+          lH = {
+            x: round3lib(raiseL.x + fL.x),
+            y: raiseL.y,
+            z: round3lib(raiseL.z + fL.z),
+          };
+          lH = clampToArmReach("left", lH.x, lH.y, lH.z, 0.88);
+          lH = { x: round3lib(lH.x), y: round3lib(lH.y), z: round3lib(lH.z) };
+        }
+        if (raiseR) {
+          var fR = waveFlapOffset("right", sign, inten);
+          rH = {
+            x: round3lib(raiseR.x + fR.x),
+            y: raiseR.y,
+            z: round3lib(raiseR.z + fR.z),
+          };
+          rH = clampToArmReach("right", rH.x, rH.y, rH.z, 0.88);
+          rH = { x: round3lib(rH.x), y: round3lib(rH.y), z: round3lib(rH.z) };
+        }
+        addFrame(320 + fi * 220, lH, rH, 0.22);
+      }
+      // Return rest
+      addFrame(
+        320 + flaps.length * 220 + 80,
+        sides.indexOf("left") >= 0 ? handRestObj("left") : null,
+        sides.indexOf("right") >= 0 ? handRestObj("right") : null,
+        0.35
+      );
+      return {
+        ok: true,
+        id: planId,
+        intent: "wave",
+        side: side,
+        source: "joint_xyz_template",
+        look: look,
+        frames: frames,
+        measured: {
+          peak_left: raiseL,
+          peak_right: raiseR,
+          rest_left: handRestObj("left"),
+          rest_right: handRestObj("right"),
+          reach_left: round3lib(armReachLen("left")),
+          reach_right: round3lib(armReachLen("right")),
+        },
+      };
+    }
+
+    if (n === "point") {
+      var pL = side === "left" || side === "both" ? handPeakObj("point", "left", inten) : null;
+      var pR = side === "right" || side === "both" ? handPeakObj("point", "right", inten) : null;
+      addFrame(0, pL, pR, 1.1, look);
+      addFrame(
+        1200,
+        side === "left" || side === "both" ? handRestObj("left") : null,
+        side === "right" || side === "both" ? handRestObj("right") : null,
+        0.3
+      );
+      return {
+        ok: true,
+        id: planId,
+        intent: "point",
+        side: side,
+        source: "joint_xyz_template",
+        look: look,
+        frames: frames,
+      };
+    }
+
+    if (n === "cheer") {
+      var cL = handPeakObj("cheer", "left", inten);
+      var cR = handPeakObj("cheer", "right", inten);
+      addFrame(0, cL, cR, 0.9, look);
+      addFrame(1000, handRestObj("left"), handRestObj("right"), 0.3);
+      return {
+        ok: true,
+        id: "cheer",
+        intent: "cheer",
+        source: "joint_xyz_template",
+        look: look,
+        frames: frames,
+      };
+    }
+
+    if (n === "shrug") {
+      var shL = vr.shoulderLeft || { x: -0.16, y: 1.2, z: 0 };
+      var shR = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
+      var rL = armReachLen("left");
+      var rR = armReachLen("right");
+      var fwdL = viewerForwardXZ(shL);
+      var fwdR = viewerForwardXZ(shR);
+      var leftUp = clampToArmReach(
+        "left",
+        shL.x - rL * 0.22,
+        shL.y + rL * 0.08,
+        shL.z + fwdL.x * rL * 0.12 + fwdL.z * rL * 0.12,
+        0.85
+      );
+      var rightUp = clampToArmReach(
+        "right",
+        shR.x + rR * 0.22,
+        shR.y + rR * 0.08,
+        shR.z + fwdR.x * rR * 0.12 + fwdR.z * rR * 0.12,
+        0.85
+      );
+      addFrame(
+        0,
+        { x: round3lib(leftUp.x), y: round3lib(leftUp.y), z: round3lib(leftUp.z) },
+        { x: round3lib(rightUp.x), y: round3lib(rightUp.y), z: round3lib(rightUp.z) },
+        0.9,
+        look
+      );
+      addFrame(1100, handRestObj("left"), handRestObj("right"), 0.3);
+      return {
+        ok: true,
+        id: "shrug",
+        intent: "shrug",
+        source: "joint_xyz_template",
+        look: look,
+        frames: frames,
+      };
+    }
+
+    if (n === "think") {
+      // Hand near temple from measured head + shoulder (optional intentional pose).
+      var shRt = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
+      var headY = (vr.restHead && vr.restHead.y) || shRt.y + 0.15;
+      var rr = armReachLen("right");
+      var fwdT = viewerForwardXZ(shRt);
+      var thinkPt = clampToArmReach(
+        "right",
+        shRt.x + rr * 0.1,
+        Math.min(headY - rr * 0.08, shRt.y + rr * 0.32),
+        shRt.z + fwdT.x * rr * 0.28 + fwdT.z * rr * 0.28,
+        0.85
+      );
+      addFrame(
+        0,
+        null,
+        { x: round3lib(thinkPt.x), y: round3lib(thinkPt.y), z: round3lib(thinkPt.z) },
+        1.8,
+        { x: 0.25, y: 0.12, hold_sec: 2 }
+      );
+      addFrame(2000, null, handRestObj("right"), 0.3);
+      return {
+        ok: true,
+        id: "think",
+        intent: "think",
+        source: "joint_xyz_template",
+        frames: frames,
+      };
+    }
+
+    if (n === "clap") {
+      var shCl = vr.shoulderLeft || { x: -0.16, y: 1.2, z: 0 };
+      var shCr = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
+      var rCl = armReachLen("left");
+      var fwdCl = viewerForwardXZ({
+        x: (shCl.x + shCr.x) * 0.5,
+        z: (shCl.z + shCr.z) * 0.5,
+      });
+      var midY = (shCl.y + shCr.y) * 0.5 - rCl * 0.25;
+      var midX = (shCl.x + shCr.x) * 0.5 + fwdCl.x * rCl * 0.32;
+      var midZ = (shCl.z + shCr.z) * 0.5 + fwdCl.z * rCl * 0.32;
+      var cl = clampToArmReach("left", midX - 0.04, midY, midZ, 0.8);
+      var cr = clampToArmReach("right", midX + 0.04, midY, midZ, 0.8);
+      addFrame(
+        0,
+        { x: round3lib(cl.x), y: round3lib(cl.y), z: round3lib(cl.z) },
+        { x: round3lib(cr.x), y: round3lib(cr.y), z: round3lib(cr.z) },
+        0.25,
+        look
+      );
+      var cl2 = clampToArmReach("left", midX - 0.02, midY, midZ, 0.8);
+      var cr2 = clampToArmReach("right", midX + 0.02, midY, midZ, 0.8);
+      addFrame(
+        280,
+        { x: round3lib(cl2.x), y: round3lib(cl2.y), z: round3lib(cl2.z) },
+        { x: round3lib(cr2.x), y: round3lib(cr2.y), z: round3lib(cr2.z) },
+        0.2
+      );
+      addFrame(560, handRestObj("left"), handRestObj("right"), 0.3);
+      return {
+        ok: true,
+        id: "clap",
+        intent: "clap",
+        source: "joint_xyz_template",
+        look: look,
+        frames: frames,
+      };
+    }
+
+    if (n === "bow" || n === "lean_in") {
+      // Look + slight lean via torso is state-driven; hands stay rest, head dips.
+      return {
+        ok: true,
+        id: n,
+        intent: n,
+        source: "joint_xyz_template",
+        look: { x: look.x, y: n === "bow" ? -0.45 : 0.15, hold_sec: 1.2 },
+        frames: [
+          {
+            at_ms: 0,
+            left: handRestObj("left"),
+            right: handRestObj("right"),
+            look: { x: look.x, y: n === "bow" ? -0.45 : 0.18, hold_sec: 1.0 },
+            hold_sec: 1.0,
+          },
+          {
+            at_ms: 1200,
+            look: look,
+            hold_sec: 0.4,
+          },
+        ],
+      };
+    }
+
+    if (n === "hands_on_hips") {
+      var shLH = vr.shoulderLeft || { x: -0.16, y: 1.2, z: 0 };
+      var shRH = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
+      var rLH = armReachLen("left");
+      var rRH = armReachLen("right");
+      var hipsY = Math.min(
+        (vr.restLeft && vr.restLeft.y) || shLH.y - rLH * 0.7,
+        (vr.restRight && vr.restRight.y) || shRH.y - rRH * 0.7
+      );
+      var hl = clampToArmReach("left", shLH.x - rLH * 0.08, hipsY + rLH * 0.05, shLH.z + rLH * 0.05, 0.75);
+      var hr = clampToArmReach("right", shRH.x + rRH * 0.08, hipsY + rRH * 0.05, shRH.z + rRH * 0.05, 0.75);
+      addFrame(
+        0,
+        { x: round3lib(hl.x), y: round3lib(hl.y), z: round3lib(hl.z) },
+        { x: round3lib(hr.x), y: round3lib(hr.y), z: round3lib(hr.z) },
+        1.8,
+        look
+      );
+      addFrame(2000, handRestObj("left"), handRestObj("right"), 0.3);
+      return {
+        ok: true,
+        id: "hands_on_hips",
+        intent: "hands_on_hips",
+        source: "joint_xyz_template",
+        frames: frames,
+      };
+    }
+
+    if (n === "crossed_arms") {
+      var shLC = vr.shoulderLeft || { x: -0.16, y: 1.2, z: 0 };
+      var shRC = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
+      var rLC = armReachLen("left");
+      var rRC = armReachLen("right");
+      var cy = Math.min(shLC.y, shRC.y) - Math.min(rLC, rRC) * 0.35;
+      var cla = clampToArmReach("left", 0.04, cy, shLC.z + rLC * 0.15, 0.8);
+      var cra = clampToArmReach("right", -0.04, cy - 0.02, shRC.z + rRC * 0.12, 0.8);
+      addFrame(
+        0,
+        { x: round3lib(cla.x), y: round3lib(cla.y), z: round3lib(cla.z) },
+        { x: round3lib(cra.x), y: round3lib(cra.y), z: round3lib(cra.z) },
+        2.0,
+        look
+      );
+      addFrame(2200, handRestObj("left"), handRestObj("right"), 0.3);
+      return {
+        ok: true,
+        id: "crossed_arms",
+        intent: "crossed_arms",
+        source: "joint_xyz_template",
+        frames: frames,
+      };
+    }
+
+    return null;
+  }
+
+  /** Catalog of templates + VRMA clips available for this avatar. */
+  function exportMotionLibrary() {
+    var cam = cameraHipsLocal();
+    var catalog = [
+      { id: "rest", aliases: ["idle", "reset"], description: "Measured soft hang rest", source: "joint_xyz" },
+      { id: "wave_right", aliases: ["wave", "hello"], description: "Wave (VRMA goodbye clip, any VRM)", source: "vrma", vrma: "goodbye" },
+      { id: "wave_left", aliases: [], description: "Wave left (joint-XYZ peak)", source: "joint_xyz" },
+      { id: "wave_both", aliases: [], description: "Wave both hands", source: "joint_xyz" },
+      { id: "point_right", aliases: ["point"], description: "Point right wrist toward camera", source: "joint_xyz" },
+      { id: "point_left", aliases: [], description: "Point left wrist toward camera", source: "joint_xyz" },
+      { id: "nod", aliases: ["yes"], description: "Head nod via look keyframes", source: "joint_xyz" },
+      { id: "shake_head", aliases: ["no"], description: "Head shake via look keyframes", source: "joint_xyz" },
+      { id: "shrug", aliases: [], description: "Relax VRMA / shoulder shrug", source: "vrma", vrma: "relax" },
+      { id: "think", aliases: ["thinking"], description: "Thinking VRMA clip", source: "vrma", vrma: "thinking" },
+      { id: "clap", aliases: ["clapping"], description: "Clapping VRMA clip", source: "vrma", vrma: "clapping" },
+      { id: "cheer", aliases: ["celebrate", "jump"], description: "Jump / cheer VRMA", source: "vrma", vrma: "jump" },
+      { id: "bow", aliases: [], description: "Head dip", source: "joint_xyz" },
+      { id: "lean_in", aliases: [], description: "Slight lean toward viewer", source: "joint_xyz" },
+      { id: "hands_on_hips", aliases: [], description: "Wrists near hips from measured hang", source: "joint_xyz" },
+      { id: "crossed_arms", aliases: [], description: "Arms crossed from shoulder XYZ", source: "joint_xyz" },
+      { id: "goodbye", aliases: ["bye"], description: "Goodbye wave VRMA", source: "vrma", vrma: "goodbye" },
+      { id: "angry", aliases: ["mad"], description: "Angry VRMA", source: "vrma", vrma: "angry" },
+      { id: "sad", aliases: [], description: "Sad VRMA", source: "vrma", vrma: "sad" },
+      { id: "sleepy", aliases: ["sleep"], description: "Sleepy VRMA", source: "vrma", vrma: "sleepy" },
+      { id: "surprised", aliases: ["surprise"], description: "Surprised VRMA", source: "vrma", vrma: "surprised" },
+      { id: "blush", aliases: ["shy"], description: "Blush VRMA", source: "vrma", vrma: "blush" },
+      { id: "lookaround", aliases: ["look_around"], description: "Look around VRMA", source: "vrma", vrma: "lookaround" },
+      { id: "relax", aliases: [], description: "Relaxed VRMA", source: "vrma", vrma: "relax" },
+    ];
+    var vrmaList = listVrma();
+    motionLibraryMeta = {
+      ok: true,
+      source: "vrma+joint_xyz",
+      space: "hips_local",
+      note:
+        "PREFERRED: body_pose with VRMA-backed ids (wave→goodbye, clap, think, jump, …) — " +
+        "clips retarget to any VRM humanoid. Joint-XYZ templates recompute wrist targets from live " +
+        "shoulders/rest/reach/camera when no clip maps.",
+      joints: {
+        shoulder_left: vr.shoulderLeft
+          ? { x: round3lib(vr.shoulderLeft.x), y: round3lib(vr.shoulderLeft.y), z: round3lib(vr.shoulderLeft.z) }
+          : null,
+        shoulder_right: vr.shoulderRight
+          ? { x: round3lib(vr.shoulderRight.x), y: round3lib(vr.shoulderRight.y), z: round3lib(vr.shoulderRight.z) }
+          : null,
+        rest_left: handRestObj("left"),
+        rest_right: handRestObj("right"),
+        reach_left: round3lib(armReachLen("left")),
+        reach_right: round3lib(armReachLen("right")),
+        camera_hips_local: cam
+          ? { x: round3lib(cam.x), y: round3lib(cam.y), z: round3lib(cam.z) }
+          : null,
+      },
+      catalog: catalog,
+      template_ids: catalog.map(function (c) {
+        return c.id;
+      }),
+      vrma: vrmaList,
+      vrma_playing: isVrmaPlaying() ? vrmaClipId : null,
+    };
+    return motionLibraryMeta;
+  }
+
+  /**
+   * Play a named template: prefer portable VRMA when mapped, else rebuild
+   * joint-XYZ frames from live shoulders/rest/reach/camera.
+   */
+  function playTemplate(name, opts) {
+    opts = opts || {};
+    var n = String(name || "")
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_");
+    // VRMA-first for catalog gestures (any VRM, real joint relative motion).
+    var vrmaId = resolveVrmaId(n, opts);
+    if (vrmaId && canPlayVrma()) {
+      playVrma(vrmaId, {
+        loop: !!opts.loop,
+        intensity: opts.intensity,
+        fallback: n,
+        side: opts.side,
+      });
+      return true;
+    }
+    var plan = buildTemplatePlan(name, opts);
+    if (!plan || !plan.frames || !plan.frames.length) {
+      try {
+        console.warn("[CompanionStage] playTemplate unknown", name);
+      } catch (_) {}
+      return false;
+    }
+    try {
+      console.log(
+        "[CompanionStage] playTemplate",
+        plan.id,
+        "frames=" + plan.frames.length,
+        "source=joint_xyz"
+      );
+    } catch (_) {}
+    stopVrmaInternal(false);
+    // playAiMotion is defined later in this IIFE; function decls are hoisted.
+    return playAiMotion(plan);
+  }
+
+  // ─── VRMA (portable VRM Animation clips) ─────────────────────────────────
+
+  /** Gesture / pose name → bundled .vrma id (filename without extension). */
+  var VRMA_GESTURE_MAP = {
+    wave: "goodbye",
+    wave_left: "goodbye",
+    wave_right: "goodbye",
+    wave_both: "goodbye",
+    hello: "goodbye",
+    goodbye: "goodbye",
+    bye: "goodbye",
+    clap: "clapping",
+    clapping: "clapping",
+    think: "thinking",
+    thinking: "thinking",
+    cheer: "jump",
+    celebrate: "jump",
+    jump: "jump",
+    shrug: "relax",
+    relax: "relax",
+    rest: "relax",
+    idle: "relax",
+    lookaround: "lookaround",
+    look_around: "lookaround",
+    sad: "sad",
+    angry: "angry",
+    mad: "angry",
+    sleepy: "sleepy",
+    sleep: "sleepy",
+    surprised: "surprised",
+    surprise: "surprised",
+    blush: "blush",
+    shy: "blush",
+    test: "test",
+  };
+
+  /** Built-in catalog metadata (aliases for voice agent / tools). */
+  var VRMA_CATALOG = [
+    { id: "goodbye", aliases: ["wave", "hello", "bye"], description: "Wave goodbye / greeting" },
+    { id: "clapping", aliases: ["clap"], description: "Clap hands" },
+    { id: "thinking", aliases: ["think"], description: "Thinking pose" },
+    { id: "jump", aliases: ["cheer", "celebrate"], description: "Jump / celebrate" },
+    { id: "relax", aliases: ["shrug", "idle", "rest"], description: "Relaxed stance" },
+    { id: "lookaround", aliases: ["look_around"], description: "Look around" },
+    { id: "sad", aliases: [], description: "Sad emotion pose" },
+    { id: "angry", aliases: ["mad"], description: "Angry emotion pose" },
+    { id: "sleepy", aliases: ["sleep"], description: "Sleepy pose" },
+    { id: "surprised", aliases: ["surprise"], description: "Surprised reaction" },
+    { id: "blush", aliases: ["shy"], description: "Blush / shy" },
+    { id: "test", aliases: [], description: "three-vrm sample clip" },
+  ];
+
+  function canPlayVrma() {
+    var L = getLibs();
+    return !!(
+      vrm &&
+      !usingFallback &&
+      L &&
+      L.VRMAnimationLoaderPlugin &&
+      typeof L.createVRMAnimationClip === "function" &&
+      L.THREE &&
+      L.THREE.AnimationMixer
+    );
+  }
+
+  function isVrmaPlaying() {
+    return !!(vrmaAction && vrmaMixer && vrmaClipId);
+  }
+
+  function listVrma() {
+    var ids = VRMA_CATALOG.map(function (c) {
+      return c.id;
+    });
+    try {
+      var bridge = hostBridge();
+      if (bridge && typeof bridge.listVrmaClips === "function") {
+        var raw = bridge.listVrmaClips();
+        if (raw) {
+          var arr = typeof raw === "string" ? JSON.parse(raw) : raw;
+          if (arr && arr.length) {
+            ids = arr.map(function (x) {
+              return String(x).toLowerCase().replace(/\.vrma$/i, "");
+            });
+          }
+        }
+      }
+    } catch (_) {}
+    return {
+      ok: true,
+      source: "vrma",
+      clips: VRMA_CATALOG.filter(function (c) {
+        return ids.indexOf(c.id) >= 0 || true;
+      }),
+      ids: ids,
+      map: VRMA_GESTURE_MAP,
+      note:
+        "VRMA clips retarget to any VRM 1.0 humanoid. Prefer body_pose with these ids for reliable motion.",
+    };
+  }
+
+  function resolveVrmaId(name, opts) {
+    opts = opts || {};
+    if (opts.vrma) return String(opts.vrma).toLowerCase().replace(/\.vrma$/i, "");
+    if (opts.clip) return String(opts.clip).toLowerCase().replace(/\.vrma$/i, "");
+    var n = String(name || "")
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_");
+    if (!n) return null;
+    if (VRMA_GESTURE_MAP[n]) return VRMA_GESTURE_MAP[n];
+    // Direct clip id
+    for (var i = 0; i < VRMA_CATALOG.length; i++) {
+      if (VRMA_CATALOG[i].id === n) return n;
+      var al = VRMA_CATALOG[i].aliases || [];
+      for (var j = 0; j < al.length; j++) {
+        if (al[j] === n) return VRMA_CATALOG[i].id;
+      }
+    }
+    // wave_right etc.
+    var m = n.match(/^(wave|hello|clap|think|cheer)(?:_(left|right|both))?$/);
+    if (m && VRMA_GESTURE_MAP[m[1]]) return VRMA_GESTURE_MAP[m[1]];
+    return null;
+  }
+
+  function stopVrmaInternal(restoreHang) {
+    vrmaLoadGen++;
+    try {
+      if (vrmaAction) {
+        vrmaAction.fadeOut(0.15);
+        vrmaAction.stop();
+      }
+    } catch (_) {}
+    vrmaAction = null;
+    vrmaClipId = null;
+    vrmaUntil = 0;
+    vrmaLoop = false;
+    try {
+      if (vrmaMixer) {
+        vrmaMixer.stopAllAction();
+        vrmaMixer.update(0);
+        // Keep mixer instance for reuse on same VRM.
+      }
+    } catch (_) {}
+    if (restoreHang) {
+      try {
+        // Unlock + snap controllers, then force hang bones (not Y-pose end frame).
+        vr.left.locked = false;
+        vr.right.locked = false;
+        vr.head.locked = false;
+        activeGesture = null;
+        restoreHangPose({ recalibrate: true, recaptureBase: false });
+      } catch (_) {}
+    }
+  }
+
+  function stopVrma() {
+    stopVrmaInternal(true);
+    return true;
+  }
+
+  function destroyVrmaState() {
+    stopVrmaInternal(false);
+    try {
+      if (vrmaMixer) {
+        vrmaMixer.stopAllAction();
+        vrmaMixer.uncacheRoot(vrm && vrm.scene ? vrm.scene : null);
+      }
+    } catch (_) {}
+    vrmaMixer = null;
+    vrmaClipCache = {};
+    // Keep raw buffers — independent of VRM instance.
+  }
+
+  function ensureVrmaMixer() {
+    var L = getLibs();
+    if (!L || !L.THREE || !vrm || !vrm.scene) return null;
+    if (!vrmaMixer) {
+      vrmaMixer = new L.THREE.AnimationMixer(vrm.scene);
+    }
+    return vrmaMixer;
+  }
+
+  /**
+   * Read anim bytes via Kotlin bridge (anim:<id> alias).
+   * Caches raw ArrayBuffers in vrmaRawCache.
+   */
+  function loadVrmaBuffer(id) {
+    var key = String(id || "")
+      .toLowerCase()
+      .replace(/\.vrma$/i, "");
+    if (vrmaRawCache[key]) {
+      return Promise.resolve(vrmaRawCache[key]);
+    }
+    var bridge = hostBridge();
+    if (!bridge || typeof bridge.openVrm !== "function") {
+      return Promise.reject(new Error("Native VRM bridge missing for VRMA"));
+    }
+    var size;
+    try {
+      size = bridge.openVrm("anim:" + key);
+    } catch (e) {
+      return Promise.reject(
+        new Error("openVrm anim threw: " + ((e && e.message) || String(e)))
+      );
+    }
+    if (typeof size !== "number" || size <= 0) {
+      try {
+        if (typeof bridge.closeVrm === "function") bridge.closeVrm();
+      } catch (_) {}
+      return Promise.reject(new Error("openVrm anim failed code=" + size + " id=" + key));
+    }
+    var bytes = new Uint8Array(size);
+    var offset = 0;
+    function closeBridge() {
+      try {
+        if (typeof bridge.closeVrm === "function") bridge.closeVrm();
+      } catch (_) {}
+    }
+    function readNext() {
+      if (offset >= size) {
+        closeBridge();
+        vrmaRawCache[key] = bytes.buffer;
+        return Promise.resolve(bytes.buffer);
+      }
+      var n = Math.min(BRIDGE_CHUNK, size - offset);
+      var b64;
+      try {
+        b64 = bridge.readVrmBase64(offset, n);
+      } catch (e) {
+        closeBridge();
+        return Promise.reject(e);
+      }
+      if (!b64) {
+        closeBridge();
+        return Promise.reject(new Error("Empty VRMA chunk at " + offset));
+      }
+      var bin;
+      try {
+        bin = atob(b64);
+      } catch (e) {
+        closeBridge();
+        return Promise.reject(e);
+      }
+      for (var i = 0; i < bin.length; i++) {
+        bytes[offset + i] = bin.charCodeAt(i);
+      }
+      offset += bin.length;
+      return new Promise(function (resolve) {
+        setTimeout(resolve, 0);
+      }).then(readNext);
+    }
+    return readNext();
+  }
+
+  function parseVrmaClip(arrayBuffer, id) {
+    var L = getLibs();
+    if (!L || !L.GLTFLoader || !L.VRMAnimationLoaderPlugin) {
+      return Promise.reject(new Error("VRMA loader not in vendor bundle"));
+    }
+    if (!vrm) return Promise.reject(new Error("no VRM loaded"));
+    var cacheKey = id + "@" + (vrm.scene && vrm.scene.uuid ? vrm.scene.uuid : "vrm");
+    if (vrmaClipCache[cacheKey]) {
+      return Promise.resolve(vrmaClipCache[cacheKey]);
+    }
+    var loader = new L.GLTFLoader();
+    loader.register(function (parser) {
+      return new L.VRMAnimationLoaderPlugin(parser);
+    });
+    return new Promise(function (resolve, reject) {
+      try {
+        loader.parse(
+          arrayBuffer,
+          "",
+          function (gltf) {
+            try {
+              var anims =
+                gltf.userData && gltf.userData.vrmAnimations
+                  ? gltf.userData.vrmAnimations
+                  : null;
+              if (!anims || !anims.length) {
+                reject(new Error("No VRMAnimation in " + id));
+                return;
+              }
+              var clip = L.createVRMAnimationClip(anims[0], vrm);
+              if (!clip) {
+                reject(new Error("createVRMAnimationClip failed for " + id));
+                return;
+              }
+              clip.name = id;
+              vrmaClipCache[cacheKey] = clip;
+              resolve(clip);
+            } catch (e) {
+              reject(e);
+            }
+          },
+          function (err) {
+            reject(err || new Error("VRMA parse failed"));
+          }
+        );
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  /**
+   * Play a bundled VRMA clip on the current VRM.
+   * @returns {boolean} true if playback was scheduled (async load may still fail)
+   */
+  function playVrma(nameOrId, opts) {
+    opts = opts || {};
+    if (!canPlayVrma()) {
+      try {
+        console.warn("[CompanionStage] playVrma unavailable");
+      } catch (_) {}
+      // Fall back to joint-XYZ if requested.
+      if (opts.fallback) {
+        var plan = buildTemplatePlan(opts.fallback, opts);
+        if (plan) return playAiMotion(plan);
+      }
+      return false;
+    }
+    var id = resolveVrmaId(nameOrId, opts) || String(nameOrId || "")
+      .toLowerCase()
+      .replace(/\.vrma$/i, "");
+    if (!id) return false;
+
+    // Cancel competing motion layers.
+    try {
+      clearAiMotionTimers();
+      aiMotionGen++;
+    } catch (_) {}
+    activeGesture = null;
+    vr.left.locked = false;
+    vr.right.locked = false;
+
+    var gen = ++vrmaLoadGen;
+    var loop = !!opts.loop;
+    vrmaLoop = loop;
+    vrmaClipId = id; // mark early so body motion yields
+    vrmaUntil = idleTime + 30; // safety until clip duration known
+
+    try {
+      console.log("[CompanionStage] playVrma", id, "loop=" + loop);
+    } catch (_) {}
+
+    loadVrmaBuffer(id)
+      .then(function (buf) {
+        if (gen !== vrmaLoadGen || !vrm) return null;
+        return parseVrmaClip(buf, id);
+      })
+      .then(function (clip) {
+        if (!clip || gen !== vrmaLoadGen || !vrm) return;
+        var mixer = ensureVrmaMixer();
+        if (!mixer) return;
+        try {
+          if (vrmaAction) {
+            vrmaAction.fadeOut(0.2);
+            vrmaAction.stop();
+          }
+        } catch (_) {}
+        mixer.stopAllAction();
+        var action = mixer.clipAction(clip);
+        action.reset();
+        action.setLoop(
+          loop
+            ? getLibs().THREE.LoopRepeat
+            : getLibs().THREE.LoopOnce,
+          loop ? Infinity : 1
+        );
+        action.clampWhenFinished = !loop;
+        action.fadeIn(0.2);
+        action.play();
+        vrmaAction = action;
+        vrmaClipId = id;
+        var dur = typeof clip.duration === "number" && clip.duration > 0 ? clip.duration : 2.5;
+        vrmaUntil = loop ? idleTime + 1e9 : idleTime + dur + 0.35;
+        try {
+          console.log(
+            "[CompanionStage] VRMA playing",
+            id,
+            "tracks=" + (clip.tracks ? clip.tracks.length : 0),
+            "dur=" + dur.toFixed(2)
+          );
+        } catch (_) {}
+      })
+      .catch(function (e) {
+        try {
+          console.warn(
+            "[CompanionStage] playVrma failed",
+            id,
+            (e && e.message) || e
+          );
+        } catch (_) {}
+        if (gen === vrmaLoadGen) {
+          vrmaClipId = null;
+          vrmaAction = null;
+          // Template fallback for wave/etc.
+          if (opts.fallback) {
+            var p = buildTemplatePlan(opts.fallback, opts);
+            if (p) playAiMotion(p);
+          } else if (nameOrId && nameOrId !== id) {
+            var p2 = buildTemplatePlan(nameOrId, opts);
+            if (p2) playAiMotion(p2);
+          }
+        }
+      });
+    return true;
+  }
+
+  function updateVrma(dt) {
+    if (!vrmaMixer || !isVrmaPlaying()) {
+      if (vrmaClipId && !vrmaAction && idleTime > vrmaUntil) {
+        vrmaClipId = null;
+      }
+      return;
+    }
+    try {
+      vrmaMixer.update(dt);
+    } catch (_) {}
+    if (!vrmaLoop && idleTime >= vrmaUntil) {
+      // Hard stop mixer — do not leave clampWhenFinished end-frame as rest.
+      try {
+        if (vrmaAction) {
+          vrmaAction.stop();
+        }
+        vrmaMixer.stopAllAction();
+        vrmaMixer.update(0);
+      } catch (_) {}
+      vrmaAction = null;
+      vrmaClipId = null;
+      vrmaUntil = 0;
+      try {
+        vr.left.locked = false;
+        vr.right.locked = false;
+        activeGesture = null;
+        // Re-apply solved hang + geometric wrists (fixes post-gesture Y-pose).
+        restoreHangPose({ recalibrate: true, recaptureBase: false });
+      } catch (_) {}
+    }
   }
 
   /** Look toward the orbit camera (viewer). */
@@ -1701,66 +2959,35 @@
   }
 
   /**
-   * State posture is mostly body lean — arms are owned by the VR hand targets
-   * so tool gestures and physics stay consistent.
+   * State posture is mostly body lean — arms stay at measured hang rest unless a
+   * template / tool owns them. Auto chin-think / speak-raise made the right arm
+   * twitch every turn and looked broken on many VRMs.
    */
   function pickStatePoseTarget(state) {
     var p = emptyPose();
     if (state === STATE_LISTENING) {
-      p.spine = [0.02, 0, 0];
-      p.chest = [0.015, 0, 0];
-      // Tiny lean only — head motion comes from sparse nods / lookAt eyes.
-      p.neck = [0.004, 0, 0];
-      p.head = [0.002, 0, 0];
-    } else if (state === STATE_THINKING) {
-      p.hips = [0.008, -0.02, 0.012];
-      p.spine = [0.01, 0.025, 0.01];
-      p.chest = [0.01, 0.015, 0.006];
-      p.neck = [0.01, 0.03, 0.01];
-      p.head = [0.006, 0.04, 0.012];
-    } else if (state === STATE_SPEAKING) {
-      p.hips = [0.008, 0, 0];
-      p.spine = [0.014, 0, 0];
-      p.chest = [0.02, 0, 0];
+      p.spine = [0.012, 0, 0];
+      p.chest = [0.01, 0, 0];
       p.neck = [0.002, 0, 0];
       p.head = [0.001, 0, 0];
+    } else if (state === STATE_THINKING) {
+      // Subtle torso only — no forced hand-to-chin (was glitchy between turns).
+      p.hips = [0.004, -0.008, 0.006];
+      p.spine = [0.008, 0.012, 0.006];
+      p.chest = [0.008, 0.008, 0.004];
+      p.neck = [0.006, 0.015, 0.006];
+      p.head = [0.004, 0.02, 0.006];
+    } else if (state === STATE_SPEAKING) {
+      p.hips = [0.004, 0, 0];
+      p.spine = [0.01, 0, 0];
+      p.chest = [0.012, 0, 0];
+      p.neck = [0.001, 0, 0];
+      p.head = [0.001, 0, 0];
     } else {
-      p.spine = [0.008, 0, 0];
+      p.spine = [0.006, 0, 0];
     }
     statePoseTarget = p;
-
-    // Default VR hand intents per state (overridden by tools / gestures).
-    // All absolute targets must be scale-relative to this VRM (never human-meter hardcoded).
-    if (!activeGesture) {
-      if (state === STATE_THINKING) {
-        // Chin / temple-near pose from measured head + shoulder, within arm reach.
-        var shR = vr.shoulderRight || { x: 0.16, y: 0.3, z: 0 };
-        var hy = (vr.restHead && vr.restHead.y) || shR.y + 0.12;
-        var rReach = armReachLen("right");
-        setHandTarget(
-          "right",
-          shR.x + rReach * 0.12,
-          Math.min(hy - rReach * 0.15, shR.y + rReach * 0.35),
-          shR.z + rReach * 0.35,
-          2.0,
-          true
-        );
-      } else if (state === STATE_LISTENING) {
-        setHandTarget("left", vr.restLeft.x, vr.restLeft.y, vr.restLeft.z + 0.02, 0, false);
-        setHandTarget("right", vr.restRight.x, vr.restRight.y, vr.restRight.z + 0.02, 0, false);
-      } else if (state === STATE_SPEAKING) {
-        // Tiny ready raise; gravity returns to hang rest.
-        var sr = armReachLen("right");
-        setHandTarget(
-          "right",
-          vr.restRight.x + sr * 0.03,
-          vr.restRight.y + sr * 0.06,
-          vr.restRight.z + sr * 0.06,
-          0.6,
-          false
-        );
-      }
-    }
+    // Hands: do NOT auto-pose on listen/think/speak. Soft hang + tools/templates only.
   }
 
   function setHandTarget(side, x, y, z, holdSec, locked) {
@@ -1837,7 +3064,8 @@
       var maxR = Math.max(armReachLen("left"), armReachLen("right"));
       h.x = clamp(h.x, -maxR * 1.55, maxR * 1.55);
       h.y = clamp(h.y, shY - maxR * 1.25, shY + maxR * 0.95);
-      h.z = clamp(h.z, -maxR * 0.45, maxR * 1.35);
+      // Symmetric Z: viewer may sit in hips −Z (common when hips yaw ~180°).
+      h.z = clamp(h.z, -maxR * 1.35, maxR * 1.35);
     }
     stepHand(vr.left, vr.restLeft);
     stepHand(vr.right, vr.restRight);
@@ -1887,14 +3115,18 @@
   }
 
   /**
-   * True when this hand should leave soft-hang eulers and use two-bone IK.
-   * Idle / free hands near rest stay on reliable A-pose eulers (no T-pose).
+   * True when this hand should use two-bone IK (bind-relative).
+   * Prefer IK whenever armMeta exists — including idle hang — so rest is the
+   * geometric wrist target, not shallow euler Y-pose. Euler hang is fallback
+   * only when meta/bind axes are missing.
    */
   function handNeedsIk(side) {
     var isLeft = side === "left";
     var h = isLeft ? vr.left : vr.right;
     var rest = isLeft ? vr.restLeft : vr.restRight;
     if (!h || !rest) return false;
+    // Measured skeleton → always IK (idle hang + gestures).
+    if (armMeta && armMeta[side] && armMeta[side].upperLen > 0) return true;
     if (h.locked) return true;
     if (activeGesture && activeGesture.kind) {
       var gs = activeGesture.side || "right";
@@ -1920,8 +3152,8 @@
   }
 
   /**
-   * Soft hang eulers (+ optional raise blend). Base already includes A-pose;
-   * raise cancels hang Z toward T and lifts the arm for simple non-IK motion.
+   * Soft hang eulers (+ optional raise blend) — fallback when armMeta missing.
+   * Base already includes solved hang; raise cancels hang toward T / lift.
    */
   function applySoftHangArm(side, raiseAmt) {
     var isLeft = side === "left";
@@ -1930,13 +3162,13 @@
     var lowerKey = isLeft ? "leftLowerArm" : "rightLowerArm";
     var handKey = isLeft ? "leftHand" : "rightHand";
     var raise = clamp(raiseAmt || 0, 0, 1.4);
-    // Base Z hang is +1.26 left / -1.26 right; cancel with -sign * raise * ~1.2
+    // Match ~1.52 hang magnitude so raise=1 returns near T-pose.
     addEuler(
       restBones[upperKey],
       upperKey,
-      -raise * 0.85,
+      -raise * 0.9,
       sign * raise * 0.12,
-      -sign * raise * 1.18
+      -sign * raise * 1.42
     );
     addEuler(restBones[lowerKey], lowerKey, raise * 0.2, 0, -sign * raise * 0.05);
     addEuler(restBones[handKey], handKey, raise * 0.08, 0, 0);
@@ -1944,7 +3176,7 @@
 
   /**
    * Two-bone IK: shoulder → elbow → wrist reaches virtual VR controller point.
-   * Idle hands use soft A-pose eulers; raised/locked hands use bind-relative IK.
+   * Idle uses IK to geometric hang rests; raised/locked same path.
    */
   function applyHandIk(side) {
     var L = getLibs();
@@ -1995,12 +3227,7 @@
       return;
     }
 
-    // Speaking: free hands get tiny controller jitter (ragdoll noise).
-    if (currentState === STATE_SPEAKING && !h.locked && mouthValue > 0.04) {
-      var j = mouthValue * 0.012;
-      S.target.x += Math.sin(idleTime * 2.4 + (isLeft ? 0 : 1.7)) * j;
-      S.target.y += Math.abs(Math.sin(idleTime * 3.1)) * j * 0.6;
-    }
+    // No mouth→wrist jitter (caused weird arm wiggle while speaking).
 
     S.toTarget.copy(S.target).sub(S.shoulder);
     var dist = S.toTarget.length();
@@ -2077,7 +3304,8 @@
       hand.rotateZ(isLeft ? 0.55 : -0.55);
       var camH = cameraHipsLocal();
       if (camH) {
-        var yaw = Math.atan2(camH.x - h.x, Math.max(0.05, camH.z - h.z));
+        // Full atan2 — do not force cam.z > hand.z (viewer is often hips −Z).
+        var yaw = Math.atan2(camH.x - h.x, camH.z - h.z);
         hand.rotateY(clamp(yaw * 0.55 + lat * 1.8, -0.95, 0.95));
       } else {
         hand.rotateY(clamp(lat * 2.2 * (isLeft ? 1 : -1), -0.9, 0.9));
@@ -2105,52 +3333,74 @@
     var inten = typeof g.intensity === "number" ? g.intensity : 1;
 
     if (g.kind === "wave") {
-      // Raise to shoulder-high (not overhead), toward camera, flap palm at viewer.
-      var side = g.side === "left" ? "left" : "right";
-      var rest = side === "left" ? vr.restLeft : vr.restRight;
-      var peak = gesturePeak("wave", side, inten);
-      var peakX = peak.x;
-      var peakY = peak.y;
-      var peakZ = peak.z;
-      if (u < 0.14) {
-        lookTowardCamera(g.duration);
-        var k0 = easeInOut(u / 0.14);
-        setHandTarget(
-          side,
-          rest.x + (peakX - rest.x) * k0,
-          rest.y + (peakY - rest.y) * k0,
-          rest.z + (peakZ - rest.z) * k0,
-          0,
-          true
-        );
-      } else if (u < 0.82) {
-        // Lateral flap in the plane facing the camera (not vertical arm thrash).
-        var camW = cameraHipsLocal();
-        var waveReach = armReachLen(side);
-        var flap =
-          Math.sin((g.t - g.duration * 0.14) * 11.5) * waveReach * 0.28 * inten;
-        var fx = peakX + flap;
-        var fz = peakZ;
-        if (camW) {
-          // Oscillate along camera-facing tangent (side-to-side from viewer).
-          var tdx = camW.x - peakX;
-          var tdz = camW.z - peakZ;
-          var tlen = Math.sqrt(tdx * tdx + tdz * tdz) || 1;
-          // Perp in XZ: (-dz, dx)
-          fx = peakX + (-tdz / tlen) * flap;
-          fz = peakZ + (tdx / tlen) * flap;
+      // Raise near head height, toward camera, flap palm at viewer.
+      var waveSides =
+        g.side === "both"
+          ? ["left", "right"]
+          : [g.side === "left" ? "left" : "right"];
+      if (u < 0.14) lookTowardCamera(g.duration);
+      for (var wi = 0; wi < waveSides.length; wi++) {
+        var side = waveSides[wi];
+        var rest = side === "left" ? vr.restLeft : vr.restRight;
+        var peak = gesturePeak("wave", side, inten);
+        var peakX = peak.x;
+        var peakY = peak.y;
+        var peakZ = peak.z;
+        if (u < 0.18) {
+          var k0 = easeInOut(u / 0.18);
+          setHandTarget(
+            side,
+            rest.x + (peakX - rest.x) * k0,
+            rest.y + (peakY - rest.y) * k0,
+            rest.z + (peakZ - rest.z) * k0,
+            0,
+            true
+          );
+        } else if (u < 0.82) {
+          // Lateral flap in the plane facing the camera (not behind the body).
+          var camW = cameraHipsLocal();
+          var waveReach = armReachLen(side);
+          var flap =
+            Math.sin((g.t - g.duration * 0.18) * 10.5) *
+            waveReach *
+            0.22 *
+            inten;
+          var fx = peakX + flap;
+          var fz = peakZ;
+          if (camW) {
+            // Oscillate along camera-facing tangent (side-to-side from viewer).
+            var tdx = camW.x - peakX;
+            var tdz = camW.z - peakZ;
+            var tlen = Math.sqrt(tdx * tdx + tdz * tdz) || 1;
+            // Perp in XZ: (-dz, dx)
+            fx = peakX + (-tdz / tlen) * flap;
+            fz = peakZ + (tdx / tlen) * flap;
+            // Keep peak on the camera side of the shoulder (safety).
+            var shW = side === "left" ? vr.shoulderLeft : vr.shoulderRight;
+            if (shW) {
+              var toCamX = camW.x - shW.x;
+              var toCamZ = camW.z - shW.z;
+              var handOffX = fx - shW.x;
+              var handOffZ = fz - shW.z;
+              if (handOffX * toCamX + handOffZ * toCamZ < 0) {
+                var clen = Math.sqrt(toCamX * toCamX + toCamZ * toCamZ) || 1;
+                fx = shW.x + (toCamX / clen) * waveReach * 0.4;
+                fz = shW.z + (toCamZ / clen) * waveReach * 0.4;
+              }
+            }
+          }
+          setHandTarget(side, fx, peakY + Math.abs(flap) * 0.06, fz, 0, true);
+        } else {
+          var k1 = easeInOut((u - 0.82) / 0.18);
+          setHandTarget(
+            side,
+            peakX + (rest.x - peakX) * k1,
+            peakY + (rest.y - peakY) * k1,
+            peakZ + (rest.z - peakZ) * k1,
+            0,
+            true
+          );
         }
-        setHandTarget(side, fx, peakY + Math.abs(flap) * 0.08, fz, 0, true);
-      } else {
-        var k1 = easeInOut((u - 0.82) / 0.18);
-        setHandTarget(
-          side,
-          peakX + (rest.x - peakX) * k1,
-          peakY + (rest.y - peakY) * k1,
-          peakZ + (rest.z - peakZ) * k1,
-          0,
-          true
-        );
       }
       if (g.t > g.duration) activeGesture = null;
       return true;
@@ -2170,12 +3420,20 @@
     }
     if (g.kind === "point") {
       // Controller pushed toward camera / forward at shoulder height.
-      var ps = g.side === "left" ? "left" : "right";
-      var pSign = ps === "left" ? -1 : 1;
-      var pp = gesturePeak("point", ps, inten);
-      setHandTarget(ps, pp.x, pp.y, pp.z, 0, true);
+      var pointSides =
+        g.side === "both"
+          ? ["left", "right"]
+          : [g.side === "left" ? "left" : "right"];
       lookTowardCamera(0.35);
-      lookTarget.x = clamp(lookTarget.x + pSign * 0.2 * inten, -1, 1);
+      for (var pi = 0; pi < pointSides.length; pi++) {
+        var ps = pointSides[pi];
+        var pSign = ps === "left" ? -1 : 1;
+        var pp = gesturePeak("point", ps, inten);
+        setHandTarget(ps, pp.x, pp.y, pp.z, 0, true);
+        if (pointSides.length === 1) {
+          lookTarget.x = clamp(lookTarget.x + pSign * 0.2 * inten, -1, 1);
+        }
+      }
       if (g.t > g.duration) activeGesture = null;
       return true;
     }
@@ -2278,19 +3536,31 @@
 
   function resetBodyInternal() {
     activeGesture = null;
+    try {
+      stopVrmaInternal(false);
+    } catch (_) {}
+    try {
+      clearAiMotionTimers();
+      aiMotionGen++;
+    } catch (_) {}
     vr.left.locked = false;
     vr.right.locked = false;
     vr.head.locked = false;
     vr.left.holdUntil = 0;
     vr.right.holdUntil = 0;
-    vr.left.x = vr.restLeft.x;
-    vr.left.y = vr.restLeft.y;
-    vr.left.z = vr.restLeft.z;
-    vr.right.x = vr.restRight.x;
-    vr.right.y = vr.restRight.y;
-    vr.right.z = vr.restRight.z;
-    vr.left.vx = vr.left.vy = vr.left.vz = 0;
-    vr.right.vx = vr.right.vy = vr.right.vz = 0;
+    // Force hang bones + geometric rests (not whatever VRMA left behind).
+    try {
+      restoreHangPose({ recalibrate: true, recaptureBase: false });
+    } catch (_) {
+      vr.left.x = vr.restLeft.x;
+      vr.left.y = vr.restLeft.y;
+      vr.left.z = vr.restLeft.z;
+      vr.right.x = vr.restRight.x;
+      vr.right.y = vr.restRight.y;
+      vr.right.z = vr.restRight.z;
+      vr.left.vx = vr.left.vy = vr.left.vz = 0;
+      vr.right.vx = vr.right.vy = vr.right.vz = 0;
+    }
     vr.head.x = vr.restHead.x;
     vr.head.y = vr.restHead.y;
     vr.head.z = vr.restHead.z;
@@ -2306,18 +3576,23 @@
    */
   function applyBodyMotion(dt) {
     if (!vrm || !restBones || !restBones.base) return;
-    // After load: remeasure bind arm meta, re-apply hang, sample rest wrists.
+    // After load: remeasure bind arm meta, re-solve hang, geometric rest wrists.
     if (restRecalibLeft > 0) {
       restRecalibLeft -= 1;
-      if (restRecalibLeft === 0 && !activeGesture) {
+      if (restRecalibLeft === 0 && !activeGesture && !isVrmaPlaying()) {
         try {
           restoreArmBindPose();
           if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
           measureArmMeta("left");
           measureArmMeta("right");
+          restBones.hangDeltas = solveHangDeltas();
           applySoftHangEulers();
+          captureBaseFromBones();
           if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
           calibrateVrRestsFromBones();
+          try {
+            exportMotionLibrary();
+          } catch (_) {}
         } catch (_) {}
       }
     }
@@ -2438,20 +3713,55 @@
       .replace(/[\s-]+/g, "_");
     var intensity =
       typeof opts.intensity === "number" ? clamp(opts.intensity, 0.2, 1.5) : 1;
-    var side = String(opts.side || "right").toLowerCase();
-    if (side !== "left" && side !== "right" && side !== "both") side = "right";
+    var asymmetric = n === "wave" || n === "point" || n === "hello";
+    var sideRaw =
+      opts.side == null || opts.side === ""
+        ? ""
+        : String(opts.side).toLowerCase().trim();
+    if (sideRaw === "l") sideRaw = "left";
+    if (sideRaw === "r") sideRaw = "right";
+    if (sideRaw === "all") sideRaw = "both";
+    var side = sideRaw;
+    if (side !== "left" && side !== "right" && side !== "both") {
+      if (asymmetric) {
+        // Default right when host omitted side (still plays — never silent).
+        side = "right";
+      } else {
+        side = "right";
+      }
+    }
+    try {
+      console.log(
+        "[CompanionStage] playGesture resolved",
+        n,
+        "side=" + side,
+        "rawSide=" + (opts.side == null ? "(null)" : String(opts.side))
+      );
+    } catch (_) {}
 
     if (n === "reset" || n === "reset_body" || n === "idle") {
       resetBodyInternal();
       return true;
     }
 
+    // Portable VRMA first (real joint animation on any VRM).
+    var vrmaId = resolveVrmaId(n, opts);
+    if (vrmaId && canPlayVrma() && n !== "point") {
+      // Point stays joint-XYZ (camera-aimed); everything else with a VRMA map uses clips.
+      return playVrma(vrmaId, {
+        intensity: intensity,
+        side: side,
+        fallback: n,
+        loop: !!opts.loop,
+      });
+    }
+
     var table = {
-      wave: { kind: "wave", duration: 1.8, side: side === "both" ? "right" : side },
+      wave: { kind: "wave", duration: 1.8, side: side },
       nod: { kind: "nod", duration: 0.9 },
       shake_head: { kind: "shake_head", duration: 1.1 },
       no: { kind: "shake_head", duration: 1.1 },
-      point: { kind: "point", duration: 1.6, side: side === "both" ? "right" : side },
+      point: { kind: "point", duration: 1.6, side: side },
       shrug: { kind: "shrug", duration: 1.4 },
       think: { kind: "think", duration: 2.2 },
       clap: { kind: "clap", duration: 1.2 },
@@ -2461,7 +3771,7 @@
       hands_on_hips: { kind: "hands_on_hips", duration: 2.0 },
       crossed_arms: { kind: "crossed_arms", duration: 2.2 },
       celebrate: { kind: "cheer", duration: 1.5 },
-      hello: { kind: "wave", duration: 1.8, side: "right" },
+      hello: { kind: "wave", duration: 1.8, side: side },
       yes: { kind: "nod", duration: 0.9 },
     };
     var spec = table[n];
@@ -2478,6 +3788,14 @@
       intensity: intensity,
       side: spec.side || side,
     };
+    try {
+      console.log(
+        "[CompanionStage] playGesture",
+        n,
+        "side=" + activeGesture.side,
+        "intensity=" + intensity
+      );
+    } catch (_) {}
     return true;
   }
 
@@ -2501,25 +3819,25 @@
     function num(v, fallback) {
       return typeof v === "number" && isFinite(v) ? v : fallback;
     }
+    function resolveSideHand(side, handObj) {
+      if (!handObj || typeof handObj !== "object") return null;
+      if (handObj.rest === true) {
+        var r = side === "left" ? vr.restLeft : vr.restRight;
+        return { x: r.x, y: r.y, z: r.z };
+      }
+      return {
+        x: num(handObj.x, side === "left" ? vr.restLeft.x : vr.restRight.x),
+        y: num(handObj.y, side === "left" ? vr.restLeft.y : vr.restRight.y),
+        z: num(handObj.z, side === "left" ? vr.restLeft.z : vr.restRight.z),
+      };
+    }
     if (o.left && typeof o.left === "object") {
-      setHandTarget(
-        "left",
-        num(o.left.x, vr.restLeft.x),
-        num(o.left.y, vr.restLeft.y),
-        num(o.left.z, vr.restLeft.z),
-        hold,
-        locked
-      );
+      var L = resolveSideHand("left", o.left);
+      if (L) setHandTarget("left", L.x, L.y, L.z, hold, locked);
     }
     if (o.right && typeof o.right === "object") {
-      setHandTarget(
-        "right",
-        num(o.right.x, vr.restRight.x),
-        num(o.right.y, vr.restRight.y),
-        num(o.right.z, vr.restRight.z),
-        hold,
-        locked
-      );
+      var R = resolveSideHand("right", o.right);
+      if (R) setHandTarget("right", R.x, R.y, R.z, hold, locked);
     }
     // Single-hand form: { hand, x, y, z }
     if (o.hand === "left" || o.hand === "right") {
@@ -2534,6 +3852,132 @@
       );
     }
     activeGesture = null;
+    return true;
+  }
+
+  /** AI / template motion: schedule wrist/look keyframes. */
+  var aiMotionTimers = [];
+  var aiMotionGen = 0;
+
+  function clearAiMotionTimers() {
+    for (var i = 0; i < aiMotionTimers.length; i++) {
+      try {
+        clearTimeout(aiMotionTimers[i]);
+      } catch (_) {}
+    }
+    aiMotionTimers = [];
+  }
+
+  function playAiMotion(jsonOrObj) {
+    var o = jsonOrObj;
+    if (typeof o === "string") {
+      try {
+        o = JSON.parse(o);
+      } catch (_) {
+        return false;
+      }
+    }
+    if (!o || typeof o !== "object") return false;
+    clearAiMotionTimers();
+    aiMotionGen++;
+    var gen = aiMotionGen;
+    activeGesture = null;
+
+    if (o.look && typeof o.look === "object") {
+      try {
+        setLook(o.look);
+      } catch (_) {}
+    }
+
+    var frames = o.frames;
+    if (!frames || !frames.length) {
+      // Single-pose shorthand on root
+      if (o.left || o.right || o.hand) {
+        setHands(o);
+        return true;
+      }
+      return false;
+    }
+
+    // Look-only frames (nod / shake) — schedule gaze without requiring hands.
+    var anyHands = false;
+    for (var hi = 0; hi < frames.length; hi++) {
+      var hf = frames[hi];
+      if (hf && (hf.left || hf.right || hf.hand)) anyHands = true;
+    }
+    if (!anyHands) {
+      for (var li = 0; li < frames.length; li++) {
+        (function (fr) {
+          if (!fr || typeof fr !== "object") return;
+          var at =
+            typeof fr.at_ms === "number"
+              ? fr.at_ms
+              : typeof fr.t_ms === "number"
+                ? fr.t_ms
+                : 0;
+          var tid = setTimeout(function () {
+            if (gen !== aiMotionGen) return;
+            if (fr.look && typeof fr.look === "object") {
+              try {
+                setLook(fr.look);
+              } catch (_) {}
+            }
+          }, Math.max(0, at));
+          aiMotionTimers.push(tid);
+        })(frames[li]);
+      }
+      return true;
+    }
+
+    // Sort by at_ms
+    var list = [];
+    for (var fi = 0; fi < frames.length; fi++) {
+      var fr = frames[fi];
+      if (!fr || typeof fr !== "object") continue;
+      var at =
+        typeof fr.at_ms === "number"
+          ? fr.at_ms
+          : typeof fr.t_ms === "number"
+            ? fr.t_ms
+            : 0;
+      list.push({ at: Math.max(0, at), fr: fr });
+    }
+    list.sort(function (a, b) {
+      return a.at - b.at;
+    });
+
+    try {
+      console.log("[CompanionStage] playAiMotion frames=" + list.length);
+    } catch (_) {}
+
+    for (var i = 0; i < list.length; i++) {
+      (function (item) {
+        var tid = setTimeout(function () {
+          if (gen !== aiMotionGen) return;
+          var fr = item.fr;
+          var payload = {};
+          if (fr.left) payload.left = fr.left;
+          if (fr.right) payload.right = fr.right;
+          if (fr.hand) {
+            payload.hand = fr.hand;
+            payload.x = fr.x;
+            payload.y = fr.y;
+            payload.z = fr.z;
+          }
+          if (typeof fr.hold_sec === "number") payload.hold_sec = fr.hold_sec;
+          else payload.hold_sec = 0.45;
+          if (payload.left || payload.right || payload.hand) {
+            setHands(payload);
+          }
+          if (fr.look && typeof fr.look === "object") {
+            try {
+              setLook(fr.look);
+            } catch (_) {}
+          }
+        }, item.at);
+        aiMotionTimers.push(tid);
+      })(list[i]);
+    }
     return true;
   }
 
@@ -2973,49 +4417,40 @@
 
   function applyStateExpressions(state) {
     if (!vrm || !vrm.expressionManager) return;
-    ["happy", "angry", "sad", "relaxed", "surprised", "neutral"].forEach(function (n) {
-      try {
-        vrm.expressionManager.setValue(n, 0);
-      } catch (_) {}
-    });
-    exprPulse.happy = 0;
-    exprPulse.relaxed = 0;
-    exprPulse.surprised = 0;
-    exprPulseT = 0.4 + Math.random() * 0.8;
+    // Soft baselines only — do NOT zero every expression or snap look on phase
+    // changes (that looked like a camera/VRM glitch between voice turns).
+    exprPulseT = Math.min(exprPulseT, 0.6);
     switch (state) {
       case STATE_LISTENING:
-        setExpression("happy", 0.35);
-        setExpression("relaxed", 0.2);
+        setExpression("happy", 0.28);
+        setExpression("relaxed", 0.18);
+        // Keep gaze near camera; no hard snap.
         if (idleTime >= lookHoldUntil) {
-          lookTarget.x = 0;
-          lookTarget.y = 0.05;
-          lookWanderT = 0.6;
+          lookWanderT = Math.max(lookWanderT, 1.5);
         }
         break;
       case STATE_THINKING:
-        setExpression("relaxed", 0.15);
+        setExpression("happy", 0.12);
+        setExpression("relaxed", 0.16);
         if (idleTime >= lookHoldUntil) {
-          lookTarget.x = 0.32;
-          lookTarget.y = 0.18;
-          lookWanderT = 0.8;
+          // Mild thinking glance only if wander is free — small delta, not a jump.
+          lookTarget.x = clamp(lookTarget.x * 0.5 + 0.12, -0.35, 0.35);
+          lookTarget.y = clamp(lookTarget.y * 0.5 + 0.06, -0.2, 0.25);
+          lookWanderT = Math.max(lookWanderT, 1.2);
         }
         break;
       case STATE_SPEAKING:
-        setExpression("happy", 0.25);
+        setExpression("happy", 0.22);
+        setExpression("relaxed", 0.08);
         if (idleTime >= lookHoldUntil) {
-          lookTarget.x = 0;
-          lookTarget.y = 0.02;
-          lookWanderT = 1.2;
+          lookWanderT = Math.max(lookWanderT, 2.0);
         }
-        gestureBurstT = 0.3;
         break;
       case STATE_IDLE:
       default:
         setExpression("relaxed", 0.12);
         if (idleTime >= lookHoldUntil) {
-          lookTarget.x = 0;
-          lookTarget.y = 0;
-          lookWanderT = 1.5 + Math.random();
+          lookWanderT = Math.max(lookWanderT, 1.8);
         }
         break;
     }
@@ -3223,12 +4658,20 @@
       }
 
       if (vrm && !usingFallback) {
-        applyBodyMotion(dt);
+        if (isVrmaPlaying()) {
+          updateVrma(dt);
+          // VRMA owns humanoid bones — still allow look/blink/mouth layers.
+        } else {
+          // Still advance mixer fade-out / cleanup timers if any.
+          if (vrmaMixer || vrmaClipId) updateVrma(dt);
+          applyBodyMotion(dt);
+        }
         updateLookWander(dt);
         updateMicroExpressions(dt);
 
-        lookSmooth.x += (lookTarget.x - lookSmooth.x) * Math.min(1, dt * 3.4);
-        lookSmooth.y += (lookTarget.y - lookSmooth.y) * Math.min(1, dt * 3.4);
+        // Gentle look ease (was 3.4 — fast snaps looked like camera/VRM glitches between turns).
+        lookSmooth.x += (lookTarget.x - lookSmooth.x) * Math.min(1, dt * 2.1);
+        lookSmooth.y += (lookTarget.y - lookSmooth.y) * Math.min(1, dt * 2.1);
         if (vrm.lookAt) {
           try {
             if (typeof vrm.lookAt.lookAt === "function" && camera) {
@@ -3382,7 +4825,35 @@
     if (debugSkeletonOn) {
       rebuildDebugVisuals();
     }
+    // Warm VRMA raw cache in the background (small clips; any VRM can play them).
+    try {
+      preloadVrmaPack();
+    } catch (_) {}
     return label || "VRM";
+  }
+
+  function preloadVrmaPack() {
+    if (!canPlayVrma() && !getLibs()) return;
+    var ids = VRMA_CATALOG.map(function (c) {
+      return c.id;
+    });
+    var i = 0;
+    function next() {
+      if (i >= ids.length) return;
+      var id = ids[i++];
+      if (vrmaRawCache[id]) {
+        setTimeout(next, 0);
+        return;
+      }
+      loadVrmaBuffer(id)
+        .then(function () {
+          setTimeout(next, 20);
+        })
+        .catch(function () {
+          setTimeout(next, 20);
+        });
+    }
+    setTimeout(next, 400);
   }
 
   function parseVrmBuffer(arrayBuffer, label, token) {
@@ -3640,8 +5111,9 @@
     if (usingFallback || !vrm) return;
     if (prev !== s) {
       pickStatePoseTarget(s);
+      // Soft expression blend only on real phase change (avoids flash every push).
+      applyStateExpressions(s);
     }
-    applyStateExpressions(s);
     if (s !== STATE_SPEAKING && targetMouth < 0.02) {
       clearTalkExpressions();
     }
@@ -3664,6 +5136,11 @@
   function playMotion(name) {
     if (!name) return;
     var n = String(name).toLowerCase();
+    // Full-body VRMA when the name matches a clip / mapped gesture.
+    var vid = resolveVrmaId(n, {});
+    if (vid && canPlayVrma()) {
+      playVrma(vid, { fallback: n.replace(/\s+/g, "_") });
+    }
     if (n.indexOf("happy") >= 0) {
       setExpression("happy", 0.7);
       return;
@@ -3710,7 +5187,8 @@
   /**
    * Full environment + avatar snapshot for AI tool calling.
    * Coordinate space for VR controllers: hips-local meters
-   *   x = right+, y = up+, z = forward+ (toward camera / face-out).
+   *   x = right+, y = up+, z = hips-forward (may NOT equal viewer-forward).
+   * Prefer camera_hips_local / examples.wave_* for viewer-facing targets.
    * Use rest.* as the hang baseline; set_hands targets should be absolute
    * points in the same space so two-bone IK can reach them.
    */
@@ -3899,13 +5377,20 @@
       fallback: !!usingFallback,
       space: "hips_local",
       unit: "meters_avatar_scale",
-      axes: { x: "right+", y: "up+", z: "forward+" },
+      axes: {
+        x: "hips_right+",
+        y: "up+",
+        z: "hips_forward+ (not always toward camera)",
+      },
       notes:
-        "Soft hang rest is measured from this VRM's shoulders + arm lengths on load. " +
-        "Wave/point peaks face the camera (viewer). Prefer body_gesture for named moves; " +
-        "use joints/chains + camera for custom set_hands. " +
-        "User-renamed joints live in joint_labels + named_joints (name → id/local/world). " +
-        "Each bone has id + name (custom or default humanoid label).",
+        "PREFERRED motion: body_pose with VRMA-backed ids (wave→goodbye, clap, think, jump, …). " +
+        "VRMA clips retarget relative joint motion onto ANY loaded VRM humanoid. " +
+        "Joint-XYZ templates recompute wrist targets when no clip maps (e.g. point). " +
+        "ai_move only for novel freeform poses. Soft hang rest is measured per VRM on load. " +
+        "Do not assume hips +Z is face-out — use camera_hips_local.",
+      motion_library: exportMotionLibrary(),
+      vrma: listVrma(),
+      vrma_playing: isVrmaPlaying() ? vrmaClipId : null,
       state: currentState,
       t: round3(idleTime),
       look: {
@@ -3995,7 +5480,13 @@
         },
         body_gesture: {
           description:
-            "Named full moves (wave, nod, point, shrug, …). Wave faces camera automatically.",
+            "Named full moves (wave, nod, point, shrug, clap, think, …). " +
+            "Wave/clap/think/etc play portable VRMA when available; point uses joint-XYZ toward camera.",
+        },
+        play_vrma: {
+          description:
+            "Play a bundled .vrma clip id directly (goodbye, clapping, thinking, jump, …).",
+          ids: listVrma().ids,
         },
       },
     };
@@ -4007,8 +5498,15 @@
     setMouth: setMouth,
     playMotion: playMotion,
     playGesture: playGesture,
+    playTemplate: playTemplate,
+    playVrma: playVrma,
+    stopVrma: stopVrma,
+    listVrma: listVrma,
+    exportMotionLibrary: exportMotionLibrary,
+    buildTemplatePlan: buildTemplatePlan,
     setHands: setHands,
     setLook: setLook,
+    playAiMotion: playAiMotion,
     resetBody: resetBody,
     resetCamera: resetCamera,
     setOrbit: setOrbit,
@@ -4028,6 +5526,7 @@
     isFallback: function () {
       return usingFallback;
     },
+    isVrmaPlaying: isVrmaPlaying,
   };
 
   function boot() {

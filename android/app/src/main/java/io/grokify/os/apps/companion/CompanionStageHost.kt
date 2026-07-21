@@ -163,10 +163,25 @@ object CompanionStageHost {
         }
     }
 
-    fun playGesture(name: String, intensity: Double = 1.0, side: String = "right") {
+    fun playGesture(name: String, intensity: Double = 1.0, side: String = "") {
         val n = JSONObject.quote(name.trim().ifBlank { "wave" })
-        val s = JSONObject.quote(side.trim().ifBlank { "right" })
+        // Do not silently default empty side to "right" — JS maps asymmetric → both.
+        val s = JSONObject.quote(side.trim())
         val i = intensity.coerceIn(0.2, 1.5)
+        runCatching {
+            android.util.Log.i(
+                TAG,
+                "playGesture name=${name.trim()} side=${side.trim().ifBlank { "(empty)" }} intensity=$i",
+            )
+        }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Sys,
+                "stage",
+                "playGesture ${name.trim()} side=${side.trim().ifBlank { "—" }}",
+                "intensity=$i",
+            )
+        }
         eval(
             "window.CompanionStage && window.CompanionStage.playGesture($n, " +
                 "{intensity:$i, side:$s});",
@@ -176,6 +191,98 @@ object CompanionStageHost {
     fun setHands(payload: JSONObject) {
         val json = JSONObject.quote(payload.toString())
         eval("window.CompanionStage && window.CompanionStage.setHands($json);")
+    }
+
+    /**
+     * AI movement agent keyframe plan: { look?, frames:[{at_ms,left?,right?,hold_sec?}] }.
+     * Stage schedules frames with measured rest resolution — no scripted gesture table.
+     */
+    fun playAiMotion(payload: JSONObject) {
+        val json = JSONObject.quote(payload.toString())
+        runCatching {
+            Log.i(TAG, "playAiMotion frames=${payload.optJSONArray("frames")?.length() ?: 0}")
+        }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Sys,
+                "stage",
+                "playAiMotion",
+                payload.toString().take(1_500),
+            )
+        }
+        eval("window.CompanionStage && window.CompanionStage.playAiMotion($json);")
+    }
+
+    /**
+     * Play a motion template / VRMA-backed pose for the loaded VRM.
+     * Stage prefers portable VRMA clips when mapped, else joint-XYZ templates.
+     */
+    fun playTemplate(name: String, intensity: Double = 1.0, side: String = ""): Boolean {
+        val n = JSONObject.quote(name.trim().ifBlank { "wave" })
+        val s = JSONObject.quote(side.trim())
+        val i = intensity.coerceIn(0.2, 1.5)
+        runCatching {
+            Log.i(TAG, "playTemplate name=${name.trim()} side=${side.trim().ifBlank { "(empty)" }}")
+        }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Sys,
+                "stage",
+                "playTemplate ${name.trim()} side=${side.trim().ifBlank { "—" }}",
+                "intensity=$i",
+            )
+        }
+        if (!isAttached()) return false
+        eval(
+            "window.CompanionStage && window.CompanionStage.playTemplate($n, " +
+                "{intensity:$i, side:$s});",
+        )
+        return true
+    }
+
+    /**
+     * Play a bundled VRMA clip by id (goodbye, clapping, thinking, …).
+     * Retargets to any loaded VRM humanoid.
+     */
+    fun playVrma(id: String, loop: Boolean = false): Boolean {
+        val n = JSONObject.quote(id.trim().ifBlank { "goodbye" })
+        runCatching { Log.i(TAG, "playVrma id=${id.trim()} loop=$loop") }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Sys,
+                "stage",
+                "playVrma ${id.trim()}",
+                "loop=$loop",
+            )
+        }
+        if (!isAttached()) return false
+        eval(
+            "window.CompanionStage && window.CompanionStage.playVrma($n, {loop:${if (loop) "true" else "false"}});",
+        )
+        return true
+    }
+
+    fun stopVrma() {
+        eval("window.CompanionStage && window.CompanionStage.stopVrma && window.CompanionStage.stopVrma();")
+    }
+
+    /** Catalog of joint-XYZ templates for the current avatar. */
+    fun getMotionLibrary(timeoutMs: Long = 1_200): JSONObject {
+        if (!isAttached()) {
+            return JSONObject().put("ok", false).put("error", "stage_not_attached")
+        }
+        val raw = evalForResult(
+            "(function(){try{" +
+                "if(!window.CompanionStage||typeof window.CompanionStage.exportMotionLibrary!=='function')" +
+                "return {ok:false,error:'no_exportMotionLibrary'};" +
+                "return window.CompanionStage.exportMotionLibrary();" +
+                "}catch(e){return {ok:false,error:String(e&&e.message||e)};}})()",
+            timeoutMs,
+        )
+        if (raw.isNullOrBlank() || raw == "null") {
+            return JSONObject().put("ok", false).put("error", "empty_result")
+        }
+        return parseJsJson(raw)
     }
 
     fun setLook(x: Double, y: Double) {

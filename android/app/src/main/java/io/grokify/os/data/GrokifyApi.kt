@@ -169,11 +169,19 @@ class GrokifyApi(
         return executeJson(req)
     }
 
-    fun createMessage(sessionId: String, role: String, content: String): JSONObject {
+    fun createMessage(
+        sessionId: String,
+        role: String,
+        content: String,
+        metadata: JSONObject? = null,
+    ): JSONObject {
         val body = JSONObject()
             .put("session_id", sessionId)
             .put("role", role)
             .put("content", content)
+        if (metadata != null) {
+            body.put("metadata", metadata)
+        }
         val req = authRequest("/admin-system-chat-messages.php")
             .post(jsonBody(body))
             .build()

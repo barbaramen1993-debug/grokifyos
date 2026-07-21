@@ -172,11 +172,13 @@ import android.net.Uri
 import android.widget.Toast
 import android.widget.VideoView
 import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.filled.Image
 import coil.compose.AsyncImage
 import io.grokify.os.BuildConfig
 import io.grokify.os.ui.chat.MarkdownText
 import io.grokify.os.ui.theme.GrokifyColors
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Chat stick-to-bottom: [scrollToItem] only aligns the *top* of a row, so tall
@@ -219,7 +221,8 @@ fun GrokifyAppRoot(
     state: UiState,
     onSaveToken: (String) -> Unit,
     onRefresh: () -> Unit,
-    onSend: (String) -> Unit,
+    onSend: (String, List<ChatImageAttachment>) -> Unit,
+    onPrepareChatImage: suspend (android.net.Uri) -> ChatImageAttachment? = { null },
     onCheckUpdate: () -> Unit,
     onDownloadInstallUpdate: () -> Unit = {},
     onToggleExpand: (String) -> Unit = {},
@@ -570,10 +573,11 @@ fun GrokifyAppRoot(
                         draft = chatDraft,
                         keyboardOpen = keyboardOpen,
                         onDraft = { chatDraft = it },
-                        onSend = {
-                            onSend(chatDraft)
+                        onSend = { images ->
+                            onSend(chatDraft, images)
                             chatDraft = ""
                         },
+                        onPrepareChatImage = onPrepareChatImage,
                         onToggleExpand = onToggleExpand,
                         onRefresh = onRefresh,
                         onSetPanel = onSetPanel,
@@ -1169,7 +1173,8 @@ private fun ChatPane(
     draft: String,
     keyboardOpen: Boolean,
     onDraft: (String) -> Unit,
-    onSend: () -> Unit,
+    onSend: (List<ChatImageAttachment>) -> Unit,
+    onPrepareChatImage: suspend (android.net.Uri) -> ChatImageAttachment? = { null },
     onToggleExpand: (String) -> Unit,
     onRefresh: () -> Unit,
     onSetPanel: (ChatPanel) -> Unit,
@@ -1598,6 +1603,7 @@ private fun ChatPane(
                 enterForNewline = state.enterForNewline,
                 onDraft = onDraft,
                 onSend = onSend,
+                onPrepareChatImage = onPrepareChatImage,
             )
         }
 
@@ -1899,75 +1905,211 @@ private fun ComposerBar(
     connected: Boolean,
     enterForNewline: Boolean,
     onDraft: (String) -> Unit,
-    onSend: () -> Unit,
+    onSend: (List<ChatImageAttachment>) -> Unit,
+    onPrepareChatImage: suspend (android.net.Uri) -> ChatImageAttachment? = { null },
 ) {
-    val canSend = draft.isNotBlank() && !busy
+    val context = LocalContext.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var pending by remember { mutableStateOf<List<ChatImageAttachment>>(emptyList()) }
+    var preparing by remember { mutableStateOf(false) }
+    var prepareError by remember { mutableStateOf<String?>(null) }
+
+    val pickImages = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia(
+            maxItems = 4,
+        ),
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        preparing = true
+        prepareError = null
+        scope.launch {
+            val ready = mutableListOf<ChatImageAttachment>()
+            // Keep existing attachments; fill up to 4
+            ready += pending
+            for (uri in uris) {
+                if (ready.size >= 4) break
+                val att = onPrepareChatImage(uri)
+                if (att != null) ready += att
+            }
+            pending = ready.take(4)
+            if (pending.isEmpty() && uris.isNotEmpty()) {
+                prepareError = "Could not load image"
+            }
+            preparing = false
+        }
+    }
+
+    val canSend = (draft.isNotBlank() || pending.isNotEmpty()) && !busy && !preparing
     val hint = when {
         !connected -> "Bridge offline — reconnect first"
+        pending.isNotEmpty() -> "Add a note about the photo… (optional)"
         enterForNewline -> "Message Grok… (Enter = new line)"
         else -> "Message Grok… (Enter = send)"
     }
-    Row(
+
+    fun doSend() {
+        if (!canSend) return
+        val imgs = pending
+        pending = emptyList()
+        prepareError = null
+        onSend(imgs)
+    }
+
+    Column(
         Modifier
             .fillMaxWidth()
             .background(GrokifyColors.VoidElevated.copy(alpha = 0.95f))
-            .border(0.5.dp, GrokifyColors.PanelBorder)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+            .border(0.5.dp, GrokifyColors.PanelBorder),
     ) {
-        OutlinedTextField(
-            value = draft,
-            onValueChange = onDraft,
-            modifier = Modifier.weight(1f),
-            placeholder = {
-                Text(hint, color = GrokifyColors.TextDim)
-            },
-            minLines = 1,
-            maxLines = 8,
-            keyboardOptions = KeyboardOptions(
-                imeAction = if (enterForNewline) ImeAction.Default else ImeAction.Send,
-                keyboardType = androidx.compose.ui.text.input.KeyboardType.Text,
-            ),
-            keyboardActions = KeyboardActions(
-                onSend = {
-                    if (canSend && !enterForNewline) onSend()
-                },
-            ),
-            colors = fieldColors(),
-            shape = RoundedCornerShape(16.dp),
-        )
-        Box(
-            modifier = Modifier
-                .size(48.dp)
-                .clip(CircleShape)
-                .background(
-                    if (canSend) {
-                        Brush.linearGradient(
-                            listOf(GrokifyColors.GlowCyan, GrokifyColors.GlowMint)
+        if (pending.isNotEmpty() || preparing) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                pending.forEachIndexed { idx, att ->
+                    Box(
+                        Modifier
+                            .size(64.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(10.dp)),
+                    ) {
+                        AsyncImage(
+                            model = att.displayUrl,
+                            contentDescription = "Attachment ${idx + 1}",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
                         )
-                    } else {
-                        Brush.linearGradient(
-                            listOf(GrokifyColors.PanelSoft, GrokifyColors.PanelSoft)
-                        )
+                        Box(
+                            Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(2.dp)
+                                .size(20.dp)
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.65f))
+                                .clickable {
+                                    pending = pending.filterIndexed { i, _ -> i != idx }
+                                },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Remove",
+                                tint = Color.White,
+                                modifier = Modifier.size(12.dp),
+                            )
+                        }
                     }
-                )
-                .clickable(enabled = canSend, onClick = onSend),
-            contentAlignment = Alignment.Center,
+                }
+                if (preparing) {
+                    CircularProgressIndicator(
+                        Modifier.size(28.dp),
+                        strokeWidth = 2.dp,
+                        color = GrokifyColors.GlowCyan,
+                    )
+                }
+            }
+        }
+        prepareError?.let { err ->
+            Text(
+                err,
+                color = GrokifyColors.GlowRose,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+            )
+        }
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (busy) {
-                CircularProgressIndicator(
-                    Modifier.size(20.dp),
-                    strokeWidth = 2.dp,
-                    color = GrokifyColors.GlowCyan,
-                )
-            } else {
+            // Media attach — bottom-left of composer
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(GrokifyColors.PanelSoft)
+                    .border(1.dp, GrokifyColors.PanelBorder, CircleShape)
+                    .clickable(enabled = !busy && !preparing && pending.size < 4) {
+                        try {
+                            pickImages.launch(
+                                androidx.activity.result.PickVisualMediaRequest(
+                                    androidx.activity.result.contract.ActivityResultContracts
+                                        .PickVisualMedia.ImageOnly,
+                                ),
+                            )
+                        } catch (e: Exception) {
+                            prepareError = e.message ?: "Picker unavailable"
+                            Toast.makeText(context, prepareError, Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
                 Icon(
-                    Icons.AutoMirrored.Filled.Send,
-                    contentDescription = "Send",
-                    tint = if (draft.isNotBlank()) Color(0xFF041016) else GrokifyColors.TextDim,
-                    modifier = Modifier.size(20.dp),
+                    Icons.Default.Image,
+                    contentDescription = "Add image",
+                    tint = if (pending.isNotEmpty()) GrokifyColors.GlowCyan else GrokifyColors.TextMuted,
+                    modifier = Modifier.size(22.dp),
                 )
+            }
+            OutlinedTextField(
+                value = draft,
+                onValueChange = onDraft,
+                modifier = Modifier.weight(1f),
+                placeholder = {
+                    Text(hint, color = GrokifyColors.TextDim)
+                },
+                minLines = 1,
+                maxLines = 8,
+                keyboardOptions = KeyboardOptions(
+                    imeAction = if (enterForNewline) ImeAction.Default else ImeAction.Send,
+                    keyboardType = androidx.compose.ui.text.input.KeyboardType.Text,
+                ),
+                keyboardActions = KeyboardActions(
+                    onSend = {
+                        if (canSend && !enterForNewline) doSend()
+                    },
+                ),
+                colors = fieldColors(),
+                shape = RoundedCornerShape(16.dp),
+            )
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (canSend) {
+                            Brush.linearGradient(
+                                listOf(GrokifyColors.GlowCyan, GrokifyColors.GlowMint)
+                            )
+                        } else {
+                            Brush.linearGradient(
+                                listOf(GrokifyColors.PanelSoft, GrokifyColors.PanelSoft)
+                            )
+                        }
+                    )
+                    .clickable(enabled = canSend, onClick = { doSend() }),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (busy) {
+                    CircularProgressIndicator(
+                        Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = GrokifyColors.GlowCyan,
+                    )
+                } else {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send",
+                        tint = if (canSend) Color(0xFF041016) else GrokifyColors.TextDim,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
             }
         }
     }
@@ -3852,6 +3994,7 @@ private fun UserBubble(
     onTap: () -> Unit,
     actions: @Composable () -> Unit,
 ) {
+    val context = LocalContext.current
     val shape = RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp)
     val borderColor = when {
         selected -> GrokifyColors.GlowBlue.copy(alpha = 0.55f)
@@ -3904,8 +4047,43 @@ private fun UserBubble(
                     }
                 }
                 Spacer(Modifier.height(4.dp))
+                if (msg.userMediaUrls.isNotEmpty()) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        msg.userMediaUrls.forEach { url ->
+                            AsyncImage(
+                                model = url,
+                                contentDescription = "Attached image",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(120.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .border(
+                                        1.dp,
+                                        GrokifyColors.GlowBlue.copy(alpha = 0.35f),
+                                        RoundedCornerShape(10.dp),
+                                    )
+                                    .clickable {
+                                        runCatching {
+                                            val ctx = context
+                                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            ctx.startActivity(intent)
+                                        }
+                                    },
+                            )
+                        }
+                    }
+                }
                 // Links need to receive taps; consume only non-link presses via parent combinedClickable
-                MarkdownText(msg.text, textColor = GrokifyColors.TextPrimary)
+                if (msg.text.isNotBlank()) {
+                    MarkdownText(msg.text, textColor = GrokifyColors.TextPrimary)
+                }
             }
             AnimatedVisibility(
                 visible = selected,

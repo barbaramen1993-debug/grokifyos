@@ -6,20 +6,105 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Client-side Voice Agent tools that drive the VRM like VRChat controllers
- * (head + hands with gravity). Executed on-device via [CompanionStageHost].
+ * Client-side Voice Agent tools for Companion body control.
  *
- * Includes a read tool ([TOOL_OBSERVE]) so the model can see live controller /
- * bone positions before emitting absolute set_hands targets.
+ * **Primary path:** [TOOL_BODY_POSE] plays joint-XYZ motion templates rebuilt
+ * for the loaded VRM (shoulders / rest / reach / camera). Instant, no bridge.
+ *
+ * **Secondary:** [TOOL_AI_MOVE] / [TOOL_GESTURE] → [CompanionMovementAgent]
+ * (template match first, bridge planner only for novel poses).
+ *
+ * Direct [TOOL_SET_HANDS] / [TOOL_LOOK] remain for advanced use.
  */
 object CompanionBodyTools {
     private const val TAG = "CompanionBodyTools"
 
+    const val TOOL_BODY_POSE = "body_pose"
+    const val TOOL_AI_MOVE = "ai_move"
     const val TOOL_GESTURE = "body_gesture"
     const val TOOL_SET_HANDS = "set_hands"
     const val TOOL_LOOK = "look_at"
     const val TOOL_RESET = "reset_body"
     const val TOOL_OBSERVE = "observe_environment"
+
+    /** Latest committed user transcript — used to fill missing wave/point side. */
+    @Volatile
+    var lastUserTextForSide: String = ""
+        private set
+
+    /**
+     * True after a [TOOL_GESTURE] runs this user turn. Voice session keyword net
+     * skips if the model already drove the body.
+     */
+    @Volatile
+    var gestureToolFiredThisTurn: Boolean = false
+        private set
+
+    fun noteUserTranscript(text: String) {
+        lastUserTextForSide = text.trim()
+        gestureToolFiredThisTurn = false
+    }
+
+    fun markGestureToolFired() {
+        gestureToolFiredThisTurn = true
+    }
+
+    /**
+     * Infer wave side from natural language when the model omits tools or `side`.
+     * Returns null when no explicit left/right/both is present (do not guess right).
+     */
+    fun inferWaveSideFromUserText(text: String): String? {
+        val t = text.lowercase()
+        val wantsWave =
+            Regex("""\b(wave|waving|hello)\b""").containsMatchIn(t) ||
+                (t.contains("hand") && Regex("""\b(raise|lift|up)\b""").containsMatchIn(t))
+        if (!wantsWave) return null
+        val left = Regex("""\bleft\b""").containsMatchIn(t)
+        val right = Regex("""\bright\b""").containsMatchIn(t)
+        val both = Regex("""\bboth\b""").containsMatchIn(t) ||
+            (left && right) ||
+            Regex("""\bhands\b""").containsMatchIn(t) && !left && !right
+        return when {
+            both && !left && !right -> "both"
+            left && right -> "both"
+            left -> "left"
+            right -> "right"
+            else -> null
+        }
+    }
+
+    /**
+     * Host-side safety net: if the voice model never called a body tool but the
+     * user clearly asked for motion, kick the bridge **movement agent**.
+     */
+    fun maybeKeywordWaveFallback(userText: String = lastUserTextForSide): Boolean {
+        if (gestureToolFiredThisTurn) return false
+        if (!CompanionMovementAgent.wantsMotion(userText)) return false
+        val side = inferWaveSideFromUserText(userText)
+        val intent = if (side != null) {
+            "User asked for a wave/gesture. Side preference: $side. Perform a natural wave."
+        } else {
+            "User asked for body motion: ${userText.take(200)}"
+        }
+        runCatching {
+            Log.i(TAG, "keyword motion → movement agent text=${userText.take(80)}")
+        }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Sys,
+                "keyword",
+                "ai_move fallback",
+                userText.take(500),
+            )
+        }
+        markGestureToolFired()
+        CompanionMovementAgent.requestAsync(
+            intent = intent,
+            userText = userText,
+            source = "keyword_fallback",
+        )
+        return true
+    }
 
     private val GESTURES = listOf(
         "wave",
@@ -35,14 +120,25 @@ object CompanionBodyTools {
         "hands_on_hips",
         "crossed_arms",
         "hello",
+        "goodbye",
         "yes",
         "no",
         "celebrate",
+        "jump",
+        "angry",
+        "sad",
+        "sleepy",
+        "surprised",
+        "blush",
+        "lookaround",
+        "relax",
         "reset",
     )
 
     fun sessionTools(): JSONArray {
         val tools = JSONArray()
+        tools.put(bodyPoseTool())
+        tools.put(aiMoveTool())
         tools.put(observeTool())
         tools.put(gestureTool())
         tools.put(setHandsTool())
@@ -53,55 +149,44 @@ object CompanionBodyTools {
 
     fun toolInstructions(): String = buildString {
         append(
-            "You inhabit a 3D VRM avatar driven like a VR game: virtual HMD (head) + " +
-                "left/right wrist controllers (two-bone arm IK + gravity). ",
+            "YOU are the voice agent. Body motion prefers PORTABLE VRMA CLIPS that retarget " +
+                "to ANY loaded VRM humanoid (relative joint animation). " +
+                "Fallback: joint-XYZ templates measured for this avatar. " +
+                "You do NOT invent joint meters.\n",
+        )
+        append("ALWAYS speak your reply aloud in the same turn as any body tool.\n")
+        append(
+            "MOVEMENT RULES (mandatory):\n" +
+                "1. PREFERRED: body_pose({pose:\"wave\"}) — wave/hello/goodbye, clap, think, " +
+                "cheer/jump, shrug/relax, angry, sad, sleepy, surprised, blush, lookaround " +
+                "play real VRMA on any VRM. Also: point, nod, shake_head, bow, lean_in, " +
+                "hands_on_hips, crossed_arms, yes, no.\n" +
+                "2. For wave/point pass side left|right|both when the user says it; " +
+                "if omitted, host defaults to right.\n" +
+                "3. ai_move only for novel / freeform poses not in the catalog.\n" +
+                "4. body_gesture is an alias for the same catalog.\n" +
+                "5. Do NOT use set_hands unless user demands exact coords AND you observe_environment first.\n" +
+                "6. look_at for gaze; reset_body to cancel.\n",
         )
         append(
-            "ALWAYS speak your reply aloud first. Body tools are optional garnish — " +
-                "never answer with only a tool call and no speech. ",
+            "EXAMPLES:\n" +
+                "User: Wave your left hand. → body_pose({pose:\"wave\",side:\"left\"}) + speak.\n" +
+                "User: Wave. → body_pose({pose:\"wave\",side:\"right\"}) + speak.\n" +
+                "User: Clap. → body_pose({pose:\"clap\"}) + speak.\n" +
+                "User: Point at me. → body_pose({pose:\"point\",side:\"right\"}) + speak.\n" +
+                "User: Jazz hands above your head. → ai_move({intent:\"jazz hands above head\"}) + speak.\n",
         )
         append(
-            "CLOSED LOOP / VR SENSE: call observe_environment to read the live scene — " +
-                "joints (shoulder/elbow/wrist), bones (id + name + hips-local/world/euler), " +
-                "joint_labels and named_joints (user-renamed joints; e.g. leftHand may be " +
-                "\"left wand\"), VR controller points + soft hang rest (measured from THIS avatar), " +
-                "arm_reach, camera_hips_local (viewer), camera_relative.look_toward_camera, " +
-                "and control_schema.examples scaled to this VRM. Use the name fields when the " +
-                "user refers to joints by the labels they assigned. ",
+            "observe_environment includes motion_library (VRMA + joint-XYZ) + live joints. " +
+                "reset_body: stop VRMA + soft hang rest.",
         )
-        append(
-            "For custom poses: observe_environment → plan absolute hips-local {x,y,z} " +
-                "from joints.shoulders / vr.rest / arm_reach / camera → set_hands. " +
-                "Axes: x right+, y up+, z forward+ (toward viewer is usually +z). " +
-                "Hang rest is below the shoulders (soft A, not Y/T). " +
-                "Wave is shoulder-high toward the camera — never straight up above the head. " +
-                "Never invent human-scale Y (~1.0+); use observed joints/arm_reach for this avatar. " +
-                "Runtime clamps set_hands to ~0.88 * max_reach of the shoulder. ",
-        )
-        append(
-            "When the user asks you to move, look, or gesture, call the matching tool " +
-                "in the same turn as speech. Prefer body_gesture for named moves " +
-                "(wave already faces the camera); look_at direction=camera for the viewer; " +
-                "set_hands only for custom controller poses. ",
-        )
-        append(
-            "body_gesture: wave, nod, shake_head, point, shrug, think, clap, cheer, bow, " +
-                "lean_in, hands_on_hips, crossed_arms, hello, yes, no, celebrate, reset. ",
-        )
-        append(
-            "look_at: x=-1 LEFT .. 1 RIGHT, y=-1 down .. 1 up, " +
-                "or direction left|right|up|down|forward|camera. Holds ~5s unless hold_sec set. ",
-        )
-        append(
-            "set_hands places wrist controller points in avatar space. " +
-                "After hold_sec, gravity springs them home to measured hang rest. ",
-        )
-        append("reset_body returns to soft hang rest. Tools are instant and do not replace speech.")
     }
 
     fun isBodyTool(name: String): Boolean {
         val n = name.trim().lowercase()
-        return n == TOOL_GESTURE ||
+        return n == TOOL_BODY_POSE ||
+            n == TOOL_AI_MOVE ||
+            n == TOOL_GESTURE ||
             n == TOOL_SET_HANDS ||
             n == TOOL_LOOK ||
             n == TOOL_RESET ||
@@ -131,6 +216,8 @@ object CompanionBodyTools {
 
     private fun executeInner(call: GrokAssistantVoiceTools.FunctionCall): GrokAssistantVoiceTools.FunctionResult {
         return when (call.name.trim()) {
+            TOOL_BODY_POSE -> execBodyPose(call)
+            TOOL_AI_MOVE -> execAiMove(call)
             TOOL_OBSERVE -> execObserve(call)
             TOOL_GESTURE -> execGesture(call)
             TOOL_SET_HANDS -> execSetHands(call)
@@ -138,6 +225,85 @@ object CompanionBodyTools {
             TOOL_RESET -> execReset(call)
             else -> err(call.callId, "unknown_function", call.name)
         }
+    }
+
+    private fun bodyPoseTool(): JSONObject {
+        val poses = CompanionMovementAgent.TEMPLATE_IDS.joinToString(", ")
+        val props = JSONObject()
+            .put(
+                "pose",
+                JSONObject()
+                    .put("type", "string")
+                    .put(
+                        "description",
+                        "Template id from the joint-XYZ library: $poses",
+                    ),
+            )
+            .put(
+                "side",
+                JSONObject()
+                    .put("type", "string")
+                    .put("description", "left | right | both (for wave/point/cheer)"),
+            )
+            .put(
+                "intensity",
+                JSONObject()
+                    .put("type", "number")
+                    .put("description", "0.2–1.5 (default 1)"),
+            )
+        return JSONObject()
+            .put("type", "function")
+            .put("name", TOOL_BODY_POSE)
+            .put(
+                "description",
+                "PREFERRED body control. Plays VRMA clips (portable to any VRM) when available, " +
+                    "else joint-XYZ templates from measured shoulders/rest/reach/camera. " +
+                    "Use for wave, clap, think, point, nod, shrug, etc. Instant — no planning delay.",
+            )
+            .put(
+                "parameters",
+                JSONObject()
+                    .put("type", "object")
+                    .put("properties", props)
+                    .put("required", JSONArray().put("pose")),
+            )
+    }
+
+    private fun aiMoveTool(): JSONObject {
+        val props = JSONObject()
+            .put(
+                "intent",
+                JSONObject()
+                    .put("type", "string")
+                    .put(
+                        "description",
+                        "Natural-language motion for novel poses not in body_pose templates. " +
+                            "Known moves (wave/point/nod) still match templates first. " +
+                            "Example: \"hold both hands out like carrying a tray\"",
+                    ),
+            )
+            .put(
+                "side",
+                JSONObject()
+                    .put("type", "string")
+                    .put("description", "Optional left | right | both hint"),
+            )
+        return JSONObject()
+            .put("type", "function")
+            .put("name", TOOL_AI_MOVE)
+            .put(
+                "description",
+                "Freeform / novel body motion. Prefers joint-XYZ templates when intent matches; " +
+                    "otherwise plans via host bridge from live joints. Prefer body_pose for " +
+                    "wave/point/nod/shrug/etc.",
+            )
+            .put(
+                "parameters",
+                JSONObject()
+                    .put("type", "object")
+                    .put("properties", props)
+                    .put("required", JSONArray().put("intent")),
+            )
     }
 
     private fun observeTool(): JSONObject =
@@ -152,7 +318,8 @@ object CompanionBodyTools {
                     "VR head/hand controllers (also named), soft hang rest, arm reach, orbit camera " +
                     "(viewer) in hips-local, look-toward-camera, active gesture, and " +
                     "set_hands examples (wave/point) facing the camera for this avatar. " +
-                    "Call before custom set_hands when you need real numbers or user joint names.",
+                    "Includes motion_library catalog of joint-XYZ templates for this avatar. " +
+                    "Call before custom set_hands when you need real numbers.",
             )
             .put(
                 "parameters",
@@ -189,7 +356,11 @@ object CompanionBodyTools {
                 "side",
                 JSONObject()
                     .put("type", "string")
-                    .put("description", "left | right | both (for wave/point)"),
+                    .put(
+                        "description",
+                        "REQUIRED for wave, point, hello: left | right | both. " +
+                            "Omitting side returns side_required error.",
+                    ),
             )
             .put(
                 "intensity",
@@ -202,9 +373,9 @@ object CompanionBodyTools {
             .put("name", TOOL_GESTURE)
             .put(
                 "description",
-                "Play a full-body VR gesture (hand controllers + head). " +
-                    "wave/hello faces the orbit camera (viewer) with palm out — " +
-                    "not arm straight up. Use while speaking to act natural.",
+                "Named gesture → joint-XYZ template (same as body_pose). " +
+                    "Prefer body_pose. For wave/point/hello pass side when known. " +
+                    "Example: {\"gesture\":\"wave\",\"side\":\"left\"}.",
             )
             .put(
                 "parameters",
@@ -257,9 +428,12 @@ object CompanionBodyTools {
             .put("name", TOOL_SET_HANDS)
             .put(
                 "description",
-                "Place virtual VR hand controller(s) in avatar-local space. " +
-                    "Prefer absolute points from observe_environment (vr.rest / examples). " +
-                    "After hold_sec, gravity springs them back to rest A-pose.",
+                "Set absolute wrist controller positions in hips-local meters. " +
+                    "ALWAYS derive numbers from a prior observe_environment call " +
+                    "(measured shoulder + arm_reach of this VRM). " +
+                    "Never invent absolute coordinates from human scale. " +
+                    "Prefer vr.rest / control_schema.examples. " +
+                    "After hold_sec, gravity springs them back to measured soft hang rest.",
             )
             .put(
                 "parameters",
@@ -360,24 +534,207 @@ object CompanionBodyTools {
         )
     }
 
+    private val ASYMMETRIC_GESTURES = setOf("wave", "point", "hello")
+
+    private fun execBodyPose(
+        call: GrokAssistantVoiceTools.FunctionCall,
+    ): GrokAssistantVoiceTools.FunctionResult {
+        markGestureToolFired()
+        val args = parseArgs(call.argumentsJson)
+        val pose = args.optString("pose", "").trim().ifBlank {
+            args.optString("name", "").trim().ifBlank {
+                args.optString("template", "").trim().ifBlank {
+                    args.optString("gesture", "").trim()
+                }
+            }
+        }.lowercase().replace(Regex("""[\s-]+"""), "_")
+        if (pose.isEmpty()) return err(call.callId, "missing_pose")
+        if (pose == "reset" || pose == "reset_body" || pose == "idle") {
+            CompanionMovementAgent.cancel()
+            CompanionStageHost.stopVrma()
+            CompanionStageHost.resetBody()
+            return ok(call.callId, JSONObject().put("reset", true).put("mode", "rest"))
+        }
+        val sideRaw = args.optString("side", "").trim().lowercase()
+        var side = when (sideRaw) {
+            "left", "l" -> "left"
+            "right", "r" -> "right"
+            "both", "all" -> "both"
+            else -> ""
+        }
+        var sideSource = if (side.isNotEmpty()) "arg" else "default"
+        if (pose in ASYMMETRIC_GESTURES || pose.startsWith("wave") || pose.startsWith("point")) {
+            if (side.isEmpty()) {
+                val inferred = inferWaveSideFromUserText(lastUserTextForSide)
+                if (inferred != null) {
+                    side = inferred
+                    sideSource = "user_text"
+                } else if (pose.contains("left")) {
+                    side = "left"
+                } else if (pose.contains("right")) {
+                    side = "right"
+                } else if (pose.contains("both")) {
+                    side = "both"
+                } else {
+                    side = "right"
+                    sideSource = "default_right"
+                }
+            }
+        }
+        val intensity = args.optDouble("intensity", 1.0).coerceIn(0.2, 1.5)
+        val resolvedSide = side
+        runCatching {
+            Log.i(TAG, "body_pose pose=$pose side=$resolvedSide src=$sideSource")
+        }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.In,
+                "body_pose",
+                "$pose side=$resolvedSide",
+                args.toString().take(500),
+            )
+        }
+        // Direct template play — joint XYZ recomputed on stage for this VRM.
+        val played = CompanionStageHost.playTemplate(pose, intensity, resolvedSide)
+        // Also route through agent so match/logging stays consistent if stage missed.
+        if (!played) {
+            CompanionMovementAgent.requestAsync(
+                intent = "template:$pose side=$resolvedSide",
+                userText = lastUserTextForSide,
+                source = "tool_body_pose",
+            )
+        }
+        return ok(
+            call.callId,
+            JSONObject()
+                .put("pose", pose)
+                .put("side", resolvedSide)
+                .put("side_source", sideSource)
+                .put("intensity", intensity)
+                .put("mode", "vrma_or_joint_xyz")
+                .put("played", played)
+                .put("stage", CompanionStageHost.isAttached())
+                .put(
+                    "hint",
+                    "Stage prefers VRMA (any VRM) then joint-XYZ templates from measured joints.",
+                ),
+        )
+    }
+
+    private fun execAiMove(
+        call: GrokAssistantVoiceTools.FunctionCall,
+    ): GrokAssistantVoiceTools.FunctionResult {
+        markGestureToolFired()
+        val args = parseArgs(call.argumentsJson)
+        val intent = args.optString("intent", "").trim().ifBlank {
+            args.optString("goal", "").trim().ifBlank {
+                args.optString("description", "").trim()
+            }
+        }
+        if (intent.isEmpty()) return err(call.callId, "missing_intent")
+        val sideRaw = args.optString("side", "").trim().lowercase()
+        val side = when (sideRaw) {
+            "left", "l" -> "left"
+            "right", "r" -> "right"
+            "both", "all" -> "both"
+            else -> CompanionBodyTools.inferWaveSideFromUserText(lastUserTextForSide).orEmpty()
+        }
+        val fullIntent = if (side.isNotEmpty() && !intent.contains(side, ignoreCase = true)) {
+            "$intent (side=$side)"
+        } else {
+            intent
+        }
+        runCatching { Log.i(TAG, "ai_move intent=${fullIntent.take(120)}") }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.In,
+                "ai_move",
+                fullIntent.take(200),
+                args.toString().take(500),
+            )
+        }
+        CompanionMovementAgent.requestAsync(
+            intent = fullIntent,
+            userText = lastUserTextForSide,
+            source = "tool_ai_move",
+        )
+        return ok(
+            call.callId,
+            JSONObject()
+                .put("queued", true)
+                .put("mode", "movement_agent")
+                .put("intent", fullIntent)
+                .put("side", side)
+                .put("stage", CompanionStageHost.isAttached())
+                .put(
+                    "hint",
+                    "Matches joint-XYZ template when possible; else bridge planner. Speak now.",
+                ),
+        )
+    }
+
     private fun execGesture(
         call: GrokAssistantVoiceTools.FunctionCall,
     ): GrokAssistantVoiceTools.FunctionResult {
+        markGestureToolFired()
         val args = parseArgs(call.argumentsJson)
         val gesture = args.optString("gesture", "").trim().ifBlank {
             args.optString("name", "").trim()
-        }
+        }.lowercase()
         if (gesture.isEmpty()) return err(call.callId, "missing_gesture")
-        val side = args.optString("side", "right").ifBlank { "right" }
+        if (gesture == "reset" || gesture == "reset_body" || gesture == "idle") {
+            CompanionStageHost.resetBody()
+            CompanionMovementAgent.cancel()
+            return ok(call.callId, JSONObject().put("reset", true).put("mode", "reset"))
+        }
+        val sideRaw = args.optString("side", "").trim().lowercase()
+        var side = when (sideRaw) {
+            "left", "l" -> "left"
+            "right", "r" -> "right"
+            "both", "all" -> "both"
+            else -> ""
+        }
+        var sideSource = if (side.isNotEmpty()) "arg" else "missing"
+        if (gesture in ASYMMETRIC_GESTURES && side.isEmpty()) {
+            val inferred = inferWaveSideFromUserText(lastUserTextForSide)
+            if (inferred != null) {
+                side = inferred
+                sideSource = "user_text"
+            } else {
+                side = "right"
+                sideSource = "default_right"
+            }
+        }
         val intensity = args.optDouble("intensity", 1.0)
-        runCatching { Log.i(TAG, "body_gesture=$gesture side=$side intensity=$intensity") }
-        CompanionStageHost.playGesture(gesture, intensity, side)
+        val resolvedSide = side.ifBlank { "right" }
+        runCatching {
+            Log.i(TAG, "body_gesture→template $gesture side=$resolvedSide src=$sideSource")
+        }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.In,
+                "gesture",
+                "$gesture → template side=$resolvedSide src=$sideSource",
+                args.toString().take(500),
+            )
+        }
+        val played = CompanionStageHost.playTemplate(gesture, intensity, resolvedSide)
+        if (!played) {
+            CompanionMovementAgent.requestAsync(
+                intent = "Named gesture: $gesture. Side: $resolvedSide.",
+                userText = lastUserTextForSide,
+                source = "tool_body_gesture",
+            )
+        }
         return ok(
             call.callId,
             JSONObject()
                 .put("gesture", gesture)
-                .put("side", side)
+                .put("side", resolvedSide)
+                .put("side_source", sideSource)
                 .put("intensity", intensity)
+                .put("mode", if (played) "vrma_or_joint_xyz" else "movement_agent")
+                .put("played", played)
                 .put("stage", CompanionStageHost.isAttached()),
         )
     }
@@ -458,6 +815,7 @@ object CompanionBodyTools {
     private fun execReset(
         call: GrokAssistantVoiceTools.FunctionCall,
     ): GrokAssistantVoiceTools.FunctionResult {
+        CompanionMovementAgent.cancel()
         CompanionStageHost.resetBody()
         return ok(call.callId, JSONObject().put("reset", true))
     }

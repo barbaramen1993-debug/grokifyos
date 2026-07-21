@@ -56,11 +56,24 @@ data class ChatLine(
     val mediaUrl: String = "",
     /** "image" or "video" */
     val mediaKind: String = "",
+    /**
+     * User-attached photo URLs (durable media-cache or content URIs for the current turn).
+     * Shown as thumbnails inside the user bubble.
+     */
+    val userMediaUrls: List<String> = emptyList(),
     /** Logical permission id for [ChatRole.PermissionRequest] (e.g. camera). */
     val permissionId: String = "",
     val permissionStatus: PermissionRequestStatus = PermissionRequestStatus.Pending,
     /** Epoch ms when the message was created (server [created_at] or local clock). */
     val createdAtMs: Long = System.currentTimeMillis(),
+)
+
+/** In-memory image ready to send with a chat prompt (base64 + durable URL for UI). */
+data class ChatImageAttachment(
+    val mimeType: String,
+    val base64: String,
+    val displayUrl: String,
+    val byteSize: Int,
 )
 
 data class SessionItem(
@@ -1454,15 +1467,27 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         val streaming = false
 
         when (roleStr) {
-            "user" -> return listOf(
-                ChatLine(
-                    role = ChatRole.User,
-                    text = content,
-                    serverMsgId = serverId,
-                    excludedFromContext = excluded,
-                    createdAtMs = createdAtMs,
-                ),
-            )
+            "user" -> {
+                val userMedia = mutableListOf<String>()
+                val mediaArr = meta?.optJSONArray("media")
+                if (mediaArr != null) {
+                    for (i in 0 until mediaArr.length()) {
+                        val m = mediaArr.optJSONObject(i) ?: continue
+                        val url = resolveMediaUrl(m.optString("url"))
+                        if (url.isNotBlank()) userMedia += url
+                    }
+                }
+                return listOf(
+                    ChatLine(
+                        role = ChatRole.User,
+                        text = content,
+                        serverMsgId = serverId,
+                        excludedFromContext = excluded,
+                        createdAtMs = createdAtMs,
+                        userMediaUrls = userMedia,
+                    ),
+                )
+            }
             "system" -> return listOf(
                 ChatLine(
                     role = ChatRole.System,
@@ -2660,17 +2685,25 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun sendMessage(text: String) {
-        val prompt = text.trim()
-        if (prompt.isEmpty()) return
+    fun sendMessage(text: String, images: List<ChatImageAttachment> = emptyList()) {
+        val prompt = text.trim().ifBlank {
+            when {
+                images.isEmpty() -> ""
+                images.size == 1 -> "Please analyze the attached image and describe what you see."
+                else -> "Please analyze the attached images and describe what you see."
+            }
+        }
+        if (prompt.isEmpty() && images.isEmpty()) return
         viewModelScope.launch {
             val localUserId = UUID.randomUUID().toString()
+            val displayUrls = images.map { it.displayUrl }.filter { it.isNotBlank() }
             _state.update {
                 it.copy(
                     messages = it.messages + ChatLine(
                         id = localUserId,
                         role = ChatRole.User,
                         text = prompt,
+                        userMediaUrls = displayUrls,
                     ),
                     draft = "",
                     busy = true,
@@ -2701,9 +2734,23 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             // Persist user message (same as admin System Chat) and attach server id
+            val meta = if (displayUrls.isNotEmpty()) {
+                val mediaArr = org.json.JSONArray()
+                for ((idx, url) in displayUrls.withIndex()) {
+                    mediaArr.put(
+                        JSONObject()
+                            .put("kind", "image")
+                            .put("url", url)
+                            .put("name", "Photo ${idx + 1}"),
+                    )
+                }
+                JSONObject().put("media", mediaArr)
+            } else {
+                null
+            }
             try {
                 val saved = withContext(Dispatchers.IO) {
-                    api.createMessage(sessionId, "user", prompt)
+                    api.createMessage(sessionId, "user", prompt, meta)
                 }
                 val mid = saved.optInt("id", 0)
                 if (mid > 0) {
@@ -2736,6 +2783,12 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             }
             val notes = buildNotesForPrompt()
 
+            val imagePayload = images.map { img ->
+                JSONObject()
+                    .put("data", img.base64)
+                    .put("mimeType", img.mimeType.ifBlank { "image/jpeg" })
+            }
+
             streamBuf = StringBuilder()
             thinkingBuf = StringBuilder()
             val ok = bridge?.sendPrompt(
@@ -2744,6 +2797,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 model = _state.value.model,
                 notes = notes,
                 history = historyPayload,
+                images = imagePayload,
             ) == true
             if (!ok) {
                 _state.update {
@@ -2753,6 +2807,100 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
             }
+        }
+    }
+
+    /**
+     * Read + compress a content/file URI into a JPEG attachment for chat vision.
+     * Also mirrors bytes into media-cache when online so history can show the photo.
+     */
+    suspend fun prepareChatImage(uri: android.net.Uri): ChatImageAttachment? {
+        val app = getApplication<Application>()
+        return withContext(Dispatchers.IO) {
+            try {
+                val jpeg = loadAndCompressChatJpeg(app, uri) ?: return@withContext null
+                // Grok drops images under 512 total pixels — already enforced via min scale in loader
+                val b64 = android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP)
+                var displayUrl = uri.toString()
+                try {
+                    val cached = api.cacheMediaBytes(jpeg, "image/jpeg")
+                    if (cached.optBoolean("ok")) {
+                        val u = cached.optString("url", "")
+                        if (u.isNotBlank()) displayUrl = resolveMediaUrl(u)
+                    }
+                } catch (_: Exception) {
+                    // Offline / cache fail: keep local content URI for this session only
+                }
+                ChatImageAttachment(
+                    mimeType = "image/jpeg",
+                    base64 = b64,
+                    displayUrl = displayUrl,
+                    byteSize = jpeg.size,
+                )
+            } catch (e: Exception) {
+                android.util.Log.w("GrokifyVM", "prepareChatImage failed: ${e.message}")
+                null
+            }
+        }
+    }
+
+    private fun loadAndCompressChatJpeg(
+        ctx: android.content.Context,
+        uri: android.net.Uri,
+        maxEdge: Int = 1600,
+        quality: Int = 85,
+    ): ByteArray? {
+        return try {
+            val resolver = ctx.contentResolver
+            // Bounds pass
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            resolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, bounds)
+            }
+            var sample = 1
+            val srcW = bounds.outWidth.coerceAtLeast(1)
+            val srcH = bounds.outHeight.coerceAtLeast(1)
+            val maxDim = maxOf(srcW, srcH)
+            while (maxDim / sample > maxEdge * 2) sample *= 2
+            val opts = android.graphics.BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+            }
+            val decoded = resolver.openInputStream(uri)?.use {
+                android.graphics.BitmapFactory.decodeStream(it, null, opts)
+            } ?: return null
+            var working = decoded
+            val dim = maxOf(working.width, working.height)
+            if (dim > maxEdge) {
+                val scale = maxEdge.toFloat() / dim
+                val w = maxOf(1, (working.width * scale).toInt())
+                val h = maxOf(1, (working.height * scale).toInt())
+                val scaled = android.graphics.Bitmap.createScaledBitmap(working, w, h, true)
+                if (scaled !== working) {
+                    working.recycle()
+                    working = scaled
+                }
+            }
+            // Ensure at least ~512 total pixels so Grok vision accepts it
+            val px = working.width.toLong() * working.height.toLong()
+            if (px < 512L) {
+                val scale = kotlin.math.ceil(kotlin.math.sqrt(512.0 / px.toDouble())).toFloat()
+                val w = maxOf(1, (working.width * scale).toInt())
+                val h = maxOf(1, (working.height * scale).toInt())
+                val up = android.graphics.Bitmap.createScaledBitmap(working, w, h, true)
+                if (up !== working) {
+                    working.recycle()
+                    working = up
+                }
+            }
+            val out = java.io.ByteArrayOutputStream()
+            working.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
+            if (working !== decoded) working.recycle()
+            else working.recycle()
+            out.toByteArray()
+        } catch (e: Exception) {
+            android.util.Log.w("GrokifyVM", "loadAndCompressChatJpeg: ${e.message}")
+            null
         }
     }
 

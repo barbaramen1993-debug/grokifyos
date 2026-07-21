@@ -83,15 +83,20 @@ class BridgeClient(
 
     fun isConnected(): Boolean = socket.get() != null
 
+    /**
+     * @param images optional ACP-style image attachments for vision analysis:
+     *   each map/JSONObject should have `data` (base64) and `mimeType` (e.g. image/jpeg).
+     */
     fun sendPrompt(
         prompt: String,
         sessionId: String,
         model: String = "",
         notes: List<String> = emptyList(),
         history: List<JSONObject> = emptyList(),
+        images: List<JSONObject> = emptyList(),
     ): Boolean {
         val ws = socket.get() ?: return false
-        // Same payload shape as assets/system-chat.js
+        // Same payload shape as assets/system-chat.js (+ optional images for multimodal)
         val payload = JSONObject()
             .put("prompt", prompt)
             .put("session_id", sessionId)
@@ -101,6 +106,9 @@ class BridgeClient(
         }
         if (history.isNotEmpty()) {
             payload.put("history", org.json.JSONArray(history))
+        }
+        if (images.isNotEmpty()) {
+            payload.put("images", org.json.JSONArray(images))
         }
         return ws.send(payload.toString())
     }
