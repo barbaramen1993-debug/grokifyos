@@ -1,17 +1,23 @@
 package io.grokify.os.apps.companion
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -69,6 +75,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -105,6 +112,10 @@ fun CompanionPane(onBack: () -> Unit) {
     var preferDeviceTts by remember { mutableStateOf(store.preferDeviceTts) }
     var modelSource by remember { mutableStateOf(store.modelSource) }
     var userModelPath by remember { mutableStateOf(store.userModelPath) }
+    var debugOverlay by remember { mutableStateOf(store.debugOverlay) }
+    var debugEntries by remember { mutableStateOf(CompanionDebugLog.snapshot()) }
+    var debugExpanded by remember { mutableStateOf(true) }
+    var debugSelectedId by remember { mutableStateOf<Long?>(null) }
 
     var avatarState by remember { mutableStateOf(CompanionAvatarState.Idle) }
     var mouth by remember { mutableFloatStateOf(0f) }
@@ -119,6 +130,8 @@ fun CompanionPane(onBack: () -> Unit) {
     var showChat by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
+    /** When non-null: rename dialog for this joint id (leftHand, vrLeft, …). */
+    var jointRename by remember { mutableStateOf<JointRenameDraft?>(null) }
     var stageReady by remember { mutableStateOf(false) }
     var hasMic by remember {
         mutableStateOf(
@@ -221,9 +234,22 @@ fun CompanionPane(onBack: () -> Unit) {
     }
 
     DisposableEffect(Unit) {
+        CompanionDebugLog.setEnabled(debugOverlay)
+        val listener = {
+            debugEntries = CompanionDebugLog.snapshot()
+        }
+        CompanionDebugLog.addListener(listener)
         onDispose {
+            CompanionDebugLog.removeListener(listener)
             CompanionVoiceSession.stop()
         }
+    }
+
+    LaunchedEffect(debugOverlay) {
+        CompanionDebugLog.setEnabled(debugOverlay)
+        store.debugOverlay = debugOverlay
+        CompanionStageHost.setDebugSkeleton(debugOverlay)
+        debugEntries = CompanionDebugLog.snapshot()
     }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -335,6 +361,14 @@ fun CompanionPane(onBack: () -> Unit) {
         busy = true
         draft = ""
         history = store.appendMessage(CompanionMessage.user(trimmed, source = "text"))
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Out,
+                "text→",
+                trimmed.take(160),
+                trimmed.take(4_000),
+            )
+        }
         avatarState = CompanionAvatarState.Thinking
         mouth = 0f
         flashStatus(null)
@@ -345,12 +379,28 @@ fun CompanionPane(onBack: () -> Unit) {
                 }
                 if (reply.isFailure) {
                     val err = reply.exceptionOrNull()?.message ?: "complete_failed"
+                    if (CompanionDebugLog.enabled) {
+                        CompanionDebugLog.append(
+                            CompanionDebugLog.Dir.Sys,
+                            "text←",
+                            "error",
+                            err.take(2_000),
+                        )
+                    }
                     history = store.appendMessage(CompanionMessage.error(err))
                     flashStatus(err.take(160))
                     avatarState = CompanionAvatarState.Idle
                     return@launch
                 }
                 val answer = reply.getOrNull().orEmpty()
+                if (CompanionDebugLog.enabled) {
+                    CompanionDebugLog.append(
+                        CompanionDebugLog.Dir.In,
+                        "text←",
+                        answer.take(160),
+                        answer.take(4_000),
+                    )
+                }
                 history = store.appendMessage(CompanionMessage.assistant(answer, source = "text"))
                 if (answer.isNotBlank()) {
                     avatarState = CompanionAvatarState.Speaking
@@ -446,34 +496,99 @@ fun CompanionPane(onBack: () -> Unit) {
             )
         }
 
-        CompanionLive2dStage(
-            modelSource = modelSource,
-            userModelPath = userModelPath,
-            avatarState = avatarState,
-            mouth = mouth,
-            onReady = { stageReady = true },
-            onModelLoaded = { path ->
-                val name = path.substringAfterLast('/').substringAfterLast('\\')
-                    .ifBlank { "VRM" }
-                    .removeSuffix(".vrm")
-                    .removeSuffix(".VRM")
-                flashStatus("Avatar: $name")
-            },
-            onModelError = { msg ->
-                flashStatus(msg.take(160))
-                if (modelSource == CompanionStore.SOURCE_USER) {
-                    modelSource = CompanionStore.SOURCE_BUNDLED
-                    store.modelSource = CompanionStore.SOURCE_BUNDLED
-                    flashStatus("User model failed — using Seed-san")
-                }
-            },
-            // Stage canvas is orbit-only (rotate / pan / pinch-zoom).
-            // Chat + voice stay on their toolbar buttons — no avatar-tap side effects.
-            onAvatarTapped = {},
-            modifier = Modifier
+        Box(
+            Modifier
                 .weight(1f)
                 .fillMaxWidth(),
-        )
+        ) {
+            CompanionLive2dStage(
+                modelSource = modelSource,
+                userModelPath = userModelPath,
+                avatarState = avatarState,
+                mouth = mouth,
+                debugSkeleton = debugOverlay,
+                onReady = { stageReady = true },
+                onModelLoaded = { path ->
+                    val name = path.substringAfterLast('/').substringAfterLast('\\')
+                        .ifBlank { "VRM" }
+                        .removeSuffix(".vrm")
+                        .removeSuffix(".VRM")
+                    flashStatus("Avatar: $name")
+                    val labels = store.jointLabelsJson
+                    if (labels.isNotBlank()) {
+                        CompanionStageHost.setJointLabels(labels)
+                    }
+                    if (debugOverlay) {
+                        CompanionStageHost.setDebugSkeleton(true)
+                    }
+                },
+                onModelError = { msg ->
+                    flashStatus(msg.take(160))
+                    if (modelSource == CompanionStore.SOURCE_USER) {
+                        modelSource = CompanionStore.SOURCE_BUNDLED
+                        store.modelSource = CompanionStore.SOURCE_BUNDLED
+                        flashStatus("User model failed — using Seed-san")
+                    }
+                },
+                // Stage canvas is orbit-only (rotate / pan / pinch-zoom).
+                // Chat + voice stay on their toolbar buttons — no avatar-tap side effects.
+                onAvatarTapped = {},
+                onJointPicked = { info ->
+                    val id = info.optString("id").trim()
+                    if (id.isEmpty()) return@CompanionLive2dStage
+                    val current = info.optString("name").ifBlank {
+                        info.optString("default_name").ifBlank { id }
+                    }
+                    val def = info.optString("default_name").ifBlank { id }
+                    jointRename = JointRenameDraft(
+                        id = id,
+                        draft = current,
+                        defaultName = def,
+                    )
+                },
+                modifier = Modifier.fillMaxSize(),
+            )
+
+            if (debugOverlay) {
+                CompanionDebugOverlay(
+                    entries = debugEntries,
+                    expanded = debugExpanded,
+                    selectedId = debugSelectedId,
+                    onToggleExpand = { debugExpanded = !debugExpanded },
+                    onSelect = { id ->
+                        debugSelectedId = if (debugSelectedId == id) null else id
+                    },
+                    onClear = {
+                        CompanionDebugLog.clear()
+                        debugEntries = emptyList()
+                        debugSelectedId = null
+                    },
+                    onCopy = { text ->
+                        val body = text.trim()
+                        if (body.isEmpty()) {
+                            Toast.makeText(appCtx, "Nothing to copy", Toast.LENGTH_SHORT).show()
+                            return@CompanionDebugOverlay
+                        }
+                        val cm = appCtx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        if (cm == null) {
+                            Toast.makeText(appCtx, "Clipboard unavailable", Toast.LENGTH_SHORT).show()
+                            return@CompanionDebugOverlay
+                        }
+                        cm.setPrimaryClip(ClipData.newPlainText("companion_debug", body))
+                        val lines = body.lineSequence().count()
+                        Toast.makeText(
+                            appCtx,
+                            if (lines > 1) "Copied $lines lines" else "Copied",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(8.dp),
+                )
+            }
+        }
 
         // Live partials strip while voice is active.
         if (voiceActive || !partialUser.isNullOrBlank() || !partialAssistant.isNullOrBlank()) {
@@ -550,6 +665,16 @@ fun CompanionPane(onBack: () -> Unit) {
                     preferDeviceTts = it
                     store.preferDeviceTts = it
                 },
+                debugOverlay = debugOverlay,
+                onDebugOverlayChange = { on ->
+                    debugOverlay = on
+                    store.debugOverlay = on
+                    CompanionDebugLog.setEnabled(on)
+                    CompanionStageHost.setDebugSkeleton(on)
+                    if (on) {
+                        flashStatus("Debug: AI traffic + bone wireframe")
+                    }
+                },
                 modelSource = modelSource,
                 onModelSourceChange = { src ->
                     modelSource = src
@@ -605,7 +730,114 @@ fun CompanionPane(onBack: () -> Unit) {
             textContentColor = GrokifyColors.TextMuted,
         )
     }
+
+    val rename = jointRename
+    if (rename != null) {
+        AlertDialog(
+            onDismissRequest = { jointRename = null },
+            title = { Text("Name joint") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Bone id: ${rename.id}",
+                        color = GrokifyColors.TextMuted,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        "Default: ${rename.defaultName}",
+                        color = GrokifyColors.TextMuted,
+                        fontSize = 12.sp,
+                    )
+                    OutlinedTextField(
+                        value = rename.draft,
+                        onValueChange = { next ->
+                            jointRename = rename.copy(draft = next.take(64))
+                        },
+                        singleLine = true,
+                        label = { Text("Display name") },
+                        colors = companionFieldColors(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "Saved on this device. observe_environment returns " +
+                            "joint_labels + named_joints so the AI can read names and positions.",
+                        color = GrokifyColors.TextMuted,
+                        fontSize = 11.sp,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val label = rename.draft.trim()
+                        CompanionStageHost.setJointLabel(rename.id, label)
+                        // Merge into prefs map.
+                        val map = runCatching {
+                            val raw = store.jointLabelsJson
+                            if (raw.isBlank()) JSONObject() else JSONObject(raw)
+                        }.getOrElse { JSONObject() }
+                        if (label.isEmpty() ||
+                            label.equals(rename.defaultName, ignoreCase = false) ||
+                            label == rename.id
+                        ) {
+                            map.remove(rename.id)
+                        } else {
+                            map.put(rename.id, label)
+                        }
+                        store.jointLabelsJson = map.toString()
+                        CompanionStageHost.setJointLabels(store.jointLabelsJson.ifBlank { "{}" })
+                        flashStatus(
+                            if (label.isBlank() || label == rename.defaultName) {
+                                "Joint ${rename.id} → default"
+                            } else {
+                                "Joint ${rename.id} → \"$label\""
+                            },
+                        )
+                        jointRename = null
+                    },
+                ) {
+                    Text("Save", color = CompanionAccent)
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            CompanionStageHost.setJointLabel(rename.id, "")
+                            val map = runCatching {
+                                val raw = store.jointLabelsJson
+                                if (raw.isBlank()) JSONObject() else JSONObject(raw)
+                            }.getOrElse { JSONObject() }
+                            map.remove(rename.id)
+                            store.jointLabelsJson = map.toString()
+                            CompanionStageHost.setJointLabels(
+                                store.jointLabelsJson.ifBlank { "{}" },
+                            )
+                            flashStatus("Joint ${rename.id} reset")
+                            jointRename = null
+                        },
+                    ) {
+                        Text("Reset", color = GrokifyColors.GlowAmber)
+                    }
+                    TextButton(onClick = { jointRename = null }) {
+                        Text("Cancel", color = GrokifyColors.TextMuted)
+                    }
+                }
+            },
+            containerColor = GrokifyColors.VoidElevated,
+            titleContentColor = GrokifyColors.TextPrimary,
+            textContentColor = GrokifyColors.TextMuted,
+        )
+    }
 }
+
+/** Draft state for the joint rename dialog. */
+private data class JointRenameDraft(
+    val id: String,
+    val draft: String,
+    val defaultName: String,
+)
 
 @Composable
 private fun CompanionTopBar(
@@ -906,6 +1138,8 @@ private fun CompanionSettingsSheet(
     onVoiceIdChange: (String) -> Unit,
     preferDeviceTts: Boolean,
     onPreferDeviceTtsChange: (Boolean) -> Unit,
+    debugOverlay: Boolean,
+    onDebugOverlayChange: (Boolean) -> Unit,
     modelSource: String,
     onModelSourceChange: (String) -> Unit,
     userModelPath: String,
@@ -1004,6 +1238,33 @@ private fun CompanionSettingsSheet(
         }
 
         Spacer(Modifier.height(12.dp))
+        SectionLabel("DEBUG")
+        SettingsRow(
+            "AI + skeleton debug",
+            "Tool traffic · bones · tap joints to name (saved for AI)",
+        ) {
+            Switch(
+                checked = debugOverlay,
+                onCheckedChange = onDebugOverlayChange,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = GrokifyColors.Void,
+                    checkedTrackColor = CompanionAccent,
+                    uncheckedThumbColor = GrokifyColors.TextMuted,
+                    uncheckedTrackColor = GrokifyColors.PanelSoft,
+                ),
+            )
+        }
+        Text(
+            "→ host sends / AI reads (user text, tool results, session prompt). " +
+                "← AI sends (assistant text, tool calls). Skeleton: cyan bones, " +
+                "joint spheres (tap to rename), cyan/magenta hand controllers, yellow HMD. " +
+                "Names persist and appear in observe_environment as joint_labels / named_joints.",
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
+
+        Spacer(Modifier.height(12.dp))
         SectionLabel("VRM AVATAR")
         ModelSourceRow(
             label = "Bundled (Seed-san)",
@@ -1062,6 +1323,148 @@ private fun SectionLabel(text: String) {
         letterSpacing = 0.6.sp,
         modifier = Modifier.padding(bottom = 6.dp, top = 4.dp),
     )
+}
+
+@Composable
+private fun CompanionDebugOverlay(
+    entries: List<CompanionDebugLog.Entry>,
+    expanded: Boolean,
+    selectedId: Long?,
+    onToggleExpand: () -> Unit,
+    onSelect: (Long) -> Unit,
+    onClear: () -> Unit,
+    onCopy: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberLazyListState()
+    LaunchedEffect(entries.size) {
+        if (entries.isNotEmpty() && expanded) {
+            listState.scrollToItem(entries.lastIndex.coerceAtLeast(0))
+        }
+    }
+    val selectedEntry = selectedId?.let { id -> entries.firstOrNull { it.id == id } }
+    Surface(
+        modifier = modifier,
+        color = GrokifyColors.VoidElevated.copy(alpha = 0.92f),
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(
+            1.dp,
+            CompanionAccent.copy(alpha = 0.35f),
+        ),
+    ) {
+        Column(Modifier.padding(8.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    "AI debug · ${entries.size}",
+                    color = CompanionAccent,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable(onClick = onToggleExpand),
+                )
+                TextButton(
+                    onClick = {
+                        // Selected row if any; otherwise entire log.
+                        val text = if (selectedEntry != null) {
+                            CompanionDebugLog.formatEntry(selectedEntry)
+                        } else {
+                            CompanionDebugLog.formatAll(entries)
+                        }
+                        onCopy(text)
+                    },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        if (selectedEntry != null) "Copy" else "Copy all",
+                        color = Color(0xFF4FD1C5),
+                        fontSize = 11.sp,
+                    )
+                }
+                TextButton(
+                    onClick = onClear,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text("Clear", color = GrokifyColors.GlowRose, fontSize = 11.sp)
+                }
+                TextButton(
+                    onClick = onToggleExpand,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        if (expanded) "Hide" else "Show",
+                        color = CompanionAccent,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+            if (!expanded) return@Column
+            Text(
+                "→ out · ← in · · joint · tap row · Copy / Copy all",
+                color = GrokifyColors.TextDim,
+                fontSize = 9.sp,
+                modifier = Modifier.padding(bottom = 4.dp),
+            )
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 180.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                items(entries, key = { it.id }) { e ->
+                    val dirMark = when (e.dir) {
+                        CompanionDebugLog.Dir.Out -> "→"
+                        CompanionDebugLog.Dir.In -> "←"
+                        CompanionDebugLog.Dir.Sys -> "·"
+                    }
+                    val dirColor = when (e.dir) {
+                        CompanionDebugLog.Dir.Out -> Color(0xFF4FD1C5)
+                        CompanionDebugLog.Dir.In -> Color(0xFFF687B3)
+                        CompanionDebugLog.Dir.Sys -> when (e.kind) {
+                            "joint" -> Color(0xFFF6E05E)
+                            else -> GrokifyColors.TextMuted
+                        }
+                    }
+                    val selected = selectedId == e.id
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(
+                                if (selected) CompanionAccent.copy(alpha = 0.12f)
+                                else Color.Transparent,
+                            )
+                            .clickable { onSelect(e.id) }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                    ) {
+                        Text(
+                            "$dirMark [${e.kind}] ${e.summary}",
+                            color = dirColor,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = if (selected) 6 else 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (selected && e.detail.isNotBlank()) {
+                            Text(
+                                e.detail,
+                                color = GrokifyColors.TextPrimary.copy(alpha = 0.85f),
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace,
+                                maxLines = 24,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1233,6 +1636,14 @@ private fun completeCompanionTurn(
             .put("system", system)
             .put("session_title", "Companion")
             .toString()
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Out,
+                "complete",
+                "system + prompt",
+                "SYSTEM:\n${system.take(3_000)}\n\nPROMPT:\n${promptForModel.take(3_000)}",
+            )
+        }
         val raw = HostAiClient.complete(ctx, promptForModel, options)
         val env = runCatching { JSONObject(raw) }.getOrElse {
             return Result.failure(Exception("bad_complete_response"))

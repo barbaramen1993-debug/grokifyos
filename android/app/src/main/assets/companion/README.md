@@ -83,6 +83,15 @@ CompanionStage.loadModel("user", "/absolute/or/file/url/MyAvatar.vrm");
 | `setState(state)` | `"idle"` \| `"listening"` \| `"thinking"` \| `"speaking"` — mood expressions + look drift. |
 | `setMouth(v)` | Mouth open `0..1` → multi-viseme blend (`aa`/`ih`/`ou`/`ee`/`oh` + `jawOpen`) with speech-phase modulation. |
 | `playMotion(name)` | Soft expression flash for names containing happy/sad/angry/surprise. |
+| `playGesture(name, opts?)` | VR wrist-controller gesture (`wave`, `nod`, `point`, …). |
+| `setHands(json)` | Place L/R wrist targets (hips-local); arms two-bone IK + gravity. |
+| `exportBodyState()` | Live VR snapshot: joints/chains, bones (id+name), joint_labels, named_joints, hang rest, camera, gesture peaks, control schema. |
+| `setJointLabel(id, name)` | Custom display name for a bone/controller (persisted via host). Empty clears. |
+| `setJointLabels(map)` | Bulk load custom labels. |
+| `getJointLabels()` | Current custom label map. |
+| `setDebugSkeleton(bool)` | SkeletonHelper wireframe + joint spheres + VR hand/HMD controller markers. |
+| `setLook({x,y,direction?,hold_sec?})` | Virtual HMD gaze; `x=-1` left, `x=1` right. |
+| `resetBody()` | Unlock controllers, clear gesture, soft hang rest. |
 
 Host callbacks on `window.GrokifyCompanion` (Android `@JavascriptInterface`):
 

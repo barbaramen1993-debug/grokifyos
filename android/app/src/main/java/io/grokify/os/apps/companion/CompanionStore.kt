@@ -59,6 +59,33 @@ class CompanionStore(ctx: Context) {
         prefs.edit().remove(KEY_VOICE_CONV).apply()
     }
 
+    /**
+     * When true: show AI traffic overlay (tool calls/results, transcripts) and
+     * push skeleton/joint wireframe to the VRM stage.
+     */
+    var debugOverlay: Boolean
+        get() = prefs.getBoolean(KEY_DEBUG_OVERLAY, false)
+        set(v) = prefs.edit().putBoolean(KEY_DEBUG_OVERLAY, v).apply()
+
+    /**
+     * User-edited joint display names (JSON object: boneKey → label).
+     * Surfaced in observe_environment as joint_labels / named_joints / bones.*.name.
+     */
+    var jointLabelsJson: String
+        get() = prefs.getString(KEY_JOINT_LABELS, "") ?: ""
+        set(v) {
+            val trimmed = v.trim()
+            if (trimmed.isEmpty() || trimmed == "{}") {
+                prefs.edit().remove(KEY_JOINT_LABELS).apply()
+            } else {
+                prefs.edit().putString(KEY_JOINT_LABELS, trimmed.take(8_000)).apply()
+            }
+        }
+
+    fun clearJointLabels() {
+        prefs.edit().remove(KEY_JOINT_LABELS).apply()
+    }
+
     fun history(): List<CompanionMessage> = synchronized(historyLock) {
         CompanionPrompts.decodeHistory(prefs.getString(KEY_HISTORY, null))
     }
@@ -96,6 +123,8 @@ class CompanionStore(ctx: Context) {
         private const val KEY_HISTORY = "chat_history_v1"
         private const val KEY_ORBIT = "last_orbit_json_v1"
         private const val KEY_VOICE_CONV = "voice_conversation_id"
+        private const val KEY_DEBUG_OVERLAY = "debug_overlay_v1"
+        private const val KEY_JOINT_LABELS = "joint_labels_v1"
 
         const val SOURCE_BUNDLED = "bundled"
         const val SOURCE_USER = "user"

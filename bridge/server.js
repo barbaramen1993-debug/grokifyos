@@ -24,7 +24,8 @@ const PORT = parseInt(envFirst('GROKIFY_BRIDGE_PORT', 'GROKPOT_BRIDGE_PORT') || 
 const INSTANCE_ID = envFirst('GROKIFY_BRIDGE_INSTANCE', 'GROKPOT_BRIDGE_INSTANCE') || 'a';
 const GROK_BIN = envFirst('GROKIFY_GROK_BIN', 'GROKPOT_GROK_BIN') || '/root/.grok/bin/grok';
 const DEFAULT_GROK_MODEL = envFirst('GROKIFY_GROK_DEFAULT_MODEL', 'GROKPOT_GROK_DEFAULT_MODEL') || 'grok-4.5';
-/** Headless CLI reasoning effort for all chats (override with GROKIFY_REASONING_EFFORT). */
+/** Headless CLI reasoning effort for all chats (override with GROKIFY_REASONING_EFFORT).
+ * Canonical levels: none, minimal, low, medium, high. (xhigh not released yet.) */
 const REASONING_EFFORT = envFirst('GROKIFY_REASONING_EFFORT', 'GROKPOT_REASONING_EFFORT') || 'high';
 const LOG_FILE = path.join(WORKSPACE, 'storage', 'logs', 'bridge.log');
 const AGENT_TIMEOUT_MS = 30 * 60 * 1000;

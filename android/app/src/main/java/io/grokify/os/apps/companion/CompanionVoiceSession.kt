@@ -235,6 +235,14 @@ object CompanionVoiceSession {
             append("\n\n")
             append(CompanionBodyTools.toolInstructions())
         }
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Out,
+                "session",
+                "voice start · instructions + tools",
+                system.take(6_000),
+            )
+        }
         val resumeId = storePrefs?.voiceConversationId?.trim().orEmpty()
             .ifBlank { null }
 
@@ -1045,6 +1053,14 @@ object CompanionVoiceSession {
         if (body.isEmpty()) return
         if (!assistantCommittedThisResponse.compareAndSet(false, true)) return
         partialAssistant.set(null)
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.In,
+                "assistant",
+                body.take(160),
+                body.take(4_000),
+            )
+        }
         notifyTranscript("assistant", body)
         publish()
     }
@@ -1067,6 +1083,14 @@ object CompanionVoiceSession {
         lastUserCommitText.set(body)
         lastUserCommitElapsedMs.set(now)
         partialUser.set(null)
+        if (CompanionDebugLog.enabled) {
+            CompanionDebugLog.append(
+                CompanionDebugLog.Dir.Out,
+                "user",
+                body.take(160),
+                body.take(4_000),
+            )
+        }
         notifyTranscript("user", body)
         publish()
         return true

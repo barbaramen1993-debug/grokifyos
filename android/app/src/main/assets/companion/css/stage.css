@@ -77,6 +77,82 @@ body {
   display: block;
 }
 
+/* Live VR controller / joint readouts when setDebugSkeleton(true) */
+#debug-skel-hud {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  z-index: 3;
+  display: none;
+  max-width: calc(100% - 16px);
+  padding: 5px 8px;
+  border-radius: 6px;
+  font: 500 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #c8f5ff;
+  background: rgba(6, 10, 18, 0.78);
+  border: 1px solid rgba(34, 211, 238, 0.4);
+  pointer-events: none;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Floating joint name tags (projected from 3D joint spheres). */
+#joint-label-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.joint-tag {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  margin-top: -2px;
+  padding: 3px 7px 4px;
+  border-radius: 8px;
+  font: 600 9px/1.2 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  color: #e8f7ff;
+  background: rgba(8, 14, 24, 0.88);
+  border: 1px solid rgba(110, 231, 255, 0.45);
+  white-space: nowrap;
+  text-align: center;
+  max-width: 48vw;
+  overflow: hidden;
+  pointer-events: none;
+  display: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.joint-tag .joint-name {
+  display: block;
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.joint-tag .joint-xyz {
+  display: block;
+  margin-top: 1px;
+  font: 500 8px/1.15 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0;
+  color: rgba(165, 243, 252, 0.95);
+  opacity: 0.95;
+}
+
+.joint-tag.selected {
+  color: #0b1220;
+  background: #6ee7ff;
+  border-color: #a5f3fc;
+  font-weight: 700;
+  z-index: 5;
+}
+
+.joint-tag.selected .joint-xyz {
+  color: rgba(11, 18, 32, 0.85);
+}
+
 #fallback-label {
   font: 600 13px/1.2 system-ui, -apple-system, sans-serif;
   color: rgba(200, 210, 235, 0.85);

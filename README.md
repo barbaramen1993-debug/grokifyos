@@ -316,6 +316,10 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### Bridge — default reasoning effort `high`
+
+- Headless Grok agents (web system chat, Android Chat, plugin / Live DJ host AI) spawn with `--reasoning-effort high`. Override with `GROKIFY_REASONING_EFFORT`. (`xhigh` was tried early but is not released yet.) Voice Agent realtime path is unchanged (`none` / deep-think `high`).
+
 ### 0.1.212 — Companion: soft hang, calmer head, tighter lip-sync, first-reply audio
 
 - **Rest pose**: soft arm hang (~72° from T), lower hand rests, less idle flare — no permanent Y-pose.

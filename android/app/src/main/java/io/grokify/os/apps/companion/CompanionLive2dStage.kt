@@ -59,10 +59,12 @@ fun CompanionLive2dStage(
     userModelPath: String,
     avatarState: CompanionAvatarState,
     mouth: Float,
+    debugSkeleton: Boolean = false,
     onReady: () -> Unit = {},
     onModelLoaded: (String) -> Unit = {},
     onModelError: (String) -> Unit = {},
     onAvatarTapped: () -> Unit = {},
+    onJointPicked: (JSONObject) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val appContext = LocalContext.current.applicationContext
@@ -77,6 +79,7 @@ fun CompanionLive2dStage(
     val onModelLoadedLatest = rememberUpdatedState(onModelLoaded)
     val onModelErrorLatest = rememberUpdatedState(onModelError)
     val onAvatarTappedLatest = rememberUpdatedState(onAvatarTapped)
+    val onJointPickedLatest = rememberUpdatedState(onJointPicked)
     val modelSourceLatest = rememberUpdatedState(modelSource)
     val userModelPathLatest = rememberUpdatedState(userModelPath)
     val avatarStateLatest = rememberUpdatedState(avatarState)
@@ -133,6 +136,12 @@ fun CompanionLive2dStage(
         lastPushedMouth = clamped
         lastMouthPushMs = now
         pushMouth(wv, clamped)
+    }
+
+    // Skeleton / joint / VR-controller wireframe.
+    LaunchedEffect(debugSkeleton, stageReady) {
+        if (!stageReady) return@LaunchedEffect
+        CompanionStageHost.setDebugSkeleton(debugSkeleton)
     }
 
     AndroidView(
@@ -207,6 +216,11 @@ fun CompanionLive2dStage(
                                 lastPushedMouth = m
                                 lastMouthPushMs = SystemClock.uptimeMillis()
                                 pushMouth(wv, m)
+                                // Restore user joint names before/with skeleton debug.
+                                val labels = CompanionStore(appContext).jointLabelsJson
+                                if (labels.isNotBlank()) {
+                                    CompanionStageHost.setJointLabels(labels)
+                                }
                                 onReadyLatest.value()
                             }
                         },
@@ -222,6 +236,10 @@ fun CompanionLive2dStage(
                                     lastPushedMouth = m
                                     lastMouthPushMs = SystemClock.uptimeMillis()
                                     pushMouth(wv, m)
+                                    val labels = CompanionStore(appContext).jointLabelsJson
+                                    if (labels.isNotBlank()) {
+                                        CompanionStageHost.setJointLabels(labels)
+                                    }
                                 }
                                 onModelLoadedLatest.value(detail)
                             }
@@ -235,6 +253,9 @@ fun CompanionLive2dStage(
                         },
                         onAvatarTapped = {
                             mainHandler.post { onAvatarTappedLatest.value() }
+                        },
+                        onJointPicked = { json ->
+                            mainHandler.post { onJointPickedLatest.value(json) }
                         },
                         resolveBundledPath = { bundledVrmPathLatest.value },
                     ),
@@ -325,7 +346,7 @@ fun CompanionLive2dStage(
 private const val TAG = "CompanionVrm"
 // Version bump forces a fresh document after Live2D → VRM migrations.
 private const val ASSET_URL =
-    "file:///android_asset/companion/index.html?stage=vrm7&v=212"
+    "file:///android_asset/companion/index.html?stage=vrm7&v=222"
 
 /**
  * Host bridge for the offline VRM stage.
@@ -340,6 +361,7 @@ private class CompanionJsBridge(
     private val onModelLoaded: (String) -> Unit,
     private val onError: (String) -> Unit,
     private val onAvatarTapped: () -> Unit,
+    private val onJointPicked: (JSONObject) -> Unit,
     private val resolveBundledPath: () -> String?,
 ) {
     private val lock = Any()
@@ -365,6 +387,49 @@ private class CompanionJsBridge(
     @JavascriptInterface
     fun onAvatarTapped() {
         onAvatarTapped.invoke()
+    }
+
+    /**
+     * Stage tapped a debug joint/controller. Payload:
+     * `{id,name,default_name,custom,local,world}`
+     */
+    @JavascriptInterface
+    fun onJointPicked(json: String?) {
+        val raw = json?.trim().orEmpty()
+        if (raw.isEmpty() || raw.length > 4_000) return
+        val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return
+        onJointPicked.invoke(obj)
+    }
+
+    /**
+     * Stage → AI debug overlay. Used for joint motion / pick samples so
+     * coords can be copied from the phone UI.
+     */
+    @JavascriptInterface
+    fun onDebugLog(kind: String?, summary: String?, detail: String?) {
+        val k = kind?.trim().orEmpty().ifBlank { "stage" }.take(32)
+        val s = summary?.trim().orEmpty().take(240)
+        if (s.isEmpty()) return
+        val d = detail?.trim().orEmpty().take(8_000)
+        CompanionDebugLog.append(CompanionDebugLog.Dir.Sys, k, s, d)
+    }
+
+    /** Persist custom joint labels JSON object from the stage. */
+    @JavascriptInterface
+    fun saveJointLabels(json: String?) {
+        val raw = json?.trim().orEmpty()
+        if (raw.length > 8_000) return
+        runCatching {
+            // Accept only object-shaped JSON.
+            if (raw.isNotEmpty() && !raw.startsWith("{")) return@runCatching
+            CompanionStore(ctx).jointLabelsJson = raw
+        }
+    }
+
+    /** Sync read of saved joint labels for stage boot / debug rebuild. */
+    @JavascriptInterface
+    fun getJointLabels(): String {
+        return runCatching { CompanionStore(ctx).jointLabelsJson }.getOrDefault("")
     }
 
     /** Persist last camera/orbit framing (called from OrbitControls end). */
