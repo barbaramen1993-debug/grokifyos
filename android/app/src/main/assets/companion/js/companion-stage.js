@@ -11,11 +11,19 @@
  *  2) Joint-XYZ templates / scripted gestures — wrist IK rebuilt per avatar
  *  3) Soft hang idle + spring VR controllers
  *
+ * Self-collision: hips-local sphere/capsule/ellipsoid proxies (torso, clothes
+ * bulk, head, shoulders) push wrists + elbows out so arms do not tunnel through
+ * the body mesh. Debug skeleton mode draws these as wireframe meshes.
+ *
  * Android WebView cannot reliably fetch() file:// VRMs ("Failed to fetch").
  * Bytes are streamed from Kotlin via openVrm/readVrmBase64, then GLTFLoader.parse.
  * VRMA uses path alias anim:<id> through the same bridge.
  *
  * Canvas gestures are orbit only (rotate / pan / pinch-zoom). Chat & voice stay on host UI buttons.
+ * Touch stick + jump (see #game-pad) drive real-time third-person locomotion via CompanionStage.control.
+ *
+ * Universal control hook: any loaded VRM is registerActor()'d and can be possess()'d.
+ * Locomotion is root transform + humanoid bone walk cycle — not mesh-specific — so custom VRMs work.
  *
  * Vendored libs: window.CompanionVrmLibs = {
  *   THREE, GLTFLoader, OrbitControls, VRMLoaderPlugin, VRMUtils, VRMExpressionPresetName,
@@ -125,11 +133,24 @@
     // Live shoulder anchors (hips-local), filled on load from bind bones.
     shoulderLeft: { x: -0.16, y: 1.22, z: 0 },
     shoulderRight: { x: 0.16, y: 1.22, z: 0 },
-    // Soft ragdoll: hands fall under gravity, spring home when free.
-    gravity: 7.2,
-    spring: 9.5,
-    damp: 5.2,
+    // Soft ragdoll: hands ease home when free (low spring = no snap).
+    // Keep spring low — high values read as a hard reset after gestures.
+    gravity: 2.2,
+    spring: 2.15,
+    damp: 5.4,
+    /** Until this idleTime, use extra-soft return spring (post-gesture / VRMA). */
+    settleUntil: 0,
   };
+  /**
+   * Walk-cycle desired wrists (hips-local). Physics springs toward
+   * rest ↔ these, blended by gaitWeight — never hard-swap bone ownership.
+   */
+  var walkWrist = {
+    left: null,
+    right: null,
+  };
+  /** Last chosen elbow bend sign (+1 / −1) for IK temporal continuity. */
+  var ikElbowSign = { left: 0, right: 0 };
   /** After VRM install, remeasure hangs once world matrices settle. */
   var restRecalibLeft = 0;
   /** Active scripted gesture (null when idle VR physics owns hands). */
@@ -149,12 +170,71 @@
   var floorMesh = null;
   var floorRing = null;
   /**
+   * In-app Companion World (godot/companion-world maps shipped in APK assets).
+   * Replaces the default disc floor with loadable maps + colliders.
+   */
+  var worldMapRoot = null;
+  var worldColliders = [];
+  var currentMapId = "stage";
+  var worldMapGen = 0;
+  /**
+   * Universal controllable actors (any VRM humanoid).
+   * Companion ships as id "companion"; a future player body is another registerActor + possess.
+   * Root motion lives on each actor's root Group; bones stay hips-local for IK/VRMA.
+   */
+  var actors = {};
+  var possessedId = null;
+  /** Real-time third-person locomotion (shared physics; applied to possessed actor root). */
+  var loco = {
+    enabled: true,
+    inputX: 0,
+    inputZ: 0,
+    jumpEdge: false,
+    jumpHeld: false,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    yaw: 0,
+    yawVel: 0,
+    grounded: true,
+    walkPhase: 0,
+    airTime: 0,
+    /**
+     * 0..1 continuous gait blend. Ramps up when walking/jumping and eases down
+     * so idle never hard-snaps from the walk cycle (the old "glitch to hang").
+     */
+    gaitWeight: 0,
+    moveSpeed: 2.35,
+    accel: 16,
+    friction: 12,
+    jumpSpeed: 4.6,
+    gravity: 16.5,
+    worldHalf: 9,
+    camFollow: true,
+    /** Last orbit-target used for camera-relative stick basis. */
+    _prevTx: 0,
+    _prevTy: 0,
+    _prevTz: 0,
+    _hasPrevTarget: false,
+  };
+  /**
    * Per-arm two-bone IK meta (bind quats, bone axes, lengths).
    * Arms are ragdolled: free hand points spring under gravity; bones IK to wrists.
    */
   var armMeta = { left: null, right: null };
   /** Reused THREE scratch for IK (allocated lazily). */
   var ikScratch = null;
+  /**
+   * Self-collision: hips-local body proxies (spheres + capsules) so wrists/elbows
+   * do not sink through the torso, head, or clothing bulk. Rebuilt on calibrate.
+   * Not true skinned-mesh collision (too heavy for mobile WebView) — wireframe
+   * proxies approximate the body + clothes envelope for IK avoidance.
+   */
+  var bodyCollisionOn = true;
+  /** @type {Array<{type:string,name:string,r?:number,x?:number,y?:number,z?:number,ax?:number,ay?:number,az?:number,bx?:number,by?:number,bz?:number,rx?:number,ry?:number,rz?:number}>|null} */
+  var bodyColliders = null;
+  /** Debug wire meshes for body colliders (child of debugGizmoRoot). */
+  var debugColliderRoot = null;
   /** Debug: SkeletonHelper + joint spheres + VR controller markers. */
   var debugSkeletonOn = false;
   var skeletonHelper = null;
@@ -480,6 +560,7 @@
     }
     debugJointMeshes = null;
     debugCtrlMeshes = null;
+    debugColliderRoot = null;
     disposeJointLabelDom();
     if (debugHudEl) {
       try {
@@ -487,6 +568,170 @@
         debugHudEl.textContent = "";
       } catch (_) {}
     }
+  }
+
+  /**
+   * Wireframe body/clothes collision proxies (debug skeleton mode).
+   * Parent under debugGizmoRoot; positions updated each frame in hips space.
+   */
+  function rebuildDebugColliders() {
+    if (!debugSkeletonOn || !debugGizmoRoot) {
+      debugColliderRoot = null;
+      return;
+    }
+    var L = getLibs();
+    if (!L || !L.THREE) return;
+    var THREE = L.THREE;
+
+    // Remove previous collider wire group if present.
+    if (debugColliderRoot) {
+      try {
+        debugGizmoRoot.remove(debugColliderRoot);
+        debugColliderRoot.traverse(function (obj) {
+          if (obj.geometry) {
+            try {
+              obj.geometry.dispose();
+            } catch (_) {}
+          }
+          if (obj.material) {
+            try {
+              if (Array.isArray(obj.material)) {
+                obj.material.forEach(function (m) {
+                  m.dispose();
+                });
+              } else {
+                obj.material.dispose();
+              }
+            } catch (_) {}
+          }
+        });
+      } catch (_) {}
+      debugColliderRoot = null;
+    }
+    if (!bodyColliders || !bodyColliders.length) return;
+
+    debugColliderRoot = new THREE.Group();
+    debugColliderRoot.name = "companion-body-colliders";
+    debugColliderRoot.renderOrder = 998;
+
+    var wireMat = new THREE.MeshBasicMaterial({
+      color: 0xff9f43,
+      wireframe: true,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+      opacity: 0.55,
+    });
+    var clothesMat = new THREE.MeshBasicMaterial({
+      color: 0xa78bfa,
+      wireframe: true,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+      opacity: 0.4,
+    });
+
+    for (var i = 0; i < bodyColliders.length; i++) {
+      var c = bodyColliders[i];
+      if (!c) continue;
+      try {
+        var mesh = null;
+        var mat = c.name === "clothes" ? clothesMat : wireMat;
+        if (c.type === "sphere") {
+          mesh = new THREE.Mesh(
+            new THREE.SphereGeometry(c.r || 0.08, 10, 8),
+            mat
+          );
+          mesh.userData.colliderIndex = i;
+          mesh.userData.colliderType = "sphere";
+        } else if (c.type === "ellipsoid") {
+          mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10), mat);
+          mesh.scale.set(c.rx || 0.1, c.ry || 0.1, c.rz || 0.1);
+          mesh.userData.colliderIndex = i;
+          mesh.userData.colliderType = "ellipsoid";
+        } else if (c.type === "capsule") {
+          var dx = (c.bx || 0) - (c.ax || 0);
+          var dy = (c.by || 0) - (c.ay || 0);
+          var dz = (c.bz || 0) - (c.az || 0);
+          var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          var r = c.r || 0.1;
+          // Cylinder body + end caps (CapsuleGeometry may exist in three 0.170).
+          if (typeof THREE.CapsuleGeometry === "function") {
+            mesh = new THREE.Mesh(
+              new THREE.CapsuleGeometry(r, Math.max(0.001, len), 4, 8),
+              mat
+            );
+          } else {
+            mesh = new THREE.Mesh(
+              new THREE.CylinderGeometry(r, r, Math.max(0.001, len), 8, 1, true),
+              mat
+            );
+          }
+          mesh.userData.colliderIndex = i;
+          mesh.userData.colliderType = "capsule";
+          mesh.userData.capLen = len;
+        }
+        if (mesh) {
+          mesh.name = "body-col-" + (c.name || i);
+          mesh.userData.pickable = false;
+          mesh.renderOrder = 998;
+          debugColliderRoot.add(mesh);
+        }
+      } catch (_) {}
+    }
+    debugGizmoRoot.add(debugColliderRoot);
+    updateDebugColliderTransforms();
+  }
+
+  /** Place collider wire meshes at current hips-local proxies (world). */
+  function updateDebugColliderTransforms() {
+    if (!debugColliderRoot || !bodyColliders || !bodyColliders.length) return;
+    var L = getLibs();
+    if (!L || !L.THREE || !restBones || !restBones.hips) return;
+    var THREE = L.THREE;
+    var tmp = new THREE.Vector3();
+    var tmpB = new THREE.Vector3();
+    var up = new THREE.Vector3(0, 1, 0);
+    var dir = new THREE.Vector3();
+    var quat = new THREE.Quaternion();
+    try {
+      restBones.hips.updateWorldMatrix(true, false);
+    } catch (_) {}
+
+    debugColliderRoot.children.forEach(function (mesh) {
+      var idx = mesh.userData.colliderIndex;
+      var c = bodyColliders[idx];
+      if (!c) {
+        mesh.visible = false;
+        return;
+      }
+      mesh.visible = true;
+      try {
+        if (c.type === "sphere" || c.type === "ellipsoid") {
+          tmp.set(c.x || 0, c.y || 0, c.z || 0);
+          tmp.applyMatrix4(restBones.hips.matrixWorld);
+          mesh.position.copy(tmp);
+          mesh.quaternion.identity();
+          if (c.type === "ellipsoid") {
+            mesh.scale.set(c.rx || 0.1, c.ry || 0.1, c.rz || 0.1);
+          }
+        } else if (c.type === "capsule") {
+          tmp.set(c.ax || 0, c.ay || 0, c.az || 0);
+          tmpB.set(c.bx || 0, c.by || 0, c.bz || 0);
+          tmp.applyMatrix4(restBones.hips.matrixWorld);
+          tmpB.applyMatrix4(restBones.hips.matrixWorld);
+          mesh.position.copy(tmp).add(tmpB).multiplyScalar(0.5);
+          dir.copy(tmpB).sub(tmp);
+          if (dir.lengthSq() > 1e-10) {
+            dir.normalize();
+            quat.setFromUnitVectors(up, dir);
+            mesh.quaternion.copy(quat);
+          }
+        }
+      } catch (_) {
+        mesh.visible = false;
+      }
+    });
   }
 
   function ensureDebugHud() {
@@ -647,6 +892,11 @@
     } catch (_) {}
 
     scene.add(debugGizmoRoot);
+    // Body / clothes collision wire proxies (if colliders already measured).
+    try {
+      if (!bodyColliders || !bodyColliders.length) rebuildBodyColliders();
+      else rebuildDebugColliders();
+    } catch (_) {}
     ensureDebugHud();
     if (debugHudEl) {
       debugHudEl.style.display = "block";
@@ -978,6 +1228,10 @@
       }
     }
 
+    try {
+      updateDebugColliderTransforms();
+    } catch (_) {}
+
     if (debugCtrlMeshes && vr) {
       hipsLocalToWorld(vr.left, tmp);
       if (debugCtrlMeshes.left) {
@@ -1189,9 +1443,17 @@
       destroyVrmaState();
     } catch (_) {}
     vrm = null;
+    // Keep actor registry entry / world pose; clear VRM handle until reload.
+    if (actors.companion) {
+      actors.companion.vrm = null;
+    }
     restBones = null;
     armMeta.left = null;
     armMeta.right = null;
+    ikElbowSign.left = 0;
+    ikElbowSign.right = 0;
+    walkWrist.left = null;
+    walkWrist.right = null;
     statePose = null;
     statePoseTarget = null;
     poseVariant = 0;
@@ -1229,6 +1491,8 @@
       neck: bone("neck"),
       head: bone("head"),
       jaw: bone("jaw"),
+      leftShoulder: bone("leftShoulder"),
+      rightShoulder: bone("rightShoulder"),
       leftUpperArm: bone("leftUpperArm"),
       rightUpperArm: bone("rightUpperArm"),
       leftLowerArm: bone("leftLowerArm"),
@@ -1239,6 +1503,8 @@
       rightUpperLeg: bone("rightUpperLeg"),
       leftLowerLeg: bone("leftLowerLeg"),
       rightLowerLeg: bone("rightLowerLeg"),
+      leftFoot: bone("leftFoot"),
+      rightFoot: bone("rightFoot"),
     };
 
     // Bind quaternions (T-pose / author rest) — raised-arm IK starts from these.
@@ -1262,6 +1528,11 @@
 
     // Per-avatar hang deltas (which local axis drops the hand) + apply.
     restBones.hangDeltas = solveHangDeltas();
+    // Knee/elbow hinge + swing axes so walk/idle never hyperextend on any VRM.
+    restBones.hinge = solveLimbHinges();
+    // Idle hang elbows/knees must use the same flex direction as walk (fixes
+    // "idle elbows bend backwards" on custom VRMs that flex on −X).
+    rewriteHangDeltasWithHinges(restBones.hangDeltas, restBones.hinge);
     applySoftHangEulers();
 
     // Base eulers = soft hang (torso / idle fallback uses addEuler from these).
@@ -1271,7 +1542,8 @@
         k === "base" ||
         k === "bindQ" ||
         k === "bindEuler" ||
-        k === "hangDeltas"
+        k === "hangDeltas" ||
+        k === "hinge"
       ) {
         return;
       }
@@ -1289,6 +1561,10 @@
       if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
     } catch (_) {}
     calibrateVrRestsFromBones();
+    try {
+      seedElbowSignFromHang("left");
+      seedElbowSignFromHang("right");
+    } catch (_) {}
 
     statePose = emptyPose();
     statePoseTarget = emptyPose();
@@ -1445,6 +1721,363 @@
   }
 
   /**
+   * Default limb hinges (VRM-ish): knees flex with -X, elbows with +X, hips/arms
+   * swing on +X. solveLimbHinges() overwrites from live bone trials per avatar.
+   */
+  function defaultLimbHinges() {
+    return {
+      leftKnee: [-1, 0, 0],
+      rightKnee: [-1, 0, 0],
+      leftElbow: [1, 0, 0],
+      rightElbow: [1, 0, 0],
+      leftHip: [1, 0, 0],
+      rightHip: [1, 0, 0],
+      leftArm: [1, 0, 0],
+      rightArm: [1, 0, 0],
+    };
+  }
+
+  /**
+   * Probe which local euler axis+sign on a hinge bone moves the tip as intended.
+   * Used so procedural walk never bends knees/elbows backwards on odd skeletons.
+   *
+   * Elbow note: from a straight T-pose, +axis and −axis both shorten hand↔shoulder
+   * almost equally (symmetric isosceles). Pure distance is a coin-flip and was
+   * the root of "elbows bend backwards after walk→idle". Elbow scoring must
+   * break that symmetry (hand toward midline + elbow slightly behind).
+   */
+  function solveLimbHinges() {
+    var out = defaultLimbHinges();
+    if (!restBones || !restBones.bindEuler || !restBones.bindQ) return out;
+
+    function restoreNode(key) {
+      var n = restBones[key];
+      if (!n) return;
+      if (restBones.bindQ[key]) n.quaternion.copy(restBones.bindQ[key]);
+      else if (restBones.bindEuler[key]) {
+        var b = restBones.bindEuler[key];
+        setEuler(n, b.x, b.y, b.z);
+      }
+    }
+
+    function worldPos(node, target) {
+      if (!node) return null;
+      try {
+        node.updateWorldMatrix(true, false);
+        if (!target) target = new (getLibs().THREE.Vector3)();
+        node.getWorldPosition(target);
+        return target;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function trialHinge(hingeKey, tipKey, axis, sign, amount) {
+      restoreNode(hingeKey);
+      restoreNode(tipKey);
+      var hinge = restBones[hingeKey];
+      var b = restBones.bindEuler[hingeKey];
+      if (!hinge || !b) return null;
+      var dx = axis === 0 ? sign * amount : 0;
+      var dy = axis === 1 ? sign * amount : 0;
+      var dz = axis === 2 ? sign * amount : 0;
+      setEuler(hinge, b.x + dx, b.y + dy, b.z + dz);
+      try {
+        if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+      } catch (_) {}
+      return worldPos(restBones[tipKey]);
+    }
+
+    /**
+     * Knee: bend should raise the foot and pull it toward the hip (not hyperextend).
+     * Elbow: shorten hand↔shoulder AND hand toward midline AND elbow behind
+     * (hips −Z). Distance alone is ±symmetric on a straight T-pose arm.
+     */
+    function solveHinge(hingeKey, tipKey, anchorKey, mode) {
+      var tip0 = worldPos(restBones[tipKey]);
+      var anc0 = worldPos(restBones[anchorKey]);
+      if (!tip0 || !anc0) return null;
+      var best = null;
+      var axes = [0, 1, 2];
+      var signs = [1, -1];
+      var amount = mode === "elbow" ? 0.9 : 0.75;
+      var i, j, tip, score, dist0, dist, lift;
+      var THREE, inv, tipLocal0, tipLocal1, elbLocal0, elbLocal1, elb0, elb1;
+      dist0 = tip0.distanceTo(anc0);
+      try {
+        THREE = getLibs().THREE;
+        inv = new THREE.Matrix4().copy(restBones.hips.matrixWorld).invert();
+        tipLocal0 = tip0.clone().applyMatrix4(inv);
+        // Elbow joint ≈ lower-arm bone origin (hinge bone itself for arms).
+        elb0 = worldPos(restBones[hingeKey]);
+        elbLocal0 = elb0 ? elb0.clone().applyMatrix4(inv) : null;
+      } catch (_) {
+        inv = null;
+      }
+      for (i = 0; i < axes.length; i++) {
+        for (j = 0; j < signs.length; j++) {
+          tip = trialHinge(hingeKey, tipKey, axes[i], signs[j], amount);
+          if (!tip) continue;
+          dist = tip.distanceTo(anc0);
+          lift = tip.y - tip0.y;
+          if (mode === "knee") {
+            // Prefer shorter tip↔hip + foot lifts off floor slightly.
+            score = dist0 - dist + Math.max(0, lift) * 0.8 - Math.max(0, -lift) * 1.5;
+          } else {
+            // Elbow: break ± symmetry. Pure shorten is ~equal for both signs.
+            score = (dist0 - dist) * 1.2;
+            if (inv && THREE) {
+              tipLocal1 = tip.clone().applyMatrix4(inv);
+              // Hand moves toward body midline (T-pose hands are far out).
+              score += (Math.abs(tipLocal0.x) - Math.abs(tipLocal1.x)) * 2.2;
+              // Mild preference for hand dropping (natural flex from T).
+              score += (tipLocal0.y - tipLocal1.y) * 0.55;
+              // Mild preference for hand a bit more forward (+Z hips) when flexing.
+              score += (tipLocal1.z - tipLocal0.z) * 0.35;
+              elb1 = worldPos(restBones[hingeKey]);
+              if (elb1 && elbLocal0) {
+                elbLocal1 = elb1.clone().applyMatrix4(inv);
+                // Elbow goes slightly behind (−Z) — natural human arm, matches IK pole.
+                score += (elbLocal0.z - elbLocal1.z) * 1.6;
+                // Keep elbow from diving deep through the torso (prefer stay out).
+                score += (Math.abs(elbLocal1.x) - Math.abs(elbLocal0.x) * 0.4) * 0.25;
+              }
+            }
+          }
+          if (!best || score > best.score) {
+            best = {
+              score: score,
+              axis: axes[i],
+              sign: signs[j],
+            };
+          }
+        }
+      }
+      restoreNode(hingeKey);
+      restoreNode(tipKey);
+      if (!best || best.score < 0.01) return null;
+      var v = [0, 0, 0];
+      v[best.axis] = best.sign;
+      return v;
+    }
+
+    /**
+     * Swing: positive amount should move tip forward in hips space (+Z local after
+     * hips, or largest horizontal travel). Used for upper leg / upper arm gait.
+     */
+    function solveSwing(hingeKey, tipKey) {
+      var hips = restBones.hips;
+      if (!hips) return null;
+      var tip0 = worldPos(restBones[tipKey]);
+      if (!tip0) return null;
+      var best = null;
+      var amount = 0.55;
+      var axes = [0, 1, 2];
+      var signs = [1, -1];
+      var i, j, tip, score, inv, local0, local1, THREE;
+      try {
+        THREE = getLibs().THREE;
+        inv = new THREE.Matrix4().copy(hips.matrixWorld).invert();
+        local0 = tip0.clone().applyMatrix4(inv);
+      } catch (_) {
+        return null;
+      }
+      for (i = 0; i < axes.length; i++) {
+        for (j = 0; j < signs.length; j++) {
+          tip = trialHinge(hingeKey, tipKey, axes[i], signs[j], amount);
+          if (!tip) continue;
+          local1 = tip.clone().applyMatrix4(inv);
+          // Forward = +Z in hips-local for most VRMs; score max delta Z.
+          score = local1.z - local0.z;
+          // Arms hang at sides: also accept largest |horizontal| if Z weak.
+          if (Math.abs(score) < 0.02) {
+            score = Math.abs(local1.x - local0.x) + Math.abs(local1.z - local0.z);
+            // Prefer the sign that moves tip forward-ish (positive Z bias).
+            score = (local1.z - local0.z) * 2 + Math.abs(local1.x - local0.x) * 0.2;
+          }
+          if (!best || score > best.score) {
+            best = { score: score, axis: axes[i], sign: signs[j] };
+          }
+        }
+      }
+      restoreNode(hingeKey);
+      restoreNode(tipKey);
+      if (!best) return null;
+      var v = [0, 0, 0];
+      v[best.axis] = best.sign;
+      return v;
+    }
+
+    try {
+      var lk = solveHinge("leftLowerLeg", "leftFoot", "leftUpperLeg", "knee");
+      // tip may be leftFoot missing — fall back to lowerLeg child / measure via lowerLeg end
+      if (!lk) lk = solveHinge("leftLowerLeg", "leftLowerLeg", "leftUpperLeg", "knee");
+      var rk = solveHinge("rightLowerLeg", "rightFoot", "rightUpperLeg", "knee");
+      if (!rk) rk = solveHinge("rightLowerLeg", "rightLowerLeg", "rightUpperLeg", "knee");
+      var le = solveHinge("leftLowerArm", "leftHand", "leftUpperArm", "elbow");
+      var re = solveHinge("rightLowerArm", "rightHand", "rightUpperArm", "elbow");
+      var lh = solveSwing("leftUpperLeg", "leftLowerLeg");
+      var rh = solveSwing("rightUpperLeg", "rightLowerLeg");
+      var la = solveSwing("leftUpperArm", "leftHand");
+      var ra = solveSwing("rightUpperArm", "rightHand");
+      if (lk) out.leftKnee = lk;
+      if (rk) out.rightKnee = rk;
+      if (le) out.leftElbow = le;
+      if (re) out.rightElbow = re;
+      if (lh) out.leftHip = lh;
+      if (rh) out.rightHip = rh;
+      if (la) out.leftArm = la;
+      if (ra) out.rightArm = ra;
+      // Second pass: confirm elbow sign from a soft-hang upper arm (not T-pose).
+      // Walk→idle hands off to IK using the same hinge; wrong sign = backwards elbows.
+      try {
+        validateElbowHingeSign(out, "left");
+        validateElbowHingeSign(out, "right");
+      } catch (_) {}
+      try {
+        console.log(
+          "[CompanionStage] limb hinges",
+          "kneeL=" + out.leftKnee,
+          "kneeR=" + out.rightKnee,
+          "elbL=" + out.leftElbow,
+          "elbR=" + out.rightElbow
+        );
+      } catch (_) {}
+    } catch (e) {
+      try {
+        console.warn("[CompanionStage] limb hinge solve failed", (e && e.message) || e);
+      } catch (_) {}
+    }
+
+    // Restore full soft hang after probing from bind.
+    try {
+      applySoftHangEulers();
+    } catch (_) {}
+    return out;
+  }
+
+  /**
+   * From soft-hang upper arms, try both elbow signs and keep the one where the
+   * elbow joint sits more behind the shoulder→hand chord (natural, not hyper).
+   */
+  function validateElbowHingeSign(hinges, side) {
+    if (!hinges || !restBones || !restBones.bindEuler || !restBones.hangDeltas) return;
+    var isLeft = side === "left";
+    var upperKey = isLeft ? "leftUpperArm" : "rightUpperArm";
+    var lowerKey = isLeft ? "leftLowerArm" : "rightLowerArm";
+    var handKey = isLeft ? "leftHand" : "rightHand";
+    var elbowKey = isLeft ? "leftElbow" : "rightElbow";
+    var upper = restBones[upperKey];
+    var lower = restBones[lowerKey];
+    var hand = restBones[handKey];
+    var bU = restBones.bindEuler[upperKey];
+    var bL = restBones.bindEuler[lowerKey];
+    var bH = restBones.bindEuler[handKey];
+    var dU = restBones.hangDeltas[upperKey];
+    if (!upper || !lower || !hand || !bU || !bL || !dU) return;
+
+    var L = getLibs();
+    if (!L || !L.THREE || !restBones.hips) return;
+    var THREE = L.THREE;
+    var amount = 0.55;
+    var cur = hinges[elbowKey] || [1, 0, 0];
+
+    function scoreFlex(hingeVec) {
+      // Hang upper arm, flex lower along hingeVec from bind.
+      setEuler(upper, bU.x + dU[0], bU.y + dU[1], bU.z + dU[2]);
+      setEuler(
+        lower,
+        bL.x + (hingeVec[0] || 0) * amount,
+        bL.y + (hingeVec[1] || 0) * amount,
+        bL.z + (hingeVec[2] || 0) * amount
+      );
+      if (bH) setEuler(hand, bH.x, bH.y, bH.z);
+      try {
+        restBones.hips.updateWorldMatrix(true, true);
+      } catch (_) {
+        return -1e9;
+      }
+      var sh = new THREE.Vector3();
+      var el = new THREE.Vector3();
+      var hd = new THREE.Vector3();
+      try {
+        upper.getWorldPosition(sh);
+        lower.getWorldPosition(el);
+        hand.getWorldPosition(hd);
+      } catch (_) {
+        return -1e9;
+      }
+      var inv = new THREE.Matrix4().copy(restBones.hips.matrixWorld).invert();
+      var shL = sh.clone().applyMatrix4(inv);
+      var elL = el.clone().applyMatrix4(inv);
+      var hdL = hd.clone().applyMatrix4(inv);
+      // Chord mid; elbow should be behind (+back = lower Z in hips space).
+      var midZ = (shL.z + hdL.z) * 0.5;
+      var behind = midZ - elL.z;
+      // Prefer elbow slightly out from midline.
+      var elbowOut = isLeft ? shL.x - elL.x : elL.x - shL.x;
+      var reach = sh.distanceTo(hd);
+      return behind * 3.2 + Math.max(0, elbowOut) * 0.8 - reach * 0.15;
+    }
+
+    var flipped = [-(cur[0] || 0), -(cur[1] || 0), -(cur[2] || 0)];
+    var sCur = scoreFlex(cur);
+    var sFlip = scoreFlex(flipped);
+    if (sFlip > sCur + 0.02) {
+      hinges[elbowKey] = flipped;
+      try {
+        console.log(
+          "[CompanionStage] elbow hinge flipped for natural bend",
+          side,
+          flipped
+        );
+      } catch (_) {}
+    }
+    // Restore arm bind so later hang apply is clean.
+    if (restBones.bindQ[upperKey]) upper.quaternion.copy(restBones.bindQ[upperKey]);
+    if (restBones.bindQ[lowerKey]) lower.quaternion.copy(restBones.bindQ[lowerKey]);
+    if (restBones.bindQ[handKey]) hand.quaternion.copy(restBones.bindQ[handKey]);
+  }
+
+  /** Apply amount along a unit hinge vector onto a bone (from soft-hang base). */
+  function addHinge(node, key, hingeVec, amount) {
+    if (!hingeVec || !node) return;
+    addEuler(
+      node,
+      key,
+      (hingeVec[0] || 0) * amount,
+      (hingeVec[1] || 0) * amount,
+      (hingeVec[2] || 0) * amount
+    );
+  }
+
+  /**
+   * After hinge probes, rewrite lower-arm / lower-leg hang deltas so idle soft
+   * hang flexes the same way as walk (never bends elbows/knees "backwards").
+   */
+  function rewriteHangDeltasWithHinges(deltas, H) {
+    if (!deltas || !H) return;
+    function along(hinge, amount, yBias, zBias) {
+      if (!hinge) return null;
+      return [
+        (hinge[0] || 0) * amount,
+        (hinge[1] || 0) * amount + (yBias || 0),
+        (hinge[2] || 0) * amount + (zBias || 0),
+      ];
+    }
+    // ~22° natural elbow hang flex along probed axis.
+    var le = along(H.leftElbow, 0.38, 0.03, 0.04);
+    var re = along(H.rightElbow, 0.38, -0.03, -0.04);
+    if (le) deltas.leftLowerArm = le;
+    if (re) deltas.rightLowerArm = re;
+    // Soft knee micro-flex (idle weight) — same flex direction as plant.
+    var lk = along(H.leftKnee, 0.07, 0, 0);
+    var rk = along(H.rightKnee, 0.055, 0, 0);
+    if (lk) deltas.leftLowerLeg = lk;
+    if (rk) deltas.rightLowerLeg = rk;
+  }
+
+  /**
    * Apply soft hang from restBones.hangDeltas (or defaults) onto bind eulers.
    */
   function applySoftHangEulers(hangFn) {
@@ -1475,7 +2108,8 @@
         k === "base" ||
         k === "bindQ" ||
         k === "bindEuler" ||
-        k === "hangDeltas"
+        k === "hangDeltas" ||
+        k === "hinge"
       ) {
         return;
       }
@@ -1491,7 +2125,8 @@
 
   /**
    * Force avatar back to measured soft hang (after VRMA / reset).
-   * Stops mixer influence, reapplies hang eulers, snaps VR wrists home.
+   * Stops mixer influence, reapplies hang eulers. Wrists ease home via spring
+   * unless opts.snapHands (hard reset) — avoids the idle "glitch pop".
    */
   function restoreHangPose(opts) {
     opts = opts || {};
@@ -1504,14 +2139,25 @@
     } catch (_) {}
     if (!restBones || !restBones.bindEuler) return;
     try {
+      // Capture live wrists BEFORE hang eulers overwrite bones (VRMA end pose).
+      if (!opts.snapHands) {
+        try {
+          sampleWristsFromBones();
+        } catch (_) {}
+      }
+      // Keep hinge-aware elbow/knee flex on every hang restore.
+      if (restBones.hinge && restBones.hangDeltas) {
+        rewriteHangDeltasWithHinges(restBones.hangDeltas, restBones.hinge);
+      }
       applySoftHangEulers();
       if (opts.recaptureBase) captureBaseFromBones();
       if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
       if (opts.recalibrate !== false) {
-        // Shoulders from current hang; wrists geometric if still high.
-        calibrateVrRestsFromBones();
-      } else {
-        // Snap free controllers to existing rest without remeasure.
+        // Shoulders from current hang; never teleport free wrists on soft restore.
+        calibrateVrRestsFromBones({ preserveHands: !opts.snapHands });
+      }
+      // Ease free hands toward rest — never teleport (snapHands opt-in only).
+      if (opts.snapHands) {
         if (!vr.left.locked) {
           vr.left.x = vr.restLeft.x;
           vr.left.y = vr.restLeft.y;
@@ -1523,6 +2169,19 @@
           vr.right.y = vr.restRight.y;
           vr.right.z = vr.restRight.z;
           vr.right.vx = vr.right.vy = vr.right.vz = 0;
+        }
+      } else {
+        // Soft settle window: extra-low spring until hands drift home.
+        vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.55);
+        if (!vr.left.locked) {
+          vr.left.vx *= 0.4;
+          vr.left.vy *= 0.4;
+          vr.left.vz *= 0.4;
+        }
+        if (!vr.right.locked) {
+          vr.right.vx *= 0.4;
+          vr.right.vy *= 0.4;
+          vr.right.vz *= 0.4;
         }
       }
     } catch (_) {}
@@ -1547,10 +2206,12 @@
     ikScratch = {
       shoulder: new T.Vector3(),
       elbow: new T.Vector3(),
+      elbowAlt: new T.Vector3(),
       target: new T.Vector3(),
       toTarget: new T.Vector3(),
       forward: new T.Vector3(),
       bend: new T.Vector3(),
+      bendAlt: new T.Vector3(),
       pole: new T.Vector3(),
       side: new T.Vector3(),
       axis: new T.Vector3(),
@@ -1558,6 +2219,7 @@
       q: new T.Quaternion(),
       qParent: new T.Quaternion(),
       qInv: new T.Quaternion(),
+      invHips: new T.Matrix4(),
     };
     return ikScratch;
   }
@@ -1708,14 +2370,378 @@
   }
 
   /**
+   * Measure hips-local sphere/capsule proxies for torso, head, hips, and shoulder
+   * bulk (clothes envelope). Cheap — safe to call every frame before arm IK.
+   */
+  function measureBodyColliders() {
+    bodyColliders = [];
+    var lSh = vr.shoulderLeft || { x: -0.16, y: 1.22, z: 0 };
+    var rSh = vr.shoulderRight || { x: 0.16, y: 1.22, z: 0 };
+    // Prefer live shoulder samples when available (breath/sway).
+    var liveL = hipsLocalOf(restBones && restBones.leftUpperArm);
+    var liveR = hipsLocalOf(restBones && restBones.rightUpperArm);
+    if (liveL) lSh = liveL;
+    if (liveR) rSh = liveR;
+    var head =
+      hipsLocalOf(restBones && restBones.head) ||
+      vr.restHead || { x: 0, y: 1.45, z: 0.05 };
+    var hips =
+      hipsLocalOf(restBones && restBones.hips) || { x: 0, y: 0, z: 0 };
+    var chest =
+      hipsLocalOf(restBones && (restBones.upperChest || restBones.chest)) || {
+        x: 0,
+        y: (lSh.y + rSh.y) * 0.5 - 0.08,
+        z: 0,
+      };
+    var midChest =
+      hipsLocalOf(restBones && restBones.chest) || {
+        x: (chest.x + hips.x) * 0.5,
+        y: (chest.y + hips.y) * 0.55,
+        z: (chest.z + hips.z) * 0.5,
+      };
+    var neck =
+      hipsLocalOf(restBones && restBones.neck) || {
+        x: head.x,
+        y: (head.y + chest.y) * 0.5,
+        z: head.z,
+      };
+
+    var shoulderSpan = Math.hypot(rSh.x - lSh.x, rSh.z - lSh.z) || 0.32;
+    var halfW = shoulderSpan * 0.5;
+    // Clothes pad: inflate torso so arms avoid mesh bulk, not just skeleton.
+    var cloth = 1.14;
+    var torsoR = Math.max(0.1, halfW * 0.52 * cloth);
+    var hipR = Math.max(0.11, halfW * 0.48 * cloth);
+    var chestR = Math.max(0.1, halfW * 0.5 * cloth);
+    var headR = Math.max(0.1, halfW * 0.42);
+    var shoulderR = Math.max(0.06, halfW * 0.28);
+
+    // Pelvis / hip bulk
+    bodyColliders.push({
+      type: "sphere",
+      name: "hips",
+      x: hips.x,
+      y: hips.y + hipR * 0.15,
+      z: hips.z,
+      r: hipR,
+    });
+    // Main torso capsule hips → upper chest (primary body + clothing wire)
+    bodyColliders.push({
+      type: "capsule",
+      name: "torso",
+      ax: hips.x,
+      ay: hips.y + hipR * 0.35,
+      az: hips.z,
+      bx: chest.x,
+      by: chest.y,
+      bz: chest.z,
+      r: torsoR,
+    });
+    // Front/back clothing ellipsoid (slightly deeper on Z for coats/shirts)
+    bodyColliders.push({
+      type: "ellipsoid",
+      name: "clothes",
+      x: midChest.x,
+      y: midChest.y,
+      z: midChest.z + torsoR * 0.05,
+      rx: torsoR * 0.95,
+      ry: Math.max(0.14, (chest.y - hips.y) * 0.42),
+      rz: torsoR * 1.12,
+    });
+    bodyColliders.push({
+      type: "sphere",
+      name: "chest",
+      x: chest.x,
+      y: chest.y,
+      z: chest.z,
+      r: chestR,
+    });
+    bodyColliders.push({
+      type: "sphere",
+      name: "neck",
+      x: neck.x,
+      y: neck.y,
+      z: neck.z,
+      r: headR * 0.55,
+    });
+    bodyColliders.push({
+      type: "sphere",
+      name: "head",
+      x: head.x,
+      y: head.y,
+      z: head.z,
+      r: headR,
+    });
+    // Shoulder caps — keep upper arms from clipping into clavicle/clothes
+    bodyColliders.push({
+      type: "sphere",
+      name: "shoulderL",
+      x: lSh.x * 0.72,
+      y: lSh.y - shoulderR * 0.15,
+      z: lSh.z,
+      r: shoulderR,
+    });
+    bodyColliders.push({
+      type: "sphere",
+      name: "shoulderR",
+      x: rSh.x * 0.72,
+      y: rSh.y - shoulderR * 0.15,
+      z: rSh.z,
+      r: shoulderR,
+    });
+  }
+
+  /** Full rebuild: measure proxies + refresh debug wire meshes if skeleton debug is on. */
+  function rebuildBodyColliders() {
+    measureBodyColliders();
+    if (debugSkeletonOn) {
+      try {
+        rebuildDebugColliders();
+      } catch (_) {}
+    }
+  }
+
+  /** Push a hips-local point out of one sphere collider. */
+  function resolveSphereCollider(px, py, pz, cx, cy, cz, r) {
+    if (!(r > 0)) return { x: px, y: py, z: pz, hit: false };
+    var dx = px - cx;
+    var dy = py - cy;
+    var dz = pz - cz;
+    var d2 = dx * dx + dy * dy + dz * dz;
+    var r2 = r * r;
+    if (d2 >= r2) return { x: px, y: py, z: pz, hit: false };
+    if (d2 < 1e-12) {
+      // Degenerate: push outward along +X (or body side preference later).
+      return { x: cx + r, y: cy, z: cz, hit: true };
+    }
+    var d = Math.sqrt(d2);
+    var s = r / d;
+    return { x: cx + dx * s, y: cy + dy * s, z: cz + dz * s, hit: true };
+  }
+
+  /** Capsule = sphere swept along segment a→b. */
+  function resolveCapsuleCollider(px, py, pz, ax, ay, az, bx, by, bz, r) {
+    var abx = bx - ax;
+    var aby = by - ay;
+    var abz = bz - az;
+    var apx = px - ax;
+    var apy = py - ay;
+    var apz = pz - az;
+    var ab2 = abx * abx + aby * aby + abz * abz;
+    var t = ab2 > 1e-12 ? (apx * abx + apy * aby + apz * abz) / ab2 : 0;
+    t = clamp(t, 0, 1);
+    return resolveSphereCollider(
+      px,
+      py,
+      pz,
+      ax + abx * t,
+      ay + aby * t,
+      az + abz * t,
+      r
+    );
+  }
+
+  /** Axis-aligned ellipsoid (good clothes bulk without full mesh). */
+  function resolveEllipsoidCollider(px, py, pz, cx, cy, cz, rx, ry, rz) {
+    if (!(rx > 1e-6) || !(ry > 1e-6) || !(rz > 1e-6)) {
+      return { x: px, y: py, z: pz, hit: false };
+    }
+    var dx = (px - cx) / rx;
+    var dy = (py - cy) / ry;
+    var dz = (pz - cz) / rz;
+    var d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 >= 1 || d2 < 1e-12) {
+      if (d2 >= 1) return { x: px, y: py, z: pz, hit: false };
+      return { x: cx + rx, y: cy, z: cz, hit: true };
+    }
+    var d = Math.sqrt(d2);
+    var s = 1 / d;
+    return {
+      x: cx + dx * s * rx,
+      y: cy + dy * s * ry,
+      z: cz + dz * s * rz,
+      hit: true,
+    };
+  }
+
+  /**
+   * Resolve a hips-local point against all body colliders.
+   * @param pad extra radius (m) — wrists get a bit more than elbows
+   * @param preferSide "left"|"right"|null — bias push direction for near-center hits
+   */
+  function resolvePointAgainstBody(px, py, pz, pad, preferSide) {
+    if (!bodyCollisionOn) return { x: px, y: py, z: pz };
+    if (!bodyColliders || !bodyColliders.length) return { x: px, y: py, z: pz };
+    pad = typeof pad === "number" ? pad : 0.02;
+    var x = px;
+    var y = py;
+    var z = pz;
+    // Iterate a few times so stacked colliders settle.
+    for (var pass = 0; pass < 3; pass++) {
+      var any = false;
+      for (var i = 0; i < bodyColliders.length; i++) {
+        var c = bodyColliders[i];
+        if (!c) continue;
+        var out = null;
+        if (c.type === "sphere") {
+          out = resolveSphereCollider(x, y, z, c.x, c.y, c.z, (c.r || 0) + pad);
+        } else if (c.type === "capsule") {
+          out = resolveCapsuleCollider(
+            x,
+            y,
+            z,
+            c.ax,
+            c.ay,
+            c.az,
+            c.bx,
+            c.by,
+            c.bz,
+            (c.r || 0) + pad
+          );
+        } else if (c.type === "ellipsoid") {
+          out = resolveEllipsoidCollider(
+            x,
+            y,
+            z,
+            c.x,
+            c.y,
+            c.z,
+            (c.rx || 0) + pad,
+            (c.ry || 0) + pad,
+            (c.rz || 0) + pad
+          );
+        }
+        if (out && out.hit) {
+          // If still near center, bias outward for the owning arm.
+          if (preferSide && Math.abs(out.x) < 0.02) {
+            out.x += preferSide === "left" ? -0.03 : 0.03;
+          }
+          x = out.x;
+          y = out.y;
+          z = out.z;
+          any = true;
+        }
+      }
+      if (!any) break;
+    }
+    return { x: x, y: y, z: z };
+  }
+
+  /** Soft separation so L/R wrists do not occupy the same point. */
+  function separateHands(minDist) {
+    if (!vr || !vr.left || !vr.right) return;
+    minDist = typeof minDist === "number" ? minDist : 0.07;
+    var dx = vr.right.x - vr.left.x;
+    var dy = vr.right.y - vr.left.y;
+    var dz = vr.right.z - vr.left.z;
+    var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (d >= minDist || d < 1e-8) {
+      if (d < 1e-8) {
+        vr.left.x -= minDist * 0.5;
+        vr.right.x += minDist * 0.5;
+      }
+      return;
+    }
+    var push = (minDist - d) * 0.5;
+    var inv = 1 / d;
+    var nx = dx * inv;
+    var ny = dy * inv;
+    var nz = dz * inv;
+    // Locked hands move less so held poses stay stable.
+    var wL = vr.left.locked ? 0.25 : 0.5;
+    var wR = vr.right.locked ? 0.25 : 0.5;
+    var sum = wL + wR || 1;
+    wL /= sum;
+    wR /= sum;
+    vr.left.x -= nx * push * wL * 2;
+    vr.left.y -= ny * push * wL * 2;
+    vr.left.z -= nz * push * wL * 2;
+    vr.right.x += nx * push * wR * 2;
+    vr.right.y += ny * push * wR * 2;
+    vr.right.z += nz * push * wR * 2;
+  }
+
+  /**
+   * Clamp + body avoid for a wrist target (hips-local).
+   * Call after any tool/physics write to the controller.
+   */
+  function sanitizeWristTarget(side, x, y, z, locked) {
+    var c = clampToArmReach(side, x, y, z, locked ? 0.88 : 0.95);
+    // Locked poses (think near face) use thinner pad so intentional near-body holds work.
+    var pad = locked ? 0.012 : 0.028;
+    var r = resolvePointAgainstBody(c.x, c.y, c.z, pad, side);
+    // Re-clamp after push so we stay in workspace.
+    return clampToArmReach(side, r.x, r.y, r.z, locked ? 0.88 : 0.95);
+  }
+
+  /** Apply body avoidance to both free/locked wrists + hand-hand separation. */
+  function applyBodyCollisionToHands() {
+    if (!bodyCollisionOn || !vr) return;
+    if (!bodyColliders || !bodyColliders.length) return;
+    var L = sanitizeWristTarget("left", vr.left.x, vr.left.y, vr.left.z, vr.left.locked);
+    var R = sanitizeWristTarget(
+      "right",
+      vr.right.x,
+      vr.right.y,
+      vr.right.z,
+      vr.right.locked
+    );
+    vr.left.x = L.x;
+    vr.left.y = L.y;
+    vr.left.z = L.z;
+    vr.right.x = R.x;
+    vr.right.y = R.y;
+    vr.right.z = R.z;
+    separateHands(Math.max(0.06, Math.min(armReachLen("left"), armReachLen("right")) * 0.12));
+  }
+
+  /**
+   * Copy live hand bone positions into VR wrist controllers (hips-local).
+   * Used when leaving VRMA / scripted poses so the spring starts from the
+   * current pose instead of teleporting to rest.
+   */
+  function sampleWristsFromBones() {
+    if (!restBones) return;
+    try {
+      if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+    } catch (_) {}
+    var l = hipsLocalOf(restBones.leftHand);
+    var r = hipsLocalOf(restBones.rightHand);
+    if (l && typeof l.x === "number") {
+      vr.left.x = l.x;
+      vr.left.y = l.y;
+      vr.left.z = l.z;
+      if (!vr.left.locked) {
+        vr.left.vx *= 0.15;
+        vr.left.vy *= 0.15;
+        vr.left.vz *= 0.15;
+      }
+    }
+    if (r && typeof r.x === "number") {
+      vr.right.x = r.x;
+      vr.right.y = r.y;
+      vr.right.z = r.z;
+      if (!vr.right.locked) {
+        vr.right.vx *= 0.15;
+        vr.right.vy *= 0.15;
+        vr.right.vz *= 0.15;
+      }
+    }
+  }
+
+  /**
    * Rest wrist/head targets in hips-local space.
    *
    * Prefer *geometric* hang: shoulder + down/out/forward scaled by arm reach.
    * Measuring from live bones alone re-encoded shallow euler hang as a permanent
    * Y-pose rest (start + post-gesture). Live hand samples only win when they
    * clearly hang below the geometric target.
+   *
+   * @param {{preserveHands?:boolean}} opts  preserveHands=true keeps live wrist
+   *   controllers (needed after VRMA / soft unlock so we spring home).
    */
-  function calibrateVrRestsFromBones() {
+  function calibrateVrRestsFromBones(opts) {
+    opts = opts || {};
     var headL = hipsLocalOf(restBones && restBones.head) || {
       x: 0,
       y: 1.45,
@@ -1753,11 +2779,12 @@
     var rightLdir = bodyRightXZ(fwdL);
     var rightRdir = bodyRightXZ(fwdR);
 
-    // Geometric soft hang — primary rest (arms down the sides, slight A-pose).
+    // Geometric soft hang — primary rest (arms down, slight A-pose, soft elbow room).
     function geometricHang(sh, reach, fwd, rightDir, isLeft) {
-      var down = reach * 0.78;
-      var out = reach * 0.16;
-      var fwdAmt = reach * 0.08;
+      // Slightly less than full hang so elbows stay softly bent (not stick-straight).
+      var down = reach * 0.72;
+      var out = reach * 0.2;
+      var fwdAmt = reach * 0.1;
       var side = isLeft ? -1 : 1;
       return {
         x: sh.x + rightDir.x * side * out + fwd.x * fwdAmt,
@@ -1805,19 +2832,31 @@
     vr.head.x = headL.x;
     vr.head.y = headL.y;
     vr.head.z = headL.z;
-    // Snap free hands home only when not mid-gesture / locked.
-    if (!vr.left.locked && !(activeGesture && activeGesture.kind)) {
+    // Snap free hands home only on hard calibrate — never during soft settle /
+    // mid-gesture (that was the "not gradual" reset after poses).
+    var settling = vr.settleUntil > 0 && idleTime < vr.settleUntil;
+    var preserve =
+      opts.preserveHands === true ||
+      settling ||
+      !!(activeGesture && activeGesture.kind);
+    if (!preserve && !vr.left.locked) {
       vr.left.x = leftL.x;
       vr.left.y = leftL.y;
       vr.left.z = leftL.z;
       vr.left.vx = vr.left.vy = vr.left.vz = 0;
     }
-    if (!vr.right.locked && !(activeGesture && activeGesture.kind)) {
+    if (!preserve && !vr.right.locked) {
       vr.right.x = rightL.x;
       vr.right.y = rightL.y;
       vr.right.z = rightL.z;
       vr.right.vx = vr.right.vy = vr.right.vz = 0;
     }
+
+    // Body / clothes proxies for self-collision (IK avoidance).
+    try {
+      rebuildBodyColliders();
+      applyBodyCollisionToHands();
+    } catch (_) {}
   }
 
   /**
@@ -2421,23 +3460,73 @@
   }
 
   /**
-   * Play a named template: prefer portable VRMA when mapped, else rebuild
-   * joint-XYZ frames from live shoulders/rest/reach/camera.
+   * Play a named template. Arm/body poses prefer camera-relative scripted IK
+   * (works on any custom VRM). Bundled VRMA clips are authored for a reference
+   * skeleton and often look inverted/mirrored on downloaded models — only use
+   * them for pure emotion clips, or when opts.preferVrma is set.
    */
   function playTemplate(name, opts) {
     opts = opts || {};
     var n = String(name || "")
       .toLowerCase()
       .replace(/[\s-]+/g, "_");
-    // VRMA-first for catalog gestures (any VRM, real joint relative motion).
-    var vrmaId = resolveVrmaId(n, opts);
-    if (vrmaId && canPlayVrma()) {
+    // Always scripted IK (measured shoulders + viewer-forward). Never VRMA.
+    var SCRIPT_BODY = {
+      bow: 1,
+      lean_in: 1,
+      hands_on_hips: 1,
+      crossed_arms: 1,
+      point: 1,
+      point_left: 1,
+      point_right: 1,
+      wave: 1,
+      hello: 1,
+      clap: 1,
+      cheer: 1,
+      celebrate: 1,
+      shrug: 1,
+      think: 1,
+      nod: 1,
+      yes: 1,
+      shake_head: 1,
+      no: 1,
+    };
+    // Emotion / stance clips that are mostly torso/face — safer on custom VRMs.
+    var EMOTION_VRMA = {
+      angry: 1,
+      mad: 1,
+      sad: 1,
+      sleepy: 1,
+      sleep: 1,
+      surprised: 1,
+      surprise: 1,
+      blush: 1,
+      shy: 1,
+      lookaround: 1,
+      look_around: 1,
+      relax: 1,
+      jump: 1,
+    };
+    // Scripted body path first for arm gestures (fixes inverted custom VRMs).
+    if (SCRIPT_BODY[n] && !opts.preferVrma) {
+      if (startScriptedGesture(n, opts)) return true;
+    }
+    // VRMA for emotions, or when caller forces preferVrma / no scripted path.
+    var vrmaId =
+      SCRIPT_BODY[n] && !opts.preferVrma
+        ? null
+        : resolveVrmaId(n, opts);
+    if (vrmaId && canPlayVrma() && (opts.preferVrma || EMOTION_VRMA[n] || !SCRIPT_BODY[n])) {
       playVrma(vrmaId, {
         loop: !!opts.loop,
         intensity: opts.intensity,
         fallback: n,
         side: opts.side,
       });
+      return true;
+    }
+    // Scripted gestures fallback.
+    if (startScriptedGesture(n, opts)) {
       return true;
     }
     var plan = buildTemplatePlan(name, opts);
@@ -2526,7 +3615,9 @@
   }
 
   function isVrmaPlaying() {
-    return !!(vrmaAction && vrmaMixer && vrmaClipId);
+    // Clip id is set as soon as play is requested (before async load finishes)
+    // so body IK/walk never fights the mixer mid-load.
+    return !!vrmaClipId;
   }
 
   function listVrma() {
@@ -2604,12 +3695,13 @@
     } catch (_) {}
     if (restoreHang) {
       try {
-        // Unlock + snap controllers, then force hang bones (not Y-pose end frame).
+        // Unlock + sample end pose → spring home (no hard hand teleport).
         vr.left.locked = false;
         vr.right.locked = false;
         vr.head.locked = false;
         activeGesture = null;
-        restoreHangPose({ recalibrate: true, recaptureBase: false });
+        vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.6);
+        restoreHangPose({ recalibrate: true, recaptureBase: false, snapHands: false });
       } catch (_) {}
     }
   }
@@ -2856,13 +3948,17 @@
         if (gen === vrmaLoadGen) {
           vrmaClipId = null;
           vrmaAction = null;
-          // Template fallback for wave/etc.
-          if (opts.fallback) {
+          // Prefer scripted IK fallback (camera-relative) over joint-XYZ look frames.
+          if (opts.fallback && startScriptedGesture(opts.fallback, opts)) {
+            /* ok */
+          } else if (opts.fallback) {
             var p = buildTemplatePlan(opts.fallback, opts);
             if (p) playAiMotion(p);
           } else if (nameOrId && nameOrId !== id) {
-            var p2 = buildTemplatePlan(nameOrId, opts);
-            if (p2) playAiMotion(p2);
+            if (!startScriptedGesture(nameOrId, opts)) {
+              var p2 = buildTemplatePlan(nameOrId, opts);
+              if (p2) playAiMotion(p2);
+            }
           }
         }
       });
@@ -2880,9 +3976,13 @@
       vrmaMixer.update(dt);
     } catch (_) {}
     if (!vrmaLoop && idleTime >= vrmaUntil) {
-      // Hard stop mixer — do not leave clampWhenFinished end-frame as rest.
+      // Soft exit: sample wrists from end pose, then spring to hang (no pop).
+      try {
+        sampleWristsFromBones();
+      } catch (_) {}
       try {
         if (vrmaAction) {
+          vrmaAction.fadeOut(0.35);
           vrmaAction.stop();
         }
         vrmaMixer.stopAllAction();
@@ -2895,8 +3995,9 @@
         vr.left.locked = false;
         vr.right.locked = false;
         activeGesture = null;
-        // Re-apply solved hang + geometric wrists (fixes post-gesture Y-pose).
-        restoreHangPose({ recalibrate: true, recaptureBase: false });
+        vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.7);
+        // Re-apply hang bones; preserve sampled wrists so IK eases home.
+        restoreHangPose({ recalibrate: true, recaptureBase: false, snapHands: false });
       } catch (_) {}
     }
   }
@@ -2993,8 +4094,8 @@
   function setHandTarget(side, x, y, z, holdSec, locked) {
     var h = side === "left" ? vr.left : vr.right;
     if (!h) return;
-    // Always clamp tool/gesture/state targets into the arm workspace.
-    var c = clampToArmReach(side, x, y, z, locked ? 0.88 : 0.95);
+    // Clamp to arm workspace + push out of body/clothes proxies.
+    var c = sanitizeWristTarget(side, x, y, z, !!locked);
     h.x = c.x;
     h.y = c.y;
     h.z = c.z;
@@ -3014,7 +4115,8 @@
 
   function blendStatePose(dt) {
     if (!statePose || !statePoseTarget) return;
-    var rate = Math.min(1, dt * 2.4);
+    // Slow ease so bow/lean/state changes never pop back to neutral.
+    var rate = Math.min(1, dt * 1.05);
     Object.keys(statePose).forEach(function (k) {
       var a = statePose[k];
       var b = statePoseTarget[k] || [0, 0, 0];
@@ -3034,45 +4136,212 @@
   }
 
   /**
-   * Spring + gravity on free VR hands (controller dropped → falls back to rest).
-   * Locked hands hold until holdUntil, then unlock and fall under gravity.
+   * One-shot: at hang rest wrists, pick the elbow bend sign that places the
+   * elbow behind the shoulder→hand chord. Seeds ikElbowSign so the first
+   * idle frame is not a coin-flip.
+   */
+  function seedElbowSignFromHang(side) {
+    var L = getLibs();
+    if (!L || !L.THREE || !restBones || !restBones.hips || !armMeta) return;
+    var meta = armMeta[side];
+    if (!meta || !(meta.upperLen > 0)) return;
+    var isLeft = side === "left";
+    var upper = restBones[isLeft ? "leftUpperArm" : "rightUpperArm"];
+    var lower = restBones[isLeft ? "leftLowerArm" : "rightLowerArm"];
+    var hand = restBones[isLeft ? "leftHand" : "rightHand"];
+    var rest = isLeft ? vr.restLeft : vr.restRight;
+    if (!upper || !lower || !hand || !rest) return;
+    var THREE = L.THREE;
+    var a = meta.upperLen;
+    var b = meta.lowerLen;
+    // Temporarily pose from bind and compute both elbows for hang wrist.
+    upper.quaternion.copy(meta.bindUpper);
+    lower.quaternion.copy(meta.bindLower);
+    hand.quaternion.copy(meta.bindHand);
+    try {
+      restBones.hips.updateWorldMatrix(true, true);
+      upper.updateWorldMatrix(true, true);
+    } catch (_) {
+      return;
+    }
+    var sh = new THREE.Vector3();
+    var tg = new THREE.Vector3(rest.x, rest.y, rest.z);
+    try {
+      upper.getWorldPosition(sh);
+      tg.applyMatrix4(restBones.hips.matrixWorld);
+    } catch (_) {
+      return;
+    }
+    var toT = tg.clone().sub(sh);
+    var dist = toT.length();
+    if (dist < 1e-4) return;
+    var maxR = (a + b) * 0.995;
+    if (dist > maxR) {
+      toT.multiplyScalar(maxR / dist);
+      dist = maxR;
+      tg.copy(sh).add(toT);
+    }
+    var cosU = clamp((a * a + dist * dist - b * b) / (2 * a * dist), -1, 1);
+    var ang = Math.acos(cosU);
+    var fwd = toT.clone().multiplyScalar(1 / dist);
+    var pole = new THREE.Vector3(0, 0, 1)
+      .transformDirection(restBones.hips.matrixWorld)
+      .normalize()
+      .multiplyScalar(-1);
+    pole.y += 0.2;
+    var sideV = new THREE.Vector3(isLeft ? -1 : 1, 0, 0).transformDirection(
+      restBones.hips.matrixWorld
+    );
+    if (sideV.lengthSq() > 1e-8) pole.addScaledVector(sideV.normalize(), 0.8);
+    var bend = pole.clone().addScaledVector(fwd, -pole.dot(fwd));
+    if (bend.lengthSq() < 1e-8) bend.set(isLeft ? -1 : 1, 0, 0);
+    bend.normalize();
+    var inv = new THREE.Matrix4().copy(restBones.hips.matrixWorld).invert();
+
+    function score(bendDir) {
+      var el = sh
+        .clone()
+        .addScaledVector(fwd, Math.cos(ang) * a)
+        .addScaledVector(bendDir, Math.sin(ang) * a);
+      var elL = el.clone().applyMatrix4(inv);
+      var shL = sh.clone().applyMatrix4(inv);
+      var tgL = tg.clone().applyMatrix4(inv);
+      var midZ = (shL.z + tgL.z) * 0.5;
+      var behind = midZ - elL.z;
+      var outAmt = isLeft ? shL.x - elL.x : elL.x - shL.x;
+      return behind * 3.5 + Math.max(-0.04, outAmt) * 1.4;
+    }
+    var sA = score(bend);
+    var sB = score(bend.clone().multiplyScalar(-1));
+    ikElbowSign[side] = sB > sA + 0.02 ? -1 : 1;
+  }
+
+  /**
+   * Soft-unlock hands after a scripted gesture so they spring home instead of
+   * staying frozen (locked=true with holdUntil=0 was permanent).
+   */
+  function unlockHandsSoft() {
+    function unlock(h) {
+      if (!h) return;
+      h.locked = false;
+      h.holdUntil = 0;
+      // Keep some residual velocity for natural follow-through (not a dead stop).
+      h.vx *= 0.45;
+      h.vy *= 0.45;
+      h.vz *= 0.45;
+    }
+    unlock(vr.left);
+    unlock(vr.right);
+    // Extra-soft spring window so return from peak never reads as a hard reset.
+    vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.65);
+  }
+
+  /**
+   * Slow independent arm "life" offsets so idle hang is never a frozen mannequin.
+   * Blended only when free hands + low gait + no active gesture.
+   */
+  function idleLifeOffset(side) {
+    var ph = side === "left" ? 0.0 : 2.15;
+    var t = idleTime;
+    var breath = Math.sin(t * 1.05) * 0.006;
+    return {
+      x:
+        Math.sin(t * 0.47 + ph) * 0.016 +
+        Math.sin(t * 0.19 + ph * 0.6) * 0.009,
+      y:
+        breath +
+        Math.sin(t * 0.82 + ph * 0.7) * 0.011 +
+        Math.sin(t * 0.29) * 0.004,
+      z:
+        Math.sin(t * 0.36 + ph * 0.5) * 0.014 +
+        Math.sin(t * 0.13 + ph) * 0.006,
+    };
+  }
+
+  /**
+   * Spring + gravity on free VR hands.
+   * Target = hang rest blended with walkWrist by gaitWeight (one continuous
+   * path — never hard-swap bone ownership between walk eulers and IK).
    */
   function updateVrPhysics(dt) {
-    function stepHand(h, rest) {
+    var gw = loco && typeof loco.gaitWeight === "number" ? loco.gaitWeight : 0;
+    var settling = vr.settleUntil > 0 && idleTime < vr.settleUntil;
+    var gestBusy = !!(activeGesture && activeGesture.kind);
+    function blendTarget(rest, walkT, side) {
+      var base = rest;
+      // Idle life: gentle wrist drift so hang isn't rigid.
+      if (!gestBusy && gw < 0.12 && rest) {
+        var life = idleLifeOffset(side);
+        base = {
+          x: rest.x + life.x,
+          y: rest.y + life.y,
+          z: rest.z + life.z,
+        };
+      }
+      if (!walkT || gw < 0.01) return base;
+      var w = clamp(gw, 0, 1);
+      // Ease gait influence so start/stop isn't linear snappy.
+      w = w * w * (3 - 2 * w);
+      return {
+        x: base.x + (walkT.x - base.x) * w,
+        y: base.y + (walkT.y - base.y) * w,
+        z: base.z + (walkT.z - base.z) * w,
+      };
+    }
+    function stepHand(h, rest, walkT, side) {
       if (h.holdUntil > 0 && idleTime >= h.holdUntil) {
         h.holdUntil = 0;
         h.locked = false;
+        // Hold expired → soft settle home (was an abrupt unlock freeze).
+        vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.4);
       }
       if (h.locked) {
         h.vx = h.vy = h.vz = 0;
         return;
       }
-      // Spring toward rest + gravity on Y (game-world feel).
-      var ax = (rest.x - h.x) * vr.spring - h.vx * vr.damp;
-      var ay = (rest.y - h.y) * vr.spring - h.vy * vr.damp - vr.gravity * 0.35;
-      var az = (rest.z - h.z) * vr.spring - h.vz * vr.damp;
+      var tgt = blendTarget(rest, walkT, side);
+      // Soft settle after gestures; slightly firmer during walk.
+      var springMul = settling ? 0.42 : gw > 0.05 ? 0.55 + gw * 0.55 : 1;
+      var dampMul = settling ? 1.35 : gw > 0.05 ? 1.2 : 1.05;
+      var springK = vr.spring * springMul;
+      var dampK = vr.damp * dampMul;
+      // Light gravity only when above rest (hang), not a constant pull down.
+      var grav =
+        h.y > tgt.y + 0.02 ? vr.gravity * 0.18 : vr.gravity * 0.04;
+      var ax = (tgt.x - h.x) * springK - h.vx * dampK;
+      var ay = (tgt.y - h.y) * springK - h.vy * dampK - grav;
+      var az = (tgt.z - h.z) * springK - h.vz * dampK;
       h.vx += ax * dt;
       h.vy += ay * dt;
       h.vz += az * dt;
+      // Cap velocity so hands never whip across the body in one frame.
+      var vmax = settling ? 0.95 : 1.45 + gw * 0.9;
+      var spd = Math.sqrt(h.vx * h.vx + h.vy * h.vy + h.vz * h.vz);
+      if (spd > vmax && spd > 1e-6) {
+        var s = vmax / spd;
+        h.vx *= s;
+        h.vy *= s;
+        h.vz *= s;
+      }
       h.x += h.vx * dt;
       h.y += h.vy * dt;
       h.z += h.vz * dt;
-      // Soft bounds relative to measured shoulders/reach (short + tall VRMs).
       var shL = vr.shoulderLeft || { x: -0.16, y: 0.3, z: 0 };
       var shR = vr.shoulderRight || { x: 0.16, y: 0.3, z: 0 };
       var shY = Math.min(shL.y, shR.y);
       var maxR = Math.max(armReachLen("left"), armReachLen("right"));
       h.x = clamp(h.x, -maxR * 1.55, maxR * 1.55);
       h.y = clamp(h.y, shY - maxR * 1.25, shY + maxR * 0.95);
-      // Symmetric Z: viewer may sit in hips −Z (common when hips yaw ~180°).
       h.z = clamp(h.z, -maxR * 1.35, maxR * 1.35);
     }
-    stepHand(vr.left, vr.restLeft);
-    stepHand(vr.right, vr.restRight);
+    stepHand(vr.left, vr.restLeft, walkWrist.left, "left");
+    stepHand(vr.right, vr.restRight, walkWrist.right, "right");
+    applyBodyCollisionToHands();
     if (!vr.head.locked) {
-      vr.head.x += (vr.restHead.x - vr.head.x) * Math.min(1, dt * 4);
-      vr.head.y += (vr.restHead.y - vr.head.y) * Math.min(1, dt * 4);
-      vr.head.z += (vr.restHead.z - vr.head.z) * Math.min(1, dt * 4);
+      var headRate = settling ? 1.6 : 2.4;
+      vr.head.x += (vr.restHead.x - vr.head.x) * Math.min(1, dt * headRate);
+      vr.head.y += (vr.restHead.y - vr.head.y) * Math.min(1, dt * headRate);
+      vr.head.z += (vr.restHead.z - vr.head.z) * Math.min(1, dt * headRate);
     }
   }
 
@@ -3170,7 +4439,17 @@
       sign * raise * 0.12,
       -sign * raise * 1.42
     );
-    addEuler(restBones[lowerKey], lowerKey, raise * 0.2, 0, -sign * raise * 0.05);
+    // Elbow: only adjust along the probed flex hinge (never hard-code +X which
+    // bends many custom VRMs backwards when idle).
+    var H = (restBones && restBones.hinge) || defaultLimbHinges();
+    var eH = isLeft ? H.leftElbow : H.rightElbow;
+    // Raise unbends slightly; at hang rest base already has flex — stay near 0 delta.
+    var elbowExtra = (1 - raise) * 0.02 - raise * 0.12;
+    if (eH && restBones[lowerKey]) {
+      addHinge(restBones[lowerKey], lowerKey, eH, elbowExtra);
+    } else {
+      addEuler(restBones[lowerKey], lowerKey, raise * 0.05, 0, -sign * raise * 0.03);
+    }
     addEuler(restBones[handKey], handKey, raise * 0.08, 0, 0);
   }
 
@@ -3253,19 +4532,27 @@
 
     S.forward.copy(S.toTarget).multiplyScalar(1 / dist);
 
-    // Elbow pole: hang = slightly behind + out; raised = more out (readable bend,
-    // not elbows jammed forward or locked straight).
+    // Elbow pole from character facing (hips world), not raw hips-local −Z.
+    // Natural: elbow slightly behind body + out. Camera-relative −Z fails when
+    // hips are yawed ~180° (common VRM) and was flipping elbows "backwards".
     var raiseAmt = clamp((h.y - (rest ? rest.y : 0.7)) / 0.45, 0, 1);
-    S.pole.set(0, raiseAmt * 0.2, -1 + raiseAmt * 0.55);
     try {
-      S.pole.transformDirection(restBones.hips.matrixWorld);
-    } catch (_) {}
-    S.side.set(isLeft ? -1 : 1, 0, 0);
-    try {
-      S.side.transformDirection(restBones.hips.matrixWorld);
-    } catch (_) {}
-    S.pole.addScaledVector(S.side, 0.55 + raiseAmt * 0.4);
-    // Project pole onto plane ⊥ forward → bend direction.
+      // Character forward ≈ hips local +Z in world (VRM humanoid).
+      S.pole.set(0, 0, 1).transformDirection(restBones.hips.matrixWorld);
+      if (S.pole.lengthSq() < 1e-8) S.pole.set(0, 0, 1);
+      S.pole.normalize();
+      // Prefer elbow *behind* the body (opposite facing).
+      S.pole.multiplyScalar(-1);
+      // Slight up bias when raised (readable fold).
+      S.pole.y += 0.15 + raiseAmt * 0.35;
+      S.side.set(isLeft ? -1 : 1, 0, 0).transformDirection(restBones.hips.matrixWorld);
+      if (S.side.lengthSq() < 1e-8) S.side.set(isLeft ? -1 : 1, 0, 0);
+      S.side.normalize();
+      S.pole.addScaledVector(S.side, 0.75 + raiseAmt * 0.45);
+    } catch (_) {
+      S.pole.set(isLeft ? -0.6 : 0.6, 0.2, -1);
+    }
+    // Project pole onto plane ⊥ shoulder→hand.
     S.bend.copy(S.pole).addScaledVector(S.forward, -S.pole.dot(S.forward));
     if (S.bend.lengthSq() < 1e-8) {
       S.bend.set(0, 1, 0).addScaledVector(S.forward, -S.forward.y);
@@ -3273,10 +4560,98 @@
     if (S.bend.lengthSq() < 1e-8) S.bend.set(isLeft ? -1 : 1, 0, 0);
     S.bend.normalize();
 
-    S.elbow
-      .copy(S.shoulder)
-      .addScaledVector(S.forward, Math.cos(upperAngle) * a)
-      .addScaledVector(S.bend, Math.sin(upperAngle) * a);
+    function placeElbow(bendDir, out) {
+      out
+        .copy(S.shoulder)
+        .addScaledVector(S.forward, Math.cos(upperAngle) * a)
+        .addScaledVector(bendDir, Math.sin(upperAngle) * a);
+      return out;
+    }
+    placeElbow(S.bend, S.elbow);
+    try {
+      if (restBones.hips) {
+        if (!S.invHips) S.invHips = new L.THREE.Matrix4();
+        S.invHips.copy(restBones.hips.matrixWorld).invert();
+        if (!S.elbowAlt) S.elbowAlt = new L.THREE.Vector3();
+        if (!S.bendAlt) S.bendAlt = new L.THREE.Vector3();
+        S.bendAlt.copy(S.bend).multiplyScalar(-1);
+        placeElbow(S.bendAlt, S.elbowAlt);
+
+        function scoreElbowCandidate(elWorld) {
+          var elLoc = elWorld.clone().applyMatrix4(S.invHips);
+          var shLoc = S.shoulder.clone().applyMatrix4(S.invHips);
+          var tgLoc = S.target.clone().applyMatrix4(S.invHips);
+          var midY = (shLoc.y + tgLoc.y) * 0.5;
+          var midZ = (shLoc.z + tgLoc.z) * 0.5;
+          // Behind chord along character +Z (hips-local): elbow has smaller Z.
+          var behind = midZ - elLoc.z;
+          // Prefer out from midline.
+          var outAmt = isLeft ? shLoc.x - elLoc.x : elLoc.x - shLoc.x;
+          // Mildly prefer elbow not above shoulder (natural hang).
+          var drop = midY - elLoc.y;
+          var raiseW = raiseAmt;
+          return (
+            behind * (3.4 - raiseW * 1.2) +
+            Math.max(-0.04, outAmt) * (1.4 + raiseW * 0.5) +
+            drop * 0.35
+          );
+        }
+
+        var sA = scoreElbowCandidate(S.elbow);
+        var sB = scoreElbowCandidate(S.elbowAlt);
+        // Temporal continuity: only flip when the other side clearly wins.
+        // Stops per-frame coin-flips that look like backwards elbows / jitter.
+        var prev = ikElbowSign[side] || 0;
+        var pickAlt = false;
+        if (prev === 0) {
+          pickAlt = sB > sA + 0.02;
+        } else if (prev < 0) {
+          // Was alt (−); stick unless + is clearly better.
+          pickAlt = !(sA > sB + 0.12);
+        } else {
+          // Was primary (+); stick unless − is clearly better.
+          pickAlt = sB > sA + 0.12;
+        }
+        if (pickAlt) {
+          S.bend.copy(S.bendAlt);
+          S.elbow.copy(S.elbowAlt);
+          ikElbowSign[side] = -1;
+        } else {
+          ikElbowSign[side] = 1;
+        }
+      }
+    } catch (_) {}
+
+    // Elbow self-collision: push out of torso/clothes so the forearm does not
+    // tunnel through the chest when the wrist crosses the midline.
+    if (bodyCollisionOn && bodyColliders && bodyColliders.length && restBones.hips) {
+      try {
+        if (!S.invHips) {
+          S.invHips = new (getLibs().THREE.Matrix4)();
+        }
+        S.invHips.copy(restBones.hips.matrixWorld).invert();
+        S.dir.copy(S.elbow).applyMatrix4(S.invHips);
+        var elR = resolvePointAgainstBody(S.dir.x, S.dir.y, S.dir.z, 0.035, side);
+        // Prefer elbows slightly out from the midline (less clothing penetration).
+        var shLocal = isLeft ? vr.shoulderLeft : vr.shoulderRight;
+        if (shLocal) {
+          var outSign = isLeft ? -1 : 1;
+          if (
+            (isLeft && elR.x > shLocal.x * 0.3) ||
+            (!isLeft && elR.x < shLocal.x * 0.3)
+          ) {
+            elR.x += outSign * 0.02;
+          }
+        }
+        S.elbow.set(elR.x, elR.y, elR.z).applyMatrix4(restBones.hips.matrixWorld);
+        // Keep upper length: project elbow onto sphere around shoulder.
+        S.toTarget.copy(S.elbow).sub(S.shoulder);
+        var eLen = S.toTarget.length();
+        if (eLen > 1e-5) {
+          S.elbow.copy(S.shoulder).addScaledVector(S.toTarget.normalize(), a);
+        }
+      } catch (_) {}
+    }
 
     aimBoneToward(upper, S.elbow, meta.upperAxis, S);
     try {
@@ -3346,8 +4721,9 @@
         var peakX = peak.x;
         var peakY = peak.y;
         var peakZ = peak.z;
-        if (u < 0.18) {
-          var k0 = easeInOut(u / 0.18);
+        // Longer ease in/out (~28%) so raise/return never snaps.
+        if (u < 0.22) {
+          var k0 = easeInOut(u / 0.22);
           setHandTarget(
             side,
             rest.x + (peakX - rest.x) * k0,
@@ -3356,12 +4732,12 @@
             0,
             true
           );
-        } else if (u < 0.82) {
+        } else if (u < 0.72) {
           // Lateral flap in the plane facing the camera (not behind the body).
           var camW = cameraHipsLocal();
           var waveReach = armReachLen(side);
           var flap =
-            Math.sin((g.t - g.duration * 0.18) * 10.5) *
+            Math.sin((g.t - g.duration * 0.22) * 10.5) *
             waveReach *
             0.22 *
             inten;
@@ -3391,7 +4767,7 @@
           }
           setHandTarget(side, fx, peakY + Math.abs(flap) * 0.06, fz, 0, true);
         } else {
-          var k1 = easeInOut((u - 0.82) / 0.18);
+          var k1 = easeInOut((u - 0.72) / 0.28);
           setHandTarget(
             side,
             peakX + (rest.x - peakX) * k1,
@@ -3402,7 +4778,10 @@
           );
         }
       }
-      if (g.t > g.duration) activeGesture = null;
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
       return true;
     }
     if (g.kind === "nod") {
@@ -3419,109 +4798,299 @@
       return false;
     }
     if (g.kind === "point") {
-      // Controller pushed toward camera / forward at shoulder height.
       var pointSides =
         g.side === "both"
           ? ["left", "right"]
           : [g.side === "left" ? "left" : "right"];
       lookTowardCamera(0.35);
+      // Ease in/hold/out so point doesn't teleport wrists.
+      var pBlend =
+        u < 0.24 ? easeInOut(u / 0.24) : u > 0.72 ? easeInOut((1 - u) / 0.28) : 1;
       for (var pi = 0; pi < pointSides.length; pi++) {
         var ps = pointSides[pi];
         var pSign = ps === "left" ? -1 : 1;
         var pp = gesturePeak("point", ps, inten);
-        setHandTarget(ps, pp.x, pp.y, pp.z, 0, true);
+        var prest = ps === "left" ? vr.restLeft : vr.restRight;
+        setHandTarget(
+          ps,
+          prest.x + (pp.x - prest.x) * pBlend,
+          prest.y + (pp.y - prest.y) * pBlend,
+          prest.z + (pp.z - prest.z) * pBlend,
+          0,
+          true
+        );
         if (pointSides.length === 1) {
-          lookTarget.x = clamp(lookTarget.x + pSign * 0.2 * inten, -1, 1);
+          lookTarget.x = clamp(lookTarget.x + pSign * 0.2 * inten * pBlend, -1, 1);
         }
       }
-      if (g.t > g.duration) activeGesture = null;
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
       return true;
     }
     if (g.kind === "shrug") {
       var ls = vr.shoulderLeft || { x: -0.16, y: 1.2, z: 0 };
       var rs = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
-      setHandTarget("left", ls.x - 0.1, ls.y - 0.08 * (1 - 0.3 * inten), ls.z + 0.1, 0, true);
-      setHandTarget("right", rs.x + 0.1, rs.y - 0.08 * (1 - 0.3 * inten), rs.z + 0.1, 0, true);
-      if (g.t > g.duration) activeGesture = null;
-      return true;
-    }
-    if (g.kind === "think") {
-      // Right controller to chin/temple from live head + shoulder (scale-relative).
-      var shT = vr.shoulderRight || { x: 0.16, y: 0.3, z: 0 };
-      var hy = (vr.restHead && vr.restHead.y) || shT.y + 0.12;
-      var rT = armReachLen("right");
+      var shBlend =
+        u < 0.22 ? easeInOut(u / 0.22) : u > 0.72 ? easeInOut((1 - u) / 0.28) : 1;
+      var lRest = vr.restLeft;
+      var rRest = vr.restRight;
+      // Camera-relative: out + toward viewer (never assume hips +Z).
+      var shFwdL = viewerForwardXZ(ls);
+      var shFwdR = viewerForwardXZ(rs);
+      var shRightL = bodyRightXZ(shFwdL);
+      var shRightR = bodyRightXZ(shFwdR);
+      var rShg = Math.min(armReachLen("left"), armReachLen("right")) || 0.55;
+      var lTx = ls.x - shRightL.x * rShg * 0.18 + shFwdL.x * rShg * 0.12;
+      var lTy = ls.y - 0.08 * (1 - 0.3 * inten);
+      var lTz = ls.z - shRightL.z * rShg * 0.18 + shFwdL.z * rShg * 0.12;
+      var rTx = rs.x + shRightR.x * rShg * 0.18 + shFwdR.x * rShg * 0.12;
+      var rTy = rs.y - 0.08 * (1 - 0.3 * inten);
+      var rTz = rs.z + shRightR.z * rShg * 0.18 + shFwdR.z * rShg * 0.12;
       setHandTarget(
-        "right",
-        shT.x + rT * 0.1,
-        Math.min(hy - rT * 0.12, shT.y + rT * 0.32),
-        shT.z + rT * 0.38,
+        "left",
+        lRest.x + (lTx - lRest.x) * shBlend,
+        lRest.y + (lTy - lRest.y) * shBlend,
+        lRest.z + (lTz - lRest.z) * shBlend,
         0,
         true
       );
-      lookTarget.x = 0.28;
-      lookTarget.y = 0.14;
+      setHandTarget(
+        "right",
+        rRest.x + (rTx - rRest.x) * shBlend,
+        rRest.y + (rTy - rRest.y) * shBlend,
+        rRest.z + (rTz - rRest.z) * shBlend,
+        0,
+        true
+      );
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
+      return true;
+    }
+    if (g.kind === "think") {
+      var shT = vr.shoulderRight || { x: 0.16, y: 0.3, z: 0 };
+      var hy = (vr.restHead && vr.restHead.y) || shT.y + 0.12;
+      var rT = armReachLen("right");
+      var thBlend =
+        u < 0.24 ? easeInOut(u / 0.24) : u > 0.72 ? easeInOut((1 - u) / 0.28) : 1;
+      var thFwd = viewerForwardXZ(shT);
+      var thRight = bodyRightXZ(thFwd);
+      var thx = shT.x + thRight.x * rT * 0.12 + thFwd.x * rT * 0.42;
+      var thy = Math.min(hy - rT * 0.12, shT.y + rT * 0.32);
+      var thz = shT.z + thRight.z * rT * 0.12 + thFwd.z * rT * 0.42;
+      setHandTarget(
+        "right",
+        vr.restRight.x + (thx - vr.restRight.x) * thBlend,
+        vr.restRight.y + (thy - vr.restRight.y) * thBlend,
+        vr.restRight.z + (thz - vr.restRight.z) * thBlend,
+        0,
+        true
+      );
+      lookTarget.x = 0.28 * thBlend;
+      lookTarget.y = 0.14 * thBlend;
       lookHoldUntil = idleTime + 0.25;
-      if (g.t > g.duration) activeGesture = null;
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
       return true;
     }
     if (g.kind === "clap") {
       var c = Math.abs(Math.sin(g.t * 12));
       var shCl = vr.shoulderLeft || { x: -0.16, y: 0.3, z: 0 };
+      var shCr = vr.shoulderRight || { x: 0.16, y: 0.3, z: 0 };
       var rCl = Math.min(armReachLen("left"), armReachLen("right"));
-      var cy = shCl.y - rCl * 0.12;
-      setHandTarget("left", -rCl * (0.18 + c * 0.06), cy, shCl.z + rCl * 0.55, 0, true);
-      setHandTarget("right", rCl * (0.18 + c * 0.06), cy, shCl.z + rCl * 0.55, 0, true);
-      if (g.t > g.duration) activeGesture = null;
+      var cy = (shCl.y + shCr.y) * 0.5 - rCl * 0.12;
+      var clBlend =
+        u < 0.2 ? easeInOut(u / 0.2) : u > 0.75 ? easeInOut((1 - u) / 0.25) : 1;
+      // Meet in front of chest toward viewer (not hips +Z).
+      var mid = {
+        x: (shCl.x + shCr.x) * 0.5,
+        y: cy,
+        z: (shCl.z + shCr.z) * 0.5,
+      };
+      var clFwd = viewerForwardXZ(mid);
+      var clRight = bodyRightXZ(clFwd);
+      var meetZ = mid.z + clFwd.z * rCl * 0.48;
+      var meetX = mid.x + clFwd.x * rCl * 0.48;
+      setHandTarget(
+        "left",
+        vr.restLeft.x +
+          (meetX - clRight.x * rCl * (0.1 + c * 0.05) - vr.restLeft.x) * clBlend,
+        vr.restLeft.y + (cy - vr.restLeft.y) * clBlend,
+        vr.restLeft.z +
+          (meetZ - clRight.z * rCl * (0.1 + c * 0.05) - vr.restLeft.z) * clBlend,
+        0,
+        true
+      );
+      setHandTarget(
+        "right",
+        vr.restRight.x +
+          (meetX + clRight.x * rCl * (0.1 + c * 0.05) - vr.restRight.x) * clBlend,
+        vr.restRight.y + (cy - vr.restRight.y) * clBlend,
+        vr.restRight.z +
+          (meetZ + clRight.z * rCl * (0.1 + c * 0.05) - vr.restRight.z) * clBlend,
+        0,
+        true
+      );
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
       return true;
     }
     if (g.kind === "cheer") {
       var cl = gesturePeak("cheer", "left", inten);
       var cr = gesturePeak("cheer", "right", inten);
       var lift = ease * armReachLen("right") * 0.12 * inten;
-      setHandTarget("left", cl.x, cl.y + lift, cl.z, 0, true);
-      setHandTarget("right", cr.x, cr.y + lift, cr.z, 0, true);
-      if (g.t > g.duration) activeGesture = null;
-      return true;
-    }
-    if (g.kind === "bow") {
-      if (statePose) {
-        statePose.spine[0] = 0.35 * ease * inten;
-        statePose.chest[0] = 0.2 * ease * inten;
-        statePose.head[0] = 0.15 * ease * inten;
-      }
-      if (g.t > g.duration) activeGesture = null;
-      return false;
-    }
-    if (g.kind === "lean_in") {
-      if (statePose) {
-        statePose.spine[0] = 0.12 * ease * inten;
-        statePose.chest[0] = 0.1 * ease * inten;
-      }
-      if (g.t > g.duration) activeGesture = null;
-      return false;
-    }
-    if (g.kind === "hands_on_hips") {
-      var hl = vr.restLeft || { x: -0.18, y: 0.75, z: 0.1 };
-      var hr = vr.restRight || { x: 0.18, y: 0.75, z: 0.1 };
-      setHandTarget("left", hl.x - 0.04, hl.y + 0.06, hl.z + 0.02, 0, true);
-      setHandTarget("right", hr.x + 0.04, hr.y + 0.06, hr.z + 0.02, 0, true);
-      if (g.t > g.duration) activeGesture = null;
-      return true;
-    }
-    if (g.kind === "crossed_arms") {
-      var shCx = vr.shoulderLeft || { x: -0.16, y: 0.3, z: 0 };
-      var rCx = Math.min(armReachLen("left"), armReachLen("right"));
-      var csy = shCx.y - rCx * 0.28;
-      setHandTarget("left", rCx * 0.18, csy, shCx.z + rCx * 0.32, 0, true);
+      var chBlend =
+        u < 0.22 ? easeInOut(u / 0.22) : u > 0.72 ? easeInOut((1 - u) / 0.28) : 1;
       setHandTarget(
-        "right",
-        -rCx * 0.18,
-        csy - rCx * 0.04,
-        shCx.z + rCx * 0.28,
+        "left",
+        vr.restLeft.x + (cl.x - vr.restLeft.x) * chBlend,
+        vr.restLeft.y + (cl.y + lift - vr.restLeft.y) * chBlend,
+        vr.restLeft.z + (cl.z - vr.restLeft.z) * chBlend,
         0,
         true
       );
-      if (g.t > g.duration) activeGesture = null;
+      setHandTarget(
+        "right",
+        vr.restRight.x + (cr.x - vr.restRight.x) * chBlend,
+        vr.restRight.y + (cr.y + lift - vr.restRight.y) * chBlend,
+        vr.restRight.z + (cr.z - vr.restRight.z) * chBlend,
+        0,
+        true
+      );
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
+      return true;
+    }
+    if (g.kind === "bow") {
+      // Sin rise/return on targets; blendStatePose eases bones (no hard zero).
+      var bowAmt = Math.sin(clamp(u, 0, 1) * Math.PI) * inten;
+      if (statePoseTarget) {
+        statePoseTarget.spine = [0.42 * bowAmt, 0, 0];
+        statePoseTarget.chest = [0.28 * bowAmt, 0, 0];
+        statePoseTarget.head = [0.22 * bowAmt, 0, 0];
+        statePoseTarget.hips = [0.08 * bowAmt, 0, 0];
+      }
+      lookTarget.y = -0.35 * bowAmt;
+      lookHoldUntil = idleTime + 0.2;
+      if (g.t > g.duration) {
+        if (statePoseTarget) {
+          statePoseTarget.spine = [0, 0, 0];
+          statePoseTarget.chest = [0, 0, 0];
+          statePoseTarget.head = [0, 0, 0];
+          statePoseTarget.hips = [0, 0, 0];
+        }
+        activeGesture = null;
+      }
+      return false;
+    }
+    if (g.kind === "lean_in") {
+      var leanAmt = Math.sin(clamp(u, 0, 1) * Math.PI) * inten;
+      if (statePoseTarget) {
+        statePoseTarget.spine = [0.14 * leanAmt, 0, 0];
+        statePoseTarget.chest = [0.12 * leanAmt, 0, 0];
+      }
+      if (g.t > g.duration) {
+        if (statePoseTarget) {
+          statePoseTarget.spine = [0, 0, 0];
+          statePoseTarget.chest = [0, 0, 0];
+        }
+        activeGesture = null;
+      }
+      return false;
+    }
+    if (g.kind === "hands_on_hips") {
+      var rHips = Math.min(armReachLen("left"), armReachLen("right")) || 0.55;
+      var shHL = vr.shoulderLeft || { x: -0.16, y: 1.2, z: 0 };
+      var shHR = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
+      var hipsY = Math.min(
+        (vr.restLeft && vr.restLeft.y) || shHL.y - rHips * 0.72,
+        (vr.restRight && vr.restRight.y) || shHR.y - rHips * 0.72
+      );
+      var hhBlend =
+        u < 0.25 ? easeInOut(u / 0.25) : u > 0.7 ? easeInOut((1 - u) / 0.3) : 1;
+      var hfL = viewerForwardXZ(shHL);
+      var hfR = viewerForwardXZ(shHR);
+      var hrL = bodyRightXZ(hfL);
+      var hrR = bodyRightXZ(hfR);
+      // Wrists near hip bones: out + slightly back from viewer.
+      var hlx = shHL.x - hrL.x * rHips * 0.2 - hfL.x * rHips * 0.06;
+      var hly = hipsY + rHips * 0.08;
+      var hlz = shHL.z - hrL.z * rHips * 0.2 - hfL.z * rHips * 0.06;
+      var hrx = shHR.x + hrR.x * rHips * 0.2 - hfR.x * rHips * 0.06;
+      var hry = hipsY + rHips * 0.08;
+      var hrz = shHR.z + hrR.z * rHips * 0.2 - hfR.z * rHips * 0.06;
+      setHandTarget(
+        "left",
+        vr.restLeft.x + (hlx - vr.restLeft.x) * hhBlend,
+        vr.restLeft.y + (hly - vr.restLeft.y) * hhBlend,
+        vr.restLeft.z + (hlz - vr.restLeft.z) * hhBlend,
+        0,
+        true
+      );
+      setHandTarget(
+        "right",
+        vr.restRight.x + (hrx - vr.restRight.x) * hhBlend,
+        vr.restRight.y + (hry - vr.restRight.y) * hhBlend,
+        vr.restRight.z + (hrz - vr.restRight.z) * hhBlend,
+        0,
+        true
+      );
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
+      return true;
+    }
+    if (g.kind === "crossed_arms") {
+      var shCx = vr.shoulderLeft || { x: -0.16, y: 1.15, z: 0 };
+      var shCxR = vr.shoulderRight || { x: 0.16, y: 1.15, z: 0 };
+      var rCx = Math.min(armReachLen("left"), armReachLen("right")) || 0.55;
+      var csy = (shCx.y + shCxR.y) * 0.5 - rCx * 0.32;
+      var cxMid = {
+        x: (shCx.x + shCxR.x) * 0.5,
+        y: csy,
+        z: (shCx.z + shCxR.z) * 0.5,
+      };
+      var cxFwd = viewerForwardXZ(cxMid);
+      var cxRight = bodyRightXZ(cxFwd);
+      // Cross in front of chest toward viewer.
+      var csz = cxMid.z + cxFwd.z * rCx * 0.28;
+      var csx = cxMid.x + cxFwd.x * rCx * 0.28;
+      var cxBlend =
+        u < 0.26 ? easeInOut(u / 0.26) : u > 0.7 ? easeInOut((1 - u) / 0.3) : 1;
+      setHandTarget(
+        "left",
+        vr.restLeft.x +
+          (csx + cxRight.x * rCx * 0.14 - vr.restLeft.x) * cxBlend,
+        vr.restLeft.y + (csy - vr.restLeft.y) * cxBlend,
+        vr.restLeft.z +
+          (csz + cxRight.z * rCx * 0.14 - vr.restLeft.z) * cxBlend,
+        0,
+        true
+      );
+      setHandTarget(
+        "right",
+        vr.restRight.x +
+          (csx - cxRight.x * rCx * 0.14 - vr.restRight.x) * cxBlend,
+        vr.restRight.y + (csy - rCx * 0.03 - vr.restRight.y) * cxBlend,
+        vr.restRight.z +
+          (csz - cxRight.z * rCx * 0.14 - vr.restRight.z) * cxBlend,
+        0,
+        true
+      );
+      if (g.t > g.duration) {
+        unlockHandsSoft();
+        activeGesture = null;
+      }
       return true;
     }
     if (g.kind === "reset") {
@@ -3529,7 +5098,8 @@
       activeGesture = null;
       return false;
     }
-    // Unknown — drop.
+    // Unknown — soft unlock then drop.
+    unlockHandsSoft();
     activeGesture = null;
     return false;
   }
@@ -3548,22 +5118,17 @@
     vr.head.locked = false;
     vr.left.holdUntil = 0;
     vr.right.holdUntil = 0;
-    // Force hang bones + geometric rests (not whatever VRMA left behind).
+    // Soft return to hang — sample current wrists, spring home (no teleport).
     try {
-      restoreHangPose({ recalibrate: true, recaptureBase: false });
+      sampleWristsFromBones();
+    } catch (_) {}
+    vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.5);
+    try {
+      restoreHangPose({ recalibrate: true, recaptureBase: false, snapHands: false });
     } catch (_) {
-      vr.left.x = vr.restLeft.x;
-      vr.left.y = vr.restLeft.y;
-      vr.left.z = vr.restLeft.z;
-      vr.right.x = vr.restRight.x;
-      vr.right.y = vr.restRight.y;
-      vr.right.z = vr.restRight.z;
-      vr.left.vx = vr.left.vy = vr.left.vz = 0;
-      vr.right.vx = vr.right.vy = vr.right.vz = 0;
+      // Keep live positions; physics will ease toward rest.
     }
-    vr.head.x = vr.restHead.x;
-    vr.head.y = vr.restHead.y;
-    vr.head.z = vr.restHead.z;
+    // Head eases via updateVrPhysics (not snapped).
     nodPulse = 0;
     lookTarget.x = 0;
     lookTarget.y = 0;
@@ -3586,10 +5151,17 @@
           measureArmMeta("left");
           measureArmMeta("right");
           restBones.hangDeltas = solveHangDeltas();
+          restBones.hinge = solveLimbHinges();
+          rewriteHangDeltasWithHinges(restBones.hangDeltas, restBones.hinge);
           applySoftHangEulers();
           captureBaseFromBones();
           if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
           calibrateVrRestsFromBones();
+          // Seed elbow polarity from hang wrists so idle never starts flipped.
+          try {
+            seedElbowSignFromHang("left");
+            seedElbowSignFromHang("right");
+          } catch (_) {}
           try {
             exportMotionLibrary();
           } catch (_) {}
@@ -3632,39 +5204,96 @@
 
     blendStatePose(dt);
     updateActiveGesture(dt);
-    updateVrPhysics(dt);
 
-    var breath = Math.sin(t * 1.2) * 0.012 + Math.sin(t * 0.32) * 0.004;
-    var sway = Math.sin(t * 0.42) * 0.016 + Math.sin(t * 0.85) * 0.005;
-    var weight = (poseBlend - 0.5) * 0.03 + Math.sin(t * 0.28) * 0.008;
-    var shoulder = Math.sin(t * 0.55) * 0.012 + Math.sin(t * 1.4) * 0.003;
+    var locoBusy = isLocoMoving();
+    // While player-steering, mute turn-based idle sway so voice phase changes
+    // don't fight walk/jump (the old "reset glitch" between listen/think/speak).
+    var locoMul = locoBusy ? 0.18 : 1;
+
+    // Idle "alive" — deeper breath, visible weight shift, soft shoulder roll.
+    // Previous amplitudes were ~½ of human micro-motion and read as a mannequin.
+    var breath = Math.sin(t * 1.05) * 0.022 + Math.sin(t * 0.31) * 0.008;
+    var sway =
+      (Math.sin(t * 0.36) * 0.032 +
+        Math.sin(t * 0.78) * 0.012 +
+        Math.sin(t * 0.15) * 0.01) *
+      locoMul;
+    var weight =
+      ((poseBlend - 0.5) * 0.055 +
+        Math.sin(t * 0.22) * 0.02 +
+        Math.sin(t * 0.11) * 0.012) *
+      locoMul;
+    var shoulder =
+      Math.sin(t * 0.48) * 0.022 +
+      Math.sin(t * 1.15) * 0.007 +
+      Math.sin(t * 0.2) * 0.01;
     // Single clean nod arc — small amplitude (was stacking with lookAt → weird bob).
-    var nodAmt = nodPulse > 0 ? Math.sin((1 - nodPulse) * Math.PI) * 0.028 : 0;
+    var nodAmt = nodPulse > 0 && !locoBusy ? Math.sin((1 - nodPulse) * Math.PI) * 0.028 : 0;
 
     if (currentState === STATE_THINKING) {
-      sway = Math.sin(t * 0.35) * 0.01;
-      breath = Math.sin(t * 1.0) * 0.01;
+      sway = (Math.sin(t * 0.32) * 0.02 + Math.sin(t * 0.55) * 0.008) * locoMul;
+      breath = Math.sin(t * 0.95) * 0.018;
+      weight = (Math.sin(t * 0.18) * 0.016 + 0.01) * locoMul;
     } else if (currentState === STATE_SPEAKING) {
-      sway = Math.sin(t * 0.65) * 0.014 + Math.sin(t * 1.15) * 0.004;
-      breath = Math.sin(t * 1.5) * 0.014 + mouthValue * 0.006;
+      sway = (Math.sin(t * 0.55) * 0.026 + Math.sin(t * 1.05) * 0.01) * locoMul;
+      breath = Math.sin(t * 1.35) * 0.024 + mouthValue * 0.01;
+      shoulder += mouthValue * 0.012;
     } else if (currentState === STATE_LISTENING) {
-      sway = Math.sin(t * 0.38) * 0.012;
+      sway = (Math.sin(t * 0.34) * 0.024 + Math.sin(t * 0.7) * 0.008) * locoMul;
+      breath = Math.sin(t * 1.0) * 0.018;
     }
 
     // 1) Pose torso / legs / head first so shoulders are in the right place.
-    addEuler(restBones.hips, "hips", 0.008 + weight * 0.35, sway * 0.3 + weight * 0.55, weight * 0.2);
+    addEuler(
+      restBones.hips,
+      "hips",
+      0.012 + weight * 0.45 + breath * 0.15,
+      sway * 0.42 + weight * 0.7,
+      weight * 0.28 + sway * 0.08
+    );
     addEuler(
       restBones.spine,
       "spine",
-      0.01 + breath * 0.55,
-      sway * 0.32 - weight * 0.22,
-      sway * 0.08 + shoulder * 0.18
+      0.014 + breath * 0.85,
+      sway * 0.42 - weight * 0.28,
+      sway * 0.12 + shoulder * 0.28
     );
     if (restBones.chest) {
-      addEuler(restBones.chest, "chest", breath * 0.7, sway * 0.2, shoulder * 0.28);
+      addEuler(
+        restBones.chest,
+        "chest",
+        breath * 1.05,
+        sway * 0.28,
+        shoulder * 0.4
+      );
     }
     if (restBones.upperChest) {
-      addEuler(restBones.upperChest, "upperChest", breath * 0.35, sway * 0.1, shoulder * 0.08);
+      addEuler(
+        restBones.upperChest,
+        "upperChest",
+        breath * 0.55,
+        sway * 0.14,
+        shoulder * 0.16
+      );
+    }
+    // Soft shoulder shrug-cycle (reads as relaxed, not T-pose mannequin).
+    if (restBones.leftShoulder) {
+      addEuler(
+        restBones.leftShoulder,
+        "leftShoulder",
+        breath * 0.08,
+        -0.01 - shoulder * 0.12,
+        0.02 + Math.sin(t * 0.4) * 0.015
+      );
+    }
+    if (restBones.rightShoulder) {
+      addEuler(
+        restBones.rightShoulder,
+        "rightShoulder",
+        breath * 0.08,
+        0.01 + shoulder * 0.12,
+        -0.02 - Math.sin(t * 0.4 + 0.8) * 0.015
+      );
     }
 
     // Virtual HMD look: tool look_at x=-1..1 must read as a clear head turn
@@ -3688,22 +5317,138 @@
       lookRoll * 0.45
     );
 
-    if (restBones.leftUpperLeg) {
-      addEuler(restBones.leftUpperLeg, "leftUpperLeg", weight * 0.5, 0, weight * 0.22);
-    }
-    if (restBones.rightUpperLeg) {
-      addEuler(restBones.rightUpperLeg, "rightUpperLeg", -weight * 0.5, 0, -weight * 0.22);
-    }
-    if (restBones.leftLowerLeg) {
-      addEuler(restBones.leftLowerLeg, "leftLowerLeg", -weight * 0.28, 0, 0);
-    }
-    if (restBones.rightLowerLeg) {
-      addEuler(restBones.rightLowerLeg, "rightLowerLeg", weight * 0.28, 0, 0);
+    // Idle weight-shift on legs only when not player-walking (hinge-correct).
+    // Larger hip rock + soft knee bounce so stance isn't a locked stick figure.
+    if (!locoBusy) {
+      var Hi = restBones.hinge || defaultLimbHinges();
+      var kneeBounce =
+        (0.045 + Math.abs(weight) * 0.55 + Math.sin(t * 0.9) * 0.012) * locoMul;
+      // Combine hinge + lateral into one write (addEuler overwrites).
+      function hipDelta(hingeVec, hingeAmt, yExtra, zExtra) {
+        var h = hingeVec || [1, 0, 0];
+        return [
+          (h[0] || 0) * hingeAmt,
+          (h[1] || 0) * hingeAmt + yExtra,
+          (h[2] || 0) * hingeAmt + zExtra,
+        ];
+      }
+      if (restBones.leftUpperLeg) {
+        var ld = hipDelta(Hi.leftHip, weight * 0.65, weight * 0.08, weight * 0.12);
+        addEuler(restBones.leftUpperLeg, "leftUpperLeg", ld[0], ld[1], ld[2]);
+      }
+      if (restBones.rightUpperLeg) {
+        var rd = hipDelta(Hi.rightHip, -weight * 0.65, -weight * 0.08, -weight * 0.12);
+        addEuler(restBones.rightUpperLeg, "rightUpperLeg", rd[0], rd[1], rd[2]);
+      }
+      if (restBones.leftLowerLeg) {
+        addHinge(
+          restBones.leftLowerLeg,
+          "leftLowerLeg",
+          Hi.leftKnee,
+          kneeBounce * (weight >= 0 ? 1.15 : 0.55)
+        );
+      }
+      if (restBones.rightLowerLeg) {
+        addHinge(
+          restBones.rightLowerLeg,
+          "rightLowerLeg",
+          Hi.rightKnee,
+          kneeBounce * (weight < 0 ? 1.15 : 0.55)
+        );
+      }
     }
 
-    // 2) Arms: two-bone IK to ragdolled VR wrist controllers (after shoulders moved).
+    // 2) Walk cycle sets leg eulers + walkWrist targets (same frame).
+    applyLocomotionPose(dt);
+    // 3) Spring free wrists toward rest↔walk blend (after targets are current).
+    updateVrPhysics(dt);
+
+    // 4) Always two-bone IK from virtual wrists — single arm path forever.
+    if (bodyCollisionOn) {
+      try {
+        measureBodyColliders();
+        applyBodyCollisionToHands();
+      } catch (_) {}
+    }
     applyHandIk("left");
     applyHandIk("right");
+  }
+
+  /**
+   * Start a frame-driven activeGesture (no VRMA). Used by playTemplate when
+   * look-only / VRMA paths would appear dead (bow, hips, cross, …).
+   */
+  function startScriptedGesture(name, opts) {
+    opts = opts || {};
+    var n = String(name || "")
+      .toLowerCase()
+      .replace(/[\s-]+/g, "_");
+    var intensity =
+      typeof opts.intensity === "number" ? clamp(opts.intensity, 0.2, 1.5) : 1;
+    var sideRaw =
+      opts.side == null || opts.side === ""
+        ? ""
+        : String(opts.side).toLowerCase().trim();
+    if (sideRaw === "l") sideRaw = "left";
+    if (sideRaw === "r") sideRaw = "right";
+    if (sideRaw === "all") sideRaw = "both";
+    var side = sideRaw;
+    if (n === "point_left") {
+      n = "point";
+      side = "left";
+    }
+    if (n === "point_right") {
+      n = "point";
+      side = "right";
+    }
+    if (side !== "left" && side !== "right" && side !== "both") {
+      side = "right";
+    }
+    if (n === "reset" || n === "reset_body" || n === "idle" || n === "rest") {
+      resetBodyInternal();
+      return true;
+    }
+    var table = {
+      wave: { kind: "wave", duration: 1.8, side: side },
+      nod: { kind: "nod", duration: 0.9 },
+      shake_head: { kind: "shake_head", duration: 1.1 },
+      no: { kind: "shake_head", duration: 1.1 },
+      point: { kind: "point", duration: 1.6, side: side },
+      shrug: { kind: "shrug", duration: 1.4 },
+      think: { kind: "think", duration: 2.2 },
+      clap: { kind: "clap", duration: 1.2 },
+      cheer: { kind: "cheer", duration: 1.5 },
+      bow: { kind: "bow", duration: 1.6 },
+      lean_in: { kind: "lean_in", duration: 1.4 },
+      hands_on_hips: { kind: "hands_on_hips", duration: 2.4 },
+      crossed_arms: { kind: "crossed_arms", duration: 2.4 },
+      celebrate: { kind: "cheer", duration: 1.5 },
+      hello: { kind: "wave", duration: 1.8, side: side },
+      yes: { kind: "nod", duration: 0.9 },
+    };
+    var spec = table[n];
+    if (!spec) return false;
+    try {
+      stopVrmaInternal(false);
+      clearAiMotionTimers();
+      aiMotionGen++;
+    } catch (_) {}
+    activeGesture = {
+      kind: spec.kind,
+      t: 0,
+      duration: spec.duration,
+      intensity: intensity,
+      side: spec.side || side,
+    };
+    try {
+      console.log(
+        "[CompanionStage] scripted gesture",
+        n,
+        "side=" + activeGesture.side,
+        "intensity=" + intensity
+      );
+    } catch (_) {}
+    return true;
   }
 
   function playGesture(name, opts) {
@@ -3744,10 +5489,19 @@
       return true;
     }
 
-    // Portable VRMA first (real joint animation on any VRM).
+    // Force scripted body path when requested (pose wheel / custom VRM safety).
+    if (opts.forceJoint || opts.scripted || !opts.preferVrma) {
+      // Prefer measured IK gestures — VRMA often inverts on downloaded models.
+      var scriptedOk = startScriptedGesture(
+        n,
+        Object.assign({}, opts, { side: side, intensity: intensity })
+      );
+      if (scriptedOk) return true;
+    }
+
+    // Portable VRMA only when no scripted path or preferVrma (emotions etc.).
     var vrmaId = resolveVrmaId(n, opts);
-    if (vrmaId && canPlayVrma() && n !== "point") {
-      // Point stays joint-XYZ (camera-aimed); everything else with a VRMA map uses clips.
+    if (vrmaId && canPlayVrma()) {
       return playVrma(vrmaId, {
         intensity: intensity,
         side: side,
@@ -3756,47 +5510,7 @@
       });
     }
 
-    var table = {
-      wave: { kind: "wave", duration: 1.8, side: side },
-      nod: { kind: "nod", duration: 0.9 },
-      shake_head: { kind: "shake_head", duration: 1.1 },
-      no: { kind: "shake_head", duration: 1.1 },
-      point: { kind: "point", duration: 1.6, side: side },
-      shrug: { kind: "shrug", duration: 1.4 },
-      think: { kind: "think", duration: 2.2 },
-      clap: { kind: "clap", duration: 1.2 },
-      cheer: { kind: "cheer", duration: 1.5 },
-      bow: { kind: "bow", duration: 1.6 },
-      lean_in: { kind: "lean_in", duration: 1.4 },
-      hands_on_hips: { kind: "hands_on_hips", duration: 2.0 },
-      crossed_arms: { kind: "crossed_arms", duration: 2.2 },
-      celebrate: { kind: "cheer", duration: 1.5 },
-      hello: { kind: "wave", duration: 1.8, side: side },
-      yes: { kind: "nod", duration: 0.9 },
-    };
-    var spec = table[n];
-    if (!spec) {
-      try {
-        console.warn("[CompanionStage] unknown gesture", n);
-      } catch (_) {}
-      return false;
-    }
-    activeGesture = {
-      kind: spec.kind,
-      t: 0,
-      duration: spec.duration,
-      intensity: intensity,
-      side: spec.side || side,
-    };
-    try {
-      console.log(
-        "[CompanionStage] playGesture",
-        n,
-        "side=" + activeGesture.side,
-        "intensity=" + intensity
-      );
-    } catch (_) {}
-    return true;
+    return startScriptedGesture(n, Object.assign({}, opts, { side: side, intensity: intensity }));
   }
 
   function setHands(jsonOrObj) {
@@ -4044,16 +5758,484 @@
     return true;
   }
 
+  // ─── Universal actor control + real-time locomotion ───────────────────────
+
+  function getPossessedActor() {
+    if (!possessedId) return null;
+    return actors[possessedId] || null;
+  }
+
+  function isControlActive() {
+    return !!(loco && loco.enabled && getPossessedActor() && getPossessedActor().root);
+  }
+
+  function isLocoMoving() {
+    if (!isControlActive()) return false;
+    // Treat gait settle as "moving" so voice state pose doesn't fight the blend.
+    if ((loco.gaitWeight || 0) > 0.12) return true;
+    var sp = Math.sqrt(loco.vx * loco.vx + loco.vz * loco.vz);
+    return sp > 0.12 || Math.abs(loco.inputX) > 0.08 || Math.abs(loco.inputZ) > 0.08 || !loco.grounded;
+  }
+
+  /**
+   * Register a VRM (or any humanoid scene root) as a controllable actor.
+   * Root receives world XZ/yaw/jump; bone layers stay avatar-local.
+   */
+  function registerActor(id, opts) {
+    opts = opts || {};
+    var aid = String(id || "").trim();
+    if (!aid) return false;
+    var root = opts.root || null;
+    var actorVrm = opts.vrm || null;
+    if (!root && actorVrm && actorVrm.scene) root = actorVrm.scene.parent || actorVrm.scene;
+    if (!root) return false;
+    actors[aid] = {
+      id: aid,
+      kind: opts.kind || "vrm",
+      root: root,
+      vrm: actorVrm,
+      label: opts.label || aid,
+    };
+    if (!possessedId) possessedId = aid;
+    return true;
+  }
+
+  function unregisterActor(id) {
+    var aid = String(id || "").trim();
+    if (!aid || !actors[aid]) return false;
+    delete actors[aid];
+    if (possessedId === aid) {
+      possessedId = null;
+      var keys = Object.keys(actors);
+      if (keys.length) possessedId = keys[0];
+    }
+    return true;
+  }
+
+  /** Possess an actor for stick/jump. Defaults to "companion". */
+  function possess(id) {
+    var aid = String(id || "companion").trim();
+    if (!actors[aid]) return false;
+    possessedId = aid;
+    // Snap loco yaw to current root rotation.
+    try {
+      loco.yaw = actors[aid].root.rotation.y || 0;
+    } catch (_) {}
+    return true;
+  }
+
+  function setControlEnabled(on) {
+    loco.enabled = !!on;
+    if (!loco.enabled) {
+      loco.inputX = 0;
+      loco.inputZ = 0;
+      loco.jumpEdge = false;
+      loco.jumpHeld = false;
+      loco.vx = 0;
+      loco.vz = 0;
+    }
+    return loco.enabled;
+  }
+
+  /**
+   * Drive locomotion from HUD / host.
+   * moveX: -1..1 strafe (right+), moveY: -1..1 stick vertical (up = forward),
+   * jump: boolean edge or held (edge fired when true after false).
+   */
+  function setControlInput(input) {
+    if (!input || typeof input !== "object") return false;
+    var mx =
+      typeof input.moveX === "number"
+        ? input.moveX
+        : typeof input.x === "number"
+          ? input.x
+          : loco.inputX;
+    var my =
+      typeof input.moveY === "number"
+        ? input.moveY
+        : typeof input.y === "number"
+          ? input.y
+          : typeof input.moveZ === "number"
+            ? input.moveZ
+            : loco.inputZ;
+    loco.inputX = clamp(mx, -1, 1);
+    // Stick up → positive forward in camera space.
+    loco.inputZ = clamp(my, -1, 1);
+    var j =
+      input.jump === true ||
+      input.jumpPressed === true ||
+      input.jumpEdge === true;
+    if (j && !loco.jumpHeld) {
+      loco.jumpEdge = true;
+    }
+    if (typeof input.jump === "boolean" || typeof input.jumpPressed === "boolean") {
+      loco.jumpHeld = !!(input.jump || input.jumpPressed);
+    } else if (input.jumpEdge === true) {
+      loco.jumpHeld = true;
+    }
+    if (input.jump === false || input.jumpPressed === false) {
+      loco.jumpHeld = false;
+    }
+    return true;
+  }
+
+  function getControlState() {
+    var act = getPossessedActor();
+    return {
+      enabled: !!loco.enabled,
+      possessed: possessedId,
+      actors: Object.keys(actors),
+      grounded: !!loco.grounded,
+      moving: isLocoMoving(),
+      input: { x: loco.inputX, y: loco.inputZ },
+      velocity: { x: loco.vx, y: loco.vy, z: loco.vz },
+      yaw: loco.yaw,
+      position: act && act.root
+        ? {
+            x: act.root.position.x,
+            y: act.root.position.y,
+            z: act.root.position.z,
+          }
+        : null,
+    };
+  }
+
+  /** Camera-relative wish direction on XZ (third-person stick). */
+  function locoWishDir() {
+    var ix = loco.inputX;
+    var iz = loco.inputZ;
+    var mag = Math.sqrt(ix * ix + iz * iz);
+    if (mag < 0.04) return { x: 0, z: 0, mag: 0 };
+    if (mag > 1) {
+      ix /= mag;
+      iz /= mag;
+      mag = 1;
+    }
+    var lookX = 0;
+    var lookZ = 1;
+    if (camera && controls && controls.target) {
+      lookX = controls.target.x - camera.position.x;
+      lookZ = controls.target.z - camera.position.z;
+    } else if (camera) {
+      lookX = -camera.position.x;
+      lookZ = -camera.position.z;
+    }
+    var llen = Math.sqrt(lookX * lookX + lookZ * lookZ);
+    if (llen < 1e-4) {
+      lookX = 0;
+      lookZ = 1;
+      llen = 1;
+    }
+    lookX /= llen;
+    lookZ /= llen;
+    // Camera right on XZ (Y-up cross: forward × up → right)
+    var rightX = -lookZ;
+    var rightZ = lookX;
+    return {
+      x: rightX * ix + lookX * iz,
+      z: rightZ * ix + lookZ * iz,
+      mag: mag,
+    };
+  }
+
+  function shortestAngle(from, to) {
+    var d = to - from;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  /**
+   * Real-time root locomotion for possessed actor. Continuous — never reset by
+   * voice idle/listen/think/speak phase changes.
+   */
+  function updateLocomotion(dt) {
+    if (!loco.enabled) return;
+    var act = getPossessedActor();
+    if (!act || !act.root) return;
+    var root = act.root;
+    var wish = locoWishDir();
+    var targetSp = loco.moveSpeed * wish.mag;
+    var wishX = wish.x;
+    var wishZ = wish.z;
+    var wlen = Math.sqrt(wishX * wishX + wishZ * wishZ);
+    if (wlen > 1e-4) {
+      wishX /= wlen;
+      wishZ /= wlen;
+    }
+
+    // Accelerate / friction on XZ
+    if (wish.mag > 0.04 && loco.grounded) {
+      var tvx = wishX * targetSp;
+      var tvz = wishZ * targetSp;
+      var ax = (tvx - loco.vx) * Math.min(1, dt * loco.accel);
+      var az = (tvz - loco.vz) * Math.min(1, dt * loco.accel);
+      loco.vx += ax;
+      loco.vz += az;
+      // Face move direction (smooth).
+      var targetYaw = Math.atan2(wishX, wishZ);
+      var dyaw = shortestAngle(loco.yaw, targetYaw);
+      loco.yaw += dyaw * Math.min(1, dt * 10);
+    } else {
+      var damp = Math.exp(-loco.friction * dt);
+      if (!loco.grounded) damp = Math.exp(-loco.friction * 0.35 * dt);
+      loco.vx *= damp;
+      loco.vz *= damp;
+      if (Math.abs(loco.vx) < 0.01) loco.vx = 0;
+      if (Math.abs(loco.vz) < 0.01) loco.vz = 0;
+    }
+
+    // Jump
+    if (loco.jumpEdge && loco.grounded) {
+      loco.vy = loco.jumpSpeed;
+      loco.grounded = false;
+      loco.airTime = 0;
+    }
+    loco.jumpEdge = false;
+
+    if (!loco.grounded) {
+      loco.vy -= loco.gravity * dt;
+      loco.airTime += dt;
+    } else {
+      loco.airTime = 0;
+      if (loco.vy < 0) loco.vy = 0;
+    }
+
+    var half = loco.worldHalf;
+    var nx = clamp(root.position.x + loco.vx * dt, -half, half);
+    var nz = clamp(root.position.z + loco.vz * dt, -half, half);
+    // Wall / platform AABB resolve (from CompanionWorldMaps when a map is loaded).
+    try {
+      var WM = window.CompanionWorldMaps;
+      if (WM && typeof WM.resolveWalls === "function" && worldColliders.length) {
+        var resolved = WM.resolveWalls(worldColliders, nx, nz, root.position.y, 0.3);
+        if (resolved) {
+          nx = resolved.x;
+          nz = resolved.z;
+        }
+      }
+    } catch (_) {}
+    root.position.x = nx;
+    root.position.z = nz;
+    root.position.y += loco.vy * dt;
+
+    var groundY = 0;
+    try {
+      var WMg = window.CompanionWorldMaps;
+      if (WMg && typeof WMg.sampleGroundY === "function" && worldColliders.length) {
+        groundY = WMg.sampleGroundY(
+          worldColliders,
+          root.position.x,
+          root.position.z,
+          root.position.y,
+          0.45,
+        );
+      }
+    } catch (_) {}
+    if (root.position.y <= groundY) {
+      root.position.y = groundY;
+      loco.vy = 0;
+      loco.grounded = true;
+    } else if (loco.grounded && root.position.y > groundY + 0.08) {
+      // Walked off a ledge
+      loco.grounded = false;
+    }
+    root.rotation.y = loco.yaw;
+
+    // Foot ring follows actor
+    if (floorRing) {
+      floorRing.position.x = root.position.x;
+      floorRing.position.z = root.position.z;
+      floorRing.position.y = groundY + 0.006;
+    }
+
+    updateCameraFollow(dt, root);
+  }
+
+  /** Keep third-person orbit target on the possessed character; preserve camera offset. */
+  function updateCameraFollow(dt, root) {
+    if (!loco.camFollow || !camera || !root) return;
+    var lookY = 1.15;
+    try {
+      if (vrm && vrm.scene) {
+        var L = getLibs();
+        if (L && L.THREE) {
+          var box = new L.THREE.Box3().setFromObject(vrm.scene);
+          if (isFinite(box.min.y) && isFinite(box.max.y)) {
+            lookY = (box.max.y - box.min.y) * 0.55;
+          }
+        }
+      }
+    } catch (_) {}
+    var tx = root.position.x;
+    var ty = root.position.y + lookY;
+    var tz = root.position.z;
+    if (controls && controls.target) {
+      var k = Math.min(1, dt * 12);
+      var ptx = controls.target.x;
+      var pty = controls.target.y;
+      var ptz = controls.target.z;
+      // Translate camera by the same delta as the target so walk doesn't leave cam behind.
+      var ntx = ptx + (tx - ptx) * k;
+      var nty = pty + (ty - pty) * k;
+      var ntz = ptz + (tz - ptz) * k;
+      var dx = ntx - ptx;
+      var dy = nty - pty;
+      var dz = ntz - ptz;
+      controls.target.set(ntx, nty, ntz);
+      camera.position.x += dx;
+      camera.position.y += dy;
+      camera.position.z += dz;
+    } else {
+      // No orbit controls — soft look-at.
+      try {
+        camera.lookAt(tx, ty, tz);
+      } catch (_) {}
+    }
+  }
+
+  /**
+   * Procedural walk / hop on humanoid legs + wrist-target arm swing (any VRM).
+   * Arms are NEVER posed by bone eulers here — only walkWrist targets, which
+   * physics blends and two-bone IK always solves. That removes walk→idle snaps.
+   */
+  function applyLocomotionPose(dt) {
+    // Clear walk wrist desires each frame; refilled when gait is active.
+    walkWrist.left = null;
+    walkWrist.right = null;
+
+    if (!isControlActive() || !restBones || isVrmaPlaying()) {
+      if (loco) {
+        loco.gaitWeight = Math.max(
+          0,
+          (loco.gaitWeight || 0) * Math.max(0, 1 - dt * 2.4)
+        );
+      }
+      return;
+    }
+    var H = restBones.hinge || defaultLimbHinges();
+    var sp = Math.sqrt(loco.vx * loco.vx + loco.vz * loco.vz);
+    var stickOn =
+      Math.abs(loco.inputX) > 0.06 || Math.abs(loco.inputZ) > 0.06;
+    var moving = sp > 0.08 && loco.grounded;
+    var airborne = !loco.grounded && loco.airTime > 0.02;
+
+    var wantGait = 0;
+    if (airborne) {
+      wantGait = 0.85;
+    } else if (moving || stickOn) {
+      wantGait = clamp(Math.max(sp / loco.moveSpeed, stickOn ? 0.4 : 0), 0.25, 1);
+    }
+    // Fast engage, slow release so stop-walking eases into hang (not a pop).
+    var rate = wantGait > loco.gaitWeight ? 7.0 : 2.1;
+    loco.gaitWeight += (wantGait - loco.gaitWeight) * Math.min(1, dt * rate);
+    if (loco.gaitWeight < 0.006) loco.gaitWeight = 0;
+
+    if (moving) {
+      loco.walkPhase += dt * (2.6 + sp * 2.4);
+    } else if (loco.grounded) {
+      loco.walkPhase *= Math.max(0, 1 - dt * 1.6);
+    }
+
+    var gw = loco.gaitWeight;
+    if (gw < 0.01 && !airborne) return;
+
+    var swing = Math.sin(loco.walkPhase);
+    var swingOpp = Math.sin(loco.walkPhase + Math.PI);
+    var amp = clamp(sp / loco.moveSpeed, 0.12, 1) * 0.82 * gw;
+    if (!moving && !airborne) {
+      amp = 0.14 * gw * Math.min(1, Math.abs(swing) + 0.2);
+    }
+    var plantL = Math.max(0, -swing);
+    var plantR = Math.max(0, -swingOpp);
+
+    if (loco.grounded && gw > 0) {
+      if (restBones.leftUpperLeg) {
+        addHinge(restBones.leftUpperLeg, "leftUpperLeg", H.leftHip, swing * amp);
+      }
+      if (restBones.rightUpperLeg) {
+        addHinge(restBones.rightUpperLeg, "rightUpperLeg", H.rightHip, swingOpp * amp);
+      }
+      if (restBones.leftLowerLeg) {
+        addHinge(restBones.leftLowerLeg, "leftLowerLeg", H.leftKnee, plantL * amp * 1.15);
+      }
+      if (restBones.rightLowerLeg) {
+        addHinge(restBones.rightLowerLeg, "rightLowerLeg", H.rightKnee, plantR * amp * 1.15);
+      }
+
+      // Counter-arm swing via wrist targets only (IK owns bones every frame).
+      if (!activeGesture && gw > 0.04) {
+        var reachL = armReachLen("left") || 0.55;
+        var reachR = armReachLen("right") || 0.55;
+        // Hips-local +Z is character forward (matches elbow pole). Blend a bit
+        // toward the camera so the swing still reads on the phone.
+        var camF = viewerForwardXZ(vr.restLeft || { x: 0, z: 0 });
+        var face = {
+          x: 0 * 0.5 + camF.x * 0.5,
+          z: 1 * 0.5 + camF.z * 0.5,
+        };
+        var flen = Math.sqrt(face.x * face.x + face.z * face.z) || 1;
+        face.x /= flen;
+        face.z /= flen;
+
+        var travelL = reachL * 0.2 * amp;
+        var travelR = reachR * 0.2 * amp;
+        walkWrist.left = {
+          x: vr.restLeft.x + face.x * swingOpp * travelL,
+          y: vr.restLeft.y + Math.abs(swingOpp) * reachL * 0.025 * amp,
+          z: vr.restLeft.z + face.z * swingOpp * travelL + reachL * 0.02 * amp,
+        };
+        walkWrist.right = {
+          x: vr.restRight.x + face.x * swing * travelR,
+          y: vr.restRight.y + Math.abs(swing) * reachR * 0.025 * amp,
+          z: vr.restRight.z + face.z * swing * travelR + reachR * 0.02 * amp,
+        };
+      }
+    }
+
+    // Air pose: legs tuck via hinges; wrists open slightly for balance (IK).
+    if (airborne) {
+      var tuck = clamp(loco.airTime * 2.5, 0, 0.55) * gw;
+      if (restBones.leftUpperLeg) {
+        addHinge(restBones.leftUpperLeg, "leftUpperLeg", H.leftHip, tuck * 0.45);
+      }
+      if (restBones.rightUpperLeg) {
+        addHinge(restBones.rightUpperLeg, "rightUpperLeg", H.rightHip, tuck * 0.4);
+      }
+      if (restBones.leftLowerLeg) {
+        addHinge(restBones.leftLowerLeg, "leftLowerLeg", H.leftKnee, tuck * 0.7);
+      }
+      if (restBones.rightLowerLeg) {
+        addHinge(restBones.rightLowerLeg, "rightLowerLeg", H.rightKnee, tuck * 0.65);
+      }
+      if (!activeGesture) {
+        var rAL = armReachLen("left") || 0.55;
+        var rAR = armReachLen("right") || 0.55;
+        walkWrist.left = {
+          x: vr.restLeft.x - rAL * 0.08 * tuck,
+          y: vr.restLeft.y + rAL * 0.1 * tuck,
+          z: vr.restLeft.z + rAL * 0.06 * tuck,
+        };
+        walkWrist.right = {
+          x: vr.restRight.x + rAR * 0.08 * tuck,
+          y: vr.restRight.y + rAR * 0.1 * tuck,
+          z: vr.restRight.z + rAR * 0.06 * tuck,
+        };
+      }
+    }
+  }
+
   function ensureFloor(THREE) {
     if (floorMesh) return;
     try {
-      var geo = new THREE.CircleGeometry(2.2, 48);
+      // Larger playable pad for third-person walk (was a tiny stage disc).
+      var geo = new THREE.CircleGeometry(12, 64);
       var mat = new THREE.MeshStandardMaterial({
-        color: 0x141a28,
-        roughness: 0.92,
-        metalness: 0.04,
+        color: 0x121826,
+        roughness: 0.94,
+        metalness: 0.05,
         transparent: true,
-        opacity: 0.88,
+        opacity: 0.92,
       });
       floorMesh = new THREE.Mesh(geo, mat);
       floorMesh.rotation.x = -Math.PI / 2;
@@ -4061,11 +6243,31 @@
       floorMesh.name = "companion-floor";
       scene.add(floorMesh);
 
-      var ringGeo = new THREE.RingGeometry(0.35, 0.42, 48);
+      // Soft grid rings for game-space depth.
+      try {
+        var grid = new THREE.RingGeometry(3.8, 3.95, 64);
+        var gridMat = new THREE.MeshBasicMaterial({
+          color: 0x3d5a80,
+          transparent: true,
+          opacity: 0.22,
+          side: THREE.DoubleSide,
+        });
+        var gridMesh = new THREE.Mesh(grid, gridMat);
+        gridMesh.rotation.x = -Math.PI / 2;
+        gridMesh.position.y = 0.003;
+        scene.add(gridMesh);
+        var grid2 = new THREE.RingGeometry(7.5, 7.65, 64);
+        var gridMesh2 = new THREE.Mesh(grid2, gridMat.clone());
+        gridMesh2.rotation.x = -Math.PI / 2;
+        gridMesh2.position.y = 0.003;
+        scene.add(gridMesh2);
+      } catch (_) {}
+
+      var ringGeo = new THREE.RingGeometry(0.32, 0.4, 48);
       var ringMat = new THREE.MeshBasicMaterial({
         color: 0x6ea8ff,
         transparent: true,
-        opacity: 0.35,
+        opacity: 0.4,
         side: THREE.DoubleSide,
       });
       floorRing = new THREE.Mesh(ringGeo, ringMat);
@@ -4076,16 +6278,179 @@
   }
 
   function placeFloorUnderAvatar() {
-    if (!floorMesh || !vrm || !vrm.scene) return;
+    if (!vrm || !vrm.scene) return;
     try {
       var L = getLibs();
       if (!L || !L.THREE) return;
+      // Keep floor as a fixed world plane; only snap avatar feet to y=0 on the root.
       var box = new L.THREE.Box3().setFromObject(vrm.scene);
       if (!isFinite(box.min.y)) return;
-      var y = box.min.y;
-      floorMesh.position.y = y;
-      if (floorRing) floorRing.position.y = y + 0.006;
+      // If VRM floats/sinks, offset the scene child (not world floor) once on calibrate.
+      var footY = box.min.y;
+      if (Math.abs(footY) > 0.002 && Math.abs(footY) < 2.5 && vrm.scene) {
+        vrm.scene.position.y -= footY;
+      }
+      if (floorMesh) floorMesh.position.y = 0;
+      if (floorRing) {
+        floorRing.position.y = 0.006;
+        if (modelRoot) {
+          floorRing.position.x = modelRoot.position.x;
+          floorRing.position.z = modelRoot.position.z;
+        }
+      }
     } catch (_) {}
+  }
+
+  function ensureWorldMapRoot(THREE) {
+    if (worldMapRoot) return worldMapRoot;
+    worldMapRoot = new THREE.Group();
+    worldMapRoot.name = "companion-world-maps";
+    scene.add(worldMapRoot);
+    return worldMapRoot;
+  }
+
+  function clearWorldMap() {
+    if (!worldMapRoot) {
+      worldColliders = [];
+      return;
+    }
+    while (worldMapRoot.children.length) {
+      var ch = worldMapRoot.children[0];
+      worldMapRoot.remove(ch);
+      try {
+        ch.traverse(function (o) {
+          if (o.geometry) o.geometry.dispose();
+          if (o.material) {
+            if (Array.isArray(o.material)) {
+              o.material.forEach(function (m) {
+                if (m && m.dispose) m.dispose();
+              });
+            } else if (o.material.dispose) o.material.dispose();
+          }
+        });
+      } catch (_) {}
+    }
+    worldColliders = [];
+  }
+
+  function setDefaultFloorVisible(on) {
+    if (floorMesh) floorMesh.visible = !!on;
+    // Keep foot ring always — helpful in maps too.
+  }
+
+  /**
+   * Load a Companion World map (same ids as Godot WorldBridge).
+   * Maps ship in assets/companion/world/ — no separate Godot APK.
+   * @returns {boolean} true if load started / completed synchronously
+   */
+  function loadMap(mapId) {
+    var id = String(mapId || "").trim();
+    if (!id) return false;
+    var L = getLibs();
+    if (!L || !L.THREE || !scene) return false;
+    var WM = window.CompanionWorldMaps;
+    if (!WM || typeof WM.buildMap !== "function") {
+      setHud("World maps module missing");
+      return false;
+    }
+    var known = WM.listMaps ? WM.listMaps() : WM.MAP_IDS || [];
+    if (known.indexOf(id) < 0) {
+      setHud("Unknown map: " + id);
+      return false;
+    }
+    var token = ++worldMapGen;
+    clearWorldMap();
+    setDefaultFloorVisible(false);
+    var root = ensureWorldMapRoot(L.THREE);
+    var colliders = [];
+    setHud("Loading " + id + "…");
+    Promise.resolve(WM.buildMap(id, L.THREE, L, root, colliders))
+      .then(function (meta) {
+        if (token !== worldMapGen) return;
+        worldColliders = colliders;
+        currentMapId = id;
+        if (meta && typeof meta.worldHalf === "number") {
+          loco.worldHalf = meta.worldHalf;
+        }
+        var spawn = (meta && meta.spawn) || { x: 0, y: 0, z: 0 };
+        var act = getPossessedActor();
+        var r = act && act.root ? act.root : modelRoot;
+        if (r) {
+          r.position.x = spawn.x;
+          r.position.y = spawn.y;
+          r.position.z = spawn.z;
+          loco.vx = 0;
+          loco.vy = 0;
+          loco.vz = 0;
+          loco.grounded = true;
+        }
+        setHud("Map: " + id);
+        setTimeout(function () {
+          if (token === worldMapGen) setHud("");
+        }, 2200);
+        try {
+          if (typeof window.GrokifyCompanion !== "undefined" && window.GrokifyCompanion.onDebugLog) {
+            window.GrokifyCompanion.onDebugLog("map_loaded " + id);
+          }
+        } catch (_) {}
+      })
+      .catch(function (e) {
+        if (token !== worldMapGen) return;
+        setDefaultFloorVisible(true);
+        currentMapId = "stage";
+        setHud("Map failed: " + ((e && e.message) || String(e)).slice(0, 80));
+      });
+    return true;
+  }
+
+  function listMaps() {
+    var WM = window.CompanionWorldMaps;
+    if (WM && typeof WM.listMaps === "function") return WM.listMaps();
+    return ["proto_arena", "kenney_plaza", "courtyard", "mini_dungeon"];
+  }
+
+  function getCurrentMap() {
+    return currentMapId;
+  }
+
+  function nextMap() {
+    var maps = listMaps();
+    if (!maps.length) return currentMapId;
+    var idx = maps.indexOf(currentMapId);
+    if (idx < 0) idx = -1;
+    var nid = maps[(idx + 1) % maps.length];
+    loadMap(nid);
+    return nid;
+  }
+
+  /** Enter in-app world mode: ensure control on + load default / given map. */
+  function enterWorld(mapId) {
+    setControlEnabled(true);
+    loco.camFollow = true;
+    var id = mapId && String(mapId).trim() ? String(mapId).trim() : "proto_arena";
+    if (currentMapId === id && worldColliders.length) {
+      setHud("Map: " + id);
+      return true;
+    }
+    return loadMap(id);
+  }
+
+  function leaveWorld() {
+    clearWorldMap();
+    setDefaultFloorVisible(true);
+    currentMapId = "stage";
+    loco.worldHalf = 9;
+    var act = getPossessedActor();
+    var r = act && act.root ? act.root : modelRoot;
+    if (r) {
+      r.position.x = 0;
+      r.position.z = 0;
+      r.position.y = 0;
+      loco.vx = loco.vy = loco.vz = 0;
+      loco.grounded = true;
+    }
+    setHud("");
+    return true;
   }
 
   /** Idle gaze wander + state-based look targets (mostly horizontal; tiny pitch). */
@@ -4491,7 +6856,7 @@
     modelRoot.name = "companion-model-root";
     scene.add(modelRoot);
 
-    camera = new THREE.PerspectiveCamera(30, 1, 0.1, 40);
+    camera = new THREE.PerspectiveCamera(32, 1, 0.1, 80);
     clock = new THREE.Clock();
 
     if (typeof L.OrbitControls === "function") {
@@ -4506,7 +6871,7 @@
       controls.minPolarAngle = 0.15;
       controls.maxPolarAngle = Math.PI * 0.92;
       controls.minDistance = 0.5;
-      controls.maxDistance = 8;
+      controls.maxDistance = 18;
       // Keep last orbit after finger lift (do not auto-revert).
       controls.enableZoom = true;
       // One finger rotate, two finger pinch-zoom + pan (mobile-friendly).
@@ -4657,6 +7022,11 @@
         if (visemeSmooth.aa > 0.001) clearTalkExpressions();
       }
 
+      // Continuous world motion (stick / jump) — independent of voice turn state.
+      try {
+        updateLocomotion(dt);
+      } catch (_) {}
+
       if (vrm && !usingFallback) {
         if (isVrmaPlaying()) {
           updateVrma(dt);
@@ -4796,6 +7166,24 @@
       ensureScene();
     }
     modelRoot.add(vrm.scene);
+
+    // Universal control hook: this VRM is the "companion" actor (any humanoid).
+    // Future player body = registerActor("player", { vrm, root }) + possess("player").
+    try {
+      registerActor("companion", {
+        vrm: vrm,
+        root: modelRoot,
+        kind: "vrm",
+        label: label || "companion",
+      });
+      possess("companion");
+      // Preserve world pose across model swaps; only zero velocity.
+      loco.vx = 0;
+      loco.vz = 0;
+      loco.vy = 0;
+      loco.grounded = modelRoot.position.y <= 0.001;
+      loco.yaw = modelRoot.rotation.y || loco.yaw || 0;
+    } catch (_) {}
 
     // Natural standing pose + idle baseline (not bind T-pose).
     // Keep host-driven state (listening/thinking/speaking) across reloads so a
@@ -5109,8 +7497,12 @@
     currentState = s;
     setFallbackState(s);
     if (usingFallback || !vrm) return;
+    // Voice turn phases must NOT teleport, re-root, or hard-reset locomotion.
+    // Only soft torso expression targets — continuous play keeps walking/jumping.
     if (prev !== s) {
-      pickStatePoseTarget(s);
+      if (!isLocoMoving()) {
+        pickStatePoseTarget(s);
+      }
       // Soft expression blend only on real phase change (avoids flash every push).
       applyStateExpressions(s);
     }
@@ -5393,6 +7785,7 @@
       vrma_playing: isVrmaPlaying() ? vrmaClipId : null,
       state: currentState,
       t: round3(idleTime),
+      control: getControlState(),
       look: {
         x: round3(lookTarget.x),
         y: round3(lookTarget.y),
@@ -5516,6 +7909,20 @@
     getDebugSkeleton: function () {
       return !!debugSkeletonOn;
     },
+    /** Enable/disable body self-collision (wrist/elbow vs torso/clothes proxies). */
+    setBodyCollision: function (on) {
+      bodyCollisionOn = !!on;
+      if (bodyCollisionOn) {
+        try {
+          if (!bodyColliders || !bodyColliders.length) rebuildBodyColliders();
+          applyBodyCollisionToHands();
+        } catch (_) {}
+      }
+    },
+    getBodyCollision: function () {
+      return !!bodyCollisionOn;
+    },
+    rebuildBodyColliders: rebuildBodyColliders,
     setJointLabel: setJointLabel,
     setJointLabels: setJointLabels,
     getJointLabels: getJointLabels,
@@ -5527,6 +7934,32 @@
       return usingFallback;
     },
     isVrmaPlaying: isVrmaPlaying,
+    /**
+     * Universal real-time control (any VRM):
+     *   registerActor / possess / setControlInput / setControlEnabled
+     * Companion is auto-registered as "companion" on loadModel.
+     */
+    control: {
+      setEnabled: setControlEnabled,
+      setInput: setControlInput,
+      getState: getControlState,
+      possess: possess,
+      registerActor: registerActor,
+      unregisterActor: unregisterActor,
+      isMoving: isLocoMoving,
+    },
+    setControlEnabled: setControlEnabled,
+    setControlInput: setControlInput,
+    getControlState: getControlState,
+    possess: possess,
+    registerActor: registerActor,
+    /** In-app Godot-parity maps (assets/companion/world/) — no side package. */
+    loadMap: loadMap,
+    nextMap: nextMap,
+    listMaps: listMaps,
+    getCurrentMap: getCurrentMap,
+    enterWorld: enterWorld,
+    leaveWorld: leaveWorld,
   };
 
   function boot() {

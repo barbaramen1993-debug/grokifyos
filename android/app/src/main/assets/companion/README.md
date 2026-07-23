@@ -124,9 +124,30 @@ CompanionStage.loadModel("user", "/absolute/or/file/url/MyAvatar.vrm");
 | `setJointLabel(id, name)` | Custom display name for a bone/controller (persisted via host). Empty clears. |
 | `setJointLabels(map)` | Bulk load custom labels. |
 | `getJointLabels()` | Current custom label map. |
-| `setDebugSkeleton(bool)` | SkeletonHelper wireframe + joint spheres + VR hand/HMD controller markers. |
+| `setDebugSkeleton(bool)` | SkeletonHelper wireframe + joint spheres + VR hand/HMD controller markers + **body collision wire meshes**. |
+| `setBodyCollision(bool)` | Toggle self-collision (wrists/elbows vs torso/clothes/head proxies). Default **on**. |
+| `getBodyCollision()` | Current self-collision flag. |
+| `rebuildBodyColliders()` | Remeasure body/clothes capsule proxies from the live skeleton. |
 | `setLook({x,y,direction?,hold_sec?})` | Virtual HMD gaze; `x=-1` left, `x=1` right. |
 | `resetBody()` | Stop VRMA, unlock controllers, soft hang rest. |
+
+### Self-collision (body / clothes)
+
+Arm IK uses **hips-local collision proxies** (not full skinned-mesh tests — too heavy for mobile WebView):
+
+| Proxy | Shape | Purpose |
+|-------|--------|---------|
+| `hips` | sphere | Pelvis bulk |
+| `torso` | capsule | Spine / ribcage |
+| `clothes` | ellipsoid | Inflated front/back clothing envelope |
+| `chest` / `neck` / `head` | spheres | Upper body + face clearance |
+| `shoulderL` / `shoulderR` | spheres | Clavicle / sleeve bulk |
+
+Each frame (and on `setHands` / gestures): wrist targets are pushed outside these volumes, then re-clamped to arm reach. Elbows from two-bone IK are resolved the same way so forearms do not clip the chest when crossing the body. L/R wrists also soft-separate.
+
+**Debug:** enable skeleton debug to see orange/purple **wireframe** collider meshes.
+
+**Limits:** VRMA clips own the skeleton while playing (collision suspended with IK). Spring-bone hair/skirt already uses VRM colliders from the model file.
 
 Host callbacks on `window.GrokifyCompanion` (Android `@JavascriptInterface`):
 

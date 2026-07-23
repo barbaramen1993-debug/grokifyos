@@ -242,3 +242,323 @@ body {
     transform: scale(1.04);
   }
 }
+
+/* ─── Third-person game pad (virtual stick + jump) ─────────────────────── */
+#game-pad {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+
+#game-pad.ready {
+  opacity: 1;
+}
+
+#stick-zone {
+  position: absolute;
+  left: max(12px, env(safe-area-inset-left, 0px));
+  bottom: max(18px, env(safe-area-inset-bottom, 0px));
+  width: 148px;
+  height: 148px;
+  pointer-events: auto;
+  touch-action: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+#stick-base {
+  width: 112px;
+  height: 112px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 40% 35%, rgba(90, 120, 180, 0.35), rgba(12, 16, 28, 0.55) 70%),
+    rgba(8, 12, 22, 0.45);
+  border: 2px solid rgba(140, 180, 255, 0.4);
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.35) inset,
+    0 8px 24px rgba(0, 0, 0, 0.35);
+  position: relative;
+  touch-action: none;
+}
+
+#stick-base.active {
+  border-color: rgba(120, 220, 255, 0.75);
+  box-shadow:
+    0 0 0 1px rgba(80, 200, 255, 0.25) inset,
+    0 0 18px rgba(60, 160, 255, 0.35),
+    0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+#stick-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 48px;
+  height: 48px;
+  margin: 0;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background:
+    radial-gradient(circle at 35% 30%, rgba(200, 230, 255, 0.95), rgba(90, 140, 220, 0.9) 55%, rgba(40, 70, 130, 0.95));
+  border: 2px solid rgba(220, 240, 255, 0.55);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  will-change: transform;
+}
+
+#action-cluster {
+  position: absolute;
+  right: max(12px, env(safe-area-inset-right, 0px));
+  bottom: max(24px, env(safe-area-inset-bottom, 0px));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  pointer-events: none;
+}
+
+#jump-btn,
+#gesture-btn,
+#map-btn {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  pointer-events: auto;
+  touch-action: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border: 2px solid rgba(160, 200, 255, 0.5);
+  background:
+    radial-gradient(circle at 40% 30%, rgba(100, 160, 255, 0.45), rgba(16, 22, 40, 0.72) 70%);
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(255, 255, 255, 0.06) inset;
+  color: #e8f2ff;
+  font: 700 11px/1 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  padding: 0;
+}
+
+#gesture-btn {
+  width: 58px;
+  height: 58px;
+  border-color: rgba(200, 160, 255, 0.5);
+  background:
+    radial-gradient(circle at 40% 30%, rgba(160, 120, 255, 0.42), rgba(20, 14, 36, 0.75) 70%);
+}
+
+#map-btn {
+  width: 52px;
+  height: 52px;
+  border-color: rgba(120, 220, 160, 0.5);
+  background:
+    radial-gradient(circle at 40% 30%, rgba(80, 200, 140, 0.4), rgba(12, 28, 22, 0.78) 70%);
+}
+
+#map-btn .map-glyph {
+  font-size: 15px;
+  line-height: 1;
+}
+
+#jump-btn .jump-glyph,
+#gesture-btn .gesture-glyph {
+  font-size: 18px;
+  line-height: 1;
+  opacity: 0.95;
+}
+
+#gesture-btn .gesture-glyph {
+  font-size: 16px;
+  color: #f0e4ff;
+}
+
+#jump-btn.active,
+#gesture-btn.active,
+#map-btn.active {
+  transform: scale(0.94);
+  border-color: rgba(140, 240, 255, 0.9);
+  background:
+    radial-gradient(circle at 40% 30%, rgba(140, 210, 255, 0.65), rgba(24, 40, 72, 0.85) 70%);
+  box-shadow:
+    0 0 20px rgba(80, 180, 255, 0.45),
+    0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+#map-btn.active {
+  border-color: rgba(140, 255, 190, 0.95);
+  background:
+    radial-gradient(circle at 40% 30%, rgba(100, 230, 160, 0.65), rgba(16, 48, 32, 0.88) 70%);
+  box-shadow:
+    0 0 20px rgba(60, 200, 120, 0.45),
+    0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+#gesture-btn.active {
+  border-color: rgba(220, 180, 255, 0.95);
+  background:
+    radial-gradient(circle at 40% 30%, rgba(190, 150, 255, 0.7), rgba(40, 24, 64, 0.88) 70%);
+  box-shadow:
+    0 0 20px rgba(160, 100, 255, 0.45),
+    0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+/* ─── Gesture / pose radial wheel ─────────────────────────────────────────── */
+#gesture-wheel {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  pointer-events: auto;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at 50% 55%, rgba(8, 12, 24, 0.55), rgba(4, 6, 12, 0.72));
+  opacity: 1;
+  transition: opacity 0.18s ease;
+}
+
+#gesture-wheel.hidden {
+  display: none;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#gesture-wheel-ring {
+  position: relative;
+  width: min(78vw, 320px);
+  height: min(78vw, 320px);
+  border-radius: 50%;
+  border: 1px solid rgba(160, 190, 255, 0.22);
+  background:
+    radial-gradient(circle at 50% 50%, rgba(30, 40, 70, 0.35) 0%, rgba(10, 14, 26, 0.15) 55%, transparent 70%);
+  box-shadow: 0 0 40px rgba(60, 100, 200, 0.15);
+}
+
+.gesture-slot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 58px;
+  height: 58px;
+  margin: -29px 0 0 -29px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(170, 200, 255, 0.45);
+  background:
+    radial-gradient(circle at 35% 30%, rgba(90, 130, 220, 0.55), rgba(14, 18, 34, 0.88) 70%);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  color: #eaf2ff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 0;
+  pointer-events: auto;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  transform: translate(var(--gx, 0), var(--gy, 0));
+  transition: transform 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+
+.gesture-slot .g-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.gesture-slot .g-label {
+  font: 600 8px/1 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  opacity: 0.9;
+  max-width: 52px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.gesture-slot:active,
+.gesture-slot.pressed {
+  transform: translate(var(--gx, 0), var(--gy, 0)) scale(0.92);
+  border-color: rgba(160, 240, 255, 0.95);
+  background:
+    radial-gradient(circle at 35% 30%, rgba(140, 200, 255, 0.7), rgba(24, 40, 72, 0.92) 70%);
+}
+
+#gesture-wheel-close {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 52px;
+  height: 52px;
+  margin: -26px 0 0 -26px;
+  border-radius: 50%;
+  border: 2px solid rgba(200, 210, 240, 0.4);
+  background: rgba(12, 16, 28, 0.85);
+  color: #e8f0ff;
+  font: 700 16px/1 system-ui, sans-serif;
+  pointer-events: auto;
+  touch-action: none;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  z-index: 2;
+}
+
+.pad-label {
+  font: 600 10px/1 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(200, 220, 255, 0.72);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+#stick-zone > .pad-label {
+  margin-bottom: 2px;
+}
+
+/* Keep pad clear of host chrome on very short screens */
+@media (max-height: 520px) {
+  #stick-zone {
+    width: 120px;
+    height: 120px;
+    bottom: max(10px, env(safe-area-inset-bottom, 0px));
+  }
+  #stick-base {
+    width: 92px;
+    height: 92px;
+  }
+  #stick-knob {
+    width: 40px;
+    height: 40px;
+  }
+  #action-cluster {
+    bottom: max(12px, env(safe-area-inset-bottom, 0px));
+    gap: 8px;
+  }
+  #jump-btn {
+    width: 60px;
+    height: 60px;
+  }
+  #gesture-btn {
+    width: 50px;
+    height: 50px;
+  }
+  .gesture-slot {
+    width: 50px;
+    height: 50px;
+    margin: -25px 0 0 -25px;
+  }
+}

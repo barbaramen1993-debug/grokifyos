@@ -120,6 +120,43 @@
     border-color: rgba(34, 211, 238, 0.45);
     background: rgba(34, 211, 238, 0.14);
 }
+.sc-usage-actions {
+    margin-top: 0.55rem;
+}
+.sc-usage-logout {
+    width: 100%;
+    border: 1px solid rgba(251, 113, 133, 0.4);
+    background: rgba(251, 113, 133, 0.08);
+    color: #fb7185;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.4rem 0.55rem;
+    border-radius: 8px;
+    cursor: pointer;
+    line-height: 1.25;
+}
+.sc-usage-logout:hover {
+    border-color: rgba(251, 113, 133, 0.65);
+    background: rgba(251, 113, 133, 0.14);
+}
+.sc-usage-logout:disabled {
+    opacity: 0.55;
+    cursor: wait;
+}
+.sc-usage-login-link {
+    display: inline-block;
+    margin-top: 0.4rem;
+    color: #67e8f9;
+    font-weight: 600;
+    word-break: break-all;
+}
+.sc-usage-user-code {
+    margin-top: 0.35rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #e5e7eb;
+}
 .sc-usage-detail-body {
     line-height: 1.4;
     color: #9ca3af;

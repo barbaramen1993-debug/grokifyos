@@ -1280,26 +1280,55 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun ensureGrokLoginUrl(forceNew: Boolean = false): String? {
         return try {
             val data = withContext(Dispatchers.IO) { api.startGrokLogin(force = forceNew) }
-            val fields = parseLoginFields(data)
-            _state.update {
-                val prev = it.usage ?: UsageInfo()
-                it.copy(
-                    usage = prev.copy(
-                        loginNeeded = true,
-                        loginStatus = fields.loginStatus ?: "pending",
-                        loginUrl = fields.loginUrl ?: prev.loginUrl,
-                        loginUserCode = fields.loginUserCode ?: prev.loginUserCode,
-                        loginMessage = fields.loginMessage ?: prev.loginMessage,
-                        label = "Usage: tap to re-login",
-                        error = prev.error ?: "Grok re-login needed",
-                    ),
-                )
-            }
-            maybeStartLoginPoll(fields.loginStatus ?: "pending")
-            fields.loginUrl ?: _state.value.usage?.loginUrl
+            applyLoginResponse(data, defaultError = "Grok re-login needed")
         } catch (_: Exception) {
             _state.value.usage?.loginUrl
         }
+    }
+
+    /**
+     * Sign out of the current Grok/xAI account on the bridge and start a new OAuth
+     * device-code flow. Returns the browser URL so the user can log in as another account.
+     */
+    suspend fun logoutGrokAndGetLoginUrl(): String? {
+        return try {
+            val data = withContext(Dispatchers.IO) { api.logoutGrokAndStartLogin() }
+            applyLoginResponse(
+                data,
+                defaultError = data.optString("message").ifBlank {
+                    "Signed out — open the login link"
+                },
+            )
+        } catch (_: Exception) {
+            _state.value.usage?.loginUrl
+        }
+    }
+
+    private fun applyLoginResponse(data: JSONObject, defaultError: String): String? {
+        val fields = parseLoginFields(data)
+        val msg = data.optString("message").ifBlank {
+            fields.loginMessage ?: defaultError
+        }
+        _state.update {
+            val prev = it.usage ?: UsageInfo()
+            it.copy(
+                usage = prev.copy(
+                    loginNeeded = true,
+                    loginStatus = fields.loginStatus ?: "pending",
+                    loginUrl = fields.loginUrl ?: prev.loginUrl,
+                    loginUserCode = fields.loginUserCode ?: prev.loginUserCode,
+                    loginMessage = msg,
+                    label = "Usage: tap to re-login",
+                    error = msg,
+                    // Clear pool numbers so the card shows the re-login UI, not stale usage.
+                    usagePercent = 0.0,
+                    remainingPercent = 0.0,
+                    products = emptyList(),
+                ),
+            )
+        }
+        maybeStartLoginPoll(fields.loginStatus ?: "pending")
+        return fields.loginUrl ?: _state.value.usage?.loginUrl
     }
 
     private data class LoginFields(

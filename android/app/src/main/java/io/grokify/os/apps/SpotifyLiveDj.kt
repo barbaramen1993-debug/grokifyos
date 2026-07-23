@@ -150,6 +150,9 @@ private const val KEY_QUEUE_PLAYLIST_CACHE = "queue_playlist_cache_v1"
 /** Inclusive bounds for “talk every N songs” settings. */
 const val BANTER_EVERY_MIN = 1
 const val BANTER_EVERY_MAX = 20
+
+/** Second Previous within this window plays the last history track (first press restarts). */
+private const val PREV_DOUBLE_PRESS_MS = 3_000L
 /** Max playlists the user can pin into the queue pool. */
 const val MAX_DJ_QUEUE_PLAYLISTS = 12
 
@@ -1814,10 +1817,12 @@ fun maybeResumeLiveDj(context: Context) {
                 listenerName = store.listenerName,
             ),
         )
+        SpotifyAndroidAuto.onLiveDjStopped(appCtx)
         return
     }
     Log.i(TAG, "resuming Live DJ after restart (queue=${store.loadQueue().size})")
     startLiveDjService(appCtx, fromResume = true)
+    SpotifyAndroidAuto.onLiveDjStarted(appCtx)
 }
 
 /**
@@ -1931,6 +1936,7 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
     store.enabled = enabled
     if (enabled) {
         startLiveDjService(appCtx, fromResume = false)
+        SpotifyAndroidAuto.onLiveDjStarted(appCtx)
     } else {
         appCtx.stopService(Intent(appCtx, SpotifyLiveDjService::class.java))
         val prevMsgs = SpotifyDjBus.state.value.messages
@@ -1975,6 +1981,8 @@ fun setSpotifyLiveDjEnabled(context: Context, enabled: Boolean) {
                 listenerName = store.listenerName,
             ),
         )
+        // Car may still be connected — hand off to thin Spotify mirror until disconnect.
+        SpotifyAndroidAuto.onLiveDjStopped(appCtx)
     }
 }
 
@@ -5316,8 +5324,52 @@ class SpotifyLiveDjService : Service() {
         )
     }
 
+    /**
+     * Previous transport: first press restarts the current cut; a second press within
+     * [PREV_DOUBLE_PRESS_MS] plays the previous history track now (Android Auto / media keys).
+     */
+    private var lastPrevPressElapsedMs: Long = 0L
+
     private fun restartOrPrevious() {
-        // Restart current from 0 when available; Spotify seek is simpler than full previous history
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val doublePress = lastPrevPressElapsedMs > 0L &&
+            (nowElapsed - lastPrevPressElapsedMs) in 1 until PREV_DOUBLE_PRESS_MS
+        lastPrevPressElapsedMs = nowElapsed
+
+        if (doublePress) {
+            val curUri = current?.uri.orEmpty()
+            val prev = synchronized(chatLog) {
+                chatLog.asReversed().firstOrNull { m ->
+                    m.role == DjChatRole.Track &&
+                        !m.trackUri.isNullOrBlank() &&
+                        m.trackUri != curUri &&
+                        !m.isNowPlaying
+                }
+            }
+            if (prev != null && !prev.trackUri.isNullOrBlank()) {
+                val track = DjQueueTrack(
+                    uri = prev.trackUri!!,
+                    name = prev.trackName.orEmpty(),
+                    artists = prev.trackArtists.orEmpty(),
+                    albumArtUrl = prev.albumArtUrl.orEmpty(),
+                    artistArtUrl = prev.artistArtUrl.orEmpty(),
+                    albumUri = prev.albumUri.orEmpty(),
+                    artistUri = prev.artistUri.orEmpty(),
+                    reason = "history prev",
+                )
+                // Reset window so a third press restarts the newly selected cut.
+                lastPrevPressElapsedMs = 0L
+                val ok = playTrack(track)
+                publish(
+                    status = if (ok) "Previous track" else "Previous failed — open Spotify",
+                    clearError = ok,
+                    error = if (ok) null else "prev_failed",
+                )
+                return
+            }
+            // No history — fall through to restart current.
+        }
+
         val uri = current?.uri
         if (uri.isNullOrBlank()) {
             publish(status = "Nothing to restart")

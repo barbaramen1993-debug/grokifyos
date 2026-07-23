@@ -14,6 +14,34 @@
     <div id="stage-root">
       <canvas id="vrm-canvas"></canvas>
       <div id="stage-hud" aria-live="polite"></div>
+      <!-- Third-person touch controls: stick (move) + jump + gesture wheel. -->
+      <div id="game-pad" aria-label="Character controls">
+        <div id="stick-zone">
+          <div id="stick-base">
+            <div id="stick-knob"></div>
+          </div>
+          <span class="pad-label">move</span>
+        </div>
+        <div id="action-cluster">
+          <button id="map-btn" type="button" aria-label="Cycle world map" title="Cycle map">
+            <span class="map-glyph">🗺</span>
+            <span class="pad-label">map</span>
+          </button>
+          <button id="gesture-btn" type="button" aria-label="Gestures and poses" aria-expanded="false">
+            <span class="gesture-glyph">✦</span>
+            <span class="pad-label">pose</span>
+          </button>
+          <button id="jump-btn" type="button" aria-label="Jump">
+            <span class="jump-glyph">⬆</span>
+            <span class="pad-label">jump</span>
+          </button>
+        </div>
+        <!-- Radial gesture / pose wheel (opens from pose button). -->
+        <div id="gesture-wheel" class="hidden" aria-hidden="true" role="menu" aria-label="Gestures">
+          <div id="gesture-wheel-ring"></div>
+          <button id="gesture-wheel-close" type="button" aria-label="Close poses">✕</button>
+        </div>
+      </div>
       <div id="fallback" aria-hidden="true">
         <div id="fallback-face">
           <div id="fallback-mouth"></div>
@@ -24,6 +52,8 @@
 
     <!-- Offline vendors (no CDN at runtime). Order matters. Cache-bust via host URL query. -->
     <script src="js/vendor/companion-vrm-libs.min.js"></script>
+    <script src="js/companion-world-maps.js"></script>
     <script src="js/companion-stage.js"></script>
+    <script src="js/companion-control.js"></script>
   </body>
 </html>

@@ -74,6 +74,8 @@
         </intent>
         <package android:name="com.spotify.music" />
         <package android:name="com.spotify.lite" />
+        <!-- Legacy Companion World side package (optional; world is now in-app) -->
+        <package android:name="io.grokify.os.companion.world" />
         <!-- On-device / cloud speech recognition for Hey Grok + hold-to-talk -->
         <intent>
             <action android:name="android.speech.RecognitionService" />
@@ -90,6 +92,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Grokify"
         android:usesCleartextTraffic="false">
+
+        <!-- Android Auto declares media apps via this meta-data (application-level). -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+        <!-- Small icon used by Android Auto media notifications / launcher badge. -->
+        <meta-data
+            android:name="com.google.android.gms.car.notification.SmallIcon"
+            android:resource="@mipmap/ic_launcher" />
 
         <activity
             android:name=".MainActivity"
@@ -141,15 +152,6 @@
                 <action android:name="android.speech.action.VOICE_SEARCH_HANDS_FREE" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
-            <!-- Android Auto / car projection hook -->
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.CAR_LAUNCHER" />
-            </intent-filter>
-            <meta-data
-                android:name="com.google.android.gms.car.application"
-                android:resource="@xml/automotive_app_desc" />
         </activity>
 
         <service
@@ -209,6 +211,19 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="spotify_live_ai_dj_playback_watch" />
+        </service>
+
+        <!-- Android Auto music source: Grokify Live DJ (booth + hand-off mirror).
+             Must be exported; AA binds via MediaBrowserService action. -->
+        <service
+            android:name=".apps.SpotifyAndroidAutoService"
+            android:exported="true"
+            android:enabled="true"
+            android:label="@string/android_auto_live_dj_label"
+            android:icon="@mipmap/ic_launcher">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
         </service>
 
         <service

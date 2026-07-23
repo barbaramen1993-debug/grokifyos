@@ -218,8 +218,12 @@ const httpServer = http.createServer(async (req, res) => {
         proxy.end();
         return;
     }
-    // Device-code OAuth login (start / status) — same path on any healthy worker.
-    if (url.pathname === '/grok-login/start' || url.pathname === '/grok-login/status') {
+    // Device-code OAuth login (start / status / logout) — same path on any healthy worker.
+    if (
+        url.pathname === '/grok-login/start'
+        || url.pathname === '/grok-login/status'
+        || url.pathname === '/grok-login/logout'
+    ) {
         const be = pickBackend();
         const q = url.search || '';
         const method = req.method === 'POST' ? 'POST' : 'GET';

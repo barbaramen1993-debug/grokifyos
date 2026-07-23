@@ -162,6 +162,18 @@ class GrokifyApi(
         return executeJson(req)
     }
 
+    /**
+     * Clear local Grok/xAI OAuth on the bridge and start a fresh device-code login.
+     * Use for account switch / multi-account: response includes login_url to open.
+     */
+    fun logoutGrokAndStartLogin(): JSONObject {
+        val body = JSONObject().put("logout", true).put("action", "logout")
+        val req = authRequest("/admin-system-chat-login.php")
+            .post(jsonBody(body))
+            .build()
+        return executeJson(req)
+    }
+
     /** Poll device-code login status (also continues server-side token poll). */
     fun grokLoginStatus(start: Boolean = false): JSONObject {
         val q = if (start) "?start=1" else ""

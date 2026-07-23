@@ -595,15 +595,17 @@ function gos_grok_auth_request_bridge_sync(bool $force = true): array
 /**
  * Call the bridge device-login endpoints (OIDC device code → clickable xAI link).
  *
- * @param 'start'|'status' $action
+ * @param 'start'|'status'|'logout' $action
  * @return array<string, mixed>
  */
 function gos_grok_auth_bridge_login(string $action = 'start', bool $force = false): array
 {
-    $action = $action === 'status' ? 'status' : 'start';
+    if ($action !== 'status' && $action !== 'logout') {
+        $action = 'start';
+    }
     $base = rtrim((string) (gos_env('GROKIFY_BRIDGE_URL', 'http://127.0.0.1:8876') ?? 'http://127.0.0.1:8876'), '/');
     $qs = [];
-    if ($force) {
+    if ($force && $action !== 'logout') {
         $qs[] = 'force=1';
     }
     if ($action === 'status' && $force) {
@@ -615,10 +617,12 @@ function gos_grok_auth_bridge_login(string $action = 'start', bool $force = fals
     if ($ch === false) {
         return ['ok' => false, 'error' => 'curl_init_failed', 'needed' => true];
     }
+    // logout + start need POST; status is GET.
+    $method = ($action === 'status') ? 'GET' : 'POST';
     curl_setopt_array($ch, [
-        CURLOPT_CUSTOMREQUEST => ($action === 'start' ? 'POST' : 'GET'),
+        CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 15,
+        CURLOPT_TIMEOUT => $action === 'logout' ? 20 : 15,
         CURLOPT_CONNECTTIMEOUT => 2,
         CURLOPT_HTTPHEADER => ['Accept: application/json'],
     ]);
@@ -632,7 +636,9 @@ function gos_grok_auth_bridge_login(string $action = 'start', bool $force = fals
             'needed' => true,
             'error' => $err !== '' ? $err : 'empty_response',
             'http_code' => $code,
-            'message' => 'Could not reach bridge to start Grok login',
+            'message' => $action === 'logout'
+                ? 'Could not reach bridge to log out of Grok'
+                : 'Could not reach bridge to start Grok login',
         ];
     }
     $json = json_decode($resp, true);

@@ -329,4 +329,46 @@ object CompanionStageHost {
         val v = JSONObject.quote(label.trim())
         eval("window.CompanionStage && window.CompanionStage.setJointLabel($k, $v);")
     }
+
+    /**
+     * Enter in-app Companion World (maps bundled under assets/companion/world/).
+     * Same stick/jump + VRM; no external Godot package.
+     */
+    fun enterWorld(mapId: String = "proto_arena"): Boolean {
+        if (!isAttached()) return false
+        val id = JSONObject.quote(mapId.trim().ifBlank { "proto_arena" })
+        eval(
+            "window.CompanionStage && window.CompanionStage.enterWorld && " +
+                "window.CompanionStage.enterWorld($id);",
+        )
+        return true
+    }
+
+    fun loadMap(mapId: String): Boolean {
+        if (!isAttached()) return false
+        val id = JSONObject.quote(mapId.trim().ifBlank { "proto_arena" })
+        eval(
+            "window.CompanionStage && window.CompanionStage.loadMap && " +
+                "window.CompanionStage.loadMap($id);",
+        )
+        return true
+    }
+
+    fun nextMap(): Boolean {
+        if (!isAttached()) return false
+        eval(
+            "window.CompanionStage && window.CompanionStage.nextMap && " +
+                "window.CompanionStage.nextMap();",
+        )
+        return true
+    }
+
+    fun leaveWorld(): Boolean {
+        if (!isAttached()) return false
+        eval(
+            "window.CompanionStage && window.CompanionStage.leaveWorld && " +
+                "window.CompanionStage.leaveWorld();",
+        )
+        return true
+    }
 }

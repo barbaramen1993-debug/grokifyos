@@ -217,6 +217,11 @@ $assetV = '20260719-no-host-keys';
                     <button type="button" class="sc-usage-refresh" id="sc-usage-refresh" title="Refresh">↻</button>
                   </div>
                   <div class="sc-usage-detail-body" id="sc-usage-detail-body">…</div>
+                  <div class="sc-usage-actions">
+                    <button type="button" class="sc-usage-logout" id="sc-usage-logout" title="Sign out Grok Build and open a fresh OAuth link">
+                      Log out &amp; get login link
+                    </button>
+                  </div>
                 </div>
                 <label class="sc-settings-label" for="sc-model-select">Model</label>
                 <select id="sc-model-select" class="sc-select w-full max-w-none"></select>

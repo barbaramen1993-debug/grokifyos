@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "description": "Free / open-source Godot-ready map sources for Companion World",
+  "bundled_maps": [
+    {
+      "id": "proto_arena",
+      "title": "Proto Arena",
+      "license": "MIT (Grokify)",
+      "source": "local",
+      "scene": "res://maps/proto_arena.tscn"
+    },
+    {
+      "id": "kenney_plaza",
+      "title": "Kenney Plaza",
+      "license": "CC0",
+      "source": "https://github.com/KenneyNL/Starter-Kit-3D-Platformer",
+      "scene": "res://maps/kenney_plaza.tscn",
+      "notes": "Platforms + grass from Kenney Starter Kit 3D Platformer (CC0)"
+    },
+    {
+      "id": "courtyard",
+      "title": "Courtyard",
+      "license": "MIT (Grokify layout)",
+      "source": "local",
+      "scene": "res://maps/courtyard.tscn",
+      "notes": "Stylized courtyard built from primitives — stand-in for KayKit village packs"
+    },
+    {
+      "id": "mini_dungeon",
+      "title": "Mini Dungeon",
+      "license": "MIT (Grokify layout)",
+      "source": "local",
+      "scene": "res://maps/mini_dungeon.tscn",
+      "notes": "Compact dungeon rooms — stand-in for KayKit Dungeon Remastered (CC0)"
+    }
+  ],
+  "external_repos": [
+    {
+      "name": "Kenney Starter Kit 3D Platformer",
+      "url": "https://github.com/KenneyNL/Starter-Kit-3D-Platformer",
+      "license": "MIT code + CC0 assets",
+      "godot": "4.x",
+      "why": "Ready platform props (GLB) + sample levels; already vendored under maps/vendor/kenney-platformer"
+    },
+    {
+      "name": "Kenney Starter Kit City Builder",
+      "url": "https://github.com/KenneyNL/Starter-Kit-City-Builder",
+      "license": "MIT code + CC0 assets",
+      "godot": "4.x",
+      "why": "City block meshes and sample map.res — good outdoor plaza material"
+    },
+    {
+      "name": "Kenney Starter Kit FPS",
+      "url": "https://github.com/KenneyNL/Starter-Kit-FPS",
+      "license": "MIT code + CC0 assets",
+      "godot": "4.x",
+      "why": "Interior / corridor props"
+    },
+    {
+      "name": "Kenney Starter Kit Basic Scene",
+      "url": "https://github.com/KenneyNL/Starter-Kit-Basic-Scene",
+      "license": "MIT + CC0",
+      "godot": "4.x",
+      "why": "Minimal lit scene bootstrap"
+    },
+    {
+      "name": "KayKit Dungeon Remastered",
+      "url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0",
+      "license": "CC0",
+      "godot": "GLTF/FBX (engine-agnostic)",
+      "why": "200+ dungeon walls/floors/props — pull with scripts/fetch_map_pack.sh kaykit-dungeon"
+    },
+    {
+      "name": "Kenney assets hub",
+      "url": "https://kenney.nl/assets",
+      "license": "CC0",
+      "godot": "n/a (raw packs)",
+      "why": "All Kenney 3D packs are public domain — import GLB into maps/vendor/"
+    },
+    {
+      "name": "Quaternius Ultimate Modular Packs",
+      "url": "https://quaternius.com/",
+      "license": "CC0",
+      "godot": "GLTF",
+      "why": "Nature, buildings, characters — large free packs"
+    },
+    {
+      "name": "Godot demo projects",
+      "url": "https://github.com/godotengine/godot-demo-projects",
+      "license": "MIT",
+      "godot": "4.x",
+      "why": "Official 3D demos with small playable maps"
+    }
+  ]
+}

@@ -947,6 +947,96 @@ async function getDeviceLoginStatus({ startIfNeeded = false, forceNew = false } 
     return publicDeviceLoginView(state);
 }
 
+/**
+ * Wipe CLI + PHP-readable Grok OAuth so a fresh device-code login can switch accounts.
+ * Does not revoke tokens at xAI — only clears local credentials.
+ */
+function clearGrokAuthFiles() {
+    const src = grokAuthSrcPath();
+    const dest = grokAuthDestPath();
+    const cleared = [];
+    const errors = [];
+
+    function wipeAuthFile(p, { wwwData = false } = {}) {
+        if (!p) return;
+        try {
+            fs.mkdirSync(path.dirname(p), { recursive: true });
+            const tmp = p + '.tmp.' + process.pid;
+            // Empty object = no usable entry (same shape CLI/PHP already handle).
+            fs.writeFileSync(tmp, '{}\n', { mode: wwwData ? 0o640 : 0o600 });
+            if (wwwData) {
+                try {
+                    const uid = Number(execSync('id -u www-data', { encoding: 'utf8' }).trim());
+                    const gid = Number(execSync('id -g www-data', { encoding: 'utf8' }).trim());
+                    fs.chownSync(tmp, uid, gid);
+                } catch (_) { /* non-Linux / no www-data */ }
+            }
+            fs.renameSync(tmp, p);
+            if (wwwData) {
+                try {
+                    const uid = Number(execSync('id -u www-data', { encoding: 'utf8' }).trim());
+                    const gid = Number(execSync('id -g www-data', { encoding: 'utf8' }).trim());
+                    fs.chownSync(p, uid, gid);
+                    fs.chmodSync(p, 0o640);
+                } catch (_) {}
+            } else {
+                try { fs.chmodSync(p, 0o600); } catch (_) {}
+            }
+            cleared.push(p);
+        } catch (err) {
+            errors.push({ path: p, error: err.message || String(err) });
+        }
+    }
+
+    wipeAuthFile(src, { wwwData: false });
+    if (path.resolve(src) !== path.resolve(dest)) {
+        wipeAuthFile(dest, { wwwData: true });
+    }
+
+    clearDeviceLoginPollTimer();
+    try {
+        writeDeviceLoginState({
+            status: 'idle',
+            cleared_at: isoNow(),
+            message: 'Signed out',
+        });
+    } catch (err) {
+        errors.push({ path: GROK_DEVICE_LOGIN_STATE_PATH, error: err.message || String(err) });
+    }
+
+    return { cleared, errors };
+}
+
+/**
+ * Log out current Grok/xAI account and immediately start a new device-code OAuth flow.
+ * Returns verification_uri_complete so the app can open the re-login link.
+ */
+async function logoutAndStartDeviceLogin() {
+    const previous = peekGrokAuthStatus();
+    const wipe = clearGrokAuthFiles();
+    log('info', 'auth', 'Grok auth cleared for account switch / re-login', {
+        previous_email: previous && previous.email ? previous.email : null,
+        cleared: wipe.cleared,
+        errors: wipe.errors,
+        instance: INSTANCE_ID,
+    });
+    const login = await startDeviceLogin(true);
+    return {
+        ...login,
+        ok: true,
+        logged_out: true,
+        needed: true,
+        previous_email: (previous && previous.email) || null,
+        auth_cleared: wipe.cleared,
+        auth_clear_errors: wipe.errors.length ? wipe.errors : undefined,
+        message: login.status === 'pending'
+            ? (previous && previous.email
+                ? `Signed out ${previous.email}. Open the link to sign in with another account.`
+                : 'Signed out. Open the link to sign in with Grok / xAI.')
+            : (login.message || 'Signed out. Start login again if the link is missing.'),
+    };
+}
+
 // Resume pending device login after bridge restart.
 (() => {
     try {
@@ -2413,6 +2503,26 @@ const httpServer = http.createServer((req, res) => {
     }
     // OIDC device-code login: start returns a clickable verification_uri_complete;
     // status polls until the user approves in the browser.
+    // logout clears local auth.json then starts a fresh device-code flow (account switch).
+    if (url.pathname === '/grok-login/logout' && (req.method === 'POST' || req.method === 'GET')) {
+        logoutAndStartDeviceLogin()
+            .then((result) => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            })
+            .catch((err) => {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    ok: false,
+                    status: 'error',
+                    needed: true,
+                    logged_out: false,
+                    error: err.message || 'logout_failed',
+                    message: 'Failed to log out / start Grok device login',
+                }));
+            });
+        return;
+    }
     if (url.pathname === '/grok-login/start' && (req.method === 'POST' || req.method === 'GET')) {
         const forceNew = url.searchParams.get('force') === '1';
         startDeviceLogin(forceNew)

@@ -316,6 +316,18 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.250 — Grok logout + re-login (switch accounts)
+
+- **Settings → Weekly usage → “Log out & get login link”** (Android + web): clears host Grok Build OAuth, starts a fresh OIDC device-code login, and opens the xAI verification URL so you can approve a different account.
+- **Bridge** `POST /grok-login/logout`: wipes `~/.grok/auth.json` + `storage/grok-auth.json`, cancels any in-flight device login, returns `verification_uri_complete` (same shape as start). Gateway proxies the new path; PHP `admin-system-chat-login.php` accepts `{ "logout": true }`.
+- One host Grok session at a time — logout then re-login is the intentional multi-account path.
+
+Also in this ship window (0.1.234–0.1.249 OTA range, same tree):
+
+- **Companion body self-collision**: hips-local spheres + torso capsule + clothes ellipsoid push wrists/elbows out of the mesh; hand–hand soft separation; debug wireframe colliders.
+- **Companion World in-app**: playable maps (`proto_arena`, `kenney_plaza`, `courtyard`, `mini_dungeon`) bundled under `assets/companion/world/`; Settings → **Open Companion World**; stick / jump / MAP on stage. Source under `godot/companion-world` + plan docs.
+- **Android Auto Live DJ**: `MediaBrowserService` music source when Live DJ is on air; Spotify pane master switch; car meta-data on the application.
+
 ### 0.1.233 — Main chat image attach + Companion VRMA / movement agent
 
 - **Main chat media button**: bottom-left attach control in the composer (Android Chat). Photo picker (up to 4 images), client JPEG compress, optional media-cache upload for durable history thumbs, and vision analysis via the bridge.

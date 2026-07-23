@@ -2074,6 +2074,61 @@
     }
   }
 
+  /**
+   * Clear bridge Grok OAuth and start a fresh device-code login link (account switch).
+   */
+  async function logoutGrokAndShowLogin() {
+    const btn = $('sc-usage-logout');
+    const chip = $('sc-usage-chip');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Signing out…';
+    }
+    try {
+      const data = await apiPost('/admin-system-chat-login.php', { logout: true, action: 'logout' });
+      const login = (data && data.login) || data || {};
+      const url = (data && data.login_url)
+        || login.verification_uri_complete
+        || '';
+      const code = (data && data.login_user_code) || login.user_code || '';
+      const msg = (data && data.message)
+        || login.message
+        || 'Signed out. Open the login link to continue.';
+      if (chip) {
+        chip.textContent = 'Usage: re-login';
+        chip.classList.remove('sc-usage-warn', 'sc-usage-crit');
+        chip.title = msg;
+      }
+      let bodyHtml = '<div class="sc-usage-error">' + escapeHtml(msg) + '</div>';
+      if (code) {
+        bodyHtml += '<div class="sc-usage-user-code">Code: ' + escapeHtml(code) + '</div>';
+      }
+      if (url) {
+        bodyHtml +=
+          '<a class="sc-usage-login-link" href="' + escapeHtml(url) +
+          '" target="_blank" rel="noopener noreferrer">Open Grok / xAI login</a>';
+      }
+      const body = $('sc-usage-detail-body');
+      if (body) body.innerHTML = bodyHtml;
+      if (url) {
+        try { window.open(url, '_blank', 'noopener,noreferrer'); } catch (_) {}
+      }
+      // Poll usage after a short delay so approval can land.
+      setTimeout(() => loadUsage(true), 8000);
+    } catch (e) {
+      const body = $('sc-usage-detail-body');
+      if (body) {
+        body.innerHTML = '<div class="sc-usage-error">' +
+          escapeHtml(e.message || 'Logout failed') + '</div>';
+      }
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Log out & get login link';
+      }
+    }
+  }
+
   async function loadModels() {
     const data = await apiGet('/admin-system-chat-models.php');
     wsToken = data.ws_token || '';
@@ -2620,6 +2675,12 @@
         e.preventDefault();
         e.stopPropagation();
         loadUsage(true);
+      });
+    $('sc-usage-logout') &&
+      $('sc-usage-logout').addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        logoutGrokAndShowLogin();
       });
     $('sc-new-chat') && $('sc-new-chat').addEventListener('click', () => newChat());
 

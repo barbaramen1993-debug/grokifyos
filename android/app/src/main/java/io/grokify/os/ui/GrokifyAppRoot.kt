@@ -268,6 +268,8 @@ fun GrokifyAppRoot(
     onRefreshUsage: () -> Unit = {},
     /** Open xAI device-code OAuth link when Grok Build needs re-login. */
     onGrokLogin: () -> Unit = {},
+    /** Clear bridge Grok auth and open a fresh login link (account switch). */
+    onGrokLogout: () -> Unit = {},
     onSetAppOrder: (List<String>) -> Unit = {},
 ) {
     var tab by remember { mutableIntStateOf(1) } // default Chat
@@ -535,6 +537,7 @@ fun GrokifyAppRoot(
                         onBack = onCloseSettings,
                         onRefreshUsage = onRefreshUsage,
                         onGrokLogin = onGrokLogin,
+                        onGrokLogout = onGrokLogout,
                         onSelectModel = onSelectModel,
                         onSetWorkDir = onSetWorkDir,
                         onResetWorkDir = onResetWorkDir,
@@ -2361,6 +2364,7 @@ private fun SettingsPage(
     onOpenAppPermissionSettings: () -> Unit = {},
     onRefreshUsage: () -> Unit = {},
     onGrokLogin: () -> Unit = {},
+    onGrokLogout: () -> Unit = {},
     onSaveMapboxAccessToken: (String) -> Unit = {},
     onClearMapboxAccessToken: () -> Unit = {},
     onSaveApiKey: (id: String, value: String, label: String?, description: String?) -> Unit = { _, _, _, _ -> },
@@ -2431,7 +2435,12 @@ private fun SettingsPage(
             }
         }
 
-        UsageCard(state = state, onRefresh = onRefreshUsage, onGrokLogin = onGrokLogin)
+        UsageCard(
+            state = state,
+            onRefresh = onRefreshUsage,
+            onGrokLogin = onGrokLogin,
+            onGrokLogout = onGrokLogout,
+        )
 
         Text("CHAT", style = MaterialTheme.typography.labelSmall, color = GrokifyColors.GlowCyan)
         SettingRow(
@@ -3549,6 +3558,7 @@ private fun UsageCard(
     state: UiState,
     onRefresh: () -> Unit,
     onGrokLogin: () -> Unit = {},
+    onGrokLogout: () -> Unit = {},
 ) {
     val usage = state.usage
     val pct = usage?.usagePercent ?: 0.0
@@ -3557,7 +3567,8 @@ private fun UsageCard(
     val loginNeeded = usage?.loginNeeded == true ||
         !usage?.loginUrl.isNullOrBlank() ||
         (usage?.error?.contains("login", ignoreCase = true) == true) ||
-        (usage?.error?.contains("auth", ignoreCase = true) == true)
+        (usage?.error?.contains("auth", ignoreCase = true) == true) ||
+        (usage?.error?.contains("signed out", ignoreCase = true) == true)
     val hardError = usage?.error != null &&
         (usage.label.isBlank() || (usage.usagePercent <= 0.0 && usage.products.isEmpty()))
 
@@ -3621,6 +3632,8 @@ private fun UsageCard(
                     when {
                         usage?.loginStatus == "pending" ->
                             "Waiting for xAI approval…"
+                        usage?.loginMessage?.contains("signed out", ignoreCase = true) == true ->
+                            "Signed out — re-login to continue"
                         loginNeeded ->
                             "Grok Build session expired"
                         else ->
@@ -3661,6 +3674,17 @@ private fun UsageCard(
                             fontWeight = FontWeight.SemiBold,
                         )
                     }
+                    // Force a brand-new device code (e.g. expired link or switch account mid-flow).
+                    TextButton(
+                        onClick = onGrokLogout,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            "New login link (switch account)",
+                            color = GrokifyColors.TextMuted,
+                            fontSize = 12.sp,
+                        )
+                    }
                 }
             }
             usage == null && state.usageLoading -> {
@@ -3672,6 +3696,16 @@ private fun UsageCard(
                     color = GrokifyColors.TextMuted,
                     fontSize = 13.sp,
                 )
+                OutlinedButton(
+                    onClick = onGrokLogout,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = GrokifyColors.GlowRose,
+                    ),
+                    border = BorderStroke(1.dp, GrokifyColors.GlowRose.copy(alpha = 0.45f)),
+                ) {
+                    Text("Log out & get login link", fontWeight = FontWeight.SemiBold)
+                }
             }
             else -> {
                 Row(
@@ -3795,6 +3829,22 @@ private fun UsageCard(
                             }
                         }
                     }
+                }
+
+                Text(
+                    "Switch accounts or re-auth: signs out Grok Build on this server and opens a fresh OAuth link.",
+                    color = GrokifyColors.TextDim,
+                    fontSize = 11.sp,
+                )
+                OutlinedButton(
+                    onClick = onGrokLogout,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = GrokifyColors.GlowRose,
+                    ),
+                    border = BorderStroke(1.dp, GrokifyColors.GlowRose.copy(alpha = 0.45f)),
+                ) {
+                    Text("Log out & get login link", fontWeight = FontWeight.SemiBold)
                 }
             }
         }

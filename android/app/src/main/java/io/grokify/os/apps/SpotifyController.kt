@@ -149,6 +149,8 @@ private const val KEY_ENABLED = "enabled"
 private const val KEY_PREFERRED_DEVICE = "preferred_device_id"
 private const val KEY_LAST_STATUS = "last_status"
 private const val KEY_LAST_ERROR = "last_error"
+/** Master switch: expose Grokify Live DJ as an Android Auto music source. */
+private const val KEY_ANDROID_AUTO = "android_auto_v1"
 const val SPOTIFY_CTRL_NOTIF_ID = 47001
 
 /** Process-lifetime: true while [SpotifyControllerService] is created. */
@@ -279,6 +281,16 @@ class SpotifyControllerStore(context: Context) {
     var lastError: String
         get() = prefs.getString(KEY_LAST_ERROR, "").orEmpty()
         set(value) = prefs.edit().putString(KEY_LAST_ERROR, value).apply()
+
+    /**
+     * Master switch for the Android Auto media browser ("Grokify Live DJ").
+     * When on, the car source is offered only while Live DJ is on air (then may
+     * hand off to a thin Spotify mirror until the car disconnects). Changes apply
+     * on the next Live DJ start or car reconnect — not mid-session.
+     */
+    var androidAutoEnabled: Boolean
+        get() = prefs.getBoolean(KEY_ANDROID_AUTO, false)
+        set(value) = prefs.edit().putBoolean(KEY_ANDROID_AUTO, value).apply()
 
     fun recordStatus(status: String, error: String = "") {
         prefs.edit()
@@ -2003,6 +2015,7 @@ fun SpotifyControllerPane(
     var devicesLoading by remember { mutableStateOf(false) }
     var devicesTransferringId by remember { mutableStateOf<String?>(null) }
     var preferredDeviceId by remember { mutableStateOf(store.preferredDeviceId) }
+    var androidAutoEnabled by remember { mutableStateOf(store.androidAutoEnabled) }
 
     // Liked Songs heart (Control + Live DJ chat tracks, including past cuts)
     var trackLiked by remember { mutableStateOf(false) }
@@ -2443,6 +2456,68 @@ fun SpotifyControllerPane(
                                 uncheckedThumbColor = GrokifyColors.TextMuted,
                                 uncheckedTrackColor = GrokifyColors.PanelSoft,
                             ),
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // Android Auto master switch — car media browser (booth while Live DJ is on)
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(GrokifyColors.Panel)
+                        .border(1.dp, GrokifyColors.PanelBorder, RoundedCornerShape(14.dp))
+                        .padding(16.dp),
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Android Auto",
+                                color = GrokifyColors.TextPrimary,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 15.sp,
+                            )
+                            Text(
+                                if (androidAutoEnabled) {
+                                    "On — “Grokify Live DJ” appears in Android Auto media apps " +
+                                        "(idle until Live DJ is on air; full booth when live)"
+                                } else {
+                                    "Off — hidden from the car media list"
+                                },
+                                color = GrokifyColors.TextDim,
+                                fontSize = 12.sp,
+                            )
+                        }
+                        Switch(
+                            checked = androidAutoEnabled,
+                            onCheckedChange = { on ->
+                                store.androidAutoEnabled = on
+                                androidAutoEnabled = on
+                                SpotifyAndroidAuto.onSettingChanged(appCtx)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = GrokifyColors.Void,
+                                checkedTrackColor = GrokifyColors.GlowMint,
+                                uncheckedThumbColor = GrokifyColors.TextMuted,
+                                uncheckedTrackColor = GrokifyColors.PanelSoft,
+                            ),
+                        )
+                    }
+                    if (androidAutoEnabled) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            "Not seeing it in the car? Grokify is sideloaded, so Android Auto " +
+                                "hides it until you enable Unknown sources:\n" +
+                                "1. Phone → Settings → Apps → Android Auto → Additional settings in the app\n" +
+                                "2. Tap “Version” 10× → open ⋮ Developer settings\n" +
+                                "3. Enable “Unknown sources”\n" +
+                                "4. Force-stop Android Auto, reopen GrokifyOS, reconnect the car\n" +
+                                "Look for “Grokify Live DJ” under media apps (next to Spotify).",
+                            color = GrokifyColors.TextMuted,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp,
                         )
                     }
                 }

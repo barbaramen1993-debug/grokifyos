@@ -1,0 +1,89 @@
+[gd_scene load_steps=8 format=3 uid="uid://bcompanionarena01"]
+
+[ext_resource type="Script" path="res://scripts/proto_arena.gd" id="1_arena"]
+
+[sub_resource type="BoxMesh" id="BoxMesh_floor"]
+size = Vector3(40, 0.4, 40)
+
+[sub_resource type="StandardMaterial3D" id="Mat_floor"]
+albedo_color = Color(0.09, 0.11, 0.16, 1)
+roughness = 0.92
+
+[sub_resource type="BoxShape3D" id="BoxShape_floor"]
+size = Vector3(40, 0.4, 40)
+
+[sub_resource type="BoxMesh" id="BoxMesh_wall"]
+size = Vector3(40, 1.2, 0.35)
+
+[sub_resource type="StandardMaterial3D" id="Mat_wall"]
+albedo_color = Color(0.18, 0.24, 0.34, 1)
+roughness = 0.85
+
+[sub_resource type="BoxShape3D" id="BoxShape_wall"]
+size = Vector3(40, 1.2, 0.35)
+
+[node name="ProtoArena" type="Node3D"]
+script = ExtResource("1_arena")
+
+[node name="Floor" type="StaticBody3D" parent="."]
+collision_layer = 1
+collision_mask = 0
+
+[node name="Mesh" type="MeshInstance3D" parent="Floor"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.2, 0)
+mesh = SubResource("BoxMesh_floor")
+surface_material_override/0 = SubResource("Mat_floor")
+
+[node name="Collision" type="CollisionShape3D" parent="Floor"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.2, 0)
+shape = SubResource("BoxShape_floor")
+
+[node name="WallN" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.4, -20)
+collision_layer = 1
+
+[node name="Mesh" type="MeshInstance3D" parent="WallN"]
+mesh = SubResource("BoxMesh_wall")
+surface_material_override/0 = SubResource("Mat_wall")
+
+[node name="Collision" type="CollisionShape3D" parent="WallN"]
+shape = SubResource("BoxShape_wall")
+
+[node name="WallS" type="StaticBody3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.4, 20)
+collision_layer = 1
+
+[node name="Mesh" type="MeshInstance3D" parent="WallS"]
+mesh = SubResource("BoxMesh_wall")
+surface_material_override/0 = SubResource("Mat_wall")
+
+[node name="Collision" type="CollisionShape3D" parent="WallS"]
+shape = SubResource("BoxShape_wall")
+
+[node name="WallE" type="StaticBody3D" parent="."]
+transform = Transform3D(0, 0, 1, 0, 1, 0, -1, 0, 0, 20, 0.4, 0)
+collision_layer = 1
+
+[node name="Mesh" type="MeshInstance3D" parent="WallE"]
+mesh = SubResource("BoxMesh_wall")
+surface_material_override/0 = SubResource("Mat_wall")
+
+[node name="Collision" type="CollisionShape3D" parent="WallE"]
+shape = SubResource("BoxShape_wall")
+
+[node name="WallW" type="StaticBody3D" parent="."]
+transform = Transform3D(0, 0, 1, 0, 1, 0, -1, 0, 0, -20, 0.4, 0)
+collision_layer = 1
+
+[node name="Mesh" type="MeshInstance3D" parent="WallW"]
+mesh = SubResource("BoxMesh_wall")
+surface_material_override/0 = SubResource("Mat_wall")
+
+[node name="Collision" type="CollisionShape3D" parent="WallW"]
+shape = SubResource("BoxShape_wall")
+
+[node name="Spawn" type="Marker3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.05, 0)
+
+[node name="Pad" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.02, 0)

@@ -145,19 +145,12 @@ class MainActivity : ComponentActivity() {
                         onRefreshUsage = { vm.refreshUsage(force = true) },
                         onGrokLogin = {
                             lifecycleScope.launch {
-                                val url = vm.ensureGrokLoginUrl(forceNew = false)
-                                if (!url.isNullOrBlank()) {
-                                    try {
-                                        startActivity(
-                                            Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                                        )
-                                    } catch (_: Exception) {
-                                        // No browser / invalid URL — status chip still shows code.
-                                    }
-                                } else {
-                                    vm.refreshUsage(force = true)
-                                }
+                                openGrokLoginUrl(vm.ensureGrokLoginUrl(forceNew = false))
+                            }
+                        },
+                        onGrokLogout = {
+                            lifecycleScope.launch {
+                                openGrokLoginUrl(vm.logoutGrokAndGetLoginUrl())
                             }
                         },
                         onSetAppOrder = vm::setAppOrder,
@@ -184,6 +177,19 @@ class MainActivity : ComponentActivity() {
         io.grokify.os.apps.plugin.SpotifyOAuth.handleRedirect(this, intent)
         io.grokify.os.widgets.WidgetNav.handleIntent(intent)
         handleAssistantEntry(intent)
+    }
+
+    /** Open xAI device-code verification URL in the system browser (re-login / account switch). */
+    private fun openGrokLoginUrl(url: String?) {
+        if (url.isNullOrBlank()) return
+        try {
+            startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        } catch (_: Exception) {
+            // No browser / invalid URL — Settings usage card still shows code + message.
+        }
     }
 
     /**

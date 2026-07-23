@@ -349,7 +349,7 @@ fun CompanionLive2dStage(
 private const val TAG = "CompanionVrm"
 // Version bump forces a fresh document after Live2D → VRM migrations.
 private const val ASSET_URL =
-    "file:///android_asset/companion/index.html?stage=vrm8&v=231"
+    "file:///android_asset/companion/index.html?stage=vrm9&v=248"
 
 /**
  * Host bridge for the offline VRM stage.
@@ -702,9 +702,13 @@ private fun interceptCompanionResource(
         when {
             url.startsWith("file:///android_asset/companion/") -> {
                 val assetPath = url.removePrefix("file:///android_asset/")
-                // Never serve multi‑MB VRMs through intercept+fetch (fails on OEMs).
+                // Multi‑MB VRMs must not go through intercept+fetch (fails on OEMs).
+                // Small world map GLBs under companion/world/ are fine and needed offline.
+                val isWorldGlb =
+                    assetPath.endsWith(".glb", ignoreCase = true) &&
+                        assetPath.contains("/world/")
                 if (assetPath.endsWith(".vrm", ignoreCase = true) ||
-                    assetPath.endsWith(".glb", ignoreCase = true)
+                    (assetPath.endsWith(".glb", ignoreCase = true) && !isWorldGlb)
                 ) {
                     return null
                 }

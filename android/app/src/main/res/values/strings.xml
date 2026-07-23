@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">GrokifyOS</string>
+    <string name="android_auto_live_dj_label">Grokify Live DJ</string>
     <string name="notification_channel_assistant">GrokifyOS (quiet)</string>
     <string name="notification_channel_assistant_desc">Required by Android while the background assistant bridge is active. Minimal priority — no sound or lockscreen.</string>
     <string name="notification_channel_updates">App updates</string>

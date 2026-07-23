@@ -13,11 +13,39 @@ if ($method !== 'GET' && $method !== 'POST') {
 }
 
 $force = isset($_GET['force']) && (string) $_GET['force'] !== '0' && (string) $_GET['force'] !== '';
+$logout = isset($_GET['logout']) && (string) $_GET['logout'] !== '0' && (string) $_GET['logout'] !== '';
 if ($method === 'POST') {
     $body = gos_json_body();
     if (!empty($body['force'])) {
         $force = true;
     }
+    if (!empty($body['logout']) || (($body['action'] ?? '') === 'logout')) {
+        $logout = true;
+    }
+}
+
+// Logout clears local Grok/xAI OAuth and starts a fresh device-code link for re-login /
+// multi-account switch. POST preferred; GET ?logout=1 also works.
+if ($logout) {
+    $login = gos_grok_auth_bridge_login('logout', true);
+    gos_system_chat_audit('info', 'auth', 'Grok device logout + re-login started', [
+        'status' => $login['status'] ?? null,
+        'user_code' => $login['user_code'] ?? null,
+        'previous_email' => $login['previous_email'] ?? null,
+        'logged_out' => !empty($login['logged_out']),
+    ], $userId);
+
+    gos_api_json([
+        'ok' => !empty($login['ok'])
+            || (($login['status'] ?? '') === 'pending')
+            || !empty($login['logged_out']),
+        'logged_out' => !empty($login['logged_out']),
+        'previous_email' => $login['previous_email'] ?? null,
+        'login' => $login,
+        'login_url' => $login['verification_uri_complete'] ?? null,
+        'login_user_code' => $login['user_code'] ?? null,
+        'message' => $login['message'] ?? 'Signed out. Open the login link to continue.',
+    ]);
 }
 
 // POST always starts (optionally force-new). GET is status; ?start=1 also starts.

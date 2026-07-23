@@ -25,3 +25,6 @@
 
 # Git worktrees (local isolation)
 .worktrees/
+
+# Godot editor cache (regenerated locally)
+godot/**/.godot/

@@ -705,6 +705,21 @@ fun CompanionPane(onBack: () -> Unit) {
                     )
                 },
                 hasXaiKey = hasXaiKey,
+                worldInstalled = true,
+                onOpenWorld = {
+                    if (!stageReady || !CompanionStageHost.isAttached()) {
+                        flashStatus("Wait for the avatar to load, then open World again")
+                        return@CompanionSettingsSheet
+                    }
+                    val err = CompanionWorldLauncher.openWorld(appCtx, "proto_arena")
+                    if (err != null) {
+                        flashStatus(err)
+                    } else {
+                        showSettings = false
+                        showChat = false
+                        flashStatus("World: stick · jump · MAP to cycle maps")
+                    }
+                },
                 onClearHistory = { showClearConfirm = true },
                 onClose = { showSettings = false },
             )
@@ -1155,6 +1170,8 @@ private fun CompanionSettingsSheet(
     userModelPath: String,
     onLoadModel: () -> Unit,
     hasXaiKey: Boolean,
+    worldInstalled: Boolean,
+    onOpenWorld: () -> Unit,
     onClearHistory: () -> Unit,
     onClose: () -> Unit,
 ) {
@@ -1245,6 +1262,32 @@ private fun CompanionSettingsSheet(
                     uncheckedTrackColor = GrokifyColors.PanelSoft,
                 ),
             )
+        }
+
+        Spacer(Modifier.height(12.dp))
+        SectionLabel("WORLD · IN-APP")
+        Text(
+            "Playable maps ship inside this app (from godot/companion-world). " +
+                "No separate Godot install — stick, jump, and MAP on the stage.",
+            color = GrokifyColors.TextDim,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(bottom = 6.dp),
+        )
+        Text(
+            "Maps: proto_arena · kenney_plaza · courtyard · mini_dungeon",
+            color = GrokifyColors.TextMuted,
+            fontSize = 10.sp,
+            modifier = Modifier.padding(bottom = 6.dp),
+        )
+        Button(
+            onClick = onOpenWorld,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = CompanionAccent.copy(alpha = 0.22f),
+                contentColor = CompanionAccent,
+            ),
+        ) {
+            Text("Open Companion World")
         }
 
         Spacer(Modifier.height(12.dp))

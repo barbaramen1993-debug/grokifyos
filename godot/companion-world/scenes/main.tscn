@@ -1,0 +1,187 @@
+[gd_scene load_steps=8 format=3 uid="uid://bcompanionmain01"]
+
+[ext_resource type="PackedScene" uid="uid://bcompanionplayer01" path="res://scenes/player.tscn" id="1_player"]
+[ext_resource type="PackedScene" uid="uid://bcompanionarena01" path="res://maps/proto_arena.tscn" id="2_arena"]
+[ext_resource type="Script" path="res://scripts/camera_follow.gd" id="3_cam"]
+[ext_resource type="Script" path="res://scripts/touch_controls.gd" id="4_touch"]
+
+[sub_resource type="Environment" id="Environment_main"]
+background_mode = 1
+background_color = Color(0.05, 0.07, 0.11, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.45, 0.5, 0.62, 1)
+ambient_light_energy = 0.55
+tonemap_mode = 2
+glow_enabled = true
+glow_intensity = 0.25
+
+[sub_resource type="StyleBoxFlat" id="Style_stick"]
+bg_color = Color(0.12, 0.14, 0.2, 0.55)
+corner_radius_top_left = 80
+corner_radius_top_right = 80
+corner_radius_bottom_right = 80
+corner_radius_bottom_left = 80
+border_width_left = 2
+border_width_top = 2
+border_width_right = 2
+border_width_bottom = 2
+border_color = Color(0.55, 0.42, 0.92, 0.55)
+
+[sub_resource type="StyleBoxFlat" id="Style_knob"]
+bg_color = Color(0.72, 0.62, 1, 0.85)
+corner_radius_top_left = 40
+corner_radius_top_right = 40
+corner_radius_bottom_right = 40
+corner_radius_bottom_left = 40
+
+[node name="Main" type="Node3D"]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_main")
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866, -0.354, 0.354, 0, 0.707, 0.707, -0.5, -0.612, 0.612, 4, 10, 6)
+shadow_enabled = true
+directional_shadow_mode = 1
+
+[node name="Fill" type="OmniLight3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 3, 2)
+light_color = Color(0.55, 0.65, 1, 1)
+light_energy = 0.45
+omni_range = 18.0
+
+[node name="MapRoot" type="Node3D" parent="."]
+
+[node name="ProtoArena" parent="MapRoot" instance=ExtResource("2_arena")]
+
+[node name="Player" parent="." instance=ExtResource("1_player")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
+
+[node name="CameraRig" type="Node3D" parent="."]
+script = ExtResource("3_cam")
+target_path = NodePath("../Player")
+
+[node name="SpringArm3D" type="SpringArm3D" parent="CameraRig"]
+spring_length = 3.4
+margin = 0.15
+
+[node name="Camera3D" type="Camera3D" parent="CameraRig/SpringArm3D"]
+current = true
+fov = 55.0
+near = 0.08
+far = 120.0
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="TouchControls" type="Control" parent="UI"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 1
+script = ExtResource("4_touch")
+player_path = NodePath("../../Player")
+
+[node name="StickZone" type="Control" parent="UI/TouchControls"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 2
+anchor_top = 1.0
+anchor_bottom = 1.0
+offset_left = 24.0
+offset_top = -220.0
+offset_right = 200.0
+offset_bottom = -36.0
+grow_vertical = 0
+mouse_filter = 0
+
+[node name="StickBase" type="Panel" parent="UI/TouchControls/StickZone"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -72.0
+offset_top = -72.0
+offset_right = 72.0
+offset_bottom = 72.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+theme_override_styles/panel = SubResource("Style_stick")
+
+[node name="StickKnob" type="Panel" parent="UI/TouchControls/StickZone/StickBase"]
+unique_name_in_owner = true
+layout_mode = 0
+offset_left = 44.0
+offset_top = 44.0
+offset_right = 100.0
+offset_bottom = 100.0
+mouse_filter = 2
+theme_override_styles/panel = SubResource("Style_knob")
+
+[node name="JumpBtn" type="Button" parent="UI/TouchControls"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 3
+anchor_left = 1.0
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = -148.0
+offset_top = -148.0
+offset_right = -36.0
+offset_bottom = -36.0
+grow_horizontal = 0
+grow_vertical = 0
+theme_override_font_sizes/font_size = 22
+text = "JUMP"
+
+[node name="Hint" type="Label" parent="UI/TouchControls"]
+layout_mode = 1
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = -180.0
+offset_top = 18.0
+offset_right = 180.0
+offset_bottom = 48.0
+grow_horizontal = 2
+theme_override_colors/font_color = Color(0.75, 0.78, 0.9, 0.75)
+theme_override_font_sizes/font_size = 14
+text = "Companion World · stick + jump · MAP cycles free packs"
+horizontal_alignment = 1
+
+[node name="MapBtn" type="Button" parent="UI/TouchControls"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -132.0
+offset_top = 16.0
+offset_right = -16.0
+offset_bottom = 60.0
+grow_horizontal = 0
+theme_override_font_sizes/font_size = 16
+text = "MAP"
+
+[node name="MapLabel" type="Label" parent="UI/TouchControls"]
+unique_name_in_owner = true
+layout_mode = 1
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -220.0
+offset_top = 64.0
+offset_right = -16.0
+offset_bottom = 88.0
+grow_horizontal = 0
+theme_override_colors/font_color = Color(0.7, 0.75, 0.9, 0.85)
+theme_override_font_sizes/font_size = 12
+text = "proto_arena"
+horizontal_alignment = 2
