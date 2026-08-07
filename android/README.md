@@ -75,13 +75,15 @@ Server: `GET /api/update.php?version_code=N` then `GET /api/apk-download.php` wi
 
 ## Current release
 
-See root **[README.md § Changelog](../README.md#changelog)** for full history. Ship notes:
+See root **[README.md § Changelog](../README.md#changelog)** for full history. Ship notes (phone host; wear/face are separate channels):
 
-| versionName | versionCode | Notes |
-|-------------|-------------|--------|
-| **0.1.160** | 160 | Chat stick-to-bottom unlock when scrolled up |
-| 0.1.159 | 159 | Bridge agent working directory (Settings picker) |
-| 0.1.158 | 158 | Live DJ shared radio removed |
-| 0.1.149–0.1.157 | … | Queue system, prompt templates, console UI, OAuth/PKCE, temporary host-keys experiment |
+| Channel | versionName | versionCode | Notes |
+|---------|-------------|-------------|--------|
+| **phone** | **0.1.265** | **265** | Watch Deploy, multi-channel OTA, Data Layer key/token sync |
+| **wear** | **0.1.8** | **8** | Standalone AI + radial HUD; on-watch Update app |
+| **wear-face** | **0.1.1** | **1** | WFF always-on face (time + HR/steps complications) |
+| phone | 0.1.250 | 250 | Grok logout + re-login; Companion world; Android Auto |
+| phone | 0.1.233 | 233 | Chat image attach + Companion VRMA / movement agent |
+| phone | 0.1.160 | 160 | Chat stick-to-bottom unlock when scrolled up |
 
 **Settings → Working directory** picks the bridge agent `cwd` (default = GrokifyOS install path).

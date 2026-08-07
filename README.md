@@ -314,7 +314,27 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 ## Changelog
 
-Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Newest first. OTA notes on the phone come from `publish.sh --changelog`; this section is the longer human history.
+Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Wear and watch-face channels keep **independent** version streams (`android/wear`, `android/wear-face`). Newest first. OTA notes on the phone/watch come from `publish.sh --changelog`; this section is the longer human history.
+
+### 0.1.251–0.1.265 — Wear OS closed loop (phone host)
+
+**Phone host `0.1.265` (versionCode 265)** — multi-channel OTA, Watch Deploy, Data Layer key sync.
+
+- **Three OTA channels** (never mix): `phone` (`:app`), `wear` (`:wear`), `wear-face` (`:wear-face`). Publish with `./scripts/publish.sh debug --channel <name> --changelog "…"`. Schema `003_apk_channel.sql` + `gos_latest_apk($channel)` / `update.php?channel=`.
+- **Watch Deploy** (Apps hub): wireless ADB to Galaxy Watch via bundled arm64 `libadb.so`. Pair / Connect IP:port, **Update & install** (one tap: check + download wear APK + install), soft-then-hard reconnect after OTA so open no longer hangs on a stale port (`0.1.264`).
+- **Data Layer wear bridge**: `WearApiKeySync` + `WearApiKeyListenerService` push Grok API key and device token to the watch when package ids match (`io.grokify.os` / debug twin). ADB key inject remains a fallback.
+- **Wear OTA auth**: phone device token can authorize wear update checks so the watch can self-update over LTE after the first Deploy install.
+- **Build helpers**: `./scripts/build.sh debug phone|wear|wear-face|all`.
+
+**Wear app `0.1.8` (versionCode 8)** — standalone AI assistant + radial telemetry HUD (not a phone UI clone).
+
+- Radial breathing HUD: time, HR, steps, compass, location, weather (Open-Meteo), battery, media/messages (notification listener).
+- Carina chat + on-watch **Update app** (check → download → install) once `0.1.8+` is installed.
+- `applicationId` aligned with phone for Wear Data Layer; Kotlin `namespace` stays `io.grokify.os.wear`.
+
+**Watch face `0.1.1` (versionCode 1)** — Watch Face Format package (`io.grokify.os.wear.face`), resource-only (`hasCode=false`). Separate APK from `:wear` (Play / Wear OS requirement). Always-on WFF twin (time + system complications for HR/steps); interactive HUD stays in the wear app.
+
+Also in this window (Companion / stage polish shipped with the same tree): companion stage, amplitude, and system-chat updates used by phone host builds through `0.1.265`.
 
 ### 0.1.250 — Grok logout + re-login (switch accounts)
 
