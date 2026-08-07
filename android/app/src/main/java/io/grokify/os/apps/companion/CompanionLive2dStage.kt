@@ -124,7 +124,7 @@ fun CompanionLive2dStage(
         pushState(wv, avatarState)
     }
 
-    // Throttle mouth: push on meaningful delta or ~50 fps so lips track PCM envelope.
+    // Throttle mouth: push on meaningful delta or ~60 fps so lips track PCM envelope.
     LaunchedEffect(mouth, stageReady) {
         val wv = webView ?: return@LaunchedEffect
         if (!stageReady) return@LaunchedEffect
@@ -133,7 +133,7 @@ fun CompanionLive2dStage(
         val delta = if (lastPushedMouth.isNaN()) 1f else abs(clamped - lastPushedMouth)
         val elapsed = now - lastMouthPushMs
         // Push often — lips desync when small envelope edges are dropped.
-        if (!lastPushedMouth.isNaN() && delta <= 0.008f && elapsed < 12L) {
+        if (!lastPushedMouth.isNaN() && delta <= 0.004f && elapsed < 10L) {
             return@LaunchedEffect
         }
         lastPushedMouth = clamped

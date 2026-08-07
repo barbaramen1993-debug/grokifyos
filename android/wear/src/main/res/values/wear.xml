@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@array/android_wear_capabilities">
+    <!-- Static capability so the phone can discover the wear app via CapabilityClient. -->
+    <string-array name="android_wear_capabilities">
+        <item>grokify_wear</item>
+    </string-array>
+</resources>

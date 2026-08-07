@@ -27,7 +27,8 @@ if (!$bridgeHealthy) {
 }
 
 $selected = gos_system_chat_selected_model();
-$latest = gos_latest_apk();
+$latest = gos_latest_apk('phone');
+$latestWear = gos_latest_apk('wear');
 $devices = $access['auth'] === 'session' ? gos_devices_for_user((int) $user['id'])['active'] : [];
 
 gos_api_json([
@@ -44,9 +45,16 @@ gos_api_json([
     'ws_url' => $wsUrl,
     'device_count' => count($devices),
     'latest_apk' => $latest ? [
+        'channel' => 'phone',
         'version_code' => (int) $latest['version_code'],
         'version_name' => $latest['version_name'],
         'created_at' => $latest['created_at'] ?? null,
+    ] : null,
+    'latest_wear_apk' => $latestWear ? [
+        'channel' => 'wear',
+        'version_code' => (int) $latestWear['version_code'],
+        'version_name' => $latestWear['version_name'],
+        'created_at' => $latestWear['created_at'] ?? null,
     ] : null,
     'tables_ready' => gos_table_exists('grokify_devices'),
     'system_chat_ready' => gos_system_chat_tables_ready(),

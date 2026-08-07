@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 /**
- * Apply schema/001_init.sql and optionally create first admin.
+ * Apply schema/*.sql migrations (skip already-applied) and optionally create first admin.
  *
  * Usage:
  *   php scripts/install.php
@@ -48,8 +48,27 @@ try {
 $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
 $pdo->exec("USE `{$name}`");
 
+$applied = [];
+try {
+    $st = $pdo->query('SELECT id FROM schema_migrations');
+    if ($st) {
+        while ($row = $st->fetch(PDO::FETCH_ASSOC)) {
+            if (!empty($row['id'])) {
+                $applied[(string) $row['id']] = true;
+            }
+        }
+    }
+} catch (Throwable $e) {
+    // schema_migrations missing until 001_init runs
+}
+
 foreach ($schemaFiles as $sqlFile) {
     $label = basename($sqlFile);
+    $migrationId = pathinfo($label, PATHINFO_FILENAME);
+    if (isset($applied[$migrationId])) {
+        echo "  skip {$label} (already applied)\n";
+        continue;
+    }
     $sql = file_get_contents($sqlFile);
     if ($sql === false) {
         fwrite(STDERR, "Could not read schema {$label}\n");
@@ -68,6 +87,7 @@ foreach ($schemaFiles as $sqlFile) {
         $pdo->exec($noComments);
     }
     echo "  applied {$label}\n";
+    $applied[$migrationId] = true;
 }
 
 echo "Schema applied.\n";

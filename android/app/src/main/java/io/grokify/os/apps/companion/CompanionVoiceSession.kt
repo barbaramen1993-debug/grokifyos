@@ -66,8 +66,8 @@ object CompanionVoiceSession {
         fun onError(message: String)
     }
 
-    /** ~40–50 fps mouth/level publish for responsive lip-sync. */
-    private const val LEVEL_PUBLISH_MS = 22L
+    /** ~60 fps mouth/level publish for responsive lip-sync. */
+    private const val LEVEL_PUBLISH_MS = 16L
     private const val WATCHDOG_MS = 250L
     /**
      * Hard ceiling while a response is in flight (serverResponseActive).
@@ -1025,16 +1025,38 @@ object CompanionVoiceSession {
 
     private fun noteMouthFromPcm(pcm: ByteArray) {
         val samples = CompanionAmplitude.pcm16LeToShorts(pcm)
-        val rms = CompanionAmplitude.rmsPcm16(samples, samples.size)
-        val peak = CompanionAmplitude.peakPcm16(samples, samples.size)
+        if (samples.isEmpty()) return
+        // ~12.5ms windows @ 24 kHz so multi-frame TTS deltas keep syllable peaks.
+        val win = max(160, GrokAssistantVoiceClient.SAMPLE_RATE / 80)
+        val env = CompanionAmplitude.windowedEnvelope(samples, win)
+        val rms = env[0]
+        val peak = env[1]
+        // Walk short sub-windows through the smoother so large chunks still
+        // attack/release inside the buffer (not one averaged step).
         val prev = mouth.get()
-        val next = mouthSmoother.next(rms, peak)
+        var last = prev
+        var peakOpen = 0f
+        var i = 0
+        while (i < samples.size) {
+            val n = min(win, samples.size - i)
+            val wRms = CompanionAmplitude.rmsPcm16(samples, i, n)
+            val wPeak = CompanionAmplitude.peakPcm16(samples, i, n)
+            last = mouthSmoother.next(wRms, wPeak)
+            if (last > peakOpen) peakOpen = last
+            i += n
+        }
+        // Prefer in-chunk peak so lips open on the loud syllable, not the tail.
+        val next = if (samples.size > win * 2) {
+            max(last, peakOpen * 0.94f)
+        } else {
+            last
+        }
         mouth.set(next)
         // Always publish mouth while audio is leaving the speaker — throttle only
         // kills lip-sync when PCM chunks are small/frequent.
-        val changed = abs(next - prev) > 0.012f
-        val onset = next - prev > 0.08f
-        noteLevel(min(1f, max(rms * 4.2f, peak * 1.6f)), force = onset || changed)
+        val changed = abs(next - prev) > 0.006f
+        val onset = next - prev > 0.05f
+        noteLevel(min(1f, max(rms * 5.5f, peak * 1.85f)), force = onset || changed)
     }
 
     private fun extractTranscript(event: JSONObject): String {

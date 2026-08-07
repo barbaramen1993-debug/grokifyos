@@ -3,7 +3,7 @@
  * Host bridge: window.GrokifyCompanion.{onReady,onModelLoaded,onError,onDebugLog,onJointPicked,openVrm,readVrmBase64,closeVrm,listVrmaClips}
  * Stage API:   window.CompanionStage.{loadModel,setState,setMouth,playMotion,
  *              playGesture,playTemplate,playVrma,stopVrma,listVrma,exportMotionLibrary,setHands,setLook,
- *              playAiMotion,resetBody,exportBodyState,
+ *              playAiMotion,resetBody,recalibrateAvatar,exportBodyState,
  *              setDebugSkeleton,setJointLabel,setJointLabels,getJointLabels,selectJoint}
  *
  * Motion layers (priority):
@@ -153,6 +153,13 @@
   var ikElbowSign = { left: 0, right: 0 };
   /** After VRM install, remeasure hangs once world matrices settle. */
   var restRecalibLeft = 0;
+  /**
+   * 0→1 ease after load/recalibrate so arms drop into hang instead of popping.
+   * Multiplies how aggressively wrists seek full geometric hang.
+   */
+  var hangEase = 1;
+  /** Second pass after camera fit (viewer-forward becomes valid). */
+  var postFitRecalib = false;
   /** Active scripted gesture (null when idle VR physics owns hands). */
   var activeGesture = null;
   /**
@@ -1469,7 +1476,269 @@
         return vrm.humanoid.getNormalizedBoneNode(name) || null;
       }
     } catch (_) {}
+    // Fallback for older three-vrm builds.
+    try {
+      if (typeof vrm.humanoid.getBoneNode === "function") {
+        return vrm.humanoid.getBoneNode(name) || null;
+      }
+    } catch (_) {}
     return null;
+  }
+
+  /**
+   * Default hips-local body axes (VRM humanoid: +Z face-out, +X right, +Y up).
+   * Custom / mis-authored VRMs often invert face-forward or spine pitch — we
+   * overwrite these in measureBodyAxes() right after load.
+   */
+  function defaultBodyAxes() {
+    return {
+      forward: { x: 0, y: 0, z: 1 },
+      right: { x: 1, y: 0, z: 0 },
+      spinePitchSign: 1,
+      headPitchSign: 1,
+    };
+  }
+
+  function bodyAxes() {
+    return (restBones && restBones.axes) || defaultBodyAxes();
+  }
+
+  /** +1 when +X euler on spine/chest bows toward face-forward; −1 if inverted. */
+  function spinePitchSign() {
+    var a = bodyAxes();
+    return a.spinePitchSign < 0 ? -1 : 1;
+  }
+
+  function headPitchSign() {
+    var a = bodyAxes();
+    return a.headPitchSign < 0 ? -1 : 1;
+  }
+
+  /** Hips-local unit face-forward (mostly XZ). */
+  function faceForward() {
+    var f = bodyAxes().forward;
+    if (f && typeof f.z === "number") return f;
+    return { x: 0, y: 0, z: 1 };
+  }
+
+  /** Projection of a hips-local XZ delta onto face-forward (positive = toward face). */
+  function alongFace(dx, dz) {
+    var f = faceForward();
+    return (dx || 0) * (f.x || 0) + (dz || 0) * (f.z || 0);
+  }
+
+  /**
+   * How far a hips-local point sits *behind* a reference along face-forward
+   * (positive = more behind the body — natural elbow fold side).
+   */
+  function behindAlongFace(point, ref) {
+    if (!point || !ref) return 0;
+    return alongFace((ref.x || 0) - (point.x || 0), (ref.z || 0) - (point.z || 0));
+  }
+
+  /**
+   * Transform a bone-local direction into hips-local XZ unit (or null).
+   * Used to read the authored face axis off head/chest instead of guessing +Z.
+   */
+  function hipsLocalDirFromBone(boneNode, lx, ly, lz) {
+    var L = getLibs();
+    if (!L || !L.THREE || !restBones || !restBones.hips || !boneNode) return null;
+    try {
+      restBones.hips.updateWorldMatrix(true, false);
+      boneNode.updateWorldMatrix(true, false);
+      var THREE = L.THREE;
+      var world = new THREE.Vector3(lx, ly, lz);
+      world.transformDirection(boneNode.matrixWorld);
+      var qH = new THREE.Quaternion();
+      restBones.hips.getWorldQuaternion(qH);
+      world.applyQuaternion(qH.invert());
+      world.y = 0;
+      if (world.lengthSq() < 1e-8) return null;
+      world.normalize();
+      return { x: world.x, z: world.z };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Measure face-forward / body-right + spine/head pitch signs.
+   * Call at bind (T-pose) before hang eulers are applied.
+   *
+   * Shoulder cross alone always yields +Z when arms are on ±X — it cannot
+   * detect a face-inverted avatar. We disambiguate with head/chest local axes
+   * and a tiny head-vs-hips offset, then probe pitch polarity.
+   */
+  function measureBodyAxes() {
+    var axes = defaultBodyAxes();
+    if (!restBones || !restBones.hips) return axes;
+    try {
+      if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+    } catch (_) {}
+
+    var lSh = hipsLocalOf(restBones.leftUpperArm);
+    var rSh = hipsLocalOf(restBones.rightUpperArm);
+    var shFwd = null;
+    if (lSh && rSh) {
+      var rx = rSh.x - lSh.x;
+      var ry = rSh.y - lSh.y;
+      var rz = rSh.z - lSh.z;
+      var rlen = Math.sqrt(rx * rx + ry * ry + rz * rz);
+      if (rlen > 1e-4) {
+        axes.right = { x: rx / rlen, y: ry / rlen, z: rz / rlen };
+        // forward candidate = right × up → (−right.z, 0, right.x)
+        var fx = -axes.right.z;
+        var fz = axes.right.x;
+        var flen = Math.sqrt(fx * fx + fz * fz);
+        if (flen > 1e-4) {
+          shFwd = { x: fx / flen, z: fz / flen };
+        }
+      }
+    }
+
+    // Score a unit XZ forward: head should sit slightly along it, and head-bone
+    // local +Z (VRM face) should align with it when available.
+    function scoreForward(fwd) {
+      if (!fwd) return -1e9;
+      var score = 0;
+      var head = hipsLocalOf(restBones.head);
+      var chest = hipsLocalOf(restBones.chest || restBones.upperChest || restBones.spine);
+      if (head) {
+        // Head slightly in front of hips origin along face (many VRMs ~+Z).
+        score += (head.x * fwd.x + head.z * fwd.z) * 2.5;
+      }
+      if (head && chest) {
+        score +=
+          ((head.x - chest.x) * fwd.x + (head.z - chest.z) * fwd.z) * 3.5;
+      }
+      // Head bone local axes — VRM face is usually local +Z.
+      var candidates = [
+        hipsLocalDirFromBone(restBones.head, 0, 0, 1),
+        hipsLocalDirFromBone(restBones.head, 0, 0, -1),
+        hipsLocalDirFromBone(restBones.head, 0, 1, 0),
+        hipsLocalDirFromBone(restBones.chest || restBones.spine, 0, 0, 1),
+        hipsLocalDirFromBone(restBones.chest || restBones.spine, 0, 0, -1),
+      ];
+      var ci;
+      for (ci = 0; ci < candidates.length; ci++) {
+        var c = candidates[ci];
+        if (!c) continue;
+        var al = c.x * fwd.x + c.z * fwd.z;
+        if (al > score) {
+          /* keep best axis alignment as bonus */
+        }
+        score += Math.max(0, al) * 1.8;
+      }
+      // Soft prior: viewer / camera when already framed.
+      try {
+        var cam = cameraHipsLocal();
+        if (cam) {
+          var cdx = cam.x;
+          var cdz = cam.z;
+          var cl = Math.sqrt(cdx * cdx + cdz * cdz);
+          if (cl > 0.15) {
+            score += ((cdx / cl) * fwd.x + (cdz / cl) * fwd.z) * 1.1;
+          }
+        }
+      } catch (_) {}
+      return score;
+    }
+
+    var bestFwd = shFwd || { x: 0, z: 1 };
+    var bestScore = scoreForward(bestFwd);
+    var alt = { x: -bestFwd.x, z: -bestFwd.z };
+    var altScore = scoreForward(alt);
+    // Also try pure ±Z / ±X in case shoulders were mislabeled.
+    var extras = [
+      { x: 0, z: 1 },
+      { x: 0, z: -1 },
+      { x: 1, z: 0 },
+      { x: -1, z: 0 },
+    ];
+    var ei;
+    for (ei = 0; ei < extras.length; ei++) {
+      var es = scoreForward(extras[ei]);
+      if (es > bestScore) {
+        bestScore = es;
+        bestFwd = extras[ei];
+      }
+    }
+    if (altScore > bestScore + 0.05) {
+      bestFwd = alt;
+      bestScore = altScore;
+    }
+    axes.forward = { x: bestFwd.x, y: 0, z: bestFwd.z };
+    // Re-derive right = up × forward so handedness matches face.
+    // (0,1,0) × (fx,0,fz) = (fz, 0, -fx)
+    axes.right = {
+      x: axes.forward.z,
+      y: 0,
+      z: -axes.forward.x,
+    };
+
+    function probePitchSign(boneKey, amount) {
+      var node = restBones[boneKey];
+      var b = restBones.bindEuler && restBones.bindEuler[boneKey];
+      var tip = restBones.head || restBones.chest || restBones.spine;
+      if (!node || !b || !tip) return 1;
+      var before = hipsLocalOf(tip);
+      if (!before) return 1;
+      setEuler(node, b.x + amount, b.y, b.z);
+      try {
+        if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+      } catch (_) {}
+      var after = hipsLocalOf(tip);
+      if (restBones.bindQ && restBones.bindQ[boneKey]) {
+        node.quaternion.copy(restBones.bindQ[boneKey]);
+      } else {
+        setEuler(node, b.x, b.y, b.z);
+      }
+      try {
+        if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+      } catch (_) {}
+      if (!after) return 1;
+      var along = alongFace(after.x - before.x, after.z - before.z);
+      var drop = before.y - after.y;
+      var score = along * 2.2 + drop * 0.8;
+      return score >= 0 ? 1 : -1;
+    }
+
+    try {
+      restBones.axes = axes;
+      axes.spinePitchSign = probePitchSign("spine", 0.4);
+      if (restBones.chest && restBones.bindEuler && restBones.bindEuler.chest) {
+        var chestSign = probePitchSign("chest", 0.35);
+        if (chestSign !== axes.spinePitchSign) {
+          // Chest is closer to the head tip — prefer it when they disagree.
+          axes.spinePitchSign = chestSign;
+        }
+      }
+      axes.headPitchSign = probePitchSign("head", 0.35);
+      if (!axes.headPitchSign) axes.headPitchSign = axes.spinePitchSign;
+    } catch (_) {}
+
+    try {
+      console.log(
+        "[CompanionStage] body axes",
+        "fwd=" + axes.forward.x.toFixed(2) + "," + axes.forward.z.toFixed(2),
+        "spinePitch=" + axes.spinePitchSign,
+        "headPitch=" + axes.headPitchSign,
+        "score=" + (typeof bestScore === "number" ? bestScore.toFixed(2) : "?")
+      );
+    } catch (_) {}
+    return axes;
+  }
+
+  /** Flip hang torso X deltas when spine +X is not a forward bow. */
+  function applyPitchSignToHangDeltas(deltas) {
+    if (!deltas) return;
+    var ps = spinePitchSign();
+    if (ps >= 0) return;
+    ["hips", "spine", "chest", "upperChest", "neck", "head"].forEach(function (k) {
+      if (deltas[k] && deltas[k].length >= 1) {
+        deltas[k][0] *= ps;
+      }
+    });
   }
 
   /**
@@ -1526,8 +1795,12 @@
     measureArmMeta("left");
     measureArmMeta("right");
 
+    // Face-forward + spine pitch polarity for THIS avatar (before hang mutates bones).
+    restBones.axes = measureBodyAxes();
+
     // Per-avatar hang deltas (which local axis drops the hand) + apply.
     restBones.hangDeltas = solveHangDeltas();
+    applyPitchSignToHangDeltas(restBones.hangDeltas);
     // Knee/elbow hinge + swing axes so walk/idle never hyperextend on any VRM.
     restBones.hinge = solveLimbHinges();
     // Idle hang elbows/knees must use the same flex direction as walk (fixes
@@ -1543,7 +1816,8 @@
         k === "bindQ" ||
         k === "bindEuler" ||
         k === "hangDeltas" ||
-        k === "hinge"
+        k === "hinge" ||
+        k === "axes"
       ) {
         return;
       }
@@ -1575,7 +1849,27 @@
     nodNextT = 2.5 + Math.random() * 2;
     activeGesture = null;
     // Remeasure after a few frames once the scene graph world matrices settle.
-    restRecalibLeft = 8;
+    restRecalibLeft = 10;
+    postFitRecalib = true;
+    // Ease arms into hang (start slightly raised so load never pops into a lock).
+    hangEase = 0;
+    try {
+      var rL = armReachLen("left");
+      var rR = armReachLen("right");
+      if (!vr.left.locked) {
+        vr.left.x = vr.restLeft.x;
+        vr.left.y = vr.restLeft.y + rL * 0.16;
+        vr.left.z = vr.restLeft.z;
+        vr.left.vx = vr.left.vy = vr.left.vz = 0;
+      }
+      if (!vr.right.locked) {
+        vr.right.x = vr.restRight.x;
+        vr.right.y = vr.restRight.y + rR * 0.16;
+        vr.right.z = vr.restRight.z;
+        vr.right.vx = vr.right.vy = vr.right.vz = 0;
+      }
+      vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.45);
+    } catch (_) {}
     pickStatePoseTarget(currentState || STATE_IDLE);
     placeFloorUnderAvatar();
   }
@@ -1672,7 +1966,19 @@
             // Prefer lowest hand; small bonus for hanging slightly outward.
             var out =
               side === "left" ? sh.x - pos.x : pos.x - sh.x;
-            score = drop + Math.max(0, Math.min(out, 0.12)) * 0.35;
+            // Prefer hands slightly face-forward of the shoulder (not behind back).
+            var handFwd = alongFace(pos.x - sh.x, pos.z - sh.z);
+            // Penalize crossing deep through midline.
+            var cross =
+              side === "left"
+                ? Math.max(0, pos.x - sh.x * 0.15)
+                : Math.max(0, sh.x * 0.15 - pos.x);
+            score =
+              drop * 1.15 +
+              Math.max(0, Math.min(out, 0.14)) * 0.45 +
+              Math.max(-0.05, Math.min(handFwd, 0.12)) * 0.9 -
+              cross * 0.8 -
+              Math.max(0, -handFwd - 0.04) * 1.6;
             if (!best || score > best.score) {
               best = {
                 score: score,
@@ -1832,13 +2138,14 @@
               score += (Math.abs(tipLocal0.x) - Math.abs(tipLocal1.x)) * 2.2;
               // Mild preference for hand dropping (natural flex from T).
               score += (tipLocal0.y - tipLocal1.y) * 0.55;
-              // Mild preference for hand a bit more forward (+Z hips) when flexing.
-              score += (tipLocal1.z - tipLocal0.z) * 0.35;
+              // Hand a bit more face-forward when flexing (not hips +Z assumption).
+              score +=
+                alongFace(tipLocal1.x - tipLocal0.x, tipLocal1.z - tipLocal0.z) * 0.35;
               elb1 = worldPos(restBones[hingeKey]);
               if (elb1 && elbLocal0) {
                 elbLocal1 = elb1.clone().applyMatrix4(inv);
-                // Elbow goes slightly behind (−Z) — natural human arm, matches IK pole.
-                score += (elbLocal0.z - elbLocal1.z) * 1.6;
+                // Elbow goes slightly behind face-forward — natural arm fold.
+                score += behindAlongFace(elbLocal1, elbLocal0) * 1.6;
                 // Keep elbow from diving deep through the torso (prefer stay out).
                 score += (Math.abs(elbLocal1.x) - Math.abs(elbLocal0.x) * 0.4) * 0.25;
               }
@@ -1887,13 +2194,13 @@
           tip = trialHinge(hingeKey, tipKey, axes[i], signs[j], amount);
           if (!tip) continue;
           local1 = tip.clone().applyMatrix4(inv);
-          // Forward = +Z in hips-local for most VRMs; score max delta Z.
-          score = local1.z - local0.z;
-          // Arms hang at sides: also accept largest |horizontal| if Z weak.
+          // Forward = measured face-forward (not always hips +Z).
+          score = alongFace(local1.x - local0.x, local1.z - local0.z);
+          // Arms hang at sides: also accept largest |horizontal| if forward weak.
           if (Math.abs(score) < 0.02) {
-            score = Math.abs(local1.x - local0.x) + Math.abs(local1.z - local0.z);
-            // Prefer the sign that moves tip forward-ish (positive Z bias).
-            score = (local1.z - local0.z) * 2 + Math.abs(local1.x - local0.x) * 0.2;
+            score =
+              alongFace(local1.x - local0.x, local1.z - local0.z) * 2 +
+              Math.abs(local1.x - local0.x) * 0.2;
           }
           if (!best || score > best.score) {
             best = { score: score, axis: axes[i], sign: signs[j] };
@@ -2011,13 +2318,30 @@
       var shL = sh.clone().applyMatrix4(inv);
       var elL = el.clone().applyMatrix4(inv);
       var hdL = hd.clone().applyMatrix4(inv);
-      // Chord mid; elbow should be behind (+back = lower Z in hips space).
-      var midZ = (shL.z + hdL.z) * 0.5;
-      var behind = midZ - elL.z;
+      // Chord mid; elbow should sit behind face-forward (natural fold).
+      var mid = {
+        x: (shL.x + hdL.x) * 0.5,
+        y: (shL.y + hdL.y) * 0.5,
+        z: (shL.z + hdL.z) * 0.5,
+      };
+      var behind = behindAlongFace(elL, mid);
+      var torsoBehind = behindAlongFace(elL, { x: 0, y: 0, z: 0 });
       // Prefer elbow slightly out from midline.
-      var elbowOut = isLeft ? shL.x - elL.x : elL.x - shL.x;
+      var brH = bodyAxes().right || { x: 1, y: 0, z: 0 };
+      var elSide =
+        (elL.x - shL.x) * (brH.x || 0) + (elL.z - shL.z) * (brH.z || 0);
+      var elbowOut = isLeft ? -elSide : elSide;
+      if (!isFinite(elbowOut)) {
+        elbowOut = isLeft ? shL.x - elL.x : elL.x - shL.x;
+      }
       var reach = sh.distanceTo(hd);
-      return behind * 3.2 + Math.max(0, elbowOut) * 0.8 - reach * 0.15;
+      return (
+        behind * 3.4 +
+        torsoBehind * 1.2 +
+        Math.max(0, elbowOut) * 0.9 -
+        reach * 0.15 -
+        Math.max(0, -behind) * 1.8
+      );
     }
 
     var flipped = [-(cur[0] || 0), -(cur[1] || 0), -(cur[2] || 0)];
@@ -2109,7 +2433,8 @@
         k === "bindQ" ||
         k === "bindEuler" ||
         k === "hangDeltas" ||
-        k === "hinge"
+        k === "hinge" ||
+        k === "axes"
       ) {
         return;
       }
@@ -2213,6 +2538,7 @@
       bend: new T.Vector3(),
       bendAlt: new T.Vector3(),
       pole: new T.Vector3(),
+      poleRef: new T.Vector3(),
       side: new T.Vector3(),
       axis: new T.Vector3(),
       dir: new T.Vector3(),
@@ -2367,6 +2693,84 @@
       return { x: sh.x + rx * s, y: sh.y + ry * s, z: sh.z + rz * s };
     }
     return { x: x, y: y, z: z };
+  }
+
+  /**
+   * Human-ish shoulder cone — distance clamp alone still allows camera-chasing
+   * targets that wrap across the chest or deep behind the back (inhuman bends).
+   * Limits: own-side bias, mild cross only, not deep behind, height band.
+   * @param {{allowCross?:boolean, allowBack?:boolean}} opts
+   *   allowCross — clap / crossed arms may sit past midline
+   *   allowBack — hands-on-hips may sit slightly behind
+   */
+  function clampToHumanArmWorkspace(side, x, y, z, maxFrac, opts) {
+    opts = opts || {};
+    maxFrac = typeof maxFrac === "number" ? maxFrac : 0.88;
+    var isLeft = side === "left";
+    var sh = isLeft ? vr.shoulderLeft : vr.shoulderRight;
+    if (!sh) return { x: x, y: y, z: z };
+    var reach = armReachLen(side);
+    if (!(reach > 1e-4)) return clampToArmReach(side, x, y, z, maxFrac);
+
+    var face = faceForward();
+    var fx = face.x || 0;
+    var fz = typeof face.z === "number" ? face.z : 1;
+    var fl = Math.sqrt(fx * fx + fz * fz) || 1;
+    fx /= fl;
+    fz /= fl;
+    var br = bodyAxes().right || { x: 1, y: 0, z: 0 };
+    var rx = br.x || 1;
+    var rz = br.z || 0;
+    var rl = Math.sqrt(rx * rx + rz * rz) || 1;
+    rx /= rl;
+    rz /= rl;
+
+    // Height band first (head / full hang).
+    var yMax = sh.y + reach * 0.92;
+    var yMin = sh.y - reach * 1.08;
+    y = clamp(y, yMin, yMax);
+
+    var ox = x - sh.x;
+    var oz = z - sh.z;
+    var sideAmt = ox * rx + oz * rz; // + = body-right
+    var ownSide = isLeft ? -sideAmt : sideAmt;
+    // Allow small midline cross (clap/think) but never full wrap to other hip.
+    var maxCross = reach * (opts.allowCross ? 0.42 : 0.2);
+    var maxOut = reach * 0.9;
+    if (ownSide < -maxCross) {
+      var targetSideAmt = isLeft ? maxCross : -maxCross;
+      var dSide = targetSideAmt - sideAmt;
+      x += rx * dSide;
+      z += rz * dSide;
+      ox = x - sh.x;
+      oz = z - sh.z;
+      sideAmt = ox * rx + oz * rz;
+      ownSide = isLeft ? -sideAmt : sideAmt;
+    }
+    if (ownSide > maxOut) {
+      var targetOutAmt = isLeft ? -maxOut : maxOut;
+      var dOut = targetOutAmt - sideAmt;
+      x += rx * dOut;
+      z += rz * dOut;
+      ox = x - sh.x;
+      oz = z - sh.z;
+    }
+
+    // Front/back along face: allow slight back (hips pose) but not behind spine.
+    var frontAmt = ox * fx + oz * fz;
+    var minFront = -reach * (opts.allowBack ? 0.32 : 0.18);
+    var maxFront = reach * 0.78;
+    if (frontAmt < minFront) {
+      var dBack = minFront - frontAmt;
+      x += fx * dBack;
+      z += fz * dBack;
+    } else if (frontAmt > maxFront) {
+      var dFwd = maxFront - frontAmt;
+      x += fx * dFwd;
+      z += fz * dFwd;
+    }
+
+    return clampToArmReach(side, x, y, z, maxFrac);
   }
 
   /**
@@ -2666,12 +3070,19 @@
    * Call after any tool/physics write to the controller.
    */
   function sanitizeWristTarget(side, x, y, z, locked) {
-    var c = clampToArmReach(side, x, y, z, locked ? 0.88 : 0.95);
+    var frac = locked ? 0.86 : 0.93;
+    var opts = {};
+    if (locked && activeGesture && activeGesture.kind) {
+      var gk = activeGesture.kind;
+      if (gk === "clap" || gk === "crossed_arms") opts.allowCross = true;
+      if (gk === "hands_on_hips") opts.allowBack = true;
+    }
+    // Human cone first (stops camera-wrap targets), then body proxies, re-clamp.
+    var c = clampToHumanArmWorkspace(side, x, y, z, frac, opts);
     // Locked poses (think near face) use thinner pad so intentional near-body holds work.
     var pad = locked ? 0.012 : 0.028;
     var r = resolvePointAgainstBody(c.x, c.y, c.z, pad, side);
-    // Re-clamp after push so we stay in workspace.
-    return clampToArmReach(side, r.x, r.y, r.z, locked ? 0.88 : 0.95);
+    return clampToHumanArmWorkspace(side, r.x, r.y, r.z, frac, opts);
   }
 
   /** Apply body avoidance to both free/locked wrists + hand-hand separation. */
@@ -2772,19 +3183,44 @@
     var yCeil = shY - Math.min(0.14, Math.min(reachL, reachR) * 0.32);
     var yFloor = shY - Math.max(reachL, reachR) * 1.2;
 
-    // Nudge slightly out + toward the viewer (camera), not hard-coded +Z.
-    // Hips-local +Z is NOT always face-out on VRM normalized skeletons.
-    var fwdL = viewerForwardXZ(lSh);
-    var fwdR = viewerForwardXZ(rSh);
-    var rightLdir = bodyRightXZ(fwdL);
-    var rightRdir = bodyRightXZ(fwdR);
+    // Character face-forward is authoritative for hang (stable across camera fit).
+    // Soft-blend a little viewer bias only when camera clearly sits in front.
+    var face = faceForward();
+    var faceXZ = { x: face.x || 0, z: face.z || 1 };
+    var fl = Math.sqrt(faceXZ.x * faceXZ.x + faceXZ.z * faceXZ.z) || 1;
+    faceXZ.x /= fl;
+    faceXZ.z /= fl;
+    var viewL = viewerForwardXZ(lSh);
+    var viewR = viewerForwardXZ(rSh);
+    function blendFwd(view) {
+      var align =
+        (view.x || 0) * faceXZ.x + (view.z || 0) * faceXZ.z;
+      // Only trust camera when it agrees with face (viewer in front of avatar).
+      var w = align > 0.25 ? Math.min(0.35, (align - 0.25) * 0.7) : 0;
+      var x = faceXZ.x * (1 - w) + (view.x || 0) * w;
+      var z = faceXZ.z * (1 - w) + (view.z || 0) * w;
+      var len = Math.sqrt(x * x + z * z) || 1;
+      return { x: x / len, z: z / len };
+    }
+    var fwdL = blendFwd(viewL);
+    var fwdR = blendFwd(viewR);
+    // Body-right from measured axes (matches face handedness), not camera cross.
+    var br = bodyAxes().right || { x: 1, z: 0 };
+    var rightLdir = { x: br.x || 1, z: br.z || 0 };
+    var rightRdir = { x: br.x || 1, z: br.z || 0 };
+    var rl = Math.sqrt(rightLdir.x * rightLdir.x + rightLdir.z * rightLdir.z) || 1;
+    rightLdir.x /= rl;
+    rightLdir.z /= rl;
+    rightRdir.x = rightLdir.x;
+    rightRdir.z = rightLdir.z;
 
     // Geometric soft hang — primary rest (arms down, slight A-pose, soft elbow room).
     function geometricHang(sh, reach, fwd, rightDir, isLeft) {
       // Slightly less than full hang so elbows stay softly bent (not stick-straight).
-      var down = reach * 0.72;
-      var out = reach * 0.2;
-      var fwdAmt = reach * 0.1;
+      var down = reach * 0.7;
+      var out = reach * 0.18;
+      // Mild face-forward so wrists sit in front of the hip plane, not behind back.
+      var fwdAmt = reach * 0.085;
       var side = isLeft ? -1 : 1;
       return {
         x: sh.x + rightDir.x * side * out + fwd.x * fwdAmt,
@@ -2873,11 +3309,48 @@
       var dz = cam.z - oz;
       var len = Math.sqrt(dx * dx + dz * dz);
       if (len > 1e-4) {
-        return { x: dx / len, z: dz / len, cam: cam };
+        return { x: dx / len, z: dz / len, cam: cam, align: null };
       }
     }
-    // Last resort: hips-local +Z (documented face-out when hips face world).
-    return { x: 0, z: 1, cam: cam };
+    // Last resort: character face-forward (not raw +Z — custom VRMs invert).
+    var ff = faceForward();
+    var fx = ff.x || 0;
+    var fz = typeof ff.z === "number" ? ff.z : 1;
+    var fl = Math.sqrt(fx * fx + fz * fz) || 1;
+    return { x: fx / fl, z: fz / fl, cam: cam, align: 1 };
+  }
+
+  /**
+   * Gesture aim direction: character face-forward is primary.
+   * Soft-bias toward the camera ONLY when the viewer sits in the front
+   * hemisphere. Following the camera around the body was wrapping arms into
+   * inhuman shoulder poses (side/behind orbits).
+   */
+  function gestureForwardXZ(origin) {
+    var face = faceForward();
+    var faceX = face.x || 0;
+    var faceZ = typeof face.z === "number" ? face.z : 1;
+    var fl = Math.sqrt(faceX * faceX + faceZ * faceZ) || 1;
+    faceX /= fl;
+    faceZ /= fl;
+    var view = viewerForwardXZ(origin);
+    var align =
+      (view.x || 0) * faceX + (view.z || 0) * faceZ;
+    // Front cone only: align>0.2 → up to ~0.5 camera weight; side/behind → 0.
+    var w = 0;
+    if (align > 0.2) {
+      w = Math.min(0.5, (align - 0.2) * 0.9);
+    }
+    var x = faceX * (1 - w) + (view.x || 0) * w;
+    var z = faceZ * (1 - w) + (view.z || 0) * w;
+    var len = Math.sqrt(x * x + z * z) || 1;
+    return {
+      x: x / len,
+      z: z / len,
+      cam: view.cam,
+      align: align,
+      camWeight: w,
+    };
   }
 
   /**
@@ -2889,9 +3362,9 @@
   }
 
   /**
-   * Wave / point peaks relative to this avatar + camera (viewer).
+   * Wave / point peaks relative to this avatar.
+   * Face-forward primary; mild camera bias only when viewer is in front.
    * Offsets use measured arm reach so short VRMs stay inside the workspace.
-   * Always place peaks toward the camera — never hardcode +Z as "forward".
    */
   function gesturePeak(kind, side, inten) {
     inten = typeof inten === "number" ? inten : 1;
@@ -2904,54 +3377,59 @@
     }
     var headY = (vr.restHead && vr.restHead.y) || sh.y + 0.2;
     var reach = armReachLen(side);
-    var fwd = viewerForwardXZ(sh);
-    var right = bodyRightXZ(fwd);
+    // Face-primary aim (not pure camera chase).
+    var fwd = gestureForwardXZ(sh);
+    // Lateral "out" from measured body-right so L/R stay on own sides.
+    var br = bodyAxes().right || { x: 1, z: 0 };
+    var right = { x: br.x || 1, z: br.z || 0 };
+    var rl = Math.sqrt(right.x * right.x + right.z * right.z) || 1;
+    right.x /= rl;
+    right.z /= rl;
     // Outward from torso for this hand (left = −body-right).
     var outX = isLeft ? -right.x : right.x;
     var outZ = isLeft ? -right.z : right.z;
     var peak = { x: sh.x, y: sh.y, z: sh.z };
 
     if (kind === "wave") {
-      // Classic "hi": hand near ear/crown height, out, clearly toward viewer.
-      // Previous peak was only ~0.2*reach above shoulder and used +Z as forward,
-      // which landed at shoulder height and behind the body on many VRMs.
-      peak.y = sh.y + reach * (0.48 + 0.1 * inten);
-      peak.y = Math.min(peak.y, headY + reach * 0.06);
-      peak.y = Math.max(peak.y, sh.y + reach * 0.32);
+      // Classic "hi": near ear height, out, slightly in front — not stretched
+      // at the camera (that locked elbows and hyperextended shoulders).
+      peak.y = sh.y + reach * (0.42 + 0.08 * inten);
+      peak.y = Math.min(peak.y, headY + reach * 0.04);
+      peak.y = Math.max(peak.y, sh.y + reach * 0.28);
       peak.x =
         sh.x +
-        outX * reach * (0.3 + 0.08 * inten) +
-        fwd.x * reach * (0.5 + 0.1 * inten);
+        outX * reach * (0.34 + 0.06 * inten) +
+        fwd.x * reach * (0.28 + 0.06 * inten);
       peak.z =
         sh.z +
-        outZ * reach * (0.3 + 0.08 * inten) +
-        fwd.z * reach * (0.5 + 0.1 * inten);
+        outZ * reach * (0.34 + 0.06 * inten) +
+        fwd.z * reach * (0.28 + 0.06 * inten);
     } else if (kind === "point") {
-      peak.y = sh.y + reach * 0.04;
+      // Point: forward of own shoulder, mild reach — not full-arm lock at cam.
+      peak.y = sh.y + reach * 0.06;
       peak.x =
         sh.x +
-        outX * reach * (0.12 + 0.05 * inten) +
-        fwd.x * reach * (0.68 + 0.1 * inten);
+        outX * reach * (0.16 + 0.04 * inten) +
+        fwd.x * reach * (0.48 + 0.08 * inten);
       peak.z =
         sh.z +
-        outZ * reach * (0.12 + 0.05 * inten) +
-        fwd.z * reach * (0.68 + 0.1 * inten);
+        outZ * reach * (0.16 + 0.04 * inten) +
+        fwd.z * reach * (0.48 + 0.08 * inten);
     } else if (kind === "cheer") {
-      peak.y = Math.min(headY + reach * 0.14, sh.y + reach * 0.78);
+      peak.y = Math.min(headY + reach * 0.12, sh.y + reach * 0.72);
       peak.x =
-        sh.x + outX * reach * 0.22 + fwd.x * reach * 0.28;
+        sh.x + outX * reach * 0.24 + fwd.x * reach * 0.22;
       peak.z =
-        sh.z + outZ * reach * 0.22 + fwd.z * reach * 0.28;
+        sh.z + outZ * reach * 0.24 + fwd.z * reach * 0.22;
     } else {
-      peak.y = sh.y + reach * 0.22;
+      peak.y = sh.y + reach * 0.2;
       peak.x =
-        sh.x + outX * reach * 0.24 + fwd.x * reach * 0.32;
+        sh.x + outX * reach * 0.26 + fwd.x * reach * 0.24;
       peak.z =
-        sh.z + outZ * reach * 0.24 + fwd.z * reach * 0.32;
+        sh.z + outZ * reach * 0.26 + fwd.z * reach * 0.24;
     }
 
-    // Keep inside arm reach from shoulder (prevents locked-straight arm).
-    return clampToArmReach(side, peak.x, peak.y, peak.z, 0.88);
+    return clampToHumanArmWorkspace(side, peak.x, peak.y, peak.z, 0.84);
   }
 
   /**
@@ -2976,13 +3454,13 @@
     return { x: round3lib(p.x), y: round3lib(p.y), z: round3lib(p.z) };
   }
 
-  /** Lateral flap offset in camera-facing plane (for wave). */
+  /** Lateral flap offset in face/gesture plane (for wave) — not pure camera. */
   function waveFlapOffset(side, sign, inten) {
     var isLeft = side === "left";
     var sh = isLeft ? vr.shoulderLeft : vr.shoulderRight;
     if (!sh) sh = { x: 0, y: 1, z: 0 };
     var reach = armReachLen(side);
-    var fwd = viewerForwardXZ(sh);
+    var fwd = gestureForwardXZ(sh);
     var right = bodyRightXZ(fwd);
     var amp = reach * (0.1 + 0.04 * (inten || 1));
     return {
@@ -3130,7 +3608,7 @@
             y: raiseL.y,
             z: round3lib(raiseL.z + fL.z),
           };
-          lH = clampToArmReach("left", lH.x, lH.y, lH.z, 0.88);
+          lH = clampToHumanArmWorkspace("left", lH.x, lH.y, lH.z, 0.84);
           lH = { x: round3lib(lH.x), y: round3lib(lH.y), z: round3lib(lH.z) };
         }
         if (raiseR) {
@@ -3140,7 +3618,7 @@
             y: raiseR.y,
             z: round3lib(raiseR.z + fR.z),
           };
-          rH = clampToArmReach("right", rH.x, rH.y, rH.z, 0.88);
+          rH = clampToHumanArmWorkspace("right", rH.x, rH.y, rH.z, 0.84);
           rH = { x: round3lib(rH.x), y: round3lib(rH.y), z: round3lib(rH.z) };
         }
         addFrame(320 + fi * 220, lH, rH, 0.22);
@@ -3212,21 +3690,22 @@
       var shR = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
       var rL = armReachLen("left");
       var rR = armReachLen("right");
-      var fwdL = viewerForwardXZ(shL);
-      var fwdR = viewerForwardXZ(shR);
-      var leftUp = clampToArmReach(
+      var fwdL = gestureForwardXZ(shL);
+      var fwdR = gestureForwardXZ(shR);
+      var brSh = bodyAxes().right || { x: 1, z: 0 };
+      var leftUp = clampToHumanArmWorkspace(
         "left",
-        shL.x - rL * 0.22,
-        shL.y + rL * 0.08,
-        shL.z + fwdL.x * rL * 0.12 + fwdL.z * rL * 0.12,
-        0.85
+        shL.x - (brSh.x || 1) * rL * 0.2 + fwdL.x * rL * 0.12,
+        shL.y + rL * 0.06,
+        shL.z - (brSh.z || 0) * rL * 0.2 + fwdL.z * rL * 0.12,
+        0.82
       );
-      var rightUp = clampToArmReach(
+      var rightUp = clampToHumanArmWorkspace(
         "right",
-        shR.x + rR * 0.22,
-        shR.y + rR * 0.08,
-        shR.z + fwdR.x * rR * 0.12 + fwdR.z * rR * 0.12,
-        0.85
+        shR.x + (brSh.x || 1) * rR * 0.2 + fwdR.x * rR * 0.12,
+        shR.y + rR * 0.06,
+        shR.z + (brSh.z || 0) * rR * 0.2 + fwdR.z * rR * 0.12,
+        0.82
       );
       addFrame(
         0,
@@ -3251,13 +3730,14 @@
       var shRt = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
       var headY = (vr.restHead && vr.restHead.y) || shRt.y + 0.15;
       var rr = armReachLen("right");
-      var fwdT = viewerForwardXZ(shRt);
-      var thinkPt = clampToArmReach(
+      var fwdT = gestureForwardXZ(shRt);
+      var brT = bodyAxes().right || { x: 1, z: 0 };
+      var thinkPt = clampToHumanArmWorkspace(
         "right",
-        shRt.x + rr * 0.1,
-        Math.min(headY - rr * 0.08, shRt.y + rr * 0.32),
-        shRt.z + fwdT.x * rr * 0.28 + fwdT.z * rr * 0.28,
-        0.85
+        shRt.x + (brT.x || 1) * rr * 0.12 + fwdT.x * rr * 0.28,
+        Math.min(headY - rr * 0.08, shRt.y + rr * 0.3),
+        shRt.z + (brT.z || 0) * rr * 0.12 + fwdT.z * rr * 0.28,
+        0.82
       );
       addFrame(
         0,
@@ -3280,15 +3760,15 @@
       var shCl = vr.shoulderLeft || { x: -0.16, y: 1.2, z: 0 };
       var shCr = vr.shoulderRight || { x: 0.16, y: 1.2, z: 0 };
       var rCl = armReachLen("left");
-      var fwdCl = viewerForwardXZ({
+      var fwdCl = gestureForwardXZ({
         x: (shCl.x + shCr.x) * 0.5,
         z: (shCl.z + shCr.z) * 0.5,
       });
       var midY = (shCl.y + shCr.y) * 0.5 - rCl * 0.25;
-      var midX = (shCl.x + shCr.x) * 0.5 + fwdCl.x * rCl * 0.32;
-      var midZ = (shCl.z + shCr.z) * 0.5 + fwdCl.z * rCl * 0.32;
-      var cl = clampToArmReach("left", midX - 0.04, midY, midZ, 0.8);
-      var cr = clampToArmReach("right", midX + 0.04, midY, midZ, 0.8);
+      var midX = (shCl.x + shCr.x) * 0.5 + fwdCl.x * rCl * 0.28;
+      var midZ = (shCl.z + shCr.z) * 0.5 + fwdCl.z * rCl * 0.28;
+      var cl = clampToHumanArmWorkspace("left", midX - 0.04, midY, midZ, 0.8);
+      var cr = clampToHumanArmWorkspace("right", midX + 0.04, midY, midZ, 0.8);
       addFrame(
         0,
         { x: round3lib(cl.x), y: round3lib(cl.y), z: round3lib(cl.z) },
@@ -3296,8 +3776,8 @@
         0.25,
         look
       );
-      var cl2 = clampToArmReach("left", midX - 0.02, midY, midZ, 0.8);
-      var cr2 = clampToArmReach("right", midX + 0.02, midY, midZ, 0.8);
+      var cl2 = clampToHumanArmWorkspace("left", midX - 0.02, midY, midZ, 0.8);
+      var cr2 = clampToHumanArmWorkspace("right", midX + 0.02, midY, midZ, 0.8);
       addFrame(
         280,
         { x: round3lib(cl2.x), y: round3lib(cl2.y), z: round3lib(cl2.z) },
@@ -3349,8 +3829,22 @@
         (vr.restLeft && vr.restLeft.y) || shLH.y - rLH * 0.7,
         (vr.restRight && vr.restRight.y) || shRH.y - rRH * 0.7
       );
-      var hl = clampToArmReach("left", shLH.x - rLH * 0.08, hipsY + rLH * 0.05, shLH.z + rLH * 0.05, 0.75);
-      var hr = clampToArmReach("right", shRH.x + rRH * 0.08, hipsY + rRH * 0.05, shRH.z + rRH * 0.05, 0.75);
+      var hl = clampToHumanArmWorkspace(
+        "left",
+        shLH.x - rLH * 0.18,
+        hipsY + rLH * 0.05,
+        shLH.z - rLH * 0.04,
+        0.75,
+        { allowBack: true }
+      );
+      var hr = clampToHumanArmWorkspace(
+        "right",
+        shRH.x + rRH * 0.18,
+        hipsY + rRH * 0.05,
+        shRH.z - rRH * 0.04,
+        0.75,
+        { allowBack: true }
+      );
       addFrame(
         0,
         { x: round3lib(hl.x), y: round3lib(hl.y), z: round3lib(hl.z) },
@@ -3374,8 +3868,26 @@
       var rLC = armReachLen("left");
       var rRC = armReachLen("right");
       var cy = Math.min(shLC.y, shRC.y) - Math.min(rLC, rRC) * 0.35;
-      var cla = clampToArmReach("left", 0.04, cy, shLC.z + rLC * 0.15, 0.8);
-      var cra = clampToArmReach("right", -0.04, cy - 0.02, shRC.z + rRC * 0.12, 0.8);
+      var fwdCx = gestureForwardXZ({
+        x: (shLC.x + shRC.x) * 0.5,
+        z: (shLC.z + shRC.z) * 0.5,
+      });
+      var cla = clampToHumanArmWorkspace(
+        "left",
+        0.04 + fwdCx.x * rLC * 0.12,
+        cy,
+        shLC.z * 0.3 + fwdCx.z * rLC * 0.22,
+        0.8,
+        { allowCross: true }
+      );
+      var cra = clampToHumanArmWorkspace(
+        "right",
+        -0.04 + fwdCx.x * rRC * 0.12,
+        cy - 0.02,
+        shRC.z * 0.3 + fwdCx.z * rRC * 0.18,
+        0.8,
+        { allowCross: true }
+      );
       addFrame(
         0,
         { x: round3lib(cla.x), y: round3lib(cla.y), z: round3lib(cla.z) },
@@ -4066,26 +4578,28 @@
    */
   function pickStatePoseTarget(state) {
     var p = emptyPose();
+    var ps = spinePitchSign();
+    var hs = headPitchSign();
     if (state === STATE_LISTENING) {
-      p.spine = [0.012, 0, 0];
-      p.chest = [0.01, 0, 0];
-      p.neck = [0.002, 0, 0];
-      p.head = [0.001, 0, 0];
+      p.spine = [0.012 * ps, 0, 0];
+      p.chest = [0.01 * ps, 0, 0];
+      p.neck = [0.002 * hs, 0, 0];
+      p.head = [0.001 * hs, 0, 0];
     } else if (state === STATE_THINKING) {
       // Subtle torso only — no forced hand-to-chin (was glitchy between turns).
-      p.hips = [0.004, -0.008, 0.006];
-      p.spine = [0.008, 0.012, 0.006];
-      p.chest = [0.008, 0.008, 0.004];
-      p.neck = [0.006, 0.015, 0.006];
-      p.head = [0.004, 0.02, 0.006];
+      p.hips = [0.004 * ps, -0.008, 0.006];
+      p.spine = [0.008 * ps, 0.012, 0.006];
+      p.chest = [0.008 * ps, 0.008, 0.004];
+      p.neck = [0.006 * hs, 0.015, 0.006];
+      p.head = [0.004 * hs, 0.02, 0.006];
     } else if (state === STATE_SPEAKING) {
-      p.hips = [0.004, 0, 0];
-      p.spine = [0.01, 0, 0];
-      p.chest = [0.012, 0, 0];
-      p.neck = [0.001, 0, 0];
-      p.head = [0.001, 0, 0];
+      p.hips = [0.004 * ps, 0, 0];
+      p.spine = [0.01 * ps, 0, 0];
+      p.chest = [0.012 * ps, 0, 0];
+      p.neck = [0.001 * hs, 0, 0];
+      p.head = [0.001 * hs, 0, 0];
     } else {
-      p.spine = [0.006, 0, 0];
+      p.spine = [0.006 * ps, 0, 0];
     }
     statePoseTarget = p;
     // Hands: do NOT auto-pose on listen/think/speak. Soft hang + tools/templates only.
@@ -4184,15 +4698,20 @@
     var cosU = clamp((a * a + dist * dist - b * b) / (2 * a * dist), -1, 1);
     var ang = Math.acos(cosU);
     var fwd = toT.clone().multiplyScalar(1 / dist);
-    var pole = new THREE.Vector3(0, 0, 1)
+    // Face-forward pole (not raw hips +Z) — matches applyHandIk.
+    var ff = faceForward();
+    var pole = new THREE.Vector3(ff.x || 0, 0, ff.z || 1)
       .transformDirection(restBones.hips.matrixWorld)
       .normalize()
       .multiplyScalar(-1);
-    pole.y += 0.2;
-    var sideV = new THREE.Vector3(isLeft ? -1 : 1, 0, 0).transformDirection(
-      restBones.hips.matrixWorld
-    );
-    if (sideV.lengthSq() > 1e-8) pole.addScaledVector(sideV.normalize(), 0.8);
+    pole.y += 0.12;
+    var br = bodyAxes().right || { x: 1, y: 0, z: 0 };
+    var sideV = new THREE.Vector3(
+      (br.x || 1) * (isLeft ? -1 : 1),
+      0,
+      (br.z || 0) * (isLeft ? -1 : 1)
+    ).transformDirection(restBones.hips.matrixWorld);
+    if (sideV.lengthSq() > 1e-8) pole.addScaledVector(sideV.normalize(), 0.85);
     var bend = pole.clone().addScaledVector(fwd, -pole.dot(fwd));
     if (bend.lengthSq() < 1e-8) bend.set(isLeft ? -1 : 1, 0, 0);
     bend.normalize();
@@ -4206,14 +4725,38 @@
       var elL = el.clone().applyMatrix4(inv);
       var shL = sh.clone().applyMatrix4(inv);
       var tgL = tg.clone().applyMatrix4(inv);
-      var midZ = (shL.z + tgL.z) * 0.5;
-      var behind = midZ - elL.z;
-      var outAmt = isLeft ? shL.x - elL.x : elL.x - shL.x;
-      return behind * 3.5 + Math.max(-0.04, outAmt) * 1.4;
+      var mid = {
+        x: (shL.x + tgL.x) * 0.5,
+        y: (shL.y + tgL.y) * 0.5,
+        z: (shL.z + tgL.z) * 0.5,
+      };
+      var behind = behindAlongFace(elL, mid);
+      var torsoBehind = behindAlongFace(elL, { x: 0, y: 0, z: 0 });
+      var elSide =
+        (elL.x - shL.x) * (br.x || 0) + (elL.z - shL.z) * (br.z || 0);
+      var outAmt = isLeft ? -elSide : elSide;
+      if (!isFinite(outAmt)) {
+        outAmt = isLeft ? shL.x - elL.x : elL.x - shL.x;
+      }
+      return (
+        behind * 3.8 +
+        torsoBehind * 1.3 +
+        Math.max(-0.04, outAmt) * 1.5 -
+        Math.max(0, -behind) * 2.0
+      );
     }
     var sA = score(bend);
     var sB = score(bend.clone().multiplyScalar(-1));
-    ikElbowSign[side] = sB > sA + 0.02 ? -1 : 1;
+    ikElbowSign[side] = sB > sA + 0.04 ? -1 : 1;
+    try {
+      console.log(
+        "[CompanionStage] elbow seed",
+        side,
+        "sign=" + ikElbowSign[side],
+        "sA=" + sA.toFixed(3),
+        "sB=" + sB.toFixed(3)
+      );
+    } catch (_) {}
   }
 
   /**
@@ -4269,13 +4812,29 @@
     var gestBusy = !!(activeGesture && activeGesture.kind);
     function blendTarget(rest, walkT, side) {
       var base = rest;
+      // Load ease: wrists drop from a soft A-pose toward full hang (no pop).
+      if (hangEase < 0.999 && rest) {
+        var shE = side === "left" ? vr.shoulderLeft : vr.shoulderRight;
+        if (shE) {
+          var he = hangEase * hangEase * (3 - 2 * hangEase);
+          var startY = rest.y + armReachLen(side) * 0.16;
+          var startX = shE.x + (rest.x - shE.x) * 0.55;
+          var startZ = shE.z + (rest.z - shE.z) * 0.55;
+          base = {
+            x: startX + (rest.x - startX) * he,
+            y: startY + (rest.y - startY) * he,
+            z: startZ + (rest.z - startZ) * he,
+          };
+        }
+      }
       // Idle life: gentle wrist drift so hang isn't rigid.
-      if (!gestBusy && gw < 0.12 && rest) {
+      if (!gestBusy && gw < 0.12 && base) {
         var life = idleLifeOffset(side);
+        var lifeW = hangEase > 0.85 ? 1 : hangEase;
         base = {
-          x: rest.x + life.x,
-          y: rest.y + life.y,
-          z: rest.z + life.z,
+          x: base.x + life.x * lifeW,
+          y: base.y + life.y * lifeW,
+          z: base.z + life.z * lifeW,
         };
       }
       if (!walkT || gw < 0.01) return base;
@@ -4347,9 +4906,11 @@
 
   /**
    * Aim a bone so its bind-time child axis points at a world-space target.
-   * Used by two-bone arm IK (VRChat-style wrist controllers).
+   * Optional poleWorld (point or direction tip) re-twists the bone so the
+   * elbow crease follows the bend plane — setFromUnitVectors alone drops roll
+   * and is the classic "elbows bend backwards" look on custom VRMs.
    */
-  function aimBoneToward(boneNode, worldTarget, localAxis, S) {
+  function aimBoneToward(boneNode, worldTarget, localAxis, S, poleWorld) {
     if (!boneNode || !boneNode.parent || !localAxis || !S) return;
     try {
       boneNode.parent.updateWorldMatrix(true, false);
@@ -4379,6 +4940,40 @@
       S.q.setFromAxisAngle(S.side.cross(S.axis).normalize(), Math.PI);
     } else {
       S.q.setFromUnitVectors(S.axis, S.dir);
+    }
+
+    // Twist correction toward pole so mesh elbow crease matches bend plane.
+    if (poleWorld) {
+      try {
+        // Pole direction in parent space (from bone origin toward pole point).
+        S.pole.copy(poleWorld).sub(S.shoulder);
+        S.pole.applyQuaternion(S.qInv);
+        // Project onto plane ⊥ aim dir.
+        S.pole.addScaledVector(S.dir, -S.pole.dot(S.dir));
+        if (S.pole.lengthSq() > 1e-10) {
+          S.pole.normalize();
+          // Secondary bone-local axis ⊥ primary child axis.
+          S.side.set(0, 1, 0);
+          if (Math.abs(S.axis.dot(S.side)) > 0.85) S.side.set(1, 0, 0);
+          S.bend.copy(S.axis).cross(S.side).normalize();
+          // Secondary after pure aim, in parent space.
+          S.side.copy(S.bend).applyQuaternion(S.q);
+          S.side.addScaledVector(S.dir, -S.side.dot(S.dir));
+          if (S.side.lengthSq() > 1e-10) {
+            S.side.normalize();
+            var cosT = clamp(S.side.dot(S.pole), -1, 1);
+            S.bend.copy(S.side).cross(S.pole);
+            var sinT = S.bend.length();
+            var signed =
+              Math.atan2(S.bend.dot(S.dir) >= 0 ? sinT : -sinT, cosT) || 0;
+            if (Math.abs(signed) > 1e-5) {
+              // Twist around aim axis in parent space, then apply aim.
+              S.qInv.setFromAxisAngle(S.dir, signed);
+              S.q.premultiply(S.qInv);
+            }
+          }
+        }
+      } catch (_) {}
     }
     boneNode.quaternion.copy(S.q);
   }
@@ -4532,25 +5127,44 @@
 
     S.forward.copy(S.toTarget).multiplyScalar(1 / dist);
 
-    // Elbow pole from character facing (hips world), not raw hips-local −Z.
-    // Natural: elbow slightly behind body + out. Camera-relative −Z fails when
-    // hips are yawed ~180° (common VRM) and was flipping elbows "backwards".
-    var raiseAmt = clamp((h.y - (rest ? rest.y : 0.7)) / 0.45, 0, 1);
+    // Elbow pole from measured face-forward (not raw hips +Z — custom VRMs invert).
+    // Hang: elbow slightly *behind* + out. Raised gestures: elbow *down + out*
+    // (forcing "behind" on a high wave produces broken shoulder/elbow folds).
+    var raiseAmt = clamp((h.y - (rest ? rest.y : 0.7)) / 0.45, 0, 1.4);
+    // How far the wrist sits in front of the shoulder (face axis) — high when
+    // pointing/waving; lower behind preference when the arm is already forward.
+    var wristFront = 0;
     try {
-      // Character forward ≈ hips local +Z in world (VRM humanoid).
-      S.pole.set(0, 0, 1).transformDirection(restBones.hips.matrixWorld);
+      var shLocH = isLeft ? vr.shoulderLeft : vr.shoulderRight;
+      if (shLocH) {
+        wristFront = alongFace(h.x - shLocH.x, h.z - shLocH.z);
+      }
+    } catch (_) {}
+    try {
+      var ff = faceForward();
+      S.pole.set(ff.x || 0, 0, ff.z || 1).transformDirection(restBones.hips.matrixWorld);
       if (S.pole.lengthSq() < 1e-8) S.pole.set(0, 0, 1);
       S.pole.normalize();
-      // Prefer elbow *behind* the body (opposite facing).
-      S.pole.multiplyScalar(-1);
-      // Slight up bias when raised (readable fold).
-      S.pole.y += 0.15 + raiseAmt * 0.35;
-      S.side.set(isLeft ? -1 : 1, 0, 0).transformDirection(restBones.hips.matrixWorld);
+      // Behind-body weight fades as the arm rises / reaches forward.
+      var behindW = clamp(1 - raiseAmt * 0.85 - Math.max(0, wristFront) * 1.2, 0.05, 1);
+      S.pole.multiplyScalar(-behindW);
+      // Raised: pull elbow down (natural under the upper arm), not up into head.
+      if (raiseAmt > 0.35) {
+        S.pole.y -= 0.35 + raiseAmt * 0.55;
+      } else {
+        S.pole.y += 0.05;
+        if (raiseAmt < 0.2) S.pole.y -= 0.06;
+      }
+      var br = bodyAxes().right || { x: 1, y: 0, z: 0 };
+      S.side
+        .set((br.x || 1) * (isLeft ? -1 : 1), 0, (br.z || 0) * (isLeft ? -1 : 1))
+        .transformDirection(restBones.hips.matrixWorld);
       if (S.side.lengthSq() < 1e-8) S.side.set(isLeft ? -1 : 1, 0, 0);
       S.side.normalize();
-      S.pole.addScaledVector(S.side, 0.75 + raiseAmt * 0.45);
+      // Stronger lateral as raise grows (wave elbow points out, not into ribs).
+      S.pole.addScaledVector(S.side, 0.9 + raiseAmt * 0.55);
     } catch (_) {
-      S.pole.set(isLeft ? -0.6 : 0.6, 0.2, -1);
+      S.pole.set(isLeft ? -0.6 : 0.6, raiseAmt > 0.4 ? -0.5 : 0.15, -1);
     }
     // Project pole onto plane ⊥ shoulder→hand.
     S.bend.copy(S.pole).addScaledVector(S.forward, -S.pole.dot(S.forward));
@@ -4582,18 +5196,37 @@
           var shLoc = S.shoulder.clone().applyMatrix4(S.invHips);
           var tgLoc = S.target.clone().applyMatrix4(S.invHips);
           var midY = (shLoc.y + tgLoc.y) * 0.5;
-          var midZ = (shLoc.z + tgLoc.z) * 0.5;
-          // Behind chord along character +Z (hips-local): elbow has smaller Z.
-          var behind = midZ - elLoc.z;
-          // Prefer out from midline.
-          var outAmt = isLeft ? shLoc.x - elLoc.x : elLoc.x - shLoc.x;
-          // Mildly prefer elbow not above shoulder (natural hang).
+          var mid = {
+            x: (shLoc.x + tgLoc.x) * 0.5,
+            y: midY,
+            z: (shLoc.z + tgLoc.z) * 0.5,
+          };
+          // Behind shoulder→hand chord along face-forward.
+          var behind = behindAlongFace(elLoc, mid);
+          // Also behind the torso frontal plane (hips origin).
+          var torsoBehind = behindAlongFace(elLoc, { x: 0, y: 0, z: 0 });
+          // Prefer out from midline (body-right aware when available).
+          var br2 = bodyAxes().right || { x: 1, y: 0, z: 0 };
+          var elSide = (elLoc.x - shLoc.x) * (br2.x || 0) + (elLoc.z - shLoc.z) * (br2.z || 0);
+          var outAmt = isLeft ? -elSide : elSide;
+          if (!isFinite(outAmt)) {
+            outAmt = isLeft ? shLoc.x - elLoc.x : elLoc.x - shLoc.x;
+          }
           var drop = midY - elLoc.y;
-          var raiseW = raiseAmt;
+          var raiseW = clamp(raiseAmt, 0, 1.2);
+          // Raised / forward wrists: care about out+down, not "behind body"
+          // (that score preferred hyper-extension on wave/point peaks).
+          var behindW = 3.4 - raiseW * 2.6;
+          var torsoW = 1.2 - raiseW * 0.95;
+          var outW = 1.7 + raiseW * 1.1;
+          var dropW = 0.45 + raiseW * 1.35;
+          var frontPen = Math.max(0, -behind) * (2.0 - raiseW * 1.2);
           return (
-            behind * (3.4 - raiseW * 1.2) +
-            Math.max(-0.04, outAmt) * (1.4 + raiseW * 0.5) +
-            drop * 0.35
+            behind * Math.max(0.35, behindW) +
+            torsoBehind * Math.max(0.15, torsoW) +
+            Math.max(-0.05, outAmt) * outW +
+            drop * dropW -
+            frontPen
           );
         }
 
@@ -4604,13 +5237,12 @@
         var prev = ikElbowSign[side] || 0;
         var pickAlt = false;
         if (prev === 0) {
-          pickAlt = sB > sA + 0.02;
+          // First frame: require a clearer win so we don't lock the wrong side.
+          pickAlt = sB > sA + 0.04;
         } else if (prev < 0) {
-          // Was alt (−); stick unless + is clearly better.
-          pickAlt = !(sA > sB + 0.12);
+          pickAlt = !(sA > sB + 0.16);
         } else {
-          // Was primary (+); stick unless − is clearly better.
-          pickAlt = sB > sA + 0.12;
+          pickAlt = sB > sA + 0.16;
         }
         if (pickAlt) {
           S.bend.copy(S.bendAlt);
@@ -4650,14 +5282,24 @@
         if (eLen > 1e-5) {
           S.elbow.copy(S.shoulder).addScaledVector(S.toTarget.normalize(), a);
         }
+        // Recompute bend from final elbow (for twist aim).
+        S.toTarget.copy(S.elbow).sub(S.shoulder);
+        S.bend.copy(S.toTarget).addScaledVector(S.forward, -S.toTarget.dot(S.forward));
+        if (S.bend.lengthSq() > 1e-10) S.bend.normalize();
       } catch (_) {}
     }
 
-    aimBoneToward(upper, S.elbow, meta.upperAxis, S);
+    // Twist reference: point off the bone along bend plane (not the elbow —
+    // elbow lies on the aim axis so it cannot define roll).
+    if (!S.poleRef) S.poleRef = new L.THREE.Vector3();
+    S.poleRef.copy(S.shoulder).addScaledVector(S.bend, Math.max(0.08, a * 0.45));
+    aimBoneToward(upper, S.elbow, meta.upperAxis, S, S.poleRef);
     try {
       upper.updateWorldMatrix(true, false);
     } catch (_) {}
-    aimBoneToward(lower, S.target, meta.lowerAxis, S);
+    // Lower arm: same bend-plane twist so the elbow crease stays consistent.
+    S.poleRef.copy(S.elbow).addScaledVector(S.bend, Math.max(0.06, b * 0.35));
+    aimBoneToward(lower, S.target, meta.lowerAxis, S, S.poleRef);
     try {
       lower.updateWorldMatrix(true, false);
     } catch (_) {}
@@ -4733,39 +5375,30 @@
             true
           );
         } else if (u < 0.72) {
-          // Lateral flap in the plane facing the camera (not behind the body).
-          var camW = cameraHipsLocal();
+          // Lateral flap in the face-forward plane (gestureForward, not pure cam).
           var waveReach = armReachLen(side);
+          var shW = side === "left" ? vr.shoulderLeft : vr.shoulderRight;
+          if (!shW) shW = { x: 0, y: 1.2, z: 0 };
+          var gFwd = gestureForwardXZ(shW);
+          var gRight = bodyRightXZ(gFwd);
           var flap =
             Math.sin((g.t - g.duration * 0.22) * 10.5) *
             waveReach *
-            0.22 *
+            0.18 *
             inten;
-          var fx = peakX + flap;
-          var fz = peakZ;
-          if (camW) {
-            // Oscillate along camera-facing tangent (side-to-side from viewer).
-            var tdx = camW.x - peakX;
-            var tdz = camW.z - peakZ;
-            var tlen = Math.sqrt(tdx * tdx + tdz * tdz) || 1;
-            // Perp in XZ: (-dz, dx)
-            fx = peakX + (-tdz / tlen) * flap;
-            fz = peakZ + (tdx / tlen) * flap;
-            // Keep peak on the camera side of the shoulder (safety).
-            var shW = side === "left" ? vr.shoulderLeft : vr.shoulderRight;
-            if (shW) {
-              var toCamX = camW.x - shW.x;
-              var toCamZ = camW.z - shW.z;
-              var handOffX = fx - shW.x;
-              var handOffZ = fz - shW.z;
-              if (handOffX * toCamX + handOffZ * toCamZ < 0) {
-                var clen = Math.sqrt(toCamX * toCamX + toCamZ * toCamZ) || 1;
-                fx = shW.x + (toCamX / clen) * waveReach * 0.4;
-                fz = shW.z + (toCamZ / clen) * waveReach * 0.4;
-              }
-            }
+          // Oscillate along body-right (viewer-facing tangent when cam is front).
+          var fx = peakX + gRight.x * flap;
+          var fz = peakZ + gRight.z * flap;
+          // Keep hand in front of shoulder along face — never wrap to camera behind.
+          var handOffX = fx - shW.x;
+          var handOffZ = fz - shW.z;
+          var frontDot =
+            handOffX * (gFwd.x || 0) + handOffZ * (gFwd.z || 0);
+          if (frontDot < waveReach * 0.08) {
+            fx = shW.x + (gFwd.x || 0) * waveReach * 0.28 + gRight.x * flap * 0.5;
+            fz = shW.z + (gFwd.z || 0) * waveReach * 0.28 + gRight.z * flap * 0.5;
           }
-          setHandTarget(side, fx, peakY + Math.abs(flap) * 0.06, fz, 0, true);
+          setHandTarget(side, fx, peakY + Math.abs(flap) * 0.05, fz, 0, true);
         } else {
           var k1 = easeInOut((u - 0.72) / 0.28);
           setHandTarget(
@@ -4836,11 +5469,12 @@
         u < 0.22 ? easeInOut(u / 0.22) : u > 0.72 ? easeInOut((1 - u) / 0.28) : 1;
       var lRest = vr.restLeft;
       var rRest = vr.restRight;
-      // Camera-relative: out + toward viewer (never assume hips +Z).
-      var shFwdL = viewerForwardXZ(ls);
-      var shFwdR = viewerForwardXZ(rs);
-      var shRightL = bodyRightXZ(shFwdL);
-      var shRightR = bodyRightXZ(shFwdR);
+      // Face-primary (soft cam bias only in front) — out + slightly forward.
+      var shFwdL = gestureForwardXZ(ls);
+      var shFwdR = gestureForwardXZ(rs);
+      var brSg = bodyAxes().right || { x: 1, z: 0 };
+      var shRightL = { x: brSg.x || 1, z: brSg.z || 0 };
+      var shRightR = { x: brSg.x || 1, z: brSg.z || 0 };
       var rShg = Math.min(armReachLen("left"), armReachLen("right")) || 0.55;
       var lTx = ls.x - shRightL.x * rShg * 0.18 + shFwdL.x * rShg * 0.12;
       var lTy = ls.y - 0.08 * (1 - 0.3 * inten);
@@ -4876,11 +5510,12 @@
       var rT = armReachLen("right");
       var thBlend =
         u < 0.24 ? easeInOut(u / 0.24) : u > 0.72 ? easeInOut((1 - u) / 0.28) : 1;
-      var thFwd = viewerForwardXZ(shT);
-      var thRight = bodyRightXZ(thFwd);
-      var thx = shT.x + thRight.x * rT * 0.12 + thFwd.x * rT * 0.42;
-      var thy = Math.min(hy - rT * 0.12, shT.y + rT * 0.32);
-      var thz = shT.z + thRight.z * rT * 0.12 + thFwd.z * rT * 0.42;
+      var thFwd = gestureForwardXZ(shT);
+      var brTh = bodyAxes().right || { x: 1, z: 0 };
+      var thRight = { x: brTh.x || 1, z: brTh.z || 0 };
+      var thx = shT.x + thRight.x * rT * 0.12 + thFwd.x * rT * 0.3;
+      var thy = Math.min(hy - rT * 0.12, shT.y + rT * 0.28);
+      var thz = shT.z + thRight.z * rT * 0.12 + thFwd.z * rT * 0.3;
       setHandTarget(
         "right",
         vr.restRight.x + (thx - vr.restRight.x) * thBlend,
@@ -4906,16 +5541,17 @@
       var cy = (shCl.y + shCr.y) * 0.5 - rCl * 0.12;
       var clBlend =
         u < 0.2 ? easeInOut(u / 0.2) : u > 0.75 ? easeInOut((1 - u) / 0.25) : 1;
-      // Meet in front of chest toward viewer (not hips +Z).
+      // Meet in front of chest (face-primary; soft cam only when in front).
       var mid = {
         x: (shCl.x + shCr.x) * 0.5,
         y: cy,
         z: (shCl.z + shCr.z) * 0.5,
       };
-      var clFwd = viewerForwardXZ(mid);
-      var clRight = bodyRightXZ(clFwd);
-      var meetZ = mid.z + clFwd.z * rCl * 0.48;
-      var meetX = mid.x + clFwd.x * rCl * 0.48;
+      var clFwd = gestureForwardXZ(mid);
+      var brCl = bodyAxes().right || { x: 1, z: 0 };
+      var clRight = { x: brCl.x || 1, z: brCl.z || 0 };
+      var meetZ = mid.z + clFwd.z * rCl * 0.32;
+      var meetX = mid.x + clFwd.x * rCl * 0.32;
       setHandTarget(
         "left",
         vr.restLeft.x +
@@ -4972,12 +5608,15 @@
     }
     if (g.kind === "bow") {
       // Sin rise/return on targets; blendStatePose eases bones (no hard zero).
+      // spinePitchSign flips +X when this VRM's spine +X leans back (common custom).
       var bowAmt = Math.sin(clamp(u, 0, 1) * Math.PI) * inten;
+      var bowPs = spinePitchSign();
+      var bowHs = headPitchSign();
       if (statePoseTarget) {
-        statePoseTarget.spine = [0.42 * bowAmt, 0, 0];
-        statePoseTarget.chest = [0.28 * bowAmt, 0, 0];
-        statePoseTarget.head = [0.22 * bowAmt, 0, 0];
-        statePoseTarget.hips = [0.08 * bowAmt, 0, 0];
+        statePoseTarget.spine = [0.42 * bowAmt * bowPs, 0, 0];
+        statePoseTarget.chest = [0.28 * bowAmt * bowPs, 0, 0];
+        statePoseTarget.head = [0.22 * bowAmt * bowHs, 0, 0];
+        statePoseTarget.hips = [0.08 * bowAmt * bowPs, 0, 0];
       }
       lookTarget.y = -0.35 * bowAmt;
       lookHoldUntil = idleTime + 0.2;
@@ -4994,9 +5633,10 @@
     }
     if (g.kind === "lean_in") {
       var leanAmt = Math.sin(clamp(u, 0, 1) * Math.PI) * inten;
+      var leanPs = spinePitchSign();
       if (statePoseTarget) {
-        statePoseTarget.spine = [0.14 * leanAmt, 0, 0];
-        statePoseTarget.chest = [0.12 * leanAmt, 0, 0];
+        statePoseTarget.spine = [0.14 * leanAmt * leanPs, 0, 0];
+        statePoseTarget.chest = [0.12 * leanAmt * leanPs, 0, 0];
       }
       if (g.t > g.duration) {
         if (statePoseTarget) {
@@ -5017,11 +5657,12 @@
       );
       var hhBlend =
         u < 0.25 ? easeInOut(u / 0.25) : u > 0.7 ? easeInOut((1 - u) / 0.3) : 1;
-      var hfL = viewerForwardXZ(shHL);
-      var hfR = viewerForwardXZ(shHR);
-      var hrL = bodyRightXZ(hfL);
-      var hrR = bodyRightXZ(hfR);
-      // Wrists near hip bones: out + slightly back from viewer.
+      var hfL = gestureForwardXZ(shHL);
+      var hfR = gestureForwardXZ(shHR);
+      var brH = bodyAxes().right || { x: 1, z: 0 };
+      var hrL = { x: brH.x || 1, z: brH.z || 0 };
+      var hrR = { x: brH.x || 1, z: brH.z || 0 };
+      // Wrists near hip bones: out + slightly back from face (not camera chase).
       var hlx = shHL.x - hrL.x * rHips * 0.2 - hfL.x * rHips * 0.06;
       var hly = hipsY + rHips * 0.08;
       var hlz = shHL.z - hrL.z * rHips * 0.2 - hfL.z * rHips * 0.06;
@@ -5060,11 +5701,12 @@
         y: csy,
         z: (shCx.z + shCxR.z) * 0.5,
       };
-      var cxFwd = viewerForwardXZ(cxMid);
-      var cxRight = bodyRightXZ(cxFwd);
-      // Cross in front of chest toward viewer.
-      var csz = cxMid.z + cxFwd.z * rCx * 0.28;
-      var csx = cxMid.x + cxFwd.x * rCx * 0.28;
+      var cxFwd = gestureForwardXZ(cxMid);
+      var brCx = bodyAxes().right || { x: 1, z: 0 };
+      var cxRight = { x: brCx.x || 1, z: brCx.z || 0 };
+      // Cross in front of chest (face-primary).
+      var csz = cxMid.z + cxFwd.z * rCx * 0.24;
+      var csx = cxMid.x + cxFwd.x * rCx * 0.24;
       var cxBlend =
         u < 0.26 ? easeInOut(u / 0.26) : u > 0.7 ? easeInOut((1 - u) / 0.3) : 1;
       setHandTarget(
@@ -5141,27 +5783,46 @@
    */
   function applyBodyMotion(dt) {
     if (!vrm || !restBones || !restBones.base) return;
+    // Smooth load: arms ease into full hang instead of snapping.
+    if (hangEase < 1) {
+      hangEase = Math.min(1, hangEase + dt / 0.9);
+    }
     // After load: remeasure bind arm meta, re-solve hang, geometric rest wrists.
     if (restRecalibLeft > 0) {
       restRecalibLeft -= 1;
       if (restRecalibLeft === 0 && !activeGesture && !isVrmaPlaying()) {
         try {
+          // Full re-calibrate once world matrices settle (custom VRMs often wrong on frame 0).
           restoreArmBindPose();
+          // Restore torso/legs to bind so axis probes see true T-pose, not hang.
+          try {
+            Object.keys(restBones.bindQ || {}).forEach(function (k) {
+              var n = restBones[k];
+              var q = restBones.bindQ[k];
+              if (n && q) n.quaternion.copy(q);
+            });
+          } catch (_) {}
           if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
           measureArmMeta("left");
           measureArmMeta("right");
+          restBones.axes = measureBodyAxes();
           restBones.hangDeltas = solveHangDeltas();
+          applyPitchSignToHangDeltas(restBones.hangDeltas);
           restBones.hinge = solveLimbHinges();
           rewriteHangDeltasWithHinges(restBones.hangDeltas, restBones.hinge);
           applySoftHangEulers();
           captureBaseFromBones();
           if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
-          calibrateVrRestsFromBones();
+          // Keep live wrists (hangEase) — only refresh rest targets + shoulders.
+          calibrateVrRestsFromBones({ preserveHands: true });
+          ikElbowSign.left = 0;
+          ikElbowSign.right = 0;
           // Seed elbow polarity from hang wrists so idle never starts flipped.
           try {
             seedElbowSignFromHang("left");
             seedElbowSignFromHang("right");
           } catch (_) {}
+          postFitRecalib = false;
           try {
             exportMotionLibrary();
           } catch (_) {}
@@ -5244,17 +5905,20 @@
     }
 
     // 1) Pose torso / legs / head first so shoulders are in the right place.
+    // Pitch (X) scaled by measured spinePitchSign so breath/lean never arches backward.
+    var psIdle = spinePitchSign();
+    var hsIdle = headPitchSign();
     addEuler(
       restBones.hips,
       "hips",
-      0.012 + weight * 0.45 + breath * 0.15,
+      (0.012 + weight * 0.45 + breath * 0.15) * psIdle,
       sway * 0.42 + weight * 0.7,
       weight * 0.28 + sway * 0.08
     );
     addEuler(
       restBones.spine,
       "spine",
-      0.014 + breath * 0.85,
+      (0.014 + breath * 0.85) * psIdle,
       sway * 0.42 - weight * 0.28,
       sway * 0.12 + shoulder * 0.28
     );
@@ -5262,7 +5926,7 @@
       addEuler(
         restBones.chest,
         "chest",
-        breath * 1.05,
+        breath * 1.05 * psIdle,
         sway * 0.28,
         shoulder * 0.4
       );
@@ -5271,7 +5935,7 @@
       addEuler(
         restBones.upperChest,
         "upperChest",
-        breath * 0.55,
+        breath * 0.55 * psIdle,
         sway * 0.14,
         shoulder * 0.16
       );
@@ -5299,20 +5963,21 @@
     // Virtual HMD look: tool look_at x=-1..1 must read as a clear head turn
     // (old gain 0.18 rad total ≈ 10° — invisible). Neck+head stack ~±45° at full.
     var lookYaw = lookSmooth.x * 0.55;
-    var lookPitch = -lookSmooth.y * 0.28;
+    // look y>0 = look up → negative pitch on standard bones; flip with headPitchSign.
+    var lookPitch = -lookSmooth.y * 0.28 * hsIdle;
     var lookRoll = lookSmooth.x * 0.06;
     var headDx = (vr.head.x - vr.restHead.x) * 0.25;
     addEuler(
       restBones.neck,
       "neck",
-      nodAmt * 0.4 + breath * 0.04 + lookPitch * 0.35,
+      (nodAmt * 0.4 + breath * 0.04) * hsIdle + lookPitch * 0.35,
       lookYaw * 0.48 + sway * 0.05 + headDx * 0.3,
       lookRoll * 0.35 + shoulder * 0.04
     );
     addEuler(
       restBones.head,
       "head",
-      nodAmt * 0.6 + lookPitch * 0.55,
+      nodAmt * 0.6 * hsIdle + lookPitch * 0.55,
       lookYaw * 0.62 + sway * 0.04 + headDx * 0.4,
       lookRoll * 0.45
     );
@@ -6167,17 +6832,8 @@
       if (!activeGesture && gw > 0.04) {
         var reachL = armReachLen("left") || 0.55;
         var reachR = armReachLen("right") || 0.55;
-        // Hips-local +Z is character forward (matches elbow pole). Blend a bit
-        // toward the camera so the swing still reads on the phone.
-        var camF = viewerForwardXZ(vr.restLeft || { x: 0, z: 0 });
-        var face = {
-          x: 0 * 0.5 + camF.x * 0.5,
-          z: 1 * 0.5 + camF.z * 0.5,
-        };
-        var flen = Math.sqrt(face.x * face.x + face.z * face.z) || 1;
-        face.x /= flen;
-        face.z /= flen;
-
+        // Character face-forward for swing (soft cam only if viewer is in front).
+        var face = gestureForwardXZ(vr.restLeft || { x: 0, z: 0 });
         var travelL = reachL * 0.2 * amp;
         var travelR = reachR * 0.2 * amp;
         walkWrist.left = {
@@ -6728,8 +7384,8 @@
   }
 
   /**
-   * Lip-sync from host amplitude envelope.
-   * Primary: aa + jawOpen track open tightly. Light secondary only.
+   * Lip-sync from host amplitude envelope (TTS PCM).
+   * Hot drive + syllable-phase chatter so the jaw visibly tracks speech energy.
    */
   function applyMouth(v) {
     var open = Math.max(0, Math.min(1, Number(v) || 0));
@@ -6740,22 +7396,27 @@
     }
     if (!vrm) return;
 
-    if (open < 0.01) {
+    if (open < 0.008) {
       clearTalkExpressions();
       return;
     }
 
-    var vel = Math.max(0, Math.min(1, Math.abs(mouthVelocity) * 2.2));
-    // Boost mid-range so quiet speech still opens lips visibly.
-    var drive = Math.min(1, open * 1.15 + vel * 0.08);
-    var wAa = drive * (0.85 + vel * 0.1);
-    var wOh = drive * (0.12 + (drive > 0.5 ? 0.1 : 0));
-    var wOu = drive < 0.3 ? drive * 0.22 : drive * 0.08;
-    var wIh = drive * 0.08 * (0.3 + vel);
-    var wEe = drive * 0.05 * vel;
+    var vel = Math.max(0, Math.min(1, Math.abs(mouthVelocity) * 3.4));
+    // Boost mid-range so quiet TTS still opens lips; onset velocity adds punch.
+    var drive = Math.min(1, open * 1.38 + vel * 0.14 + (open > 0.08 ? 0.06 : 0));
+    // Syllable-ish chatter from speechPhase (host envelope is open amount only).
+    var ph = speechPhase || 0;
+    var c1 = 0.5 + 0.5 * Math.sin(ph * 9.7);
+    var c2 = 0.5 + 0.5 * Math.sin(ph * 14.3 + 1.1);
+    var c3 = 0.5 + 0.5 * Math.sin(ph * 6.2 + 0.4);
+    var wAa = drive * (0.55 + 0.35 * c1 + vel * 0.12);
+    var wOh = drive * (0.22 + 0.28 * (1 - c1) + (drive > 0.45 ? 0.12 : 0));
+    var wOu = drive * (0.14 + 0.22 * c2 * (drive < 0.55 ? 1 : 0.45));
+    var wIh = drive * (0.12 + 0.22 * c3) * (0.35 + vel);
+    var wEe = drive * (0.08 + 0.18 * c2) * (0.25 + vel * 1.2);
 
-    // Near-instant follow on attack; quick close on release.
-    var s = drive > visemeSmooth.aa ? 0.88 : 0.7;
+    // Near-instant follow on attack; snappy close so consonants read.
+    var s = drive > visemeSmooth.aa ? 0.96 : 0.82;
     visemeSmooth.aa += (wAa - visemeSmooth.aa) * s;
     visemeSmooth.ih += (wIh - visemeSmooth.ih) * s;
     visemeSmooth.ou += (wOu - visemeSmooth.ou) * s;
@@ -6767,13 +7428,13 @@
     setExpression("ou", visemeSmooth.ou);
     setExpression("ee", visemeSmooth.ee);
     setExpression("oh", visemeSmooth.oh);
-    setExpression("jawOpen", drive * 0.95 + vel * 0.05);
+    setExpression("jawOpen", Math.min(1, drive * 1.05 + vel * 0.1));
 
     if (restBones && restBones.jaw && restBones.base && restBones.base.jaw) {
       var jb = restBones.base.jaw;
       setEuler(
         restBones.jaw,
-        jb.x + drive * 0.32 + vel * 0.04,
+        jb.x + drive * 0.48 + vel * 0.08,
         jb.y,
         jb.z
       );
@@ -7003,22 +7664,22 @@
       if (dt > 0.1) dt = 0.05;
       idleTime += dt;
 
-      // Track host envelope tightly — no fake micro-wobble (that desynced lips).
+      // Track host envelope tightly — attack almost locks, release still snappy.
       var prevMouth = mouthValue;
       var mouthDelta = targetMouth - mouthValue;
-      var mouthRate = mouthDelta > 0 ? 38 : 22;
-      if (Math.abs(mouthDelta) > 0.0005) {
+      var mouthRate = mouthDelta > 0 ? 72 : 36;
+      if (Math.abs(mouthDelta) > 0.0002) {
         mouthValue += mouthDelta * Math.min(1, dt * mouthRate);
       }
-      if (currentState === STATE_SPEAKING || targetMouth > 0.03) {
-        speechPhase += dt * (3.2 + targetMouth * 2.5);
+      if (currentState === STATE_SPEAKING || targetMouth > 0.02) {
+        speechPhase += dt * (5.5 + targetMouth * 4.2 + Math.abs(mouthVelocity) * 0.8);
       } else {
-        speechPhase *= 0.88;
+        speechPhase *= 0.82;
       }
       mouthVelocity = (mouthValue - prevMouth) / Math.max(dt, 0.001);
-      if (!usingFallback && (currentState === STATE_SPEAKING || targetMouth > 0.015 || mouthValue > 0.015)) {
+      if (!usingFallback && (currentState === STATE_SPEAKING || targetMouth > 0.01 || mouthValue > 0.01)) {
         applyMouth(mouthValue);
-      } else if (!usingFallback && mouthValue <= 0.015 && targetMouth <= 0.015) {
+      } else if (!usingFallback && mouthValue <= 0.01 && targetMouth <= 0.01) {
         if (visemeSmooth.aa > 0.001) clearTalkExpressions();
       }
 
@@ -7198,6 +7859,7 @@
     usingFallback = false;
     showFallback(false);
     // Frame once on install; prefer last-run orbit from host prefs.
+    // Camera fit BEFORE a second axis pass so viewer-forward is valid.
     userFramed = false;
     if (!pendingOrbit) {
       pendingOrbit = loadSavedOrbitFromHost();
@@ -7210,6 +7872,42 @@
         pendingOrbit = null;
       }
     }
+    // Quick post-fit face-axis refresh (camera now valid). Must restore hang
+    // eulers after bind probes so we don't leave spine at T-pose mid-frame.
+    try {
+      if (restBones && restBones.bindQ) {
+        var savedHang = hangEase;
+        var savedQ = {};
+        Object.keys(restBones.bindQ).forEach(function (k) {
+          var n = restBones[k];
+          if (n && n.quaternion) savedQ[k] = n.quaternion.clone();
+        });
+        try {
+          Object.keys(restBones.bindQ).forEach(function (k) {
+            var n = restBones[k];
+            var q = restBones.bindQ[k];
+            if (n && q) n.quaternion.copy(q);
+          });
+          if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+          restBones.axes = measureBodyAxes();
+          applyPitchSignToHangDeltas(restBones.hangDeltas);
+        } finally {
+          Object.keys(savedQ).forEach(function (k) {
+            if (restBones[k] && restBones[k].quaternion) {
+              restBones[k].quaternion.copy(savedQ[k]);
+            }
+          });
+        }
+        if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+        calibrateVrRestsFromBones({ preserveHands: true });
+        ikElbowSign.left = 0;
+        ikElbowSign.right = 0;
+        seedElbowSignFromHang("left");
+        seedElbowSignFromHang("right");
+        hangEase = savedHang;
+        postFitRecalib = true;
+      }
+    } catch (_) {}
     if (debugSkeletonOn) {
       rebuildDebugVisuals();
     }
@@ -7514,13 +8212,16 @@
   function setMouth(v) {
     targetMouth = Math.max(0, Math.min(1, Number(v) || 0));
     if (usingFallback) {
-      mouthValue = mouthValue * 0.25 + targetMouth * 0.75;
+      mouthValue = mouthValue * 0.12 + targetMouth * 0.88;
       setFallbackMouth(mouthValue);
       return;
     }
     // Snap hard on onsets/closures so lips land with the audio peak.
-    if (Math.abs(targetMouth - mouthValue) > 0.08) {
-      mouthValue = mouthValue + (targetMouth - mouthValue) * 0.78;
+    var d = targetMouth - mouthValue;
+    if (Math.abs(d) > 0.04) {
+      mouthValue = mouthValue + d * (d > 0 ? 0.92 : 0.8);
+    } else if (Math.abs(d) > 0.01) {
+      mouthValue = mouthValue + d * 0.65;
     }
     applyMouth(mouthValue);
   }
@@ -7774,6 +8475,29 @@
         y: "up+",
         z: "hips_forward+ (not always toward camera)",
       },
+      calibration: (function () {
+        var ax = bodyAxes();
+        var H = (restBones && restBones.hinge) || null;
+        return {
+          face_forward: ax.forward
+            ? { x: round3(ax.forward.x), y: round3(ax.forward.y || 0), z: round3(ax.forward.z) }
+            : null,
+          body_right: ax.right
+            ? { x: round3(ax.right.x), y: round3(ax.right.y || 0), z: round3(ax.right.z) }
+            : null,
+          spine_pitch_sign: ax.spinePitchSign < 0 ? -1 : 1,
+          head_pitch_sign: ax.headPitchSign < 0 ? -1 : 1,
+          elbow_hinge: H
+            ? { left: H.leftElbow, right: H.rightElbow }
+            : null,
+          knee_hinge: H
+            ? { left: H.leftKnee, right: H.rightKnee }
+            : null,
+          note:
+            "Measured after VRM load (and once matrices settle). Bow/lean use spine_pitch_sign; " +
+            "elbow IK uses face_forward for behind-fold polarity.",
+        };
+      })(),
       notes:
         "PREFERRED motion: body_pose with VRMA-backed ids (wave→goodbye, clap, think, jump, …). " +
         "VRMA clips retarget relative joint motion onto ANY loaded VRM humanoid. " +
@@ -7885,6 +8609,68 @@
     };
   }
 
+  /**
+   * Re-run full post-load calibration (face axes, hinges, soft hang).
+   * Useful after swapping assets or if a model looked inverted on first frame.
+   */
+  function recalibrateAvatar() {
+    if (!vrm || !restBones) {
+      return { ok: false, error: "no VRM loaded" };
+    }
+    try {
+      try {
+        Object.keys(restBones.bindQ || {}).forEach(function (k) {
+          var n = restBones[k];
+          var q = restBones.bindQ[k];
+          if (n && q) n.quaternion.copy(q);
+        });
+      } catch (_) {}
+      if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+      measureArmMeta("left");
+      measureArmMeta("right");
+      restBones.axes = measureBodyAxes();
+      restBones.hangDeltas = solveHangDeltas();
+      applyPitchSignToHangDeltas(restBones.hangDeltas);
+      restBones.hinge = solveLimbHinges();
+      rewriteHangDeltasWithHinges(restBones.hangDeltas, restBones.hinge);
+      applySoftHangEulers();
+      captureBaseFromBones();
+      if (restBones.hips) restBones.hips.updateWorldMatrix(true, true);
+      calibrateVrRestsFromBones({ preserveHands: false });
+      ikElbowSign.left = 0;
+      ikElbowSign.right = 0;
+      hangEase = 0;
+      try {
+        var rL2 = armReachLen("left");
+        var rR2 = armReachLen("right");
+        if (!vr.left.locked) {
+          vr.left.x = vr.restLeft.x;
+          vr.left.y = vr.restLeft.y + rL2 * 0.14;
+          vr.left.z = vr.restLeft.z;
+          vr.left.vx = vr.left.vy = vr.left.vz = 0;
+        }
+        if (!vr.right.locked) {
+          vr.right.x = vr.restRight.x;
+          vr.right.y = vr.restRight.y + rR2 * 0.14;
+          vr.right.z = vr.restRight.z;
+          vr.right.vx = vr.right.vy = vr.right.vz = 0;
+        }
+        vr.settleUntil = Math.max(vr.settleUntil || 0, idleTime + 1.25);
+        seedElbowSignFromHang("left");
+        seedElbowSignFromHang("right");
+      } catch (_) {}
+      pickStatePoseTarget(currentState || STATE_IDLE);
+      return {
+        ok: true,
+        axes: bodyAxes(),
+        hinge: restBones.hinge,
+        elbowSign: { left: ikElbowSign.left, right: ikElbowSign.right },
+      };
+    } catch (e) {
+      return { ok: false, error: (e && e.message) || String(e) };
+    }
+  }
+
   window.CompanionStage = {
     loadModel: loadModel,
     setState: setState,
@@ -7901,6 +8687,7 @@
     setLook: setLook,
     playAiMotion: playAiMotion,
     resetBody: resetBody,
+    recalibrateAvatar: recalibrateAvatar,
     resetCamera: resetCamera,
     setOrbit: setOrbit,
     getOrbit: getOrbit,

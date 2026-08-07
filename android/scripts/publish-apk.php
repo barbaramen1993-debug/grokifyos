@@ -8,8 +8,9 @@ declare(strict_types=1);
  *
  * Usage:
  *   php publish-apk.php --apk=/path/to.apk --version-code=1 --version-name=0.1.0
- *   php publish-apk.php --apk=... --auto   # bump version_code from latest+1
- *   php publish-apk.php --from-debug       # use app/build/outputs/apk/debug/app-debug.apk
+ *   php publish-apk.php --apk=... --auto   # bump version_code from latest+1 (per channel)
+ *   php publish-apk.php --from-debug --channel=phone
+ *   php publish-apk.php --from-debug --channel=wear
  */
 
 $root = dirname(__DIR__, 2);
@@ -27,6 +28,7 @@ $opts = getopt('', [
     'changelog:',
     'user-id:',
     'min-sdk:',
+    'channel:',
     'auto',
     'from-debug',
     'from-release',
@@ -38,26 +40,44 @@ if (isset($opts['help'])) {
 Publish GrokifyOS APK to the download store.
 
   --apk=PATH            Path to .apk
-  --from-debug          Use android debug APK output
-  --from-release        Use android release APK output
-  --version-code=N      Integer versionCode (must increase for OTA)
+  --from-debug          Use module debug APK output (see --channel)
+  --from-release        Use module release APK output (see --channel)
+  --channel=phone|wear|wear-face  Release channel (default: phone)
+  --version-code=N      Integer versionCode (must increase for OTA per channel)
   --version-name=S      e.g. 0.1.0 or 0.1.0-debug
   --changelog=TEXT      Optional notes
-  --auto                Auto-bump version-code from latest active + 1
+  --auto                Auto-bump version-code from latest active for channel + 1
   --user-id=N           created_by (default: first admin)
-  --min-sdk=N           Optional minSdk
+  --min-sdk=N           Optional minSdk (defaults: phone 26, wear 30, wear-face 33)
 
 TXT;
     exit(0);
 }
 
+$channel = function_exists('gos_apk_channel')
+    ? gos_apk_channel(isset($opts['channel']) ? (string) $opts['channel'] : 'phone')
+    : 'phone';
+
 $androidRoot = dirname(__DIR__);
+$moduleDir = match ($channel) {
+    'wear' => 'wear',
+    'wear-face' => 'wear-face',
+    default => 'app',
+};
 $apk = (string) ($opts['apk'] ?? '');
 if (isset($opts['from-debug'])) {
-    $apk = $androidRoot . '/app/build/outputs/apk/debug/app-debug.apk';
+    $apk = match ($channel) {
+        'wear' => $androidRoot . '/wear/build/outputs/apk/debug/wear-debug.apk',
+        'wear-face' => $androidRoot . '/wear-face/build/outputs/apk/debug/wear-face-debug.apk',
+        default => $androidRoot . '/app/build/outputs/apk/debug/app-debug.apk',
+    };
 }
 if (isset($opts['from-release'])) {
-    $apk = $androidRoot . '/app/build/outputs/apk/release/app-release-unsigned.apk';
+    $apk = match ($channel) {
+        'wear' => $androidRoot . '/wear/build/outputs/apk/release/wear-release-unsigned.apk',
+        'wear-face' => $androidRoot . '/wear-face/build/outputs/apk/release/wear-face-release-unsigned.apk',
+        default => $androidRoot . '/app/build/outputs/apk/release/app-release-unsigned.apk',
+    };
 }
 
 if ($apk === '' || !is_readable($apk)) {
@@ -68,10 +88,15 @@ if ($apk === '' || !is_readable($apk)) {
 $versionName = trim((string) ($opts['version-name'] ?? ''));
 $versionCode = isset($opts['version-code']) ? (int) $opts['version-code'] : 0;
 $changelog = isset($opts['changelog']) ? (string) $opts['changelog'] : null;
-$minSdk = isset($opts['min-sdk']) ? (int) $opts['min-sdk'] : 26;
+$defaultMinSdk = match ($channel) {
+    'wear' => 30,
+    'wear-face' => 33,
+    default => 26,
+};
+$minSdk = isset($opts['min-sdk']) ? (int) $opts['min-sdk'] : $defaultMinSdk;
 
-// Prefer versionCode / versionName from android/app/build.gradle.kts when present.
-$gradlePath = $androidRoot . '/app/build.gradle.kts';
+// Prefer versionCode / versionName from the channel's build.gradle.kts when present.
+$gradlePath = $androidRoot . '/' . $moduleDir . '/build.gradle.kts';
 $gradleCode = 0;
 $gradleName = '';
 if (is_readable($gradlePath)) {
@@ -88,7 +113,7 @@ if ($versionCode < 1) {
     if ($gradleCode > 0) {
         $versionCode = $gradleCode;
     } elseif (isset($opts['auto'])) {
-        $latest = gos_latest_apk();
+        $latest = gos_latest_apk($channel);
         $versionCode = $latest ? ((int) $latest['version_code'] + 1) : 1;
     }
 }
@@ -103,9 +128,9 @@ if ($versionName === '') {
     }
 }
 
-// --auto: ensure store version_code never goes backwards vs latest release
+// --auto: ensure store version_code never goes backwards vs latest release for this channel
 if (isset($opts['auto'])) {
-    $latest = gos_latest_apk();
+    $latest = gos_latest_apk($channel);
     $latestCode = $latest ? (int) $latest['version_code'] : 0;
     if ($versionCode <= $latestCode) {
         $versionCode = $latestCode + 1;
@@ -129,7 +154,8 @@ $result = gos_register_apk_upload(
     $versionName,
     $changelog,
     $userId,
-    $minSdk
+    $minSdk,
+    $channel
 );
 
 if (empty($result['ok'])) {
@@ -139,13 +165,15 @@ if (empty($result['ok'])) {
 
 $rel = $result['release'];
 $origin = gos_public_origin();
+$relChannel = isset($rel['channel']) ? (string) $rel['channel'] : $channel;
 echo "Published GrokifyOS APK\n";
+echo "  channel: {$relChannel}\n";
 echo "  version: {$rel['version_name']} (code {$rel['version_code']})\n";
 echo "  size:    " . number_format((int) $rel['file_size'] / 1048576, 2) . " MB\n";
 echo "  sha256:  {$rel['sha256']}\n";
 echo "  file:    {$rel['file_path']}\n";
 echo "  download (browser):\n";
-echo "    {$origin}/api/apk-download.php\n";
+echo "    {$origin}/api/apk-download.php?channel={$relChannel}\n";
 echo "  dashboard:\n";
 echo "    {$origin}/#build\n";
 exit(0);

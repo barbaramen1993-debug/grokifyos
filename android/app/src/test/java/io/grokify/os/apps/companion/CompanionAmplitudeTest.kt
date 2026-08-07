@@ -83,4 +83,27 @@ class CompanionAmplitudeTest {
         assertEquals(0x1000.toShort(), shorts[0])
         assertEquals(0x7FFF.toShort(), shorts[1])
     }
+
+    @Test
+    fun windowed_envelope_finds_peak_in_long_chunk() {
+        val pcm = ShortArray(2400) { 0 }
+        // Quiet padding then a short loud burst (syllable).
+        for (i in 1200 until 1400) {
+            pcm[i] = if (i % 2 == 0) 14000 else (-14000).toShort()
+        }
+        val env = CompanionAmplitude.windowedEnvelope(pcm, 240)
+        assertTrue(env[0] > 0.05f)
+        assertTrue(env[1] > 0.3f)
+        // Full-buffer RMS alone would bury the burst; peak window should not.
+        val fullRms = CompanionAmplitude.rmsPcm16(pcm, pcm.size)
+        assertTrue(env[0] >= fullRms)
+    }
+
+    @Test
+    fun range_rms_matches_prefix() {
+        val pcm = ShortArray(100) { (it * 100).toShort() }
+        val a = CompanionAmplitude.rmsPcm16(pcm, 50)
+        val b = CompanionAmplitude.rmsPcm16(pcm, 0, 50)
+        assertEquals(a, b, 0.0001f)
+    }
 }

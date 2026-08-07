@@ -1,0 +1,10 @@
+Bundled ADB binary (arm64-v8a)
+------------------------------
+Source: Android SDK Platform-Tools (AOSP), packaged via rendiix/termux-adb-fastboot
+platform-tools 34.0.0 (Android aarch64 build)
+
+License: Apache License 2.0
+https://android.googlesource.com/platform/packages/modules/adb/
+
+This binary is used only by the Watch Deploy inner app to install Wear OS APKs
+over wireless ADB (phone → watch). It is not linked into the main process.

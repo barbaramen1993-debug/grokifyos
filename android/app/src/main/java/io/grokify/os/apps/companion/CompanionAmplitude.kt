@@ -21,11 +21,16 @@ object CompanionAmplitude {
     }
 
     /** RMS of PCM16 samples normalized roughly to 0..1 (full-scale ~1). */
-    fun rmsPcm16(samples: ShortArray, count: Int): Float {
-        val n = min(count, samples.size)
+    fun rmsPcm16(samples: ShortArray, count: Int): Float =
+        rmsPcm16(samples, 0, count)
+
+    fun rmsPcm16(samples: ShortArray, offset: Int, count: Int): Float {
+        val start = offset.coerceAtLeast(0)
+        val n = min(count, samples.size - start)
         if (n <= 0) return 0f
         var sum = 0.0
-        for (i in 0 until n) {
+        val end = start + n
+        for (i in start until end) {
             val v = samples[i] / 32768.0
             sum += v * v
         }
@@ -33,11 +38,16 @@ object CompanionAmplitude {
     }
 
     /** Peak absolute amplitude 0..1. */
-    fun peakPcm16(samples: ShortArray, count: Int): Float {
-        val n = min(count, samples.size)
+    fun peakPcm16(samples: ShortArray, count: Int): Float =
+        peakPcm16(samples, 0, count)
+
+    fun peakPcm16(samples: ShortArray, offset: Int, count: Int): Float {
+        val start = offset.coerceAtLeast(0)
+        val n = min(count, samples.size - start)
         if (n <= 0) return 0f
         var peak = 0f
-        for (i in 0 until n) {
+        val end = start + n
+        for (i in start until end) {
             val a = abs(samples[i] / 32768f)
             if (a > peak) peak = a
         }
@@ -48,12 +58,17 @@ object CompanionAmplitude {
      * Zero-crossing rate 0..1 (fraction of samples that cross zero).
      * Higher ≈ brighter / more sibilant; lower ≈ vowels / silence.
      */
-    fun zeroCrossingRate(samples: ShortArray, count: Int): Float {
-        val n = min(count, samples.size)
+    fun zeroCrossingRate(samples: ShortArray, count: Int): Float =
+        zeroCrossingRate(samples, 0, count)
+
+    fun zeroCrossingRate(samples: ShortArray, offset: Int, count: Int): Float {
+        val start = offset.coerceAtLeast(0)
+        val n = min(count, samples.size - start)
         if (n < 2) return 0f
         var crosses = 0
-        var prev = samples[0].toInt()
-        for (i in 1 until n) {
+        var prev = samples[start].toInt()
+        val end = start + n
+        for (i in (start + 1) until end) {
             val cur = samples[i].toInt()
             if ((prev >= 0 && cur < 0) || (prev < 0 && cur >= 0)) {
                 crosses++
@@ -71,13 +86,16 @@ object CompanionAmplitude {
     /**
      * Envelope for lip-sync: blend RMS (body) + peak (consonant punch),
      * soft-knee map, then attack/release smoothing.
+     *
+     * Tuned hot for TTS: quiet neural speech still drives a visible jaw,
+     * onsets snap open, closures stay snappy so lips chatter with the audio.
      */
     class MouthSmoother(
-        private val attack: Float = 0.94f,
-        private val release: Float = 0.52f,
-        private val gain: Float = 8.2f,
-        private val noiseGate: Float = 0.004f,
-        private val peakWeight: Float = 0.55f,
+        private val attack: Float = 0.98f,
+        private val release: Float = 0.68f,
+        private val gain: Float = 14.5f,
+        private val noiseGate: Float = 0.002f,
+        private val peakWeight: Float = 0.68f,
     ) {
         private var value = 0f
 
@@ -86,17 +104,18 @@ object CompanionAmplitude {
             val target = when {
                 blended < noiseGate -> 0f
                 else -> {
-                    // Soft knee: speech levels open clearly; silence snaps shut.
+                    // Soft knee + mild expand so mid speech reads clearly open.
                     val x = ((blended - noiseGate) * gain).coerceAtLeast(0f)
-                    val shaped = 1f - 1f / (1f + x * 1.75f)
-                    min(1f, shaped * 1.2f)
+                    val shaped = 1f - 1f / (1f + x * 2.1f)
+                    // Floor a little openness above gate so quiet vowels still move lips.
+                    min(1f, (shaped * 1.45f + 0.06f).coerceAtMost(1f))
                 }
             }
             val coef = if (target > value) attack else release
             value += (target - value) * coef
             // Snap shut on true silence so lips don't hang open.
-            if (target < 0.01f && value < 0.05f) {
-                value *= 0.3f
+            if (target < 0.008f && value < 0.06f) {
+                value *= 0.22f
             }
             return value.coerceIn(0f, 1f)
         }
@@ -113,15 +132,16 @@ object CompanionAmplitude {
     fun visemeWeights(rms: Float, zcr: Float, open: Float): FloatArray {
         // Indices: aa, ih, ou, ee, oh
         val w = FloatArray(5)
-        if (open < 0.02f) return w
+        if (open < 0.015f) return w
         val bright = zcr.coerceIn(0f, 1f)
         val loud = rms.coerceIn(0f, 1f)
         // Closed / mid → ou, oh; open vowel → aa; bright → ee/ih.
-        w[0] = open * (0.35f + 0.45f * loud) * (1f - bright * 0.55f) // aa
-        w[1] = open * (0.15f + 0.4f * bright) * (0.6f + 0.4f * (1f - loud)) // ih
-        w[2] = open * (0.12f + 0.25f * (1f - bright)) * (0.5f + 0.5f * (1f - loud)) // ou
-        w[3] = open * bright * (0.25f + 0.5f * loud) // ee
-        w[4] = open * (0.2f + 0.35f * loud) * (0.7f - bright * 0.4f).coerceAtLeast(0.15f) // oh
+        // Stronger secondary so lips don't lock on a single morph.
+        w[0] = open * (0.42f + 0.48f * loud) * (1f - bright * 0.5f) // aa
+        w[1] = open * (0.22f + 0.5f * bright) * (0.55f + 0.45f * (1f - loud)) // ih
+        w[2] = open * (0.18f + 0.32f * (1f - bright)) * (0.45f + 0.55f * (1f - loud)) // ou
+        w[3] = open * bright * (0.35f + 0.55f * loud) // ee
+        w[4] = open * (0.28f + 0.4f * loud) * (0.75f - bright * 0.35f).coerceAtLeast(0.2f) // oh
         // Normalize so max is ~open (expression manager stacks morphs).
         var maxW = 0f
         for (v in w) if (v > maxW) maxW = v
@@ -130,5 +150,43 @@ object CompanionAmplitude {
             for (i in w.indices) w[i] = (w[i] * scale).coerceIn(0f, 1f)
         }
         return w
+    }
+
+    /**
+     * Analyze a full PCM chunk in short windows so multi-frame deltas still
+     * surface syllable peaks instead of averaging them away.
+     *
+     * @return Triple(rmsPeak, peakPeak, zcrAtPeak) — envelope stats for the loudest window.
+     */
+    fun windowedEnvelope(
+        samples: ShortArray,
+        window: Int = 480,
+    ): FloatArray {
+        if (samples.isEmpty()) return floatArrayOf(0f, 0f, 0f)
+        val win = window.coerceIn(80, samples.size)
+        var bestRms = 0f
+        var bestPeak = 0f
+        var bestZcr = 0f
+        var sumRms = 0f
+        var windows = 0
+        var i = 0
+        while (i < samples.size) {
+            val n = min(win, samples.size - i)
+            val rms = rmsPcm16(samples, i, n)
+            val peak = peakPcm16(samples, i, n)
+            val zcr = zeroCrossingRate(samples, i, n)
+            sumRms += rms
+            windows++
+            if (peak >= bestPeak || rms >= bestRms) {
+                bestRms = max(bestRms, rms)
+                bestPeak = max(bestPeak, peak)
+                bestZcr = zcr
+            }
+            i += n
+        }
+        // Blend peak window with mean so sustained soft speech still registers.
+        val meanRms = if (windows > 0) sumRms / windows else 0f
+        val rms = max(bestRms, meanRms * 1.15f)
+        return floatArrayOf(rms, bestPeak, bestZcr)
     }
 }

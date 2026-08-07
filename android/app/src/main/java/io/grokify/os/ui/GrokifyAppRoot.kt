@@ -4600,6 +4600,9 @@ private fun AppsPane(
         BuiltinPluginCatalog.COMPANION, "companion" -> CompanionPane(
             onBack = onBackToHub,
         )
+        BuiltinPluginCatalog.WATCH_DEPLOY, "watch_deploy" -> io.grokify.os.apps.watchdeploy.WatchDeployPane(
+            onBack = onBackToHub,
+        )
         else -> AppsHub(
             appOrder = appOrder,
             onOpenApp = onOpenApp,
@@ -4819,6 +4822,7 @@ private fun pluginIcon(key: PluginIconKey): ImageVector = when (key) {
     PluginIconKey.Apps -> Icons.Default.Apps
     PluginIconKey.Extension -> Icons.Default.Extension
     PluginIconKey.Chart -> Icons.Default.BarChart
+    PluginIconKey.Watch -> Icons.Filled.SystemUpdate
 }
 
 /** Compact bottom-nav label for a last-opened mini-app (fits under the icon). */
@@ -4830,6 +4834,7 @@ private fun appsNavShortTitle(app: PluginManifest): String = when (app.id) {
     BuiltinPluginCatalog.SPACEXAI_USAGE -> "Usage"
     BuiltinPluginCatalog.GROK_ASSISTANT -> "Assistant"
     BuiltinPluginCatalog.COMPANION -> "Companion"
+    BuiltinPluginCatalog.WATCH_DEPLOY -> "Watch"
     else -> app.title.take(12)
 }
 

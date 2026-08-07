@@ -1,0 +1,168 @@
+<?xml version="1.0"?>
+<!--
+  Grokify Radial — Watch Face Format twin of the wear app HUD.
+  Declarative only (no app code). Live sensors use system complications.
+-->
+<WatchFace width="450" height="450">
+  <Metadata key="CLOCK_TYPE" value="DIGITAL" />
+  <Metadata key="PREVIEW_TIME" value="10:08:32" />
+
+  <Scene backgroundColor="#ff03050a">
+    <!-- Outer cyan ring -->
+    <PartDraw x="8" y="8" width="434" height="434">
+      <Ellipse x="0" y="0" width="434" height="434">
+        <Stroke thickness="2" color="#6622D3EE" />
+      </Ellipse>
+    </PartDraw>
+
+    <!-- Mid magenta ring -->
+    <PartDraw x="36" y="36" width="378" height="378">
+      <Ellipse x="0" y="0" width="378" height="378">
+        <Stroke thickness="3" color="#99E879F9" />
+      </Ellipse>
+    </PartDraw>
+
+    <!-- Inner dim ring -->
+    <PartDraw x="64" y="64" width="322" height="322">
+      <Ellipse x="0" y="0" width="322" height="322">
+        <Stroke thickness="2" color="#4422D3EE" />
+      </Ellipse>
+    </PartDraw>
+
+    <!-- Soft center glow -->
+    <PartDraw x="150" y="150" width="150" height="150">
+      <Ellipse x="0" y="0" width="150" height="150">
+        <Fill color="#2222D3EE" />
+      </Ellipse>
+    </PartDraw>
+
+    <!-- Top complication (HR / steps / short text) -->
+    <ComplicationSlot
+        x="168" y="42" width="114" height="114"
+        slotId="0"
+        name="Top"
+        displayName="comp_top"
+        supportedTypes="SHORT_TEXT RANGED_VALUE SMALL_IMAGE MONOCHROMATIC_IMAGE EMPTY">
+      <BoundingOval x="0" y="0" width="114" height="114" outlinePadding="2" />
+      <DefaultProviderPolicy defaultSystemProvider="HEART_RATE"
+          defaultSystemProviderType="SHORT_TEXT" />
+      <Complication type="SHORT_TEXT">
+        <PartDraw x="0" y="0" width="114" height="114">
+          <Ellipse x="0" y="0" width="114" height="114">
+            <Stroke thickness="3" color="#ffE879F9" />
+          </Ellipse>
+        </PartDraw>
+        <PartText x="10" y="36" width="94" height="42">
+          <Text align="CENTER">
+            <Font family="SYNC_TO_DEVICE" size="22" weight="MEDIUM" color="#ffE879F9">
+              <Template>%s
+                <Parameter expression="[COMPLICATION.TEXT]" />
+              </Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+      <Complication type="RANGED_VALUE">
+        <PartDraw x="0" y="0" width="114" height="114">
+          <Ellipse x="0" y="0" width="114" height="114">
+            <Stroke thickness="3" color="#ffE879F9" />
+          </Ellipse>
+        </PartDraw>
+        <PartText x="10" y="36" width="94" height="42">
+          <Text align="CENTER">
+            <Font family="SYNC_TO_DEVICE" size="22" weight="MEDIUM" color="#ffE879F9">
+              <Template>%s
+                <Parameter expression="[COMPLICATION.TEXT]" />
+              </Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+      <Complication type="EMPTY">
+        <PartDraw x="0" y="0" width="114" height="114">
+          <Ellipse x="0" y="0" width="114" height="114">
+            <Stroke thickness="2" color="#4422D3EE" />
+          </Ellipse>
+        </PartDraw>
+      </Complication>
+    </ComplicationSlot>
+
+    <!-- Digital clock -->
+    <DigitalClock x="0" y="0" width="450" height="450">
+      <TimeText format="hh:mm" hourFormat="SYNC_TO_DEVICE" align="CENTER"
+          x="40" y="175" width="370" height="90" alpha="255">
+        <Variant mode="AMBIENT" target="alpha" value="0" />
+        <Font family="SYNC_TO_DEVICE" size="72" weight="BOLD" slant="NORMAL" color="#ffE2E8F0" />
+      </TimeText>
+      <TimeText format="hh:mm" hourFormat="SYNC_TO_DEVICE" align="CENTER"
+          x="40" y="175" width="370" height="90" alpha="0">
+        <Variant mode="AMBIENT" target="alpha" value="255" />
+        <Font family="SYNC_TO_DEVICE" size="72" weight="THIN" slant="NORMAL" color="#ffE2E8F0" />
+      </TimeText>
+      <TimeText format="ss" hourFormat="SYNC_TO_DEVICE" align="CENTER"
+          x="160" y="255" width="130" height="36" alpha="255">
+        <Variant mode="AMBIENT" target="alpha" value="0" />
+        <Font family="SYNC_TO_DEVICE" size="22" weight="NORMAL" color="#ff22D3EE" />
+      </TimeText>
+    </DigitalClock>
+
+    <!-- Bottom complication (steps / weather / battery) -->
+    <ComplicationSlot
+        x="168" y="300" width="114" height="114"
+        slotId="1"
+        name="Bottom"
+        displayName="comp_bottom"
+        supportedTypes="SHORT_TEXT RANGED_VALUE SMALL_IMAGE MONOCHROMATIC_IMAGE EMPTY">
+      <BoundingOval x="0" y="0" width="114" height="114" outlinePadding="2" />
+      <DefaultProviderPolicy defaultSystemProvider="STEP_COUNT"
+          defaultSystemProviderType="SHORT_TEXT" />
+      <Complication type="SHORT_TEXT">
+        <PartDraw x="0" y="0" width="114" height="114">
+          <Ellipse x="0" y="0" width="114" height="114">
+            <Stroke thickness="3" color="#ff22D3EE" />
+          </Ellipse>
+        </PartDraw>
+        <PartText x="10" y="36" width="94" height="42">
+          <Text align="CENTER">
+            <Font family="SYNC_TO_DEVICE" size="20" weight="MEDIUM" color="#ff22D3EE">
+              <Template>%s
+                <Parameter expression="[COMPLICATION.TEXT]" />
+              </Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+      <Complication type="RANGED_VALUE">
+        <PartDraw x="0" y="0" width="114" height="114">
+          <Ellipse x="0" y="0" width="114" height="114">
+            <Stroke thickness="3" color="#ff22D3EE" />
+          </Ellipse>
+        </PartDraw>
+        <PartText x="10" y="36" width="94" height="42">
+          <Text align="CENTER">
+            <Font family="SYNC_TO_DEVICE" size="20" weight="MEDIUM" color="#ff22D3EE">
+              <Template>%s
+                <Parameter expression="[COMPLICATION.TEXT]" />
+              </Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+      <Complication type="EMPTY">
+        <PartDraw x="0" y="0" width="114" height="114">
+          <Ellipse x="0" y="0" width="114" height="114">
+            <Stroke thickness="2" color="#4422D3EE" />
+          </Ellipse>
+        </PartDraw>
+      </Complication>
+    </ComplicationSlot>
+
+    <!-- Branding (interactive only) -->
+    <PartText x="100" y="400" width="250" height="28" alpha="255">
+      <Variant mode="AMBIENT" target="alpha" value="0" />
+      <Text align="CENTER">
+        <Font family="SYNC_TO_DEVICE" size="14" color="#6694A3B8">GROKIFY</Font>
+      </Text>
+    </PartText>
+  </Scene>
+</WatchFace>

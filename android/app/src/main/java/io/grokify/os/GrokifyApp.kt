@@ -6,16 +6,24 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
 import io.grokify.os.data.TokenStore
+import io.grokify.os.wearbridge.WearApiKeySync
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 class GrokifyApp : Application() {
     lateinit var tokenStore: TokenStore
         private set
+
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     override fun onCreate() {
         super.onCreate()
         instance = this
         tokenStore = TokenStore(this)
         createChannels()
+        // Keep watch Carina key in sync with phone vault.
+        WearApiKeySync.start(this, tokenStore, appScope)
         // Re-arm place-note geofence location updates after process start.
         runCatching { io.grokify.os.apps.LocationNoteWatcher.sync(this) }
         // Re-arm Hey Grok wake loop if prefs say so.

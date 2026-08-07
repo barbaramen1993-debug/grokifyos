@@ -15,7 +15,12 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 /**
- * Download the latest Grokify APK (authenticated) and hand it to the system package installer.
+ * Download a published Grokify APK (authenticated) by release channel.
+ *
+ * - [CHANNEL_PHONE] — host self-update (system package installer)
+ * - [CHANNEL_WEAR] — watch OTA hop (phone caches APK for wireless adb install)
+ *
+ * Cache files are channel-separated so phone and wear downloads never clobber each other.
  */
 class ApkUpdater(
     private val context: Context,
@@ -31,6 +36,7 @@ class ApkUpdater(
         val file: File,
         val sha256: String,
         val bytes: Long,
+        val channel: String = CHANNEL_PHONE,
     )
 
     fun canInstallPackages(): Boolean {
@@ -53,19 +59,23 @@ class ApkUpdater(
     }
 
     /**
-     * Streams APK from [downloadUrl] (or default update endpoint) into cache/apk/.
+     * Streams APK from [downloadUrl] (or channel default update endpoint) into cache/apk/.
      * [onProgress] is 0f..1f when Content-Length is known, else -1f for indeterminate.
+     *
+     * @param channel `phone` (default) or `wear` — selects cache filename and default URL
      */
     fun download(
         downloadUrl: String? = null,
         expectedSha256: String? = null,
+        channel: String = CHANNEL_PHONE,
         onProgress: (Float) -> Unit = {},
     ): DownloadResult {
         val token = tokenProvider()?.takeIf { it.isNotBlank() }
             ?: throw IllegalStateException("Not signed in — save your device token first")
 
+        val ch = normalizeChannel(channel)
         val url = downloadUrl?.takeIf { it.isNotBlank() }
-            ?: (BuildConfig.API_BASE.trimEnd('/') + "/apk-download.php")
+            ?: defaultDownloadUrl(ch)
 
         val req = Request.Builder()
             .url(url)
@@ -81,7 +91,7 @@ class ApkUpdater(
             val body = resp.body ?: throw IllegalStateException("Empty response body")
             val total = body.contentLength()
             val dir = File(context.cacheDir, "apk").apply { mkdirs() }
-            val outFile = File(dir, "grokify-update.apk")
+            val outFile = File(dir, cacheFileName(ch))
             if (outFile.exists()) outFile.delete()
 
             val digest = MessageDigest.getInstance("SHA-256")
@@ -116,10 +126,25 @@ class ApkUpdater(
                 throw IllegalStateException("Downloaded file too small ($written bytes)")
             }
             onProgress(1f)
-            return DownloadResult(file = outFile, sha256 = sha, bytes = written)
+            return DownloadResult(
+                file = outFile,
+                sha256 = sha,
+                bytes = written,
+                channel = ch,
+            )
         }
     }
 
+    /** Cached APK for [channel] if still on disk from a prior download. */
+    fun cachedApk(channel: String = CHANNEL_PHONE): File? {
+        val f = File(File(context.cacheDir, "apk"), cacheFileName(normalizeChannel(channel)))
+        return f.takeIf { it.isFile && it.length() >= 1024L }
+    }
+
+    /**
+     * Install APK on **this** device via the system package installer.
+     * Wear channel APKs should be pushed to the watch via ADB instead — do not call this for wear.
+     */
     fun install(apkFile: File) {
         if (!apkFile.exists() || apkFile.length() < 1024L) {
             throw IllegalStateException("APK file missing")
@@ -138,5 +163,30 @@ class ApkUpdater(
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)
+    }
+
+    companion object {
+        const val CHANNEL_PHONE = "phone"
+        const val CHANNEL_WEAR = "wear"
+
+        fun normalizeChannel(channel: String?): String {
+            val c = channel?.trim()?.lowercase().orEmpty()
+            return if (c == CHANNEL_WEAR) CHANNEL_WEAR else CHANNEL_PHONE
+        }
+
+        /** Phone keeps legacy filename; wear (and future channels) are isolated. */
+        fun cacheFileName(channel: String): String {
+            return when (normalizeChannel(channel)) {
+                CHANNEL_WEAR -> "grokify-wear-update.apk"
+                else -> "grokify-update.apk"
+            }
+        }
+
+        fun defaultDownloadUrl(channel: String = CHANNEL_PHONE): String {
+            val ch = normalizeChannel(channel)
+            return BuildConfig.API_BASE.trimEnd('/') +
+                "/apk-download.php?channel=" +
+                java.net.URLEncoder.encode(ch, "UTF-8")
+        }
     }
 }

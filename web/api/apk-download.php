@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 require_once dirname(__DIR__) . '/includes/bootstrap.php';
 
-$apk = gos_latest_apk();
+$channel = function_exists('gos_apk_channel')
+    ? gos_apk_channel(isset($_GET['channel']) ? (string) $_GET['channel'] : 'phone')
+    : 'phone';
+$apk = gos_latest_apk($channel);
 if ($apk === null) {
     http_response_code(404);
     header('Content-Type: text/plain; charset=utf-8');
-    echo 'No APK published.';
+    echo 'No APK published for channel=' . $channel . '.';
     exit;
 }
 

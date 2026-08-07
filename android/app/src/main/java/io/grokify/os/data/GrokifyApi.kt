@@ -39,10 +39,19 @@ class GrokifyApi(
         return executeJson(req)
     }
 
-    fun checkUpdate(versionCode: Int, versionName: String): JSONObject {
+    /**
+     * Check for a newer APK on [channel] (`phone` default, or `wear`).
+     * Phone self-update must keep defaulting to phone so wear releases never trigger host OTA.
+     */
+    fun checkUpdate(
+        versionCode: Int,
+        versionName: String,
+        channel: String = CHANNEL_PHONE,
+    ): JSONObject {
+        val ch = normalizeApkChannel(channel)
         val path = "/update.php?version_code=$versionCode&version_name=${
             java.net.URLEncoder.encode(versionName, "UTF-8")
-        }"
+        }&channel=${java.net.URLEncoder.encode(ch, "UTF-8")}"
         val req = authRequest(path).get().build()
         return executeJson(req)
     }
@@ -56,8 +65,25 @@ class GrokifyApi(
         return executeJson(req)
     }
 
-    /** Absolute download URL for the latest published APK (auth required on request). */
-    fun apkDownloadUrl(): String = BuildConfig.API_BASE.trimEnd('/') + "/apk-download.php"
+    /**
+     * Absolute download URL for the latest published APK on [channel]
+     * (`phone` | `wear`). Auth required on the request.
+     */
+    fun apkDownloadUrl(channel: String = CHANNEL_PHONE): String {
+        val ch = normalizeApkChannel(channel)
+        return BuildConfig.API_BASE.trimEnd('/') +
+            "/apk-download.php?channel=${java.net.URLEncoder.encode(ch, "UTF-8")}"
+    }
+
+    companion object {
+        const val CHANNEL_PHONE = "phone"
+        const val CHANNEL_WEAR = "wear"
+
+        fun normalizeApkChannel(channel: String?): String {
+            val c = channel?.trim()?.lowercase().orEmpty()
+            return if (c == CHANNEL_WEAR) CHANNEL_WEAR else CHANNEL_PHONE
+        }
+    }
 
     fun heartbeat(versionCode: Int, versionName: String): JSONObject {
         val body = JSONObject()

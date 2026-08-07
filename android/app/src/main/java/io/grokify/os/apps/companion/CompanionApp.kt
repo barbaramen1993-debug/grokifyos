@@ -419,20 +419,22 @@ fun CompanionPane(onBack: () -> Unit) {
                         var t = 0f
                         var syllable = 0f
                         while (isActive && busyLatest.value) {
-                            t += 0.22f
-                            syllable += 0.38f
-                            // Burst open on syllable peaks, dip toward closed between.
+                            t += 0.34f
+                            syllable += 0.58f
+                            // Faster multi-harmonic chatter so lips stay lively.
                             val syll = kotlin.math.sin(syllable.toDouble()).toFloat()
-                            val syll2 = kotlin.math.sin((syllable * 1.7f + 0.4f).toDouble()).toFloat()
+                            val syll2 = kotlin.math.sin((syllable * 2.1f + 0.4f).toDouble()).toFloat()
+                            val syll3 = kotlin.math.sin((syllable * 3.3f + 1.2f).toDouble()).toFloat()
                             val open = (
-                                0.12f +
-                                    0.42f * ((syll + 1f) * 0.5f) +
-                                    0.18f * ((syll2 + 1f) * 0.5f) +
-                                    0.08f * kotlin.math.sin((t * 2.1f).toDouble()).toFloat()
+                                0.18f +
+                                    0.48f * ((syll + 1f) * 0.5f) +
+                                    0.22f * ((syll2 + 1f) * 0.5f) +
+                                    0.14f * ((syll3 + 1f) * 0.5f) +
+                                    0.1f * kotlin.math.sin((t * 2.8f).toDouble()).toFloat()
                                 ).coerceIn(0f, 1f)
                             // Occasional near-closed "consonant" dip.
-                            mouth = if (syll > 0.92f) open * 0.25f else open
-                            delay(36)
+                            mouth = if (syll > 0.88f) open * 0.18f else open
+                            delay(22)
                         }
                     }
                     withContext(Dispatchers.IO) {

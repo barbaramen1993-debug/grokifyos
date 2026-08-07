@@ -177,6 +177,7 @@ object RemotePluginCatalog {
         "music", "spotify" -> PluginIconKey.Music
         "extension", "script", "plugin" -> PluginIconKey.Extension
         "chart", "usage", "analytics", "billing" -> PluginIconKey.Chart
+        "watch", "wear", "watch_deploy" -> PluginIconKey.Watch
         else -> PluginIconKey.Apps
     }
 }

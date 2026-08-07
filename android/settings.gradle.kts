@@ -14,3 +14,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "Grokify"
 include(":app")
+include(":wear")
+include(":wear-face")

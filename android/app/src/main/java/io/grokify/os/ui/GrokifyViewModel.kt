@@ -3028,7 +3028,11 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val json = withContext(Dispatchers.IO) {
-                    api.checkUpdate(BuildConfig.VERSION_CODE, BuildConfig.VERSION_NAME)
+                    api.checkUpdate(
+                        BuildConfig.VERSION_CODE,
+                        BuildConfig.VERSION_NAME,
+                        channel = GrokifyApi.CHANNEL_PHONE,
+                    )
                 }
                 if (json.optBoolean("update_available")) {
                     val latest = json.optJSONObject("latest")
@@ -3038,7 +3042,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     val size = latest?.optLong("file_size") ?: 0L
                     val sha = latest?.optString("sha256").orEmpty()
                     val url = latest?.optString("download_url").orEmpty().ifBlank {
-                        api.apkDownloadUrl()
+                        api.apkDownloadUrl(GrokifyApi.CHANNEL_PHONE)
                     }
                     val sizeLabel = formatBytes(size)
                     _state.update {
@@ -3090,7 +3094,11 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 // Re-check first so Install works even before a manual check.
                 try {
                     val json = withContext(Dispatchers.IO) {
-                        api.checkUpdate(BuildConfig.VERSION_CODE, BuildConfig.VERSION_NAME)
+                        api.checkUpdate(
+                            BuildConfig.VERSION_CODE,
+                            BuildConfig.VERSION_NAME,
+                            channel = GrokifyApi.CHANNEL_PHONE,
+                        )
                     }
                     if (!json.optBoolean("update_available")) {
                         _state.update {
@@ -3108,7 +3116,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                             updateSizeBytes = latest?.optLong("file_size") ?: 0L,
                             updateSha256 = latest?.optString("sha256").orEmpty(),
                             updateDownloadUrl = latest?.optString("download_url").orEmpty()
-                                .ifBlank { api.apkDownloadUrl() },
+                                .ifBlank { api.apkDownloadUrl(GrokifyApi.CHANNEL_PHONE) },
                         )
                     }
                 } catch (e: Exception) {
@@ -3128,12 +3136,15 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             try {
-                val downloadUrl = meta.updateDownloadUrl.ifBlank { api.apkDownloadUrl() }
+                val downloadUrl = meta.updateDownloadUrl.ifBlank {
+                    api.apkDownloadUrl(GrokifyApi.CHANNEL_PHONE)
+                }
                 val expectedSha = meta.updateSha256.ifBlank { null }
                 val result = withContext(Dispatchers.IO) {
                     apkUpdater.download(
                         downloadUrl = downloadUrl,
                         expectedSha256 = expectedSha,
+                        channel = ApkUpdater.CHANNEL_PHONE,
                     ) { progress ->
                         // OkHttp callback thread — StateFlow is thread-safe
                         _state.update {

@@ -994,27 +994,110 @@ function gos_public_origin(): string
     return 'https://grokifyos.grokpot.io';
 }
 
-/** @return array<string, mixed>|null */
-function gos_latest_apk(): ?array
+/**
+ * Normalize APK channel. Valid: phone | wear. Unknown → phone.
+ */
+function gos_apk_channel(?string $channel): string
+{
+    $c = strtolower(trim((string) $channel));
+    return in_array($c, ['phone', 'wear', 'wear-face'], true) ? $c : 'phone';
+}
+
+/**
+ * Whether grokify_apk_releases has a channel column (migration 003).
+ */
+function gos_apk_has_channel_column(): bool
+{
+    static $has = null;
+    if ($has !== null) {
+        return $has;
+    }
+    if (!gos_table_exists('grokify_apk_releases')) {
+        $has = false;
+        return false;
+    }
+    try {
+        $st = gos_pdo()->query("SHOW COLUMNS FROM grokify_apk_releases LIKE 'channel'");
+        $has = $st && $st->fetch(PDO::FETCH_ASSOC) !== false;
+    } catch (Throwable $e) {
+        $has = false;
+    }
+
+    return $has;
+}
+
+/**
+ * Latest active APK for a channel (default phone — backward compatible).
+ *
+ * @return array<string, mixed>|null
+ */
+function gos_latest_apk(?string $channel = 'phone'): ?array
 {
     if (!gos_table_exists('grokify_apk_releases')) {
         return null;
     }
-    $st = gos_pdo()->query(
-        'SELECT id, version_code, version_name, file_name, file_path, file_size, sha256, changelog,
-                min_sdk, is_active, created_by, created_at
-         FROM grokify_apk_releases
-         WHERE is_active = 1
-         ORDER BY version_code DESC
-         LIMIT 1'
-    );
-    $row = $st ? $st->fetch(PDO::FETCH_ASSOC) : false;
+    $channel = gos_apk_channel($channel);
+    $hasChannel = gos_apk_has_channel_column();
+
+    if ($hasChannel) {
+        $st = gos_pdo()->prepare(
+            'SELECT id, version_code, version_name, channel, file_name, file_path, file_size, sha256, changelog,
+                    min_sdk, is_active, created_by, created_at
+             FROM grokify_apk_releases
+             WHERE is_active = 1 AND channel = ?
+             ORDER BY version_code DESC
+             LIMIT 1'
+        );
+        $st->execute([$channel]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+    } else {
+        // Pre-migration: single stream (phone only)
+        if ($channel !== 'phone') {
+            return null;
+        }
+        $st = gos_pdo()->query(
+            'SELECT id, version_code, version_name, file_name, file_path, file_size, sha256, changelog,
+                    min_sdk, is_active, created_by, created_at
+             FROM grokify_apk_releases
+             WHERE is_active = 1
+             ORDER BY version_code DESC
+             LIMIT 1'
+        );
+        $row = $st ? $st->fetch(PDO::FETCH_ASSOC) : false;
+        if (is_array($row)) {
+            $row['channel'] = 'phone';
+        }
+    }
 
     return is_array($row) ? $row : null;
 }
 
 /**
- * Register a built or uploaded APK as the active release.
+ * Public summary of a release for API responses.
+ *
+ * @param array<string, mixed> $release
+ * @return array<string, mixed>
+ */
+function gos_apk_public_summary(array $release, ?string $site = null): array
+{
+    $site = $site ?? rtrim(gos_site_url(), '/');
+    $channel = gos_apk_channel(isset($release['channel']) ? (string) $release['channel'] : 'phone');
+
+    return [
+        'channel' => $channel,
+        'version_code' => (int) $release['version_code'],
+        'version_name' => $release['version_name'],
+        'file_size' => (int) ($release['file_size'] ?? 0),
+        'sha256' => $release['sha256'] ?? null,
+        'changelog' => $release['changelog'] ?? null,
+        'min_sdk' => isset($release['min_sdk']) && $release['min_sdk'] !== null ? (int) $release['min_sdk'] : null,
+        'download_url' => $site . '/api/apk-download.php?channel=' . rawurlencode($channel),
+        'created_at' => $release['created_at'] ?? null,
+    ];
+}
+
+/**
+ * Register a built or uploaded APK as the active release for a channel.
  *
  * @return array{ok: bool, release?: array<string, mixed>, error?: string}
  */
@@ -1025,8 +1108,10 @@ function gos_register_apk_upload(
     string $versionName,
     ?string $changelog,
     int $createdBy,
-    ?int $minSdk = null
+    ?int $minSdk = null,
+    string $channel = 'phone'
 ): array {
+    $channel = gos_apk_channel($channel);
     if ($versionCode < 1 || $versionName === '') {
         return ['ok' => false, 'error' => 'invalid_version'];
     }
@@ -1043,7 +1128,8 @@ function gos_register_apk_upload(
         return ['ok' => false, 'error' => 'empty_file'];
     }
 
-    $safeName = 'grokifyos-v' . $versionCode . '-' . preg_replace('/[^a-zA-Z0-9._-]+/', '_', $versionName) . '.apk';
+    $safeName = 'grokifyos-' . $channel . '-v' . $versionCode . '-'
+        . preg_replace('/[^a-zA-Z0-9._-]+/', '_', $versionName) . '.apk';
     $destDir = gos_apk_storage_dir();
     $dest = $destDir . '/' . $safeName;
 
@@ -1062,36 +1148,77 @@ function gos_register_apk_upload(
 
     $relPath = 'storage/apk/' . $safeName;
     $pdo = gos_pdo();
+    $hasChannel = gos_apk_has_channel_column();
     $pdo->beginTransaction();
     try {
-        $pdo->prepare('UPDATE grokify_apk_releases SET is_active = 0 WHERE is_active = 1')->execute();
-        $st = $pdo->prepare(
-            'INSERT INTO grokify_apk_releases
-             (version_code, version_name, file_name, file_path, file_size, sha256, changelog, min_sdk, is_active, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-             ON DUPLICATE KEY UPDATE
-               version_name = VALUES(version_name),
-               file_name = VALUES(file_name),
-               file_path = VALUES(file_path),
-               file_size = VALUES(file_size),
-               sha256 = VALUES(sha256),
-               changelog = VALUES(changelog),
-               min_sdk = VALUES(min_sdk),
-               is_active = 1,
-               created_by = VALUES(created_by),
-               created_at = CURRENT_TIMESTAMP'
-        );
-        $st->execute([
-            $versionCode,
-            mb_substr($versionName, 0, 32),
-            $safeName,
-            $relPath,
-            $size,
-            $sha,
-            $changelog,
-            $minSdk,
-            $createdBy > 0 ? $createdBy : null,
-        ]);
+        if ($hasChannel) {
+            $pdo->prepare('UPDATE grokify_apk_releases SET is_active = 0 WHERE is_active = 1 AND channel = ?')
+                ->execute([$channel]);
+            $st = $pdo->prepare(
+                'INSERT INTO grokify_apk_releases
+                 (version_code, version_name, channel, file_name, file_path, file_size, sha256, changelog, min_sdk, is_active, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 ON DUPLICATE KEY UPDATE
+                   version_name = VALUES(version_name),
+                   file_name = VALUES(file_name),
+                   file_path = VALUES(file_path),
+                   file_size = VALUES(file_size),
+                   sha256 = VALUES(sha256),
+                   changelog = VALUES(changelog),
+                   min_sdk = VALUES(min_sdk),
+                   is_active = 1,
+                   created_by = VALUES(created_by),
+                   created_at = CURRENT_TIMESTAMP'
+            );
+            $st->execute([
+                $versionCode,
+                mb_substr($versionName, 0, 32),
+                $channel,
+                $safeName,
+                $relPath,
+                $size,
+                $sha,
+                $changelog,
+                $minSdk,
+                $createdBy > 0 ? $createdBy : null,
+            ]);
+        } else {
+            // Pre-migration fallback (phone only)
+            if ($channel !== 'phone') {
+                $pdo->rollBack();
+                @unlink($dest);
+
+                return ['ok' => false, 'error' => 'channel_not_supported'];
+            }
+            $pdo->prepare('UPDATE grokify_apk_releases SET is_active = 0 WHERE is_active = 1')->execute();
+            $st = $pdo->prepare(
+                'INSERT INTO grokify_apk_releases
+                 (version_code, version_name, file_name, file_path, file_size, sha256, changelog, min_sdk, is_active, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 ON DUPLICATE KEY UPDATE
+                   version_name = VALUES(version_name),
+                   file_name = VALUES(file_name),
+                   file_path = VALUES(file_path),
+                   file_size = VALUES(file_size),
+                   sha256 = VALUES(sha256),
+                   changelog = VALUES(changelog),
+                   min_sdk = VALUES(min_sdk),
+                   is_active = 1,
+                   created_by = VALUES(created_by),
+                   created_at = CURRENT_TIMESTAMP'
+            );
+            $st->execute([
+                $versionCode,
+                mb_substr($versionName, 0, 32),
+                $safeName,
+                $relPath,
+                $size,
+                $sha,
+                $changelog,
+                $minSdk,
+                $createdBy > 0 ? $createdBy : null,
+            ]);
+        }
         $pdo->commit();
     } catch (Throwable $e) {
         $pdo->rollBack();
@@ -1100,7 +1227,7 @@ function gos_register_apk_upload(
         return ['ok' => false, 'error' => 'db_failed'];
     }
 
-    $release = gos_latest_apk();
+    $release = gos_latest_apk($channel);
 
     return $release ? ['ok' => true, 'release' => $release] : ['ok' => false, 'error' => 'not_found'];
 }

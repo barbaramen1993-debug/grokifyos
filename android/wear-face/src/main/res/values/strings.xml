@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="watch_face_name">Grokify Radial</string>
+    <string name="comp_top">Top</string>
+    <string name="comp_bottom">Bottom</string>
+</resources>

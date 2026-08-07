@@ -12,6 +12,7 @@ object BuiltinPluginCatalog {
     const val SPACEXAI_USAGE = "spacexai_usage_analyzer"
     const val GROK_ASSISTANT = "grok_assistant"
     const val COMPANION = "companion"
+    const val WATCH_DEPLOY = "watch_deploy"
 
     val all: List<PluginManifest> = listOf(
         PluginManifest(
@@ -142,6 +143,19 @@ object BuiltinPluginCatalog {
                     required = false,
                 ),
             ),
+        ),
+        PluginManifest(
+            id = WATCH_DEPLOY,
+            title = "Watch Deploy",
+            subtitle = "Developer: OTA-download the wear channel APK and install it on a Galaxy Watch over wireless ADB. Data view stub for wear→phone payloads.",
+            version = "1.0.0",
+            source = PluginSource.Builtin,
+            kind = PluginKind.HostModule,
+            hostModuleId = WATCH_DEPLOY,
+            capabilities = listOf("Wear OS", "OTA", "ADB", "Developer"),
+            accent = PluginAccent.Cyan,
+            icon = PluginIconKey.Watch,
+            featured = true,
         ),
     )
 

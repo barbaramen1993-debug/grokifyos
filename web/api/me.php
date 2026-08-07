@@ -34,7 +34,8 @@ if ($user === null) {
 }
 
 $device = $bearer['device'] ?? null;
-$latest = gos_latest_apk();
+$latest = gos_latest_apk('phone');
+$latestWear = gos_latest_apk('wear');
 
 gos_api_json([
     'ok' => true,
@@ -56,15 +57,8 @@ gos_api_json([
     'ws_path' => $wsPath,
     'ws_url' => $wsUrl,
     'bridge_url_hint' => gos_system_chat_bridge_url(),
-    'latest_apk' => $latest ? [
-        'version_code' => (int) $latest['version_code'],
-        'version_name' => $latest['version_name'],
-        'file_size' => (int) ($latest['file_size'] ?? 0),
-        'sha256' => $latest['sha256'] ?? null,
-        'changelog' => $latest['changelog'] ?? null,
-        'download_url' => $site . '/api/apk-download.php',
-        'created_at' => $latest['created_at'] ?? null,
-    ] : null,
+    'latest_apk' => $latest ? gos_apk_public_summary($latest, $site) : null,
+    'latest_wear_apk' => $latestWear ? gos_apk_public_summary($latestWear, $site) : null,
     'site' => [
         'name' => $settings['app_name'] ?? 'GrokifyOS',
         'origin' => $site,

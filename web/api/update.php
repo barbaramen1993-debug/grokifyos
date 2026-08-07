@@ -10,10 +10,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') {
 
 $access = gos_require_access();
 $currentCode = (int) ($_GET['version_code'] ?? $_GET['versionCode'] ?? 0);
-$latest = gos_latest_apk();
+$channel = gos_apk_channel(isset($_GET['channel']) ? (string) $_GET['channel'] : 'phone');
+$latest = gos_latest_apk($channel);
 $site = rtrim(gos_site_url(), '/');
 
-if (!empty($access['device'])) {
+// Only touch phone device metadata when checking the phone channel
+if ($channel === 'phone' && !empty($access['device'])) {
     $vName = isset($_GET['version_name']) ? (string) $_GET['version_name'] : null;
     gos_touch_device((int) $access['device']['id'], $vName, $currentCode > 0 ? $currentCode : null);
 }
@@ -21,6 +23,7 @@ if (!empty($access['device'])) {
 if ($latest === null) {
     gos_api_json([
         'ok' => true,
+        'channel' => $channel,
         'update_available' => false,
         'latest' => null,
     ]);
@@ -28,19 +31,12 @@ if ($latest === null) {
 
 $latestCode = (int) $latest['version_code'];
 $updateAvailable = $currentCode > 0 ? $latestCode > $currentCode : true;
+$summary = gos_apk_public_summary($latest, $site);
 
 gos_api_json([
     'ok' => true,
+    'channel' => $channel,
     'update_available' => $updateAvailable,
     'current_version_code' => $currentCode,
-    'latest' => [
-        'version_code' => $latestCode,
-        'version_name' => $latest['version_name'],
-        'file_size' => (int) ($latest['file_size'] ?? 0),
-        'sha256' => $latest['sha256'] ?? null,
-        'changelog' => $latest['changelog'] ?? null,
-        'min_sdk' => isset($latest['min_sdk']) && $latest['min_sdk'] !== null ? (int) $latest['min_sdk'] : null,
-        'download_url' => $site . '/api/apk-download.php',
-        'created_at' => $latest['created_at'] ?? null,
-    ],
+    'latest' => $summary,
 ]);
