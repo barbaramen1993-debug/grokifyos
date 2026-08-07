@@ -7,10 +7,13 @@ GrokifyOS is an **open-source, self-hosted** stack for a Grokify-style AI assist
 ```text
 ┌─────────────┐     HTTPS / LAN      ┌──────────────────┐
 │  Browser    │ ───────────────────► │  PHP web + API   │
-│  Android    │ ───────────────────► │  (web/)          │
-└─────────────┘                      └────────┬─────────┘
-                                              │
-                     MySQL ◄──────────────────┤
+│  Phone app  │ ───────────────────► │  (web/)          │
+│  Wear app   │ ───────────────────► │  multi-channel   │
+└──────┬──────┘                      │  OTA store       │
+       │ Data Layer (BT)             └────────┬─────────┘
+       │ keys + device token                  │
+       ▼                                      │
+  Galaxy Watch / Wear OS         MySQL ◄──────┤
                                               │
                      ┌────────────────────────▼─────────┐
                      │  Node bridge (WebSocket agents)  │
@@ -21,9 +24,11 @@ GrokifyOS is an **open-source, self-hosted** stack for a Grokify-style AI assist
 | Area | Scope |
 |------|--------|
 | **Web dashboard** | Password login, device pairing, chat UI, APK upload |
-| **REST APIs** | Auth, devices, chat sessions/messages, models, usage, OTA |
+| **REST APIs** | Auth, devices, chat sessions/messages, models, usage, multi-channel OTA (`phone` / `wear` / `wear-face`) |
 | **Bridge** | Agent WebSocket gateway (own port + install workspace; agent `cwd` selectable via `bridge_agent_cwd`) |
-| **Android** | Package `io.grokify.os` |
+| **Phone Android** | Package `io.grokify.os` — Chat, Apps hub, Watch Deploy, OTA |
+| **Wear Android** | Same package id as phone; standalone HUD + Carina; self-update `channel=wear` |
+| **Watch face** | Separate package `io.grokify.os.wear.face` (WFF) |
 | **Schema** | Users (password hash), chat tables, devices, APK releases |
 | **Auth** | Username/password sessions + device Bearer tokens (`gos_…`) |
 

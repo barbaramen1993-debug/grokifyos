@@ -2,15 +2,15 @@
 
 **A mobile Android development kit** — self-hosted web control plane + native phone client — so you can **build custom versions of your own AI-powered phone** by working *through* the device, not just *on* it.
 
-Think of it as **slipping the phone on for the phone**: you pair a real Android handset to *your* server, open hardware (camera, mic, GPS, Wi‑Fi, Bluetooth, notifications, media), stream agents via [Grok Build](https://grok.com), ship features as **built-in inner apps** in the host APK, and **publish APKs OTA** so the handset updates itself.
+Think of it as **slipping the phone on for the phone**: you pair a real Android handset to *your* server, open hardware (camera, mic, GPS, Wi‑Fi, Bluetooth, notifications, media), stream agents via [Grok Build](https://grok.com), ship features as **built-in inner apps** in the host APK, and **publish APKs OTA** so the handset (and optional **Wear OS** app) updates itself.
 
 | | |
 |--|--|
 | **What it is** | Self-hosted Android MDK + AI assistant stack |
-| **Clients** | Web dashboard (browser) · native app (`io.grokify.os`) |
+| **Clients** | Web dashboard (browser) · phone host (`io.grokify.os`) · Wear OS app (same package id) · optional watch face |
 | **Stack** | PHP 8.1+, MySQL/MariaDB, Node 18+ bridge, optional Android SDK |
 | **Run mode** | Laptop / LAN **or** remote VPS with HTTPS |
-| **Auth** | Username + password (web) · device Bearer tokens `gos_…` (phone) |
+| **Auth** | Username + password (web) · device Bearer tokens `gos_…` (phone + wear OTA) |
 | **License** | [MIT](LICENSE) |
 
 > **Not affiliated.** GrokifyOS is an independent, open-source project. It is **not** affiliated with, endorsed by, or sponsored by SpaceXAI/SpaceX/xAI, X (prev. Twitter), Grok, Grok Build, Mapbox, Spotify, or any related company. Product names above are trademarks of their respective owners; we only document how to use *your* accounts and APIs with *your* self-hosted stack.
@@ -23,11 +23,12 @@ Most “AI phone” demos are a chat UI glued to an API. GrokifyOS is different:
 
 1. **You own the host** — chat, devices, sessions, APKs, and secrets live on *your* machine or VPS.
 2. **The phone is the runtime** — full permission model for real hardware: camera, microphone, location, nearby Wi‑Fi, Bluetooth, notifications, media session control.
-3. **Inner apps are first-class** — Wi‑Fi / BT scanners, place notes, Spotify Live DJ, and maps ship as **built-in host modules** in the APK (no script sideloading).
-4. **Grok Build is the builder** — agents run against *your* Grok Build login on the host; you (or another agent) edit the repo, rebuild, and **push OTA**.
-5. **Closed loop** — change code → `publish.sh` → phone sees a new `versionCode` → install update → keep iterating without a cable.
+3. **Inner apps are first-class** — Wi‑Fi / BT scanners, place notes, Spotify Live DJ, maps, and **Watch Deploy** ship as **built-in host modules** in the APK (no script sideloading).
+4. **Wear is part of the loop** — standalone Grokify Wear (radial HUD + Carina voice) + optional WFF watch face; phone pushes first install via Watch Deploy; watch self-updates over LTE/Wi‑Fi.
+5. **Grok Build is the builder** — agents run against *your* Grok Build login on the host; you (or another agent) edit the repo, rebuild, and **push OTA**.
+6. **Closed loop** — change code → `publish.sh --channel …` → phone/watch sees a new `versionCode` → install update → keep iterating without a cable.
 
-Endless surface area: new Kotlin host modules, vault keys, maps, scanners, media, geofences — all under one paired device token.
+Endless surface area: new Kotlin host modules, vault keys, maps, scanners, media, geofences, wear HUD — all under one paired device token.
 
 ---
 
@@ -39,12 +40,15 @@ Endless surface area: new Kotlin host modules, vault keys, maps, scanners, media
 | **REST APIs** | Auth, devices, chat, models, live Grok Build usage, OTA |
 | **Agent bridge** | Node WebSocket gateway for streaming agents |
 | **Android host** | Compose client: Chat · Settings · **Apps** hub · permission cards · OTA |
-| **API key vault** | On-device keys for maps, Spotify, xAI voice |
-| **Inner apps** | Built-in host modules in the APK (`BuiltinPluginCatalog`) |
+| **Grokify Wear** | Standalone Wear OS app: radial telemetry HUD + Carina AI (not a phone UI clone) |
+| **Watch face** | Separate WFF APK (`io.grokify.os.wear.face`) — always-on time + HR/steps complications |
+| **API key vault** | On-device keys for maps, Spotify, xAI voice (phone → watch via Data Layer) |
+| **Inner apps** | Built-in host modules in the phone APK (`BuiltinPluginCatalog`), including Watch Deploy |
 
 Architecture overview: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**  
 Full install (Ubuntu / Windows / macOS, TLS, bridge): **[docs/INSTALL.md](docs/INSTALL.md)**  
-Android build / pair / OTA: **[android/README.md](android/README.md)**
+Android build / pair / OTA / Wear: **[android/README.md](android/README.md)**  
+Agent release rules (three APK channels): **[AGENTS.md](AGENTS.md)**
 
 ---
 
@@ -110,20 +114,32 @@ STEPS:
      - Dashboard URL
      - Admin username
      - How to open Devices → create gos_… token
-     - How to install APK (dashboard Download or android/scripts/publish.sh)
-12. Android endpoints (if rebuilding APK): set API_BASE, WS_URL, SITE_URL in
-    android/app/build.gradle.kts BuildConfig to the same host as GROKIFY_SITE_URL.
+     - How to install phone APK (dashboard Download or android/scripts/publish.sh)
+12. Android endpoints (if rebuilding APKs): set API_BASE / WS_URL / SITE_URL in
+    android/app/build.gradle.kts and API_BASE in android/wear/build.gradle.kts
+    to the same host as GROKIFY_SITE_URL.
+13. Wear (optional, Galaxy Watch / Wear OS):
+     - Three APK channels — never mix versionCodes: phone | wear | wear-face
+     - After wear code change: bump android/wear/build.gradle.kts, then
+         cd android && ./scripts/publish.sh debug --channel wear --changelog "notes"
+     - First install: phone Apps → Watch Deploy (wireless ADB IP:port) → Update & install
+     - Later updates: on-watch Update app (LTE/Wi‑Fi) or Watch Deploy again
+     - Package id must match phone (io.grokify.os / .debug) for Data Layer key sync
+     - Full wear setup: README § Grokify Wear + AGENTS.md + android/README.md
 
 SUCCESS:
 - GET /api/health.php reports ok
 - Browser login works
 - Device token can be created
 - (If bridge + auth) chat streams and usage is non-empty or a clear auth error
+- (If wear) channel=wear APK publishes; watch can install via Deploy or self-update
 
 DO NOT:
 - Invent usage stats when auth.json is missing
 - Bake secrets into the repo or mapbox_access_token.xml (there is no compile-time token file)
 - Share MySQL with unrelated apps
+- Bump phone versionCode when only wear changed (channels are independent)
+- Change wear applicationId away from the phone package (breaks Data Layer)
 ```
 
 ### One-shot shell sketch for agents
@@ -149,7 +165,7 @@ VPS + TLS + systemd examples: `deploy/`. Deep steps: **[docs/INSTALL.md](docs/IN
 
 ## Inner apps (built-in)
 
-Open the Android app → **Apps** tab. Every app is a **native host module** compiled into the APK (`BuiltinPluginCatalog`). There is no script sideload / remote WebView plugin path — new apps ship by editing Kotlin and publishing a new APK OTA.
+Open the **phone** Android app → **Apps** tab. Every app is a **native host module** compiled into the phone APK (`BuiltinPluginCatalog`). There is no script sideload / remote WebView plugin path — new apps ship by editing Kotlin and publishing a new phone APK OTA.
 
 | App | What it does | Hardware / services | Keys |
 |-----|----------------|---------------------|------|
@@ -160,8 +176,86 @@ Open the Android app → **Apps** tab. Every app is a **native host module** com
 | **Grok Assistant** | Floating mini overlay / system assist entry; wake listen; Voice Agent tools for the main chat surface | Microphone, notifications, network | **SpaceXAI API key** for voice |
 | **Spotify** | Lockscreen / media controls; **Live AI DJ** booth (banter, queue chat); research/build/edit playlists via host Grok Build; optional Grok Voice TTS | Notifications, Media session, mic (voice), network | **Spotify Client ID** (+ optional secret); **SpaceXAI API key** for Grok Voice (device TTS works without it) |
 | **SpaceXAI API Usage Analyzer** | Prepaid credit balance, period spend, soft/hard limits, 7‑day usage by model, balance history | Network | **SpaceXAI Management key** vault id `spacexai_management_key` (billing read on [management-api.x.ai](https://management-api.x.ai)) |
+| **Watch Deploy** | Dev tooling: download OTA `channel=wear` APK and install on a Galaxy Watch over **wireless ADB** (bundled `libadb.so`). One-tap **Update & install**. Data tab is a stub for future wear→phone payloads. | Network (phone + watch on same Wi‑Fi or phone hotspot); Wireless debugging on watch | Phone device token (for OTA download); no third-party vault key |
 
 Capabilities are gated by Android permissions (Settings → Permissions, or in-chat `[[permission_request:…]]` cards). Keys live in **Settings → API key vault** on the device — never in git.
+
+> **Grokify Wear is not an inner app.** It is a **separate Wear OS APK** (`:wear` module). Watch Deploy is the phone-side installer for that APK. See [Grokify Wear](#grokify-wear-os) below.
+
+---
+
+## Grokify Wear OS
+
+Standalone AI assistant + radial telemetry HUD for Wear OS (Galaxy Watch and similar). **Not** a clone of the phone host UI.
+
+| Piece | Module | Package / channel | Role |
+|-------|--------|-------------------|------|
+| **Wear app** | `android/wear` (`:wear`) | `applicationId` = **`io.grokify.os`** (same as phone + same debug suffix) · OTA **`channel=wear`** | Carina chat/voice, radial HUD (time, HR, steps, compass, location, weather, battery, media/notifications) |
+| **Watch face** | `android/wear-face` (`:wear-face`) | `io.grokify.os.wear.face` · OTA **`channel=wear-face`** | Always-on WFF face (time + system complications). Resource-only (`hasCode=false`). Must stay a **separate** APK from the wear app (Wear OS / Play rule). |
+| **Watch Deploy** | phone inner app | phone host only | First install / recovery install of the wear app via wireless ADB |
+
+**Why shared package id:** Wear Data Layer (MessageClient / DataClient) only syncs between identical `applicationId` + signing cert. Kotlin `namespace` on wear stays `io.grokify.os.wear`.
+
+**Independent version streams:** phone, wear, and wear-face each have their own `versionCode` / `versionName`. Never reuse or “merge” them when publishing.
+
+### User setup (first time)
+
+1. **Phone** — GrokifyOS paired with a `gos_…` device token; SpaceXAI API key in vault if you want Carina voice on the watch.
+2. **Watch** — Developer options → **Wireless debugging** → note **IP:port** (Pairing port is different from the connect port; use the active connect line).
+3. **Same network** — phone and watch on the same Wi‑Fi, **or** turn on the **phone hotspot** and join the watch (works off home Wi‑Fi / travel).
+4. **Phone** → **Apps → Watch Deploy** → set Connect IP:port → **Update & install** (one tap: check OTA + download wear APK + `adb install`).
+5. **Allow install** prompts on the watch if asked.
+6. Open Grokify on the watch. With phone nearby and both apps signed the same, **Data Layer** pushes the SpaceXAI key and device token automatically. Manual paste on the watch is the fallback.
+7. **Later updates (LTE / Wi‑Fi):** on the watch open Carina / settings → **Update app** (one-step check → download → install). Needs device token on the watch + “install unknown apps” once.
+8. **Watch face (optional):** publish `--channel wear-face`, then `adb install -r` the face APK (Watch Deploy targets `channel=wear` for the app today).
+
+### Off Wi‑Fi / remote
+
+| Goal | How |
+|------|-----|
+| First install or recovery | Phone **hotspot** + watch joins → Watch Deploy (wireless ADB needs a shared IP network; **not** Bluetooth alone) |
+| Already on wear ≥ self-update | Watch **Update app** over LTE or any Wi‑Fi — no phone push |
+| Computer nearby | USB/wireless ADB from a laptop: `adb install -r wear-debug.apk` |
+
+Bluetooth Data Layer is for **keys/tokens**, not multi‑MB APK install.
+
+### Agent / AI checklist (Wear)
+
+```text
+GOAL: Ship or set up Grokify Wear for a user who already has the phone host.
+
+PREREQS:
+- Phone GrokifyOS installed, device token active, same debug/release signing as wear builds
+- Android SDK + JDK 17 if building APKs
+- Wear OS device with Wireless debugging (first install) or LTE/Wi‑Fi (self-update)
+
+STEPS:
+1. Confirm three channels: phone (:app), wear (:wear), wear-face (:wear-face). Do not mix.
+2. Wear applicationId MUST remain io.grokify.os (+ .debug suffix in debug). Never rename for Data Layer.
+3. Set API_BASE in android/wear/build.gradle.kts to the user's host /api URL.
+4. Bump versionCode/versionName only in the module you changed.
+5. Publish:
+     cd android && ./scripts/publish.sh debug --channel wear --changelog "short notes"
+     # face: --channel wear-face
+     # phone: --channel phone  (or omit --channel)
+6. Tell user first install path: Apps → Watch Deploy → IP:port → Update & install.
+   No home Wi‑Fi → phone hotspot + watch joins that network.
+7. After first install: phone open pushes API key + device token; watch Update app uses channel=wear.
+8. If install hangs in Watch Deploy: Cancel, soft reconnect, retry; hard reconnect if port stale after OTA.
+9. Do not wait for the user to ask — after shippable wear/phone/face code changes, bump + publish that channel (see AGENTS.md).
+
+SUCCESS:
+- Watch app launches; key source shows phone sync or manual key works
+- Update app reports up to date or installs newer wear build
+- Data Layer works only when phone and wear package ids match
+
+DO NOT:
+- Bundle wear app code into the watch face APK
+- Use phone versionCode for wear releases
+- Promise Bluetooth-only APK install (unsupported; use hotspot + ADB or LTE self-update)
+```
+
+Build helpers and channel flags: **[android/README.md](android/README.md)** · release defaults for agents: **[AGENTS.md](AGENTS.md)**.
 
 ---
 
@@ -174,8 +268,8 @@ All third-party keys are **optional until you use the feature**. Store them **on
 | | |
 |--|--|
 | **Where** | Web dashboard → **Devices** → create |
-| **Used for** | Android API + WebSocket auth to *your* server |
-| **Paste** | First-run / Settings on the phone |
+| **Used for** | Phone API + WebSocket auth; wear OTA (`update.php` / `apk-download.php?channel=wear`) |
+| **Paste** | First-run / Settings on the phone; watch receives it via Data Layer or manual paste |
 
 ### 2. Grok Build (server-side — agents + usage)
 
@@ -229,26 +323,38 @@ Missing auth → APIs return a **clear error** (no invented usage).
 
 ## Develop → rebuild → OTA
 
-Closed loop for custom forks of the phone app:
+Closed loop for custom forks — **three APK channels** (phone, wear, wear-face). Each keeps its own `versionCode`.
 
 ```bash
-# bump versionCode / versionName in android/app/build.gradle.kts
 cd android
+
+# Phone host (default channel)
+# bump versionCode / versionName in android/app/build.gradle.kts
 ./scripts/publish.sh debug --changelog "What changed"
-# or: ./scripts/publish.sh release …
+# same: ./scripts/publish.sh debug --channel phone --changelog "…"
+
+# Wear app
+# bump android/wear/build.gradle.kts
+./scripts/publish.sh debug --channel wear --changelog "Wear notes"
+
+# Watch face
+# bump android/wear-face/build.gradle.kts
+./scripts/publish.sh debug --channel wear-face --changelog "Face notes"
 ```
 
 That builds the APK, registers it with your host’s APK store, and makes it downloadable for paired devices.
 
-| Phone | Server |
-|-------|--------|
-| Checks `GET /api/update.php?version_code=N` | Serves newer release metadata |
-| Downloads with device token | `GET /api/apk-download.php` |
-| Installs update | `versionCode` must **increase** each ship |
+| Client | Check | Download | Install path |
+|--------|--------|----------|--------------|
+| **Phone** | `GET /api/update.php?version_code=N` (+ default channel phone) | `apk-download.php` + device token | In-app OTA installer |
+| **Wear** | `update.php?version_code=N&channel=wear` | `apk-download.php?channel=wear` | On-watch **Update app**, or phone **Watch Deploy** (ADB) |
+| **Wear face** | `channel=wear-face` | same pattern | Wireless ADB / install-device for now |
 
-Helpers: `android/scripts/build.sh`, `publish.sh`, `install-device.sh` (wireless ADB). Details: **[android/README.md](android/README.md)**.
+`versionCode` must **increase** on each ship **for that channel**.
 
-Point Grok Build at this repo on the **same host** (or a remote with deploy access) so agents can edit Kotlin/PHP, run `publish.sh`, and the handset picks up the new build without USB.
+Helpers: `android/scripts/build.sh`, `publish.sh`, `install-device.sh` (wireless ADB). Details: **[android/README.md](android/README.md)** · agent always-publish rules: **[AGENTS.md](AGENTS.md)**.
+
+Point Grok Build at this repo on the **same host** (or a remote with deploy access) so agents can edit Kotlin/PHP, run `publish.sh`, and the handset/watch pick up the new build without USB.
 
 ---
 
@@ -258,10 +364,15 @@ Point Grok Build at this repo on the **same host** (or a remote with deploy acce
 web/           PHP app (public UI, API, includes, assets)
 schema/        SQL schema (greenfield install)
 bridge/        Node WebSocket agent gateway
-android/       Kotlin + Compose host (io.grokify.os) + inner apps
+android/       Phone host (:app) + Wear (:wear) + WFF face (:wear-face)
+  app/         Phone Kotlin + Compose + inner apps (incl. Watch Deploy)
+  wear/        Grokify Wear — radial HUD + Carina
+  wear-face/   Watch Face Format package
+  scripts/     build.sh, publish.sh (multi-channel), install-device.sh
 scripts/       install.php, dev router, grok-auth helpers
 deploy/        Apache vhost + systemd unit examples
 docs/          install + architecture
+AGENTS.md      Agent release notes (phone / wear / wear-face channels)
 storage/       sessions, bridge runtime, APKs (gitignored contents)
 uploads/       chat media (gitignored)
 ```
@@ -308,7 +419,7 @@ Usage endpoints call billing with **your** credentials only. No phone-home to a 
 
 ## Contributing
 
-Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the tree. If you add an inner app, implement it as a built-in host module (`BuiltinPluginCatalog` + Compose pane) and document its capabilities and required vault key ids in this README.
+Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the tree. If you add an **inner app**, implement it as a built-in host module (`BuiltinPluginCatalog` + Compose pane) and document its capabilities and required vault key ids in this README. If you change **Wear** or the **watch face**, keep package/channel rules in **AGENTS.md**, bump the correct module only, and document user-facing setup under [Grokify Wear OS](#grokify-wear-os).
 
 ---
 
