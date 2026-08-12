@@ -8,6 +8,7 @@ import io.grokify.os.GrokifyApp
 import io.grokify.os.apps.plugin.BuiltinPluginCatalog
 import io.grokify.os.apps.plugin.isInternalAppSessionTitle
 import io.grokify.os.chat.BridgeClient
+import io.grokify.os.chat.GrokReasoning
 import io.grokify.os.data.ApiKeyEntry
 import io.grokify.os.data.ApiKeyIds
 import io.grokify.os.data.ApiKeyPresets
@@ -93,6 +94,8 @@ data class ModelItem(
     val id: String,
     val name: String,
     val provider: String,
+    val reasoningEfforts: List<String> = emptyList(),
+    val defaultReasoningEffort: String = "",
 )
 
 /** Directory entry from bridge work-dir list API. */
@@ -139,6 +142,10 @@ data class UiState(
     val userLabel: String = "",
     val model: String = "",
     val models: List<ModelItem> = emptyList(),
+    /** Grok Build CLI reasoning effort for the selected model (low|medium|high|xhigh). */
+    val reasoningEffort: String = "",
+    /** Allowed efforts for [model] — xhigh omitted on grok-4.5. */
+    val reasoningEfforts: List<String> = emptyList(),
     val messages: List<ChatLine> = emptyList(),
     /** True when older messages exist above the currently loaded window. */
     val hasMoreMessages: Boolean = false,
@@ -259,6 +266,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             val showTools = store.showToolsFlow.first()
             val showThoughts = store.showThoughtsFlow.first()
             val savedModel = store.modelFlow.first()
+            val savedEffort = store.reasoningEffortFlow.first()
             val savedSession = store.sessionIdFlow.first()
             val mapboxTok = store.mapboxAccessTokenFlow.first().orEmpty()
             val vault = store.apiKeyVaultFlow.first()
@@ -274,6 +282,8 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                     showTools = showTools,
                     showThoughts = showThoughts,
                     model = savedModel?.takeIf { it.startsWith("gb:") || it.startsWith("grok:") } ?: "",
+                    reasoningEffort = savedEffort.orEmpty(),
+                    reasoningEfforts = GrokReasoning.effortsFor(savedModel.orEmpty()),
                     sessionId = sessionId,
                     mapboxAccessToken = mapboxTok,
                     apiKeys = vaultForUi(vault, mapboxTok),
@@ -811,24 +821,57 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             // Grok Build only — skip any legacy Cursor entries
             if (provider == "cursor") continue
             if (provider.isNotBlank() && provider != "grok-build" && !id.startsWith("gb:")) continue
+            val advertised = parseEffortList(o.optJSONArray("reasoning_efforts"))
             list += ModelItem(
                 id = id,
                 name = o.optString("name").ifBlank { id.removePrefix("gb:") },
                 provider = if (provider.isBlank()) "grok-build" else provider,
+                reasoningEfforts = GrokReasoning.effortsFor(id, advertised),
+                defaultReasoningEffort = o.optString("default_reasoning_effort"),
             )
         }
         val defaultModel = json.optString("default_model").ifBlank {
             list.firstOrNull()?.id.orEmpty()
         }
         val current = _state.value.model
+        val previousEffort = _state.value.reasoningEffort
         val resolved = when {
             current.isNotBlank() && list.any { it.id == current } -> current
             else -> json.optString("selected").ifBlank { defaultModel }
         }
-        _state.update { it.copy(models = list, model = resolved) }
+        val item = list.find { it.id == resolved }
+        val serverEffort = json.optString("selected_reasoning_effort")
+        val effort = GrokReasoning.clamp(
+            resolved,
+            previousEffort.ifBlank { serverEffort },
+            item?.reasoningEfforts.orEmpty(),
+            item?.defaultReasoningEffort.orEmpty(),
+        )
+        val efforts = GrokReasoning.effortsFor(resolved, item?.reasoningEfforts.orEmpty())
+        _state.update {
+            it.copy(
+                models = list,
+                model = resolved,
+                reasoningEffort = effort,
+                reasoningEfforts = efforts,
+            )
+        }
         if (resolved.isNotBlank() && resolved != current) {
             viewModelScope.launch { store.setModel(resolved) }
         }
+        if (effort.isNotBlank() && effort != previousEffort) {
+            viewModelScope.launch { store.setReasoningEffort(effort, resolved) }
+        }
+    }
+
+    private fun parseEffortList(arr: org.json.JSONArray?): List<String> {
+        if (arr == null) return emptyList()
+        val out = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val v = arr.optString(i).trim().lowercase()
+            if (v.isNotEmpty()) out += v
+        }
+        return out
     }
 
     private fun isValidSessionId(id: String) = Regex("^[a-f0-9]{32}$").matches(id)
@@ -1972,9 +2015,43 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
     fun selectModel(modelId: String) {
         viewModelScope.launch {
             try {
+                val item = _state.value.models.find { it.id == modelId }
+                val byModel = store.reasoningByModelFlow.first()
+                val effort = GrokReasoning.clamp(
+                    modelId,
+                    byModel[modelId] ?: _state.value.reasoningEffort,
+                    item?.reasoningEfforts.orEmpty(),
+                    item?.defaultReasoningEffort.orEmpty(),
+                )
+                val efforts = GrokReasoning.effortsFor(modelId, item?.reasoningEfforts.orEmpty())
                 store.setModel(modelId)
-                _state.update { it.copy(model = modelId) }
-                withContext(Dispatchers.IO) { api.setModel(modelId) }
+                store.setReasoningEffort(effort, modelId)
+                _state.update {
+                    it.copy(model = modelId, reasoningEffort = effort, reasoningEfforts = efforts)
+                }
+                withContext(Dispatchers.IO) { api.setModel(modelId, effort) }
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message) }
+            }
+        }
+    }
+
+    fun selectReasoningEffort(effort: String) {
+        viewModelScope.launch {
+            try {
+                val model = _state.value.model
+                val item = _state.value.models.find { it.id == model }
+                val clamped = GrokReasoning.clamp(
+                    model,
+                    effort,
+                    item?.reasoningEfforts.orEmpty(),
+                    item?.defaultReasoningEffort.orEmpty(),
+                )
+                store.setReasoningEffort(clamped, model)
+                _state.update { it.copy(reasoningEffort = clamped) }
+                if (model.isNotBlank()) {
+                    withContext(Dispatchers.IO) { api.setModel(model, clamped) }
+                }
             } catch (e: Exception) {
                 _state.update { it.copy(error = e.message) }
             }
@@ -2827,6 +2904,7 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 notes = notes,
                 history = historyPayload,
                 images = imagePayload,
+                reasoningEffort = _state.value.reasoningEffort,
             ) == true
             if (!ok) {
                 _state.update {

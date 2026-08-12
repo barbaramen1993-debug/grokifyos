@@ -23,6 +23,8 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -255,6 +257,7 @@ fun GrokifyAppRoot(
     onToggleNote: (Int, Boolean) -> Unit = { _, _ -> },
     onDeleteNote: (Int) -> Unit = {},
     onSelectModel: (String) -> Unit = {},
+    onSelectReasoningEffort: (String) -> Unit = {},
     onSetWorkDir: (String) -> Unit = {},
     onResetWorkDir: () -> Unit = {},
     onToggleWorkDirBrowser: () -> Unit = {},
@@ -539,6 +542,7 @@ fun GrokifyAppRoot(
                         onGrokLogin = onGrokLogin,
                         onGrokLogout = onGrokLogout,
                         onSelectModel = onSelectModel,
+                        onSelectReasoningEffort = onSelectReasoningEffort,
                         onSetWorkDir = onSetWorkDir,
                         onResetWorkDir = onResetWorkDir,
                         onToggleWorkDirBrowser = onToggleWorkDirBrowser,
@@ -1104,7 +1108,18 @@ private fun MetricGrid(state: UiState) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             MetricTile("USER", state.userLabel.ifBlank { "—" }, Modifier.weight(1f))
-            MetricTile("MODEL", state.model, Modifier.weight(1f), mono = true)
+            MetricTile(
+                "MODEL",
+                buildString {
+                    append(state.model.ifBlank { "—" })
+                    if (state.reasoningEffort.isNotBlank()) {
+                        append(" · ")
+                        append(state.reasoningEffort)
+                    }
+                },
+                Modifier.weight(1f),
+                mono = true,
+            )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             MetricTile(
@@ -1844,7 +1859,13 @@ private fun ChatToolbar(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    state.model.removePrefix("gb:").ifBlank { state.model },
+                    buildString {
+                        append(state.model.removePrefix("gb:").ifBlank { state.model })
+                        if (state.reasoningEffort.isNotBlank()) {
+                            append(" · ")
+                            append(state.reasoningEffort)
+                        }
+                    },
                     color = GrokifyColors.TextDim,
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace,
@@ -2341,11 +2362,13 @@ private fun NotesPanel(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsPage(
     state: UiState,
     onBack: () -> Unit,
     onSelectModel: (String) -> Unit,
+    onSelectReasoningEffort: (String) -> Unit = {},
     onSetWorkDir: (String) -> Unit = {},
     onResetWorkDir: () -> Unit = {},
     onToggleWorkDirBrowser: () -> Unit = {},
@@ -2967,6 +2990,58 @@ private fun SettingsPage(
                     }
                 }
                 Spacer(Modifier.height(6.dp))
+            }
+            val efforts = state.reasoningEfforts.ifEmpty {
+                state.models.find { it.id == state.model }?.reasoningEfforts.orEmpty()
+            }
+            if (efforts.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "REASONING",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = GrokifyColors.GlowCyan,
+                )
+                Text(
+                    if ("xhigh" in efforts) {
+                        "How hard this model thinks. xhigh is grok-4.6+ only."
+                    } else {
+                        "How hard this model thinks. This model does not support xhigh."
+                    },
+                    color = GrokifyColors.TextMuted,
+                    fontSize = 12.sp,
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(top = 6.dp),
+                ) {
+                    efforts.forEach { effort ->
+                        val on = effort == state.reasoningEffort
+                        FilterChip(
+                            selected = on,
+                            onClick = { onSelectReasoningEffort(effort) },
+                            label = {
+                                Text(
+                                    effort,
+                                    fontSize = 12.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = GrokifyColors.GlowCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = GrokifyColors.GlowCyan,
+                                containerColor = GrokifyColors.PanelSoft,
+                                labelColor = GrokifyColors.TextPrimary,
+                            ),
+                            border = FilterChipDefaults.filterChipBorder(
+                                enabled = true,
+                                selected = on,
+                                borderColor = GrokifyColors.PanelBorder,
+                                selectedBorderColor = GrokifyColors.GlowCyan,
+                            ),
+                        )
+                    }
+                }
             }
         }
         Spacer(Modifier.height(24.dp))

@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import org.json.JSONObject
 
 private val Context.dataStore by preferencesDataStore("grokifyos_prefs")
 
@@ -24,6 +25,10 @@ class TokenStore(private val context: Context) {
     /** When true, thinking / thoughts cards are shown in the chat transcript. */
     private val keyShowThoughts = booleanPreferencesKey("show_thoughts")
     private val keyModel = stringPreferencesKey("preferred_model")
+    /** Last selected Grok Build reasoning effort (low|medium|high|xhigh). */
+    private val keyReasoningEffort = stringPreferencesKey("preferred_reasoning_effort")
+    /** Per-model last effort: { "gb:grok-4.6": "xhigh", "gb:grok-4.5": "high" }. */
+    private val keyReasoningByModel = stringPreferencesKey("reasoning_effort_by_model_json")
     private val keySessionId = stringPreferencesKey("active_session_id")
     /** Mapbox public access token (pk.…). Empty/null → maps stay disabled until set in Settings. */
     private val keyMapboxAccessToken = stringPreferencesKey("mapbox_access_token")
@@ -50,6 +55,9 @@ class TokenStore(private val context: Context) {
     val showThoughtsFlow: Flow<Boolean> =
         context.dataStore.data.map { it[keyShowThoughts] ?: true }
     val modelFlow: Flow<String?> = context.dataStore.data.map { it[keyModel] }
+    val reasoningEffortFlow: Flow<String?> = context.dataStore.data.map { it[keyReasoningEffort] }
+    val reasoningByModelFlow: Flow<Map<String, String>> =
+        context.dataStore.data.map { parseEffortMap(it[keyReasoningByModel]) }
     val sessionIdFlow: Flow<String?> = context.dataStore.data.map { it[keySessionId] }
     val mapboxAccessTokenFlow: Flow<String?> =
         context.dataStore.data.map { it[keyMapboxAccessToken] }
@@ -100,6 +108,22 @@ class TokenStore(private val context: Context) {
 
     suspend fun setModel(model: String) {
         context.dataStore.edit { it[keyModel] = model }
+    }
+
+    suspend fun setReasoningEffort(effort: String, modelId: String? = null) {
+        val cleaned = effort.trim().lowercase()
+        if (cleaned.isEmpty()) return
+        context.dataStore.edit { prefs ->
+            prefs[keyReasoningEffort] = cleaned
+            val mid = modelId?.trim().orEmpty()
+            if (mid.isNotEmpty()) {
+                val map = parseEffortMap(prefs[keyReasoningByModel]).toMutableMap()
+                map[mid] = cleaned
+                val encoded = JSONObject()
+                map.forEach { (k, v) -> encoded.put(k, v) }
+                prefs[keyReasoningByModel] = encoded.toString()
+            }
+        }
     }
 
     suspend fun setSessionId(id: String) {
@@ -220,4 +244,19 @@ class TokenStore(private val context: Context) {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
+
+    private fun parseEffortMap(raw: String?): Map<String, String> {
+        if (raw.isNullOrBlank()) return emptyMap()
+        return runCatching {
+            val obj = JSONObject(raw)
+            buildMap {
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = obj.optString(k)
+                    if (k.isNotBlank() && v.isNotBlank()) put(k, v)
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
 }

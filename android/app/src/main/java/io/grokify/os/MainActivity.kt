@@ -132,6 +132,7 @@ class MainActivity : ComponentActivity() {
                         onToggleNote = vm::toggleNote,
                         onDeleteNote = vm::deleteNote,
                         onSelectModel = vm::selectModel,
+                        onSelectReasoningEffort = vm::selectReasoningEffort,
                         onSetWorkDir = vm::setWorkDir,
                         onResetWorkDir = vm::resetWorkDir,
                         onToggleWorkDirBrowser = vm::toggleWorkDirBrowser,

@@ -168,6 +168,50 @@ function gos_system_chat_set_selected_model(string $model): void
     gos_setting_set('system_chat_selected_model', $model);
 }
 
+/** @return list<string> */
+function gos_reasoning_efforts_for_model(string $model): array
+{
+    $real = (string) preg_replace('/^(gb:|grok:)/', '', trim($model));
+    if (preg_match('/^grok-(\d+)(?:\.(\d+))?/', strtolower($real), $m) === 1) {
+        $major = (int) $m[1];
+        $minor = isset($m[2]) ? (int) $m[2] : 0;
+        if ($major > 4 || ($major === 4 && $minor >= 6)) {
+            return ['low', 'medium', 'high', 'xhigh'];
+        }
+    }
+
+    return ['low', 'medium', 'high'];
+}
+
+function gos_default_reasoning_effort_for_model(string $model): string
+{
+    $allowed = gos_reasoning_efforts_for_model($model);
+
+    return in_array('xhigh', $allowed, true) ? 'xhigh' : 'high';
+}
+
+function gos_clamp_reasoning_effort(string $model, string $effort): string
+{
+    $allowed = gos_reasoning_efforts_for_model($model);
+    $req = strtolower(trim($effort));
+    if (in_array($req, $allowed, true)) {
+        return $req;
+    }
+
+    return gos_default_reasoning_effort_for_model($model);
+}
+
+function gos_system_chat_selected_reasoning_effort(): string
+{
+    return strtolower(trim((string) gos_setting_get('system_chat_selected_reasoning_effort', '')));
+}
+
+function gos_system_chat_set_selected_reasoning_effort(string $effort, string $model = ''): void
+{
+    $clamped = gos_clamp_reasoning_effort($model !== '' ? $model : gos_system_chat_selected_model(), $effort);
+    gos_setting_set('system_chat_selected_reasoning_effort', $clamped);
+}
+
 function gos_system_chat_bridge_url(): string
 {
     $url = gos_env('GROKIFY_BRIDGE_URL', '') ?? '';

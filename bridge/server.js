@@ -23,10 +23,16 @@ require('dotenv').config({ path: path.join(WORKSPACE, '.env') });
 const PORT = parseInt(envFirst('GROKIFY_BRIDGE_PORT', 'GROKPOT_BRIDGE_PORT') || '8876', 10);
 const INSTANCE_ID = envFirst('GROKIFY_BRIDGE_INSTANCE', 'GROKPOT_BRIDGE_INSTANCE') || 'a';
 const GROK_BIN = envFirst('GROKIFY_GROK_BIN', 'GROKPOT_GROK_BIN') || '/root/.grok/bin/grok';
-const DEFAULT_GROK_MODEL = envFirst('GROKIFY_GROK_DEFAULT_MODEL', 'GROKPOT_GROK_DEFAULT_MODEL') || 'grok-4.5';
-/** Headless CLI reasoning effort for all chats (override with GROKIFY_REASONING_EFFORT).
- * Canonical levels: none, minimal, low, medium, high. (xhigh not released yet.) */
-const REASONING_EFFORT = envFirst('GROKIFY_REASONING_EFFORT', 'GROKPOT_REASONING_EFFORT') || 'high';
+const DEFAULT_GROK_MODEL = envFirst('GROKIFY_GROK_DEFAULT_MODEL', 'GROKPOT_GROK_DEFAULT_MODEL') || 'grok-4.6';
+/** Preferred headless CLI reasoning effort (clamped per model).
+ * grok-4.6: low | medium | high | xhigh
+ * grok-4.5: low | medium | high  (CLI rejects xhigh) */
+const REASONING_EFFORT = envFirst('GROKIFY_REASONING_EFFORT', 'GROKPOT_REASONING_EFFORT') || 'xhigh';
+const {
+    defaultEffortForModel,
+    resolveReasoningEffort,
+    decorateModels,
+} = require('./reasoning-effort');
 const LOG_FILE = path.join(WORKSPACE, 'storage', 'logs', 'bridge.log');
 const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_PROMPT_BYTES = 120000;
@@ -175,7 +181,7 @@ function refreshGrokModels() {
             nextAllowed.add('gb:' + id);
         }
         if (models.length) {
-            GROK_MODELS_FULL = models;
+            GROK_MODELS_FULL = decorateModels(models, REASONING_EFFORT);
             ALLOWED_MODELS = nextAllowed;
             log('info', 'agent', `Loaded ${models.length} Grok Build models`, { sample: models.map((m) => m.id) });
         }
@@ -2138,7 +2144,7 @@ function startAgentWatchers(agent) {
     }, AGENT_TIMEOUT_MS);
 }
 
-async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId, images = []) {
+async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, userId, images = [], reasoningEffort = '') {
     const existing = agents.get(sessionId);
     if (existing && !existing.done) cleanupAgent(sessionId, { killProcess: true });
 
@@ -2151,6 +2157,7 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
 
     const resolved = resolveGrokModel(model);
     const realModel = grokRealModel(resolved);
+    const effort = resolveReasoningEffort(realModel, reasoningEffort, REASONING_EFFORT);
     const userImages = Array.isArray(images) ? images : [];
     let fullPrompt = buildPromptWithHistory(prompt, history, notes);
     if (Buffer.byteLength(fullPrompt) > MAX_PROMPT_BYTES) {
@@ -2186,7 +2193,7 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
     log('info', 'agent', 'Spawning Grok Build', {
         session_id: sessionId,
         model: realModel,
-        reasoning_effort: REASONING_EFFORT,
+        reasoning_effort: effort,
         user_id: userId,
         prompt_bytes: Buffer.byteLength(fullPrompt),
         images: userImages.length,
@@ -2198,7 +2205,7 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
     const args = [
         '--output-format', 'streaming-json',
         '--always-approve',
-        '--reasoning-effort', REASONING_EFFORT,
+        '--reasoning-effort', effort,
         '-m', realModel,
     ];
     if (promptFile) {
@@ -2418,6 +2425,7 @@ const httpServer = http.createServer((req, res) => {
             grok_models: GROK_MODELS_FULL,
             allowed: [...ALLOWED_MODELS],
             default_model: resolveGrokModel(null),
+            default_reasoning_effort: defaultEffortForModel(DEFAULT_GROK_MODEL, REASONING_EFFORT),
         }));
         return;
     }
@@ -2678,6 +2686,7 @@ wss.on('connection', (ws, req) => {
             return;
         }
         const { model, session_id, history, notes } = data;
+        const requestedEffort = data.reasoning_effort || data.effort || data.reasoningEffort || '';
         const sessionId = session_id || '';
         if (!/^[a-f0-9]{32}$/.test(sessionId)) {
             ws.send(JSON.stringify({ type: 'error', content: 'Invalid session' }));
@@ -2693,11 +2702,16 @@ wss.on('connection', (ws, req) => {
             session_id: sessionId,
             user_id: ws.userId,
             model: resolveGrokModel(model),
+            reasoning_effort: resolveReasoningEffort(
+                grokRealModel(resolveGrokModel(model)),
+                requestedEffort,
+                REASONING_EFFORT,
+            ),
             prompt_len: prompt.length,
             images: images.length,
         });
 
-        await spawnGrokBuild(sessionId, prompt, model, ws, history, notes, ws.userId, images);
+        await spawnGrokBuild(sessionId, prompt, model, ws, history, notes, ws.userId, images, requestedEffort);
     });
 
     ws.on('close', () => {

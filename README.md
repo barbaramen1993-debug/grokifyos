@@ -427,6 +427,16 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Wear and watch-face channels keep **independent** version streams (`android/wear`, `android/wear-face`). Newest first. OTA notes on the phone/watch come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.266 — grok-4.6 default + per-model reasoning effort
+
+**Phone host `0.1.266` (versionCode 266)** — Settings → **MODEL** now has a **REASONING** row. Options follow the selected Grok Build model so `grok-4.5` never receives `xhigh` (that combination is a CLI error).
+
+- **Default headless agents** (web system chat, Android Chat, plugin / Live DJ host AI): `-m grok-4.6` and `--reasoning-effort xhigh`.
+- **Per-model efforts**: `grok-4.6` → `low` / `medium` / `high` / `xhigh`; `grok-4.5` (and older / unknown) → `low` / `medium` / `high`. Last pick is remembered per model.
+- **Bridge clamp**: WebSocket `prompt` accepts `reasoning_effort`; unsupported values are snapped before spawn (`GROKIFY_GROK_DEFAULT_MODEL` / `GROKIFY_REASONING_EFFORT` still override the preferred default).
+- **Web + Android pickers** read `reasoning_efforts` / `default_reasoning_effort` from `/models`. Switching to 4.5 while on `xhigh` snaps to `high`.
+- Voice Agent realtime path is unchanged (`none` / deep-think `high`).
+
 ### 0.1.251–0.1.265 — Wear OS closed loop (phone host)
 
 **Phone host `0.1.265` (versionCode 265)** — multi-channel OTA, Watch Deploy, Data Layer key sync.
@@ -470,7 +480,7 @@ Also in this ship window (0.1.234–0.1.249 OTA range, same tree):
 
 ### Bridge — default reasoning effort `high`
 
-- Headless Grok agents (web system chat, Android Chat, plugin / Live DJ host AI) spawn with `--reasoning-effort high`. Override with `GROKIFY_REASONING_EFFORT`. (`xhigh` was tried early but is not released yet.) Voice Agent realtime path is unchanged (`none` / deep-think `high`).
+- Headless Grok agents (web system chat, Android Chat, plugin / Live DJ host AI) spawn with `--reasoning-effort high`. Override with `GROKIFY_REASONING_EFFORT`. (`xhigh` was tried early but is not released yet.) Voice Agent realtime path is unchanged (`none` / deep-think `high`). See **0.1.266** for the later grok-4.6 / per-model effort change.
 
 ### 0.1.212 — Companion: soft hang, calmer head, tighter lip-sync, first-reply audio
 
@@ -588,7 +598,7 @@ Also in this ship window (0.1.234–0.1.249 OTA range, same tree):
 - **MediaSession ownership**: controller keeps its own session token on the card; Live DJ session stays for BT/headset; transport routes to the booth when Live DJ is on air.
 - **Home Spotify widget**: layout/control refresh so 1×4 transport matches the new notif icon set.
 - **Place Notes**: further monitoring / background FGS hardening for enter alerts when the app is closed.
-- **Bridge**: default `--reasoning-effort high` for headless Grok agents (`GROKIFY_REASONING_EFFORT` override).
+- **Bridge**: default `--reasoning-effort high` for headless Grok agents (`GROKIFY_REASONING_EFFORT` override). See **0.1.266** for grok-4.6 / per-model effort.
 
 ### 0.1.125 — Live DJ pause freeze, idle lockscreen ticks, full chat timestamps
 

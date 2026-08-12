@@ -20,7 +20,7 @@ $chatReady = gos_system_chat_tables_ready();
 $devPack = $canAccess ? gos_devices_for_user((int) $user['id']) : ['devices' => [], 'active' => []];
 $activeDevices = $devPack['active'];
 $latestApk = $canAccess ? gos_latest_apk() : null;
-$assetV = '20260719-no-host-keys';
+$assetV = '20260812-reasoning-effort';
 ?><!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -225,6 +225,9 @@ $assetV = '20260719-no-host-keys';
                 </div>
                 <label class="sc-settings-label" for="sc-model-select">Model</label>
                 <select id="sc-model-select" class="sc-select w-full max-w-none"></select>
+                <label class="sc-settings-label" for="sc-effort-select">Reasoning</label>
+                <select id="sc-effort-select" class="sc-select w-full max-w-none"></select>
+                <div class="sc-setting-sub" id="sc-effort-hint">How hard the selected model thinks</div>
 
                 <div class="sc-settings-section">WORKSPACE</div>
                 <div class="sc-workdir-block">

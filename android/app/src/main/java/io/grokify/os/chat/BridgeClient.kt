@@ -94,6 +94,7 @@ class BridgeClient(
         notes: List<String> = emptyList(),
         history: List<JSONObject> = emptyList(),
         images: List<JSONObject> = emptyList(),
+        reasoningEffort: String = "",
     ): Boolean {
         val ws = socket.get() ?: return false
         // Same payload shape as assets/system-chat.js (+ optional images for multimodal)
@@ -101,6 +102,9 @@ class BridgeClient(
             .put("prompt", prompt)
             .put("session_id", sessionId)
             .put("model", model)
+        if (reasoningEffort.isNotBlank()) {
+            payload.put("reasoning_effort", reasoningEffort.trim().lowercase())
+        }
         if (notes.isNotEmpty()) {
             payload.put("notes", org.json.JSONArray(notes))
         }

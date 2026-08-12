@@ -22,6 +22,7 @@
   let showTools = localStorage.getItem('gos_sc_show_tools') !== 'false';
   let showThoughts = localStorage.getItem('gos_sc_show_thoughts') !== 'false';
   let dbNotes = [];
+  let cachedModels = [];
 
   let streamContainer = null;
   let streamBody = null;
@@ -2129,6 +2130,74 @@
     }
   }
 
+  function effortsForCachedModel(modelId) {
+    const row = (cachedModels || []).find((m) => m && m.id === modelId);
+    if (row && Array.isArray(row.reasoning_efforts) && row.reasoning_efforts.length) {
+      return row.reasoning_efforts.map((e) => String(e).toLowerCase());
+    }
+    const real = String(modelId || '').replace(/^(gb:|grok:)/, '');
+    const match = real.toLowerCase().match(/^grok-(\d+)(?:\.(\d+))?/);
+    if (match) {
+      const major = parseInt(match[1], 10);
+      const minor = parseInt(match[2] || '0', 10);
+      if (major > 4 || (major === 4 && minor >= 6)) return ['low', 'medium', 'high', 'xhigh'];
+    }
+    return ['low', 'medium', 'high'];
+  }
+
+  function defaultEffortForCachedModel(modelId) {
+    const row = (cachedModels || []).find((m) => m && m.id === modelId);
+    const advertised = row && row.default_reasoning_effort
+      ? String(row.default_reasoning_effort).toLowerCase()
+      : '';
+    const allowed = effortsForCachedModel(modelId);
+    if (advertised && allowed.includes(advertised)) return advertised;
+    return allowed.includes('xhigh') ? 'xhigh' : 'high';
+  }
+
+  function effortMap() {
+    try {
+      const raw = JSON.parse(localStorage.getItem('gp_sc_effort_by_model') || '{}');
+      return raw && typeof raw === 'object' ? raw : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function persistEffort(modelId, effort) {
+    if (!effort) return;
+    localStorage.setItem('gp_sc_effort', effort);
+    if (!modelId) return;
+    const map = effortMap();
+    map[modelId] = effort;
+    localStorage.setItem('gp_sc_effort_by_model', JSON.stringify(map));
+  }
+
+  function fillEffortSelect(modelId, preferred) {
+    const sel = $('sc-effort-select');
+    const hint = $('sc-effort-hint');
+    if (!sel) return;
+    const allowed = effortsForCachedModel(modelId);
+    const map = effortMap();
+    let chosen = String(preferred || map[modelId] || localStorage.getItem('gp_sc_effort') || '').toLowerCase();
+    if (!allowed.includes(chosen)) chosen = defaultEffortForCachedModel(modelId);
+    sel.innerHTML = '';
+    allowed.forEach((effort) => {
+      const opt = document.createElement('option');
+      opt.value = effort;
+      opt.textContent = effort;
+      if (effort === chosen) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.value = chosen;
+    persistEffort(modelId, chosen);
+    if (hint) {
+      hint.textContent = allowed.includes('xhigh')
+        ? 'How hard this model thinks. xhigh is grok-4.6+ only.'
+        : 'How hard this model thinks. This model does not support xhigh.';
+    }
+  }
+
   async function loadModels() {
     const data = await apiGet('/admin-system-chat-models.php');
     wsToken = data.ws_token || '';
@@ -2140,6 +2209,7 @@
     if (!sel) return;
     sel.innerHTML = '';
     const models = (data.models || []).filter((m) => m.provider === 'grok-build' || (m.id && String(m.id).startsWith('gb:')));
+    cachedModels = models;
     const ids = models.map((m) => m.id);
     let preferred = localStorage.getItem('gp_sc_model') || data.selected || data.default_model || '';
     // Migrate legacy Cursor / "auto" prefs to Grok Build
@@ -2157,6 +2227,7 @@
     if (preferred && sel.value !== preferred && ids.includes(preferred)) {
       sel.value = preferred;
     }
+    fillEffortSelect(sel.value, data.selected_reasoning_effort || '');
     if (!ws) connectWS();
   }
 
@@ -2411,6 +2482,8 @@
       }
     } catch (_) { /* offline / no devices — ignore */ }
     const payload = { prompt: text, session_id: currentSessionId, model: model || '' };
+    const effortEl = $('sc-effort-select');
+    if (effortEl && effortEl.value) payload.reasoning_effort = effortEl.value;
     if (history.length) payload.history = history;
     if (notes.length) payload.notes = notes;
 
@@ -2723,8 +2796,20 @@
       $('sc-model-select').addEventListener('change', async () => {
         const v = $('sc-model-select').value;
         localStorage.setItem('gp_sc_model', v);
+        fillEffortSelect(v, (effortMap()[v] || ''));
+        const effort = ($('sc-effort-select') && $('sc-effort-select').value) || '';
         try {
-          await apiPost('/admin-system-chat-models.php', { model: v });
+          await apiPost('/admin-system-chat-models.php', { model: v, reasoning_effort: effort });
+        } catch (_) {}
+      });
+
+    $('sc-effort-select') &&
+      $('sc-effort-select').addEventListener('change', async () => {
+        const model = ($('sc-model-select') && $('sc-model-select').value) || '';
+        const effort = $('sc-effort-select').value;
+        persistEffort(model, effort);
+        try {
+          await apiPost('/admin-system-chat-models.php', { model, reasoning_effort: effort });
         } catch (_) {}
       });
 

@@ -10,6 +10,7 @@ import android.util.Log
 import io.grokify.os.BuildConfig
 import io.grokify.os.GrokifyApp
 import io.grokify.os.chat.BridgeClient
+import io.grokify.os.chat.GrokReasoning
 import io.grokify.os.data.ApiKeyIds
 import io.grokify.os.data.GrokifyApi
 import io.grokify.os.data.TokenStore
@@ -138,12 +139,17 @@ object HostAiClient {
         tokenStore(ctx).modelFlow.first()?.trim()?.takeIf { it.isNotEmpty() }
     }
 
+    private fun preferredReasoningEffort(ctx: Context): String? = runBlocking {
+        tokenStore(ctx).reasoningEffortFlow.first()?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
     /**
      * Run a one-shot Grok Build agent turn via the host bridge (same as Chat).
      *
      * optionsJson (all optional):
      * - system: instruction note injected as agent notes
-     * - model: e.g. "gb:grok-4.5" (default: host preference / server default)
+     * - model: e.g. "gb:grok-4.6" (default: host preference / server default)
+     * - reasoning_effort / effort: low|medium|high|xhigh (clamped to the selected model)
      * - session_title: override plugin session title
      */
     fun complete(ctx: Context, prompt: String, optionsJson: String?): String {
@@ -198,8 +204,8 @@ object HostAiClient {
             }
 
             val selected = modelsJson.optString("selected", "").trim()
-            val defaultModel = modelsJson.optString("default_model", "gb:grok-4.5")
-                .ifBlank { "gb:grok-4.5" }
+            val defaultModel = modelsJson.optString("default_model", "gb:grok-4.6")
+                .ifBlank { "gb:grok-4.6" }
             val optModel = opts.optString("model", "").trim()
             val model = normalizeModel(
                 when {
@@ -209,6 +215,13 @@ object HostAiClient {
                     else -> defaultModel
                 },
             )
+            val optEffort = opts.optString("reasoning_effort", "")
+                .ifBlank { opts.optString("effort", "") }
+                .trim()
+            val requestedEffort = optEffort
+                .ifBlank { preferredReasoningEffort(appCtx).orEmpty() }
+                .ifBlank { modelsJson.optString("selected_reasoning_effort") }
+            val reasoningEffort = GrokReasoning.clamp(model, requestedEffort)
 
             // Dedicated plugin session so Chat history stays clean.
             val sessionId = resolvePluginSession(api, sessionTitle)
@@ -339,6 +352,7 @@ object HostAiClient {
                     model = model,
                     notes = notes,
                     history = emptyList(),
+                    reasoningEffort = reasoningEffort,
                 )
                 promptSent.set(true)
                 if (!sent) {
@@ -886,11 +900,11 @@ object HostAiClient {
 
     private fun normalizeModel(raw: String): String {
         val m = raw.trim()
-        if (m.isEmpty()) return "gb:grok-4.5"
+        if (m.isEmpty()) return "gb:grok-4.6"
         // Strip accidental OpenAI-style ids plugins might still pass
         if (m == "grok-3" || m == "grok-2" || m.startsWith("grok-") && !m.startsWith("gb:")) {
             // Prefer host default rather than inventing a bad CLI id
-            return if (m.startsWith("grok-")) "gb:$m" else "gb:grok-4.5"
+            return if (m.startsWith("grok-")) "gb:$m" else "gb:grok-4.6"
         }
         if (m.startsWith("grok:") && !m.startsWith("gb:")) {
             return "gb:" + m.removePrefix("grok:")

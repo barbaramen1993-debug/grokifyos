@@ -263,8 +263,11 @@ class GrokifyApi(
         return executeJson(req)
     }
 
-    fun setModel(model: String): JSONObject {
+    fun setModel(model: String, reasoningEffort: String? = null): JSONObject {
         val body = JSONObject().put("model", model)
+        if (!reasoningEffort.isNullOrBlank()) {
+            body.put("reasoning_effort", reasoningEffort.trim().lowercase())
+        }
         val req = authRequest("/admin-system-chat-models.php")
             .post(jsonBody(body))
             .build()
