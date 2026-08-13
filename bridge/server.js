@@ -33,9 +33,13 @@ const {
     resolveReasoningEffort,
     decorateModels,
 } = require('./reasoning-effort');
+const {
+    MAX_PROMPT_BYTES,
+    fitPromptContext,
+    shouldUsePromptFile,
+} = require('./prompt-context');
 const LOG_FILE = path.join(WORKSPACE, 'storage', 'logs', 'bridge.log');
 const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
-const MAX_PROMPT_BYTES = 120000;
 // When true (default), CLI agents are detached + file-tailed so they survive bridge restarts
 const DETACH_AGENTS = (envFirst('GROKIFY_BRIDGE_DETACH', 'GROKPOT_BRIDGE_DETACH') || '1') !== '0';
 function wsSecret() {
@@ -1270,25 +1274,15 @@ function healTimeline(timeline, { seal = false } = {}) {
     });
 }
 
-function buildPromptWithHistory(prompt, history, notes) {
-    let ctx = 'When you reply, write only your new answer. Do not repeat prior lines unless asked.\n\n';
-    if (notes && notes.length) {
-        ctx += '<additional_notes>\n';
-        for (const n of notes) ctx += `- ${n}\n`;
-        ctx += '</additional_notes>\n\n';
-    }
-    if (history && history.length) {
-        const recent = history.slice(-30);
-        ctx += '<conversation_history>\n';
-        for (const msg of recent) {
-            const role = msg.role === 'user' ? 'User' : 'Assistant';
-            const body = healChatText(msg.content || '');
-            ctx += `[${role}]: ${body}\n\n`;
-        }
-        ctx += '</conversation_history>\n\n';
-    }
-    ctx += `[User]: ${prompt}`;
-    return ctx;
+function healHistoryForPrompt(history) {
+    if (!Array.isArray(history)) return [];
+    return history.map((msg) => {
+        if (!msg || typeof msg !== 'object') return msg;
+        return {
+            role: msg.role,
+            content: healChatText(msg.content || ''),
+        };
+    });
 }
 
 /** Max user-attached images per turn (Android chat media button). */
@@ -1351,6 +1345,15 @@ function writePromptBlocksFile(sessionId, fullPromptText, images) {
         ...images,
     ];
     fs.writeFileSync(filePath, JSON.stringify(blocks), { mode: 0o600 });
+    return filePath;
+}
+
+/** Plain-text prompt file for `grok --prompt-file` (avoids MAX_ARG_STRLEN). */
+function writePromptTextFile(sessionId, fullPromptText) {
+    const dir = path.join(WORKSPACE, 'storage', 'bridge-runtime', sessionId);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `prompt-${Date.now()}.txt`);
+    fs.writeFileSync(filePath, String(fullPromptText || ''), { mode: 0o600 });
     return filePath;
 }
 
@@ -2159,10 +2162,8 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
     const realModel = grokRealModel(resolved);
     const effort = resolveReasoningEffort(realModel, reasoningEffort, REASONING_EFFORT);
     const userImages = Array.isArray(images) ? images : [];
-    let fullPrompt = buildPromptWithHistory(prompt, history, notes);
-    if (Buffer.byteLength(fullPrompt) > MAX_PROMPT_BYTES) {
-        fullPrompt = buildPromptWithHistory(prompt, (history || []).slice(-10), notes);
-    }
+    const fitted = fitPromptContext(prompt, healHistoryForPrompt(history), notes, MAX_PROMPT_BYTES);
+    let fullPrompt = fitted.text;
     if (userImages.length > 0) {
         fullPrompt +=
             `\n\n(The user attached ${userImages.length} image(s) inline for you to analyze visually.)`;
@@ -2170,11 +2171,15 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
 
     const agentCwd = await getAgentCwd();
 
-    // Multimodal turns: write ACP content blocks to a file (avoids ARG_MAX) and use --prompt-file.
+    // Large text (and any images) go via --prompt-file so a single argv entry
+    // cannot exceed Linux MAX_ARG_STRLEN (~128KiB) and crash the worker (E2BIG).
     let promptFile = null;
-    if (userImages.length > 0) {
+    const useFile = shouldUsePromptFile(fullPrompt, userImages.length);
+    if (useFile) {
         try {
-            promptFile = writePromptBlocksFile(sessionId, fullPrompt, userImages);
+            promptFile = userImages.length > 0
+                ? writePromptBlocksFile(sessionId, fullPrompt, userImages)
+                : writePromptTextFile(sessionId, fullPrompt);
         } catch (err) {
             log('error', 'agent', `prompt-file write failed: ${err.message}`, {
                 session_id: sessionId,
@@ -2182,7 +2187,9 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
             try {
                 client.send(JSON.stringify({
                     type: 'error',
-                    content: 'Could not prepare image attachment for the agent',
+                    content: userImages.length > 0
+                        ? 'Could not prepare image attachment for the agent'
+                        : 'Could not prepare prompt file for the agent',
                 }));
             } catch (_) {}
             if (DETACH_AGENTS) runtime.releaseClaim(sessionId);
@@ -2196,6 +2203,9 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
         reasoning_effort: effort,
         user_id: userId,
         prompt_bytes: Buffer.byteLength(fullPrompt),
+        history_in: fitted.historyIn,
+        history_kept: fitted.historyKept,
+        prompt_file: !!promptFile,
         images: userImages.length,
         detach: DETACH_AGENTS,
         instance: INSTANCE_ID,
@@ -2219,21 +2229,45 @@ async function spawnGrokBuild(sessionId, prompt, model, client, history, notes, 
     let pid = null;
     let outPath = null;
 
-    if (DETACH_AGENTS) {
-        const spawned = runtime.spawnDetached(GROK_BIN, args, env, sessionId, {
-            truncate: true,
-            cwd: agentCwd,
+    try {
+        if (DETACH_AGENTS) {
+            const spawned = runtime.spawnDetached(GROK_BIN, args, env, sessionId, {
+                truncate: true,
+                cwd: agentCwd,
+            });
+            proc = spawned.proc;
+            pid = spawned.pid;
+            outPath = spawned.outPath;
+        } else {
+            proc = spawn(GROK_BIN, args, {
+                cwd: agentCwd,
+                stdio: ['ignore', 'pipe', 'pipe'],
+                env,
+            });
+            pid = proc.pid;
+        }
+    } catch (err) {
+        log('error', 'error', `Spawn failed: ${err.message}`, {
+            session_id: sessionId,
+            user_id: userId,
+            code: err.code || '',
+            prompt_bytes: Buffer.byteLength(fullPrompt),
+            prompt_file: !!promptFile,
         });
-        proc = spawned.proc;
-        pid = spawned.pid;
-        outPath = spawned.outPath;
-    } else {
-        proc = spawn(GROK_BIN, args, {
-            cwd: agentCwd,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env,
-        });
-        pid = proc.pid;
+        if (promptFile) {
+            try { fs.unlinkSync(promptFile); } catch (_) {}
+        }
+        if (DETACH_AGENTS) runtime.releaseClaim(sessionId);
+        try {
+            client.send(JSON.stringify({
+                type: 'error',
+                code: err.code === 'E2BIG' ? 'prompt_too_large' : 'spawn_error',
+                content: err.code === 'E2BIG'
+                    ? 'Prompt was too large to start the agent. Send again — older context will be trimmed.'
+                    : `Could not start agent: ${err.message}`,
+            }));
+        } catch (_) {}
+        return;
     }
 
     const agent = {
@@ -2763,3 +2797,20 @@ httpServer.listen(PORT, () => {
 process.on('SIGTERM', () => { gracefulShutdown('SIGTERM').catch(() => process.exit(1)); });
 process.on('SIGINT', () => { gracefulShutdown('SIGINT').catch(() => process.exit(1)); });
 process.on('SIGHUP', () => { gracefulShutdown('SIGHUP').catch(() => process.exit(1)); });
+
+// E2BIG from `spawn(grok, ['-p', hugePrompt])` used to be uncaught and systemd
+// force-restarted the worker mid-chat. Keep the process up; spawnGrokBuild
+// already reports the error to the client when it catches it.
+process.on('uncaughtException', (err) => {
+    const code = err && err.code;
+    log('error', 'error', `uncaughtException: ${err && err.message}`, {
+        code: code || '',
+        instance: INSTANCE_ID,
+    });
+    if (code === 'E2BIG') return;
+    gracefulShutdown('uncaughtException').catch(() => process.exit(1));
+});
+process.on('unhandledRejection', (reason) => {
+    const msg = reason && reason.message ? reason.message : String(reason);
+    log('error', 'error', `unhandledRejection: ${msg}`, { instance: INSTANCE_ID });
+});

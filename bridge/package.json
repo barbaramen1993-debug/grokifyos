@@ -5,7 +5,8 @@
   "description": "WebSocket agent bridge for GrokifyOS",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node reasoning-effort.test.js && node prompt-context.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

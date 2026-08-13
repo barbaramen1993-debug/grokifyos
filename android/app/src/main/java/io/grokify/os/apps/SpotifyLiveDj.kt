@@ -72,29 +72,6 @@ object LiveDjMediaSessionHolder {
     }
 }
 
-/** Process-talk openers the model sometimes leaks into banter TTS. */
-private val META_NARRATION_OPENER = Regex(
-    """(?i)^\s*(""" +
-        """checking(\s+for)?|looking\s+up|searching(\s+for)?|fetching|researching|""" +
-        """before\s+(i\s+|we\s+)?writ|let\s+me(\s+\w+){0,3}|i('ll| will)\s+(check|look|search|find|write|verify)|""" +
-        """i('m| am)\s+(checking|looking|searching|about\s+to|going\s+to)|""" +
-        """as\s+i\s+(check|look|search|write|research)|note\s+to\s+self|""" +
-        """writing\s+the\s+(dj|spoken)|here'?s\s+my\s+(plan|process|draft)""" +
-        """)\b""",
-)
-
-/** Phrases that mark a sentence as off-mic process narration, not radio copy. */
-private val META_NARRATION_PHRASE = Regex(
-    """(?i)(""" +
-        """before\s+writing\s+the\s+(dj|spoken)\s+line|""" +
-        """public\s+tidbit|""" +
-        """writing\s+the\s+dj\s+line|""" +
-        """checking\s+for\s+a\s+(real\s+)?(public\s+)?tidbit|""" +
-        """\b(verify|verifying)\s+(that|this|the)\b|""" +
-        """\b(tool|web\s*search|browsing)\b""" +
-        """)""",
-)
-
 private const val PREFS = "spotify_live_dj"
 private const val KEY_ENABLED = "enabled"
 private const val KEY_VOICE = "voice_id"
@@ -153,6 +130,8 @@ const val BANTER_EVERY_MAX = 20
 
 /** Second Previous within this window plays the last history track (first press restarts). */
 private const val PREV_DOUBLE_PRESS_MS = 3_000L
+/** Second Skip within this window bypasses upcoming research / banter. */
+private const val DOUBLE_SKIP_MS = 1_600L
 /** Max playlists the user can pin into the queue pool. */
 const val MAX_DJ_QUEUE_PLAYLISTS = 12
 
@@ -193,7 +172,7 @@ enum class DjQueueSource(
     Excluded(
         "excluded",
         "Disliked",
-        "Honor permanent dislikes and “tired for now” cooldowns",
+        "Always on — blocked songs/artists and tired cooldowns never re-enter the set",
     ),
     ArtistRadio(
         "artist_radio",
@@ -237,11 +216,16 @@ enum class DjQueueSource(
                     if (fromId(id) != null) out.add(id)
                 }
                 // Empty array is intentional “none”; null/missing stays default.
-                if (out.isEmpty() && arr.length() == 0) emptySet() else {
+                val parsed = if (out.isEmpty() && arr.length() == 0) {
+                    emptySet()
+                } else {
                     // If user had an older partial list, keep only known ids.
                     // If parsing yielded nothing from non-empty junk, fall back to default.
                     if (out.isEmpty()) defaultEnabledIds() else out
                 }
+                // Dislikes are never optional — turning the chip off used to re-queue
+                // blocked artists/songs. Always keep the honor-exclusions source on.
+                parsed + Excluded.id
             }.getOrElse { defaultEnabledIds() }
         }
 
@@ -867,8 +851,10 @@ class SpotifyDjStore(context: Context) {
     }
 
     fun toggleQueueSource(source: DjQueueSource, enabled: Boolean) {
+        if (source == DjQueueSource.Excluded && !enabled) return
         val next = queueSourcesEnabled.toMutableSet()
         if (enabled) next.add(source.id) else next.remove(source.id)
+        next.add(DjQueueSource.Excluded.id)
         queueSourcesEnabled = next
     }
 
@@ -1168,161 +1154,342 @@ class SpotifyDjStore(context: Context) {
 
     // ── Dislike filters (durable; not cleared by “new queue” played soft-forget) ──
 
-    /** uri → reasons (song / lyrics). */
-    private val blockedTracksCache = LinkedHashMap<String, MutableSet<String>>()
-    /** artistId or `name:<lower>` → display name. */
-    private val blockedArtistsCache = LinkedHashMap<String, String>()
-    /** uri → until epoch ms. */
-    private val tiredTracksCache = LinkedHashMap<String, Long>()
-    private var dislikesLoaded = false
-
     private fun ensureDislikesLoaded() {
-        if (dislikesLoaded) return
-        synchronized(this) {
-            if (dislikesLoaded) return
-            blockedTracksCache.clear()
-            blockedArtistsCache.clear()
-            tiredTracksCache.clear()
-            // Tracks
-            runCatching {
-                val raw = prefs.getString(KEY_DISLIKE_TRACKS, null)
-                if (raw != null) {
-                    val arr = JSONArray(raw)
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        val uri = o.optString("uri", "")
-                        if (uri.isBlank()) continue
-                        val reasons = LinkedHashSet<String>()
-                        val r = o.optJSONArray("reasons")
-                        if (r != null) {
-                            for (j in 0 until r.length()) {
-                                val s = r.optString(j, "")
-                                if (s.isNotBlank()) reasons.add(s)
-                            }
-                        }
-                        if (reasons.isEmpty()) reasons.add(DjDislikeReason.SONG)
-                        blockedTracksCache[uri] = reasons
-                    }
-                }
-            }.onFailure { Log.w(TAG, "load dislike tracks: ${it.message}") }
-            // Artists
-            runCatching {
-                val raw = prefs.getString(KEY_DISLIKE_ARTISTS, null)
-                if (raw != null) {
-                    val arr = JSONArray(raw)
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        val id = o.optString("id", "")
-                        val name = o.optString("name", "")
-                        val key = id.ifBlank {
-                            name.trim().lowercase().takeIf { it.isNotBlank() }
-                                ?.let { "name:$it" }.orEmpty()
-                        }
-                        if (key.isBlank()) continue
-                        blockedArtistsCache[key] = name.ifBlank { id }
-                    }
-                }
-            }.onFailure { Log.w(TAG, "load dislike artists: ${it.message}") }
-            // Tired (drop expired)
-            runCatching {
-                val raw = prefs.getString(KEY_DISLIKE_TIRED, null)
-                val now = System.currentTimeMillis()
-                if (raw != null) {
-                    val arr = JSONArray(raw)
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        val uri = o.optString("uri", "")
-                        val until = o.optLong("until", 0L)
-                        if (uri.isBlank() || until <= now) continue
-                        tiredTracksCache[uri] = until
-                    }
-                }
-            }.onFailure { Log.w(TAG, "load dislike tired: ${it.message}") }
-            dislikesLoaded = true
+        if (DjDislikeMemory.loaded) return
+        synchronized(DjDislikeMemory.lock) {
+            if (DjDislikeMemory.loaded) return
+            DjDislikeMemory.tracks.clear()
+            DjDislikeMemory.artists.clear()
+            DjDislikeMemory.tired.clear()
+            decodeBlockedTracks(prefs.getString(KEY_DISLIKE_TRACKS, null)).forEach { t ->
+                DjDislikeMemory.tracks[t.uri] = t
+            }
+            decodeBlockedArtists(prefs.getString(KEY_DISLIKE_ARTISTS, null)).forEach { a ->
+                DjDislikeMemory.artists[a.key] = a
+            }
+            decodeTiredTracks(prefs.getString(KEY_DISLIKE_TIRED, null)).forEach { t ->
+                DjDislikeMemory.tired[t.uri] = t
+            }
+            DjDislikeMemory.loaded = true
         }
+        // Fill names from chat / UP NEXT so the BLOCKS tab is not a list of IDs.
+        hydrateBlockedLabelsFromHistory()
     }
 
     private fun persistBlockedTracks() {
-        runCatching {
-            val arr = JSONArray()
-            blockedTracksCache.entries.toList().takeLast(400).forEach { e ->
-                val uri = e.key
-                val reasons = e.value
-                if (uri.isBlank()) return@forEach
-                val r = JSONArray()
-                reasons.forEach { reason -> r.put(reason) }
-                arr.put(
-                    JSONObject()
-                        .put("uri", uri)
-                        .put("reasons", r)
-                        .put("ts", System.currentTimeMillis()),
-                )
-            }
-            prefs.edit().putString(KEY_DISLIKE_TRACKS, arr.toString()).apply()
-        }.onFailure { Log.w(TAG, "save dislike tracks: ${it.message}") }
+        synchronized(DjDislikeMemory.lock) {
+            val keep = DjDislikeMemory.tracks.values
+                .sortedBy { it.lastTs }
+                .takeLast(400)
+            DjDislikeMemory.tracks.clear()
+            keep.forEach { DjDislikeMemory.tracks[it.uri] = it }
+            runCatching {
+                prefs.edit().putString(KEY_DISLIKE_TRACKS, encodeBlockedTracks(keep)).apply()
+            }.onFailure { Log.w(TAG, "save dislike tracks: ${it.message}") }
+        }
     }
 
     private fun persistBlockedArtists() {
-        runCatching {
-            val arr = JSONArray()
-            blockedArtistsCache.entries.toList().takeLast(200).forEach { e ->
-                val key = e.key
-                val name = e.value
-                if (key.isBlank()) return@forEach
-                val id = if (key.startsWith("name:")) "" else key
-                val n = name.ifBlank {
-                    if (key.startsWith("name:")) key.removePrefix("name:") else key
-                }
-                arr.put(JSONObject().put("id", id).put("name", n))
-            }
-            prefs.edit().putString(KEY_DISLIKE_ARTISTS, arr.toString()).apply()
-        }.onFailure { Log.w(TAG, "save dislike artists: ${it.message}") }
+        synchronized(DjDislikeMemory.lock) {
+            val keep = DjDislikeMemory.artists.values
+                .sortedBy { it.lastTs }
+                .takeLast(250)
+            DjDislikeMemory.artists.clear()
+            keep.forEach { DjDislikeMemory.artists[it.key] = it }
+            runCatching {
+                prefs.edit().putString(KEY_DISLIKE_ARTISTS, encodeBlockedArtists(keep)).apply()
+            }.onFailure { Log.w(TAG, "save dislike artists: ${it.message}") }
+        }
     }
 
     private fun persistTiredTracks() {
-        runCatching {
+        synchronized(DjDislikeMemory.lock) {
             val now = System.currentTimeMillis()
-            val arr = JSONArray()
-            tiredTracksCache.entries.toList()
-                .filter { it.key.isNotBlank() && it.value > now }
+            val keep = DjDislikeMemory.tired.values
+                .filter { it.until > now }
+                .sortedBy { it.lastTs }
                 .takeLast(300)
-                .forEach { e ->
-                    arr.put(JSONObject().put("uri", e.key).put("until", e.value))
+            DjDislikeMemory.tired.clear()
+            keep.forEach { DjDislikeMemory.tired[it.uri] = it }
+            runCatching {
+                prefs.edit().putString(KEY_DISLIKE_TIRED, encodeTiredTracks(keep, now)).apply()
+            }.onFailure { Log.w(TAG, "save dislike tired: ${it.message}") }
+        }
+    }
+
+    fun listBlockedTracks(): List<DjBlockedTrack> {
+        ensureDislikesLoaded()
+        synchronized(DjDislikeMemory.lock) {
+            return DjDislikeMemory.tracks.values.sortedByDescending { it.lastTs }
+        }
+    }
+
+    fun listBlockedArtists(): List<DjBlockedArtist> {
+        ensureDislikesLoaded()
+        synchronized(DjDislikeMemory.lock) {
+            return DjDislikeMemory.artists.values.sortedByDescending { it.lastTs }
+        }
+    }
+
+    fun listTiredTracks(): List<DjTiredTrack> {
+        ensureDislikesLoaded()
+        val now = System.currentTimeMillis()
+        synchronized(DjDislikeMemory.lock) {
+            val expired = DjDislikeMemory.tired.entries.filter { it.value.until <= now }.map { it.key }
+            expired.forEach { DjDislikeMemory.tired.remove(it) }
+            return DjDislikeMemory.tired.values.sortedBy { it.until }
+        }
+    }
+
+    fun dislikeCounts(): Triple<Int, Int, Int> {
+        ensureDislikesLoaded()
+        synchronized(DjDislikeMemory.lock) {
+            val now = System.currentTimeMillis()
+            val tiredN = DjDislikeMemory.tired.values.count { it.until > now }
+            return Triple(DjDislikeMemory.tracks.size, DjDislikeMemory.artists.size, tiredN)
+        }
+    }
+
+    fun removeBlockedTrack(uri: String): Boolean {
+        ensureDislikesLoaded()
+        val u = uri.trim()
+        if (u.isBlank()) return false
+        val hit = synchronized(DjDislikeMemory.lock) { DjDislikeMemory.tracks.remove(u) != null }
+        if (hit) persistBlockedTracks()
+        return hit
+    }
+
+    fun removeBlockedArtist(key: String): Boolean {
+        ensureDislikesLoaded()
+        val k = key.trim()
+        if (k.isBlank()) return false
+        val hit = synchronized(DjDislikeMemory.lock) { DjDislikeMemory.artists.remove(k) != null }
+        if (hit) persistBlockedArtists()
+        return hit
+    }
+
+    fun removeTiredTrack(uri: String): Boolean {
+        ensureDislikesLoaded()
+        val u = uri.trim()
+        if (u.isBlank()) return false
+        val hit = synchronized(DjDislikeMemory.lock) { DjDislikeMemory.tired.remove(u) != null }
+        if (hit) persistTiredTracks()
+        return hit
+    }
+
+    /**
+     * Fill blank block labels from Live DJ chat + UP NEXT (no network).
+     * @return true when at least one row gained a name/artist.
+     */
+    fun hydrateBlockedLabelsFromHistory(): Boolean {
+        ensureDislikesLoaded()
+        val byUri = LinkedHashMap<String, Pair<String, String>>()
+        val byArtistId = LinkedHashMap<String, String>()
+        fun rememberTrack(uri: String, name: String, artists: String, artistUri: String = "") {
+            if (!djIsUsableLabel(name)) return
+            val arts = artists.takeIf { djIsUsableLabel(it) }.orEmpty()
+            val pair = name.trim() to arts
+            if (uri.isNotBlank()) {
+                byUri[uri] = pair
+                djSpotifyTrackId(uri)?.let { id ->
+                    byUri["spotify:track:$id"] = pair
+                    byUri[id] = pair
                 }
-            prefs.edit().putString(KEY_DISLIKE_TIRED, arr.toString()).apply()
-        }.onFailure { Log.w(TAG, "save dislike tired: ${it.message}") }
+            }
+            djSpotifyArtistId(artistUri)?.let { id ->
+                val primary = arts.split(",").map { it.trim() }.firstOrNull { djIsUsableLabel(it) }
+                if (primary != null) byArtistId[id] = primary
+            }
+        }
+        loadMessages().forEach { m ->
+            rememberTrack(
+                uri = m.trackUri.orEmpty(),
+                name = m.trackName.orEmpty(),
+                artists = m.trackArtists.orEmpty(),
+                artistUri = m.artistUri.orEmpty(),
+            )
+        }
+        loadQueue().forEach { t ->
+            rememberTrack(t.uri, t.name, t.artists, t.artistUri)
+        }
+        var tracksChanged = false
+        var artistsChanged = false
+        var tiredChanged = false
+        synchronized(DjDislikeMemory.lock) {
+            DjDislikeMemory.tracks.entries.toList().forEach { (uri, rec) ->
+                if (!djBlockedTrackNeedsLabel(rec)) return@forEach
+                val hit = byUri[uri]
+                    ?: djSpotifyTrackId(uri)?.let { byUri["spotify:track:$it"] ?: byUri[it] }
+                    ?: return@forEach
+                DjDislikeMemory.tracks[uri] = rec.copy(
+                    name = if (djIsUsableLabel(rec.name)) rec.name else hit.first,
+                    artists = if (djIsUsableLabel(rec.artists)) rec.artists else hit.second,
+                    titleKey = rec.titleKey.ifBlank { djTrackTitleKey(hit.first, hit.second) },
+                )
+                tracksChanged = true
+            }
+            DjDislikeMemory.tired.entries.toList().forEach { (uri, rec) ->
+                if (!djTiredTrackNeedsLabel(rec)) return@forEach
+                val hit = byUri[uri]
+                    ?: djSpotifyTrackId(uri)?.let { byUri["spotify:track:$it"] ?: byUri[it] }
+                    ?: return@forEach
+                DjDislikeMemory.tired[uri] = rec.copy(
+                    name = if (djIsUsableLabel(rec.name)) rec.name else hit.first,
+                    artists = if (djIsUsableLabel(rec.artists)) rec.artists else hit.second,
+                    titleKey = rec.titleKey.ifBlank { djTrackTitleKey(hit.first, hit.second) },
+                )
+                tiredChanged = true
+            }
+            DjDislikeMemory.artists.entries.toList().forEach { (key, rec) ->
+                if (!djBlockedArtistNeedsLabel(rec)) return@forEach
+                val resolved = byArtistId[key]
+                    ?: rec.aliases.firstOrNull { djIsUsableLabel(it) }
+                    ?: key.takeIf { it.startsWith("name:") }?.removePrefix("name:")
+                        ?.takeIf { djIsUsableLabel(it) }
+                    ?: return@forEach
+                if (!djIsUsableLabel(resolved)) return@forEach
+                DjDislikeMemory.artists[key] = rec.copy(name = resolved)
+                artistsChanged = true
+            }
+        }
+        if (tracksChanged) persistBlockedTracks()
+        if (artistsChanged) persistBlockedArtists()
+        if (tiredChanged) persistTiredTracks()
+        return tracksChanged || artistsChanged || tiredChanged
+    }
+
+    /**
+     * Look up remaining unlabeled blocks via Spotify Web API and persist names.
+     * Safe to call from the UI thread's IO dispatcher.
+     */
+    fun resolveBlockedLabelsFromSpotify(): Boolean {
+        ensureDislikesLoaded()
+        var changed = hydrateBlockedLabelsFromHistory()
+        if (SpotifyOAuth.isRateLimited() || !SpotifyOAuth.isLoggedIn(appCtx)) return changed
+
+        val missingTrackIds = LinkedHashSet<String>()
+        val missingArtistIds = LinkedHashSet<String>()
+        synchronized(DjDislikeMemory.lock) {
+            DjDislikeMemory.tracks.values.forEach { t ->
+                if (djBlockedTrackNeedsLabel(t)) {
+                    djSpotifyTrackId(t.uri)?.let { missingTrackIds.add(it) }
+                }
+            }
+            DjDislikeMemory.tired.values.forEach { t ->
+                if (djTiredTrackNeedsLabel(t)) {
+                    djSpotifyTrackId(t.uri)?.let { missingTrackIds.add(it) }
+                }
+            }
+            DjDislikeMemory.artists.values.forEach { a ->
+                if (djBlockedArtistNeedsLabel(a)) {
+                    djSpotifyArtistId(a.key)?.let { missingArtistIds.add(it) }
+                }
+            }
+        }
+        if (missingTrackIds.isEmpty() && missingArtistIds.isEmpty()) return changed
+
+        val trackLabels = LinkedHashMap<String, Pair<String, String>>()
+        for (chunk in missingTrackIds.chunked(50)) {
+            val body = spotifyGetJson("/v1/tracks?ids=${chunk.joinToString(",")}") ?: continue
+            djParseSpotifyTracksObject(body).forEach { (uri, name, artists) ->
+                trackLabels[uri] = name to artists
+                djSpotifyTrackId(uri)?.let { id ->
+                    trackLabels["spotify:track:$id"] = name to artists
+                    trackLabels[id] = name to artists
+                }
+            }
+        }
+        val artistLabels = LinkedHashMap<String, String>()
+        for (chunk in missingArtistIds.chunked(50)) {
+            val body = spotifyGetJson("/v1/artists?ids=${chunk.joinToString(",")}") ?: continue
+            djParseSpotifyArtistsObject(body).forEach { (id, name) ->
+                artistLabels[id] = name
+            }
+        }
+
+        var tracksChanged = false
+        var artistsChanged = false
+        var tiredChanged = false
+        synchronized(DjDislikeMemory.lock) {
+            DjDislikeMemory.tracks.entries.toList().forEach { (uri, rec) ->
+                if (!djBlockedTrackNeedsLabel(rec)) return@forEach
+                val hit = trackLabels[uri]
+                    ?: djSpotifyTrackId(uri)?.let { trackLabels["spotify:track:$it"] ?: trackLabels[it] }
+                    ?: return@forEach
+                DjDislikeMemory.tracks[uri] = rec.copy(
+                    name = if (djIsUsableLabel(rec.name)) rec.name else hit.first,
+                    artists = if (djIsUsableLabel(rec.artists)) rec.artists else hit.second,
+                    titleKey = rec.titleKey.ifBlank { djTrackTitleKey(hit.first, hit.second) },
+                )
+                tracksChanged = true
+            }
+            DjDislikeMemory.tired.entries.toList().forEach { (uri, rec) ->
+                if (!djTiredTrackNeedsLabel(rec)) return@forEach
+                val hit = trackLabels[uri]
+                    ?: djSpotifyTrackId(uri)?.let { trackLabels["spotify:track:$it"] ?: trackLabels[it] }
+                    ?: return@forEach
+                DjDislikeMemory.tired[uri] = rec.copy(
+                    name = if (djIsUsableLabel(rec.name)) rec.name else hit.first,
+                    artists = if (djIsUsableLabel(rec.artists)) rec.artists else hit.second,
+                    titleKey = rec.titleKey.ifBlank { djTrackTitleKey(hit.first, hit.second) },
+                )
+                tiredChanged = true
+            }
+            DjDislikeMemory.artists.entries.toList().forEach { (key, rec) ->
+                if (!djBlockedArtistNeedsLabel(rec)) return@forEach
+                val resolved = artistLabels[key]
+                    ?: djSpotifyArtistId(key)?.let { artistLabels[it] }
+                    ?: return@forEach
+                DjDislikeMemory.artists[key] = rec.copy(name = resolved)
+                artistsChanged = true
+            }
+        }
+        if (tracksChanged) persistBlockedTracks()
+        if (artistsChanged) persistBlockedArtists()
+        if (tiredChanged) persistTiredTracks()
+        return changed || tracksChanged || artistsChanged || tiredChanged
+    }
+
+    private fun spotifyGetJson(path: String): JSONObject? {
+        return runCatching {
+            val raw = SpotifyOAuth.api(appCtx, "GET", path, null)
+            val o = JSONObject(raw)
+            val status = o.optInt("status", 0)
+            if (!(o.optBoolean("ok", false) || status in 200..299)) return null
+            val body = o.optString("body", "").trim()
+            if (!body.startsWith("{")) return null
+            JSONObject(body)
+        }.getOrNull()
     }
 
     fun isArtistIdBlocked(artistId: String): Boolean {
         ensureDislikesLoaded()
-        val id = artistId.trim()
-        return id.isNotBlank() && blockedArtistsCache.containsKey(id)
+        val id = djSpotifyArtistId(artistId) ?: artistId.trim()
+        if (id.isBlank()) return false
+        synchronized(DjDislikeMemory.lock) {
+            return DjDislikeMemory.artists.containsKey(id)
+        }
     }
 
     fun isArtistNameBlocked(artists: String): Boolean {
         ensureDislikesLoaded()
-        if (blockedArtistsCache.isEmpty()) return false
-        val parts = artists.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-        if (parts.isEmpty()) return false
-        return parts.any { blockedArtistsCache.containsKey("name:$it") }
-    }
-
-    fun isTrackBlocked(uri: String): Boolean {
-        ensureDislikesLoaded()
-        val u = uri.trim()
-        return u.isNotBlank() && blockedTracksCache.containsKey(u)
-    }
-
-    fun isTired(uri: String): Boolean {
-        ensureDislikesLoaded()
-        val u = uri.trim()
-        if (u.isBlank()) return false
-        val until = tiredTracksCache[u] ?: return false
-        if (until <= System.currentTimeMillis()) {
-            tiredTracksCache.remove(u)
-            return false
+        synchronized(DjDislikeMemory.lock) {
+            return djArtistIsBlocked(emptyList(), artists, "", DjDislikeMemory.artists)
         }
-        return true
+    }
+
+    fun isTrackBlocked(uri: String, name: String = "", artists: String = ""): Boolean {
+        ensureDislikesLoaded()
+        synchronized(DjDislikeMemory.lock) {
+            return djTrackIsBlocked(uri, name, artists, DjDislikeMemory.tracks)
+        }
+    }
+
+    fun isTired(uri: String, name: String = "", artists: String = ""): Boolean {
+        ensureDislikesLoaded()
+        synchronized(DjDislikeMemory.lock) {
+            return djTrackIsTired(uri, name, artists, DjDislikeMemory.tired)
+        }
     }
 
     /**
@@ -1333,21 +1500,21 @@ class SpotifyDjStore(context: Context) {
         artistIds: List<String> = emptyList(),
         artists: String = "",
         artistUri: String = "",
+        name: String = "",
     ): Boolean {
         ensureDislikesLoaded()
-        val u = uri.trim()
-        if (u.isNotBlank() && (isTrackBlocked(u) || isTired(u))) return true
-        val idFromUri = artistUri.trim().let { raw ->
-            when {
-                raw.startsWith("spotify:artist:") -> raw.removePrefix("spotify:artist:")
-                raw.contains("/artist/") -> raw.substringAfterLast('/').substringBefore('?')
-                else -> raw
-            }.trim().takeIf { it.isNotBlank() && !it.contains(':') && !it.contains('/') }
+        synchronized(DjDislikeMemory.lock) {
+            return djIsDisliked(
+                uri = uri,
+                artistIds = artistIds,
+                artists = artists,
+                artistUri = artistUri,
+                name = name,
+                blockedTracks = DjDislikeMemory.tracks,
+                blockedArtists = DjDislikeMemory.artists,
+                tiredTracks = DjDislikeMemory.tired,
+            )
         }
-        if (!idFromUri.isNullOrBlank() && isArtistIdBlocked(idFromUri)) return true
-        if (artistIds.any { isArtistIdBlocked(it) }) return true
-        if (isArtistNameBlocked(artists)) return true
-        return false
     }
 
     /**
@@ -1365,67 +1532,133 @@ class SpotifyDjStore(context: Context) {
         val uri = trackUri.trim()
         val picked = reasons.map { it.trim().lowercase() }.filter { it.isNotBlank() }.toSet()
         if (picked.isEmpty()) return "Pick at least one reason"
+        val now = System.currentTimeMillis()
+        val safeName = trackName.takeIf { djIsUsableLabel(it) }.orEmpty()
+        val safeArtists = artists.takeIf { djIsUsableLabel(it) }.orEmpty()
+        val titleKey = djTrackTitleKey(safeName, safeArtists)
 
         val permanentTrack = DjDislikeReason.SONG in picked || DjDislikeReason.LYRICS in picked
         val blockArtist = DjDislikeReason.ARTIST in picked
         val tired = DjDislikeReason.TIRED in picked
 
-        if (permanentTrack && uri.isNotBlank()) {
-            val set = blockedTracksCache.getOrPut(uri) { LinkedHashSet() }
-            if (DjDislikeReason.SONG in picked) set.add(DjDislikeReason.SONG)
-            if (DjDislikeReason.LYRICS in picked) set.add(DjDislikeReason.LYRICS)
+        if (permanentTrack && (uri.isNotBlank() || titleKey.isNotBlank())) {
+            synchronized(DjDislikeMemory.lock) {
+                val existing = if (uri.isNotBlank()) {
+                    DjDislikeMemory.tracks[uri]
+                } else {
+                    DjDislikeMemory.tracks.values.firstOrNull { it.titleKey == titleKey }
+                }
+                val reasonSet = LinkedHashSet(existing?.reasons.orEmpty())
+                if (DjDislikeReason.SONG in picked) reasonSet.add(DjDislikeReason.SONG)
+                if (DjDislikeReason.LYRICS in picked) reasonSet.add(DjDislikeReason.LYRICS)
+                val rec = DjBlockedTrack(
+                    uri = uri.ifBlank { existing?.uri.orEmpty() }.ifBlank { "title:$titleKey" },
+                    name = safeName.ifBlank { existing?.name?.takeIf { djIsUsableLabel(it) }.orEmpty() },
+                    artists = safeArtists.ifBlank { existing?.artists?.takeIf { djIsUsableLabel(it) }.orEmpty() },
+                    reasons = reasonSet,
+                    count = (existing?.count ?: 0) + 1,
+                    firstTs = existing?.firstTs?.takeIf { it > 0L } ?: now,
+                    lastTs = now,
+                    titleKey = titleKey.ifBlank { existing?.titleKey.orEmpty() },
+                )
+                DjDislikeMemory.tracks[rec.uri] = rec
+            }
             persistBlockedTracks()
         }
         if (blockArtist) {
-            val primaryName = artists.split(",").map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
+            val tokens = djArtistNameTokens(safeArtists.ifBlank { artists })
+            val primaryName = safeArtists.split(Regex("\\s*,\\s*"))
+                .map { it.trim() }
+                .firstOrNull { djIsUsableLabel(it) }
+                .orEmpty()
+                .ifBlank { tokens.firstOrNull().orEmpty() }
             val ids = LinkedHashSet<String>()
-            artistIds.forEach { if (it.isNotBlank()) ids.add(it.trim()) }
-            artistUri.trim().let { raw ->
-                val id = when {
-                    raw.startsWith("spotify:artist:") -> raw.removePrefix("spotify:artist:")
-                    raw.contains("/artist/") -> raw.substringAfterLast('/').substringBefore('?')
-                    else -> ""
-                }.trim()
-                if (id.isNotBlank() && !id.contains(':') && !id.contains('/')) ids.add(id)
-            }
-            if (ids.isEmpty() && primaryName.isNotBlank()) {
-                blockedArtistsCache["name:${primaryName.lowercase()}"] = primaryName
-            } else {
-                ids.forEach { id ->
-                    blockedArtistsCache[id] = primaryName.ifBlank { id }
-                }
-                // Also name-key so seeds without ids still match.
-                if (primaryName.isNotBlank()) {
-                    blockedArtistsCache["name:${primaryName.lowercase()}"] = primaryName
+            artistIds.forEach { djSpotifyArtistId(it)?.let { id -> ids.add(id) } }
+            djSpotifyArtistId(artistUri)?.let { ids.add(it) }
+            val aliases = LinkedHashSet<String>()
+            tokens.forEach { aliases.add(it) }
+            if (primaryName.isNotBlank()) aliases.add(djNormalizeArtistName(primaryName))
+            val display = primaryName.ifBlank { tokens.firstOrNull().orEmpty() }
+            synchronized(DjDislikeMemory.lock) {
+                if (ids.isEmpty() && display.isNotBlank()) {
+                    val key = "name:${djNormalizeArtistName(display)}"
+                    upsertBlockedArtist(key, display, aliases, now)
+                } else {
+                    ids.forEach { id ->
+                        upsertBlockedArtist(id, display.ifBlank { id }, aliases, now)
+                    }
+                    if (display.isNotBlank()) {
+                        upsertBlockedArtist(
+                            "name:${djNormalizeArtistName(display)}",
+                            display,
+                            aliases,
+                            now,
+                        )
+                    }
                 }
             }
             persistBlockedArtists()
         }
-        if (tired && uri.isNotBlank()) {
-            tiredTracksCache[uri] = System.currentTimeMillis() + DJ_TIRED_COOLDOWN_MS
-            // Cap map size
-            while (tiredTracksCache.size > 300) {
-                val first = tiredTracksCache.keys.firstOrNull() ?: break
-                tiredTracksCache.remove(first)
+        if (tired && (uri.isNotBlank() || titleKey.isNotBlank())) {
+            synchronized(DjDislikeMemory.lock) {
+                val existing = if (uri.isNotBlank()) {
+                    DjDislikeMemory.tired[uri]
+                } else {
+                    DjDislikeMemory.tired.values.firstOrNull { it.titleKey == titleKey }
+                }
+                val rec = DjTiredTrack(
+                    uri = uri.ifBlank { existing?.uri.orEmpty() }.ifBlank { "title:$titleKey" },
+                    name = safeName.ifBlank { existing?.name?.takeIf { djIsUsableLabel(it) }.orEmpty() },
+                    artists = safeArtists.ifBlank { existing?.artists?.takeIf { djIsUsableLabel(it) }.orEmpty() },
+                    until = now + DJ_TIRED_COOLDOWN_MS,
+                    count = (existing?.count ?: 0) + 1,
+                    lastTs = now,
+                    titleKey = titleKey.ifBlank { existing?.titleKey.orEmpty() },
+                )
+                DjDislikeMemory.tired[rec.uri] = rec
             }
             persistTiredTracks()
         }
 
         val bits = ArrayList<String>(4)
         if (blockArtist) {
-            val who = artists.split(",").map { it.trim() }.firstOrNull { it.isNotEmpty() }
+            val who = djArtistNameTokens(artists).firstOrNull()
+                ?: artists.split(",").map { it.trim() }.firstOrNull { it.isNotEmpty() }
                 ?: "artist"
             bits.add("artist “${who.take(40)}” blocked")
         }
         if (DjDislikeReason.SONG in picked) bits.add("song blocked")
         if (DjDislikeReason.LYRICS in picked) bits.add("lyrics blocked")
         if (tired) bits.add("cooled ~14 days")
-        val title = trackName.ifBlank { uri.takeLast(18) }.take(48)
+        val title = safeName.ifBlank { uri.takeLast(18) }.take(48)
         return if (bits.isEmpty()) {
             "Disliked “$title”"
         } else {
             "Disliked “$title” · ${bits.joinToString(" · ")}"
         }
+    }
+
+    private fun upsertBlockedArtist(
+        key: String,
+        display: String,
+        aliases: Set<String>,
+        now: Long,
+    ) {
+        if (key.isBlank()) return
+        val existing = DjDislikeMemory.artists[key]
+        DjDislikeMemory.artists[key] = DjBlockedArtist(
+            key = key,
+            name = display.takeIf { djIsUsableLabel(it) }
+                .orEmpty()
+                .ifBlank { existing?.name?.takeIf { djIsUsableLabel(it) }.orEmpty() }
+                .ifBlank {
+                    if (key.startsWith("name:")) key.removePrefix("name:") else ""
+                },
+            count = (existing?.count ?: 0) + 1,
+            firstTs = existing?.firstTs?.takeIf { it > 0L } ?: now,
+            lastTs = now,
+            aliases = (existing?.aliases.orEmpty() + aliases).filter { it.isNotBlank() }.toSet(),
+        )
     }
 }
 
@@ -2004,11 +2237,12 @@ private fun startDjServiceAction(context: Context, intent: Intent, tag: String) 
  *   or a line was already prefetched for the next track — otherwise just
  *   skip and decrement the banter countdown by one.
  */
-fun spotifyLiveDjSkip(context: Context, forceTalk: Boolean = false) {
+fun spotifyLiveDjSkip(context: Context, forceTalk: Boolean = false, hardSkip: Boolean = false) {
     val appCtx = context.applicationContext
     val i = Intent(appCtx, SpotifyLiveDjService::class.java)
         .setAction(SpotifyLiveDjService.ACTION_DJ_SKIP)
         .putExtra(SpotifyLiveDjService.EXTRA_FORCE_TALK, forceTalk)
+        .putExtra(SpotifyLiveDjService.EXTRA_HARD_SKIP, hardSkip)
     startDjServiceAction(appCtx, i, "skip")
 }
 
@@ -2305,6 +2539,12 @@ class SpotifyLiveDjService : Service() {
     private var banterEvery = 4
     /** Skip + talk (or explicit chat force) forces a banter line. Plain skip does not. */
     private var forceBanter = false
+    /** Second skip (or skip mid-handoff) cancels research/banter and plays next now. */
+    private val abortBanter = AtomicBoolean(false)
+    /** True from a skip command until [runTransition] finishes. */
+    @Volatile private var skipInFlight = false
+    /** Second skip within this window cuts upcoming research/banter. */
+    private var lastSkipRequestMs = 0L
     /**
      * URI of the cut we already counted toward banter on this handoff.
      * Stops double +1 when playTrack lands and a late external sync also matches the queue.
@@ -2312,7 +2552,7 @@ class SpotifyLiveDjService : Service() {
     private var lastBanterCountedPlayUri: String? = null
     /** Soft rotation of radio seed modes (liked / top / recent / artist). */
     private var radioModeIdx = 0
-    /** Prefetched spoken line for the upcoming handoff (keyed by next URI). */
+    /** Held spoken line + bake for the planned talk target (may be 2 songs ahead). */
     private var prefetchedBanter: String? = null
     private var prefetchedForUri: String? = null
     /** Pre-baked TTS mp3 for seamless handoff (especially when talk-over is off). */
@@ -2415,14 +2655,42 @@ class SpotifyLiveDjService : Service() {
                 publish(status = status, persist = false)
             }
             ACTION_DJ_SKIP -> {
-                // Only Skip + talk forces banter; plain skip follows the countdown.
-                forceBanter = intent.getBooleanExtra(EXTRA_FORCE_TALK, false) && store.banterEnabled
-                sessionWork = true
-                scope.launch {
-                    try {
-                        runTransition("skip")
-                    } finally {
-                        finishSessionIfNeeded()
+                val extraTalk = intent.getBooleanExtra(EXTRA_FORCE_TALK, false) && store.banterEnabled
+                val extraHard = intent.getBooleanExtra(EXTRA_HARD_SKIP, false)
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val doubleTap = lastSkipRequestMs > 0L &&
+                    nowElapsed - lastSkipRequestMs < DOUBLE_SKIP_MS
+                lastSkipRequestMs = nowElapsed
+                val cutTalk = extraHard || doubleTap || skipInFlight || transitioning.get()
+                if (cutTalk) {
+                    abortBanter.set(true)
+                    forceBanter = false
+                    HostAiClient.stopSpeaking(this)
+                    publish(status = "Hard skip — cutting research/banter", persist = false)
+                    if (transitioning.get() || skipInFlight) {
+                        sessionWork = store.enabled
+                    } else {
+                        skipInFlight = true
+                        sessionWork = true
+                        scope.launch {
+                            try {
+                                runTransition("hard_skip")
+                            } finally {
+                                finishSessionIfNeeded()
+                            }
+                        }
+                    }
+                } else {
+                    abortBanter.set(false)
+                    forceBanter = extraTalk
+                    skipInFlight = true
+                    sessionWork = true
+                    scope.launch {
+                        try {
+                            runTransition("skip")
+                        } finally {
+                            finishSessionIfNeeded()
+                        }
                     }
                 }
             }
@@ -3309,12 +3577,13 @@ class SpotifyLiveDjService : Service() {
         // Banter: enter handoff with enough headroom for the wait loop — NOT to skip.
         // Talk-over ON: speech duration + pad so the line lands on the outro.
         // Talk-over OFF: enter late; waitUntilRemainAbout holds until the last second.
-        // Caps stay tight so a long/unknown TTS bake never arms "mid song".
+        // Headroom follows the real clip (up to 90s) so a long bake is not chopped.
         val banterThreshold = when {
             !banterDue -> 0L
             allowTalkSnap && banterAudioReady ->
-                (prefetchedTtsDurationMs + 1_200L).coerceIn(6_000L, 18_000L)
-            allowTalkSnap && banterPrefetched -> 10_000L
+                talkoverArmRemainMs(prefetchedTtsDurationMs)
+            allowTalkSnap && banterPrefetched ->
+                talkoverArmRemainMs(estimateBanterSpeechMs(prefetchedBanter.orEmpty()))
             banterAudioReady -> 5_000L // clean mic: short headroom; audio already baked
             banterPrefetched -> 7_000L
             else -> 9_000L // still researching / baking — modest early arm only
@@ -3417,29 +3686,10 @@ class SpotifyLiveDjService : Service() {
         if (queue.size < 3 && !filling.get()) {
             scope.launch(Dispatchers.IO) { fillQueue(useAi = store.useAiRank) }
         }
-        // Prefetch AI banter + TTS early — research + bake need wall-clock time.
-        // Start as soon as banter is due on this cut (or within ~1 track) so talk-over OFF
-        // still has audio ready before the last second. Skip while paused.
-        val untilTalkNow = tracksUntilTalk(songsSinceBanter, banterEvery)
-        val shouldPrefetch = store.banterEnabled && !autoHandoffHeld && playing &&
-            remain > 12_000L &&
-            (banterDue || untilTalkNow <= 1)
-        if (shouldPrefetch) {
-            val peek = synchronized(queue) { queue.firstOrNull() }
-            val needLine = peek != null && (
-                prefetchedForUri != peek.uri ||
-                    prefetchedBanter.isNullOrBlank()
-                )
-            val needAudio = peek != null && (
-                prefetchedForUri == peek.uri &&
-                    !prefetchedBanter.isNullOrBlank() &&
-                    (prefetchedTtsPath.isNullOrBlank() || !File(prefetchedTtsPath!!).isFile)
-                )
-            if (peek != null && (needLine || needAudio) && !prefetchingBanter.get()) {
-                val prevSnap = current
-                scope.launch(Dispatchers.IO) { prefetchBanter(prevSnap, peek) }
-            }
-        }
+        // Prefetch research + TTS up to 2 songs ahead, then hold until that handoff.
+        // Do not require "now playing" — bake while paused so skip-on-the-song-before
+        // can fire the clip immediately. Skip only while a handoff is already running.
+        maybeLaunchBanterPrefetch()
         // Flush banter counters every poll so leave/return always sees the true countdown.
         // Random mode: banterEvery is the rolled target for *this* cycle (not re-rolled each poll).
         store.songsSinceBanter = songsSinceBanter
@@ -3512,21 +3762,38 @@ class SpotifyLiveDjService : Service() {
         return true
     }
 
-    /** Drop prefetched / pending banter when it no longer matches the queue head. */
+    /**
+     * Drop held research / TTS only when the *planned talk target* changed.
+     * A bake for queue[1] (talk in 2) must survive a silent handoff onto queue[0].
+     * Fill-queue [pendingBanter] stays keyed to the current head.
+     */
     private fun invalidateStaleBanterCaches(expectedNextUri: String?) {
-        val next = expectedNextUri?.takeIf { it.isNotBlank() }
-        if (prefetchedForUri != null && prefetchedForUri != next) {
-            Log.i(TAG, "drop prefetched banter (was for ${prefetchedForUri}, head=$next)")
+        val upcoming = synchronized(queue) { queue.map { it.uri } }
+        val head = expectedNextUri?.takeIf { it.isNotBlank() } ?: upcoming.firstOrNull()
+        val plan = planBanterPrefetch(
+            upcomingUris = upcoming,
+            currentUri = current?.uri ?: lastUri,
+            tracksUntilTalk = tracksUntilTalk(songsSinceBanter, banterEvery),
+            banterEnabled = store.banterEnabled,
+        )
+        if (!shouldKeepHeldBanter(prefetchedForUri, plan?.targetUri)) {
+            if (prefetchedForUri != null) {
+                Log.i(
+                    TAG,
+                    "drop prefetched banter (was for $prefetchedForUri, " +
+                        "plan=${plan?.targetUri}, head=$head)",
+                )
+            }
             clearPrefetchedBanterAudio()
             prefetchedBanter = null
             prefetchedForUri = null
         }
-        if (pendingBanterForUri != null && pendingBanterForUri != next) {
-            Log.i(TAG, "drop pending banter (was for $pendingBanterForUri, head=$next)")
+        if (pendingBanterForUri != null && pendingBanterForUri != head) {
+            Log.i(TAG, "drop pending banter (was for $pendingBanterForUri, head=$head)")
             pendingBanter = null
             pendingBanterForUri = null
         }
-        if (researchedForUri != null && researchedForUri != next) {
+        if (researchedForUri != null && researchedForUri != plan?.targetUri) {
             researchedForUri = null
             researchedFacts = emptyList()
         }
@@ -3553,9 +3820,52 @@ class SpotifyLiveDjService : Service() {
      */
     private fun ensureDjQueueMirroredOnSpotify(force: Boolean, quiet: Boolean = true): Boolean = true
 
+    /** Snapshot of the planned talk target (queue head now, or queue[1] when talk is 2 away). */
+    private fun currentBanterPlan(): BanterPrefetchPlan? {
+        val upcoming = synchronized(queue) { queue.map { it.uri } }
+        return planBanterPrefetch(
+            upcomingUris = upcoming,
+            currentUri = current?.uri ?: lastUri,
+            tracksUntilTalk = tracksUntilTalk(songsSinceBanter, banterEvery),
+            banterEnabled = store.banterEnabled,
+        )
+    }
+
+    /**
+     * Start / continue research+TTS for the planned talk target. Safe to call every poll.
+     * Holds the bake until that URI is actually next (or skip on the song before).
+     */
+    private fun maybeLaunchBanterPrefetch() {
+        if (!store.banterEnabled || transitioning.get() || prefetchingBanter.get()) return
+        val upcoming = synchronized(queue) { queue.toList() }
+        val plan = planBanterPrefetch(
+            upcomingUris = upcoming.map { it.uri },
+            currentUri = current?.uri ?: lastUri,
+            tracksUntilTalk = tracksUntilTalk(songsSinceBanter, banterEvery),
+            banterEnabled = true,
+        ) ?: return
+        val target = upcoming.getOrNull(plan.targetIndex) ?: return
+        val lineReady = prefetchedForUri == target.uri && !prefetchedBanter.isNullOrBlank()
+        val audioReady = lineReady &&
+            !prefetchedTtsPath.isNullOrBlank() &&
+            File(prefetchedTtsPath!!).isFile
+        if (audioReady) return
+        val prevTrack = if (plan.targetIndex <= 0) {
+            current
+        } else {
+            upcoming.getOrNull(plan.targetIndex - 1) ?: current
+        }
+        scope.launch(Dispatchers.IO) { prefetchBanter(prevTrack, target) }
+    }
+
     private fun prefetchBanter(prev: DjQueueTrack?, next: DjQueueTrack) {
         if (!prefetchingBanter.compareAndSet(false, true)) return
         try {
+            val plan = currentBanterPlan()
+            if (plan != null && plan.targetUri != next.uri) {
+                Log.i(TAG, "prefetch abort — target moved (wanted ${next.uri}, plan=${plan.targetUri})")
+                return
+            }
             val ttsReady = prefetchedForUri == next.uri &&
                 !prefetchedBanter.isNullOrBlank() &&
                 !prefetchedTtsPath.isNullOrBlank() &&
@@ -3563,23 +3873,30 @@ class SpotifyLiveDjService : Service() {
             if (ttsReady) return
             // Text ready but audio missing — re-bake TTS only.
             val lineOnlyReady = prefetchedForUri == next.uri && !prefetchedBanter.isNullOrBlank()
-            val untilTalk = tracksUntilTalk(songsSinceBanter, banterEvery)
-            // Look ahead: songs until banter (min 1 for next, up to 6 for radio teases).
-            val lookCount = (untilTalk.coerceAtLeast(1) + 2).coerceIn(1, 6)
-            val upcoming = peekUpcoming(lookCount)
+            // Line is spoken at the B→C (or A→B) handoff — write it as due now, not as a tease.
+            val upcomingAfter = synchronized(queue) {
+                queue.dropWhile { it.uri != next.uri }.drop(1).take(5)
+            }
             if (!lineOnlyReady) {
+                val untilLive = tracksUntilTalk(songsSinceBanter, banterEvery)
+                val hint = if (untilLive > 1) " · talk in $untilLive" else ""
                 publish(
-                    status = "🔍 Researching ${primaryArtist(next.artists).ifBlank { next.name }}…",
+                    status = "🔍 Researching ${primaryArtist(next.artists).ifBlank { next.name }}…$hint",
                 )
                 // Research only here — never block near-end handoff on tools.
                 val line = generateBanter(
                     prev,
                     next,
                     allowResearch = true,
-                    upcoming = upcoming,
-                    tracksUntilTalk = untilTalk,
+                    upcoming = upcomingAfter,
+                    tracksUntilTalk = 0,
                 )
                 if (line.isBlank()) return
+                val stillPlan = currentBanterPlan()
+                if (stillPlan != null && stillPlan.targetUri != next.uri) {
+                    Log.i(TAG, "prefetch drop — target moved after research (${next.uri} → ${stillPlan.targetUri})")
+                    return
+                }
                 clearPrefetchedBanterAudio()
                 prefetchedBanter = line
                 prefetchedForUri = next.uri
@@ -3604,7 +3921,7 @@ class SpotifyLiveDjService : Service() {
                         runCatching { File(prefetchedTtsPath!!).delete() }
                     }
                     prefetchedTtsPath = p
-                    prefetchedTtsDurationMs = if (dur > 0L) dur else estimateSpeechMs(line)
+                    prefetchedTtsDurationMs = resolveBanterSpeechMs(line, dur)
                     Log.i(
                         TAG,
                         "baked banter TTS path=$p durationMs=$prefetchedTtsDurationMs " +
@@ -3630,19 +3947,15 @@ class SpotifyLiveDjService : Service() {
         }
     }
 
-    /** Rough on-air duration for a banter line (~150 wpm + padding). */
-    private fun estimateSpeechMs(line: String): Long {
-        val words = line.trim().split(Regex("\\s+")).count { it.isNotBlank() }.coerceAtLeast(1)
-        return (words * 400L + 500L).coerceIn(2_500L, 18_000L)
-    }
+    /** Rough on-air duration for a banter line. Delegates to [estimateBanterSpeechMs]. */
+    private fun estimateSpeechMs(line: String): Long = estimateBanterSpeechMs(line)
 
     /**
      * Prefer measured TTS duration when we pre-baked audio; else word-count estimate.
      * Used to land talkover on the outro and to know silence budget when talk-over is off.
      */
     private fun speechDurationMs(line: String, bakedMs: Long = prefetchedTtsDurationMs): Long {
-        if (bakedMs in 1_200L..45_000L) return bakedMs
-        return estimateSpeechMs(line)
+        return resolveBanterSpeechMs(line, bakedMs)
     }
 
 
@@ -3699,6 +4012,10 @@ class SpotifyLiveDjService : Service() {
         val stuckEndMs = 14_000L
         val hardMidMs = 25_000L
         while (System.currentTimeMillis() < deadline) {
+            if (abortBanter.get()) {
+                Log.i(TAG, "waitUntilRemainAbout — hard skip abort")
+                return true
+            }
             val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
             if (snap == null) {
                 emptyStreak++
@@ -3795,6 +4112,7 @@ class SpotifyLiveDjService : Service() {
     ): Boolean {
         val deadline = System.currentTimeMillis() + maxWaitMs
         while (System.currentTimeMillis() < deadline) {
+            if (abortBanter.get()) return false
             val snap = withContext(Dispatchers.IO) { readPlaybackSnap() }
             if (snap != null && snap.uri.isNotBlank()) {
                 val moved = fromUri.isNullOrBlank() || snap.uri != fromUri
@@ -4055,13 +4373,9 @@ class SpotifyLiveDjService : Service() {
 
         nearEndArmed = false
         handoffLaunchedForUri = null
-        clearPrefetchedBanterAudio()
-        prefetchedBanter = null
-        prefetchedForUri = null
-        pendingBanter = null
-        pendingBanterForUri = null
-        researchedForUri = null
-        researchedFacts = emptyList()
+        // Do not wipe a 2-ahead bake here — adopting the silent cut before
+        // banter must keep the held clip. invalidateStaleBanterCaches below
+        // drops it only if the planned talk target changed.
         expectedPlayUri = null
         expectedPlayFromUri = null
         stuckEndPolls = 0
@@ -4105,6 +4419,7 @@ class SpotifyLiveDjService : Service() {
                 lastBanterCountedPlayUri = null
             }
             persistRuntimeState()
+            maybeLaunchBanterPrefetch()
             // Only chat-spam on explicit Sync or when we actually dropped ahead tracks.
             // Quiet in-queue advances (Spotify landed on our next cut) just adopt.
             if (userInitiated || droppedAhead > 0) {
@@ -4328,7 +4643,7 @@ class SpotifyLiveDjService : Service() {
         // Works in booth mode (Live DJ auto-handoff off) for skip/chat; auto poll only when enabled.
         if (!transitioning.compareAndSet(false, true)) return
         // Manual user actions always run; automatic handoffs respect pause hold.
-        val isSkipReason = reason == "skip" || reason == "chat_skip"
+        val isSkipReason = reason == "skip" || reason == "chat_skip" || reason == "hard_skip"
         val isIdleKick = reason == "kick_idle" || reason == "idle_advance" || reason == "poll_error_advance"
         val isUserForced = isSkipReason ||
             reason.startsWith("chat_") ||
@@ -4349,7 +4664,7 @@ class SpotifyLiveDjService : Service() {
         }
         // Capture before clear — Skip + talk sets this; plain skip / natural end do not.
         // Master banter switch kills all spoken lines (including forced talk).
-        val forcedTalk = forceBanter && store.banterEnabled
+        val forcedTalk = forceBanter && store.banterEnabled && !abortBanter.get() && reason != "hard_skip"
         forceBanter = false
         // Talk-over: when the user allows it, always ride the track (duck volume) —
         // never hard-pause mid-outro. When allowTalkOver is off, pause at the last second.
@@ -4405,9 +4720,10 @@ class SpotifyLiveDjService : Service() {
                 // Plain skip: countdown −1 only. Banter only when due, already
                 // prefetched for next, or Skip + talk forced it. Master switch can mute all.
                 val banterDueCountdown = songsSinceBanter + 1 >= banterEvery
-                val banterDue = store.banterEnabled && (forcedTalk || banterDueCountdown)
+                val hardCut = abortBanter.get() || reason == "hard_skip"
+                val banterDue = store.banterEnabled && !hardCut && (forcedTalk || banterDueCountdown)
                 // Wait for research + TTS bake so talk-over OFF isn't dead air after pause.
-                if (next != null && (forcedTalk || banterDue)) {
+                if (next != null && !hardCut && (forcedTalk || banterDue)) {
                     val needWait = prefetchingBanter.get() ||
                         prefetchedForUri != next.uri ||
                         prefetchedBanter.isNullOrBlank() ||
@@ -4425,9 +4741,22 @@ class SpotifyLiveDjService : Service() {
                             scope.launch(Dispatchers.IO) { prefetchBanter(prevSnap, nextSnap) }
                         }
                         // Longer budget when talk-over is off (must have audio before pause).
-                        val waitBudget = if (allowTalk) 16_000L else 28_000L
+                        val needCustomResearch = collectBanterTalkingPoints(
+                            store.loadPromptTemplates(),
+                        ).any { !it.builtIn }
+                        val waitBudget = banterHandoffWaitBudgetMs(
+                            prefetchInFlight = prefetchingBanter.get() ||
+                                prefetchedForUri != next.uri ||
+                                prefetchedBanter.isNullOrBlank(),
+                            allowTalkOver = allowTalk,
+                            needsCustomResearch = needCustomResearch,
+                        )
                         val waitDeadline = System.currentTimeMillis() + waitBudget
                         while (System.currentTimeMillis() < waitDeadline) {
+                            if (abortBanter.get()) {
+                                Log.i(TAG, "hard skip — abort banter wait")
+                                break
+                            }
                             val textOk = prefetchedForUri == next.uri &&
                                 !prefetchedBanter.isNullOrBlank()
                             val audioOk = textOk &&
@@ -4452,15 +4781,20 @@ class SpotifyLiveDjService : Service() {
                 next = synchronized(queue) { queue.firstOrNull() }
                 invalidateStaleBanterCaches(next?.uri)
                 // Prefetch is only a speedup — never a reason to talk early.
-                // Talking every transition was caused by treating banterReady as due.
-                val banterReady = store.banterEnabled &&
-                    next != null &&
-                    prefetchedForUri == next?.uri &&
-                    !prefetchedBanter.isNullOrBlank()
-                val wantBanter = store.banterEnabled && (forcedTalk || banterDueCountdown)
-                if (!wantBanter && banterReady) {
-                    // Drop stale bake so the next due cycle re-researches for the real next cut.
-                    Log.i(TAG, "silent handoff — discard prefetched banter (not due)")
+                val wantBanter = store.banterEnabled &&
+                    !abortBanter.get() &&
+                    reason != "hard_skip" &&
+                    (forcedTalk || banterDueCountdown)
+                if (
+                    !wantBanter &&
+                    shouldDiscardHeldBanterOnSilentHandoff(
+                        heldTargetUri = prefetchedForUri,
+                        nextUri = next?.uri,
+                        banterDue = false,
+                    )
+                ) {
+                    // Drop a bake for *this* next only — keep a 2-ahead clip for later.
+                    Log.i(TAG, "silent handoff — discard prefetched banter (not due, was for next)")
                     clearPrefetchedBanterAudio()
                     prefetchedBanter = null
                     prefetchedForUri = null
@@ -4498,14 +4832,23 @@ class SpotifyLiveDjService : Service() {
                             prefetchedForUri = null
                             p
                         }
-                        // Handoff must stay fast: use cached facts / local templates only.
+                        // Prefetch missed: still research when a custom angle is on,
+                        // otherwise the booth always speaks the canned handoff.
                         else -> {
                             val until = tracksUntilTalk(songsSinceBanter, banterEvery)
                             val look = peekUpcoming((until.coerceAtLeast(1) + 2).coerceIn(1, 6))
+                            val customPending = collectBanterTalkingPoints(
+                                store.loadPromptTemplates(),
+                            ).any { !it.builtIn }
+                            val haveCustomFacts = banterNext != null &&
+                                researchedForUri == banterNext.uri &&
+                                researchHasUsableCustomBeat(researchedFacts)
                             generateBanter(
                                 banterPrev,
                                 banterNext,
-                                allowResearch = false,
+                                allowResearch = customPending &&
+                                    !haveCustomFacts &&
+                                    !prefetchingBanter.get(),
                                 upcoming = look,
                                 tracksUntilTalk = until,
                             )
@@ -4527,9 +4870,10 @@ class SpotifyLiveDjService : Service() {
                             )
                             val ready = waitUntilRemainAbout(
                                 expectedUri = prevUri,
-                                // Cap headroom so a bad TTS duration never starts mid-song.
-                                targetRemainMs = (speechMs + 900L).coerceIn(4_000L, 18_000L),
-                                maxWaitMs = 120_000L,
+                                // Follow the real clip — the old 18s clamp started the
+                                // next cut while a long custom-angle line was still talking.
+                                targetRemainMs = talkoverSpeakRemainMs(speechMs),
+                                maxWaitMs = 180_000L,
                             )
                             if (!ready) {
                                 Log.i(TAG, "banter talkover wait aborted — re-arm (no freeze)")
@@ -4574,6 +4918,27 @@ class SpotifyLiveDjService : Service() {
                         }
                     }
 
+                    if (abortBanter.get()) {
+                        Log.i(TAG, "hard skip — drop prepared banter, play next now")
+                        clearPrefetchedBanterAudio()
+                        prefetchedBanter = null
+                        prefetchedForUri = null
+                        songsSinceBanter = (songsSinceBanter + 1).coerceAtMost(banterEvery)
+                        store.songsSinceBanter = songsSinceBanter
+                        val advanced = advanceToNext(
+                            next = banterNext ?: next,
+                            prevUri = prevUri,
+                            preferSkip = false,
+                            allowPlayFallback = true,
+                        )
+                        if (advanced) {
+                            publish(
+                                status = "Hard skip · ${banterCountdownLabel(songsSinceBanter, banterEvery)}",
+                                clearError = true,
+                            )
+                        }
+                        return@withContext
+                    }
                     appendChat(
                         DjChatMessage(
                             id = "banter-${System.currentTimeMillis()}",
@@ -4599,34 +4964,38 @@ class SpotifyLiveDjService : Service() {
                         prevUri = banterNext.uri
                     }
 
-                    // Clean handoff only: pause right before speech (after wait).
-                    // Talkover / skip: leave the track running under the mic.
-                    if (!talkover && !isSkipReason) {
+                    // Pause when the line will outlast the outro (or talk-over is off).
+                    // Otherwise Spotify autoplay starts the next cut and kills the mic.
+                    val remainNow = preSpeakSnap?.remainMs ?: lastRemainMs
+                    val speechOutlasts = shouldPauseSpotifySoBanterCanFinish(speechMs, remainNow)
+                    val pauseForSpeech = (!talkover && !isSkipReason) ||
+                        (talkover && !isSkipReason && speechOutlasts)
+                    if (pauseForSpeech) {
                         val stillOnPrev = preSpeakSnap == null ||
                             prevUri == null ||
                             preSpeakSnap.uri == prevUri
                         if (stillOnPrev) {
-                            // Clean mic pause — arm grace so poll never freezes us mid-banter
-                            // after transition ends, and so empty player between pause→play
-                            // is treated as handoff buffer not "user paused".
-                            armInterTrackGrace(45_000L)
-                            wasPlaying = true // sticky: we own this pause for banter
+                            armInterTrackGrace((speechMs + 15_000L).coerceIn(20_000L, 180_000L))
+                            wasPlaying = true
                             spotifyPut("/v1/me/player/pause", "{}")
                             delay(150L)
                         }
+                    } else {
+                        armInterTrackGrace((speechMs + 15_000L).coerceIn(20_000L, 180_000L))
                     }
 
                     var duckedFrom: Int? = null
-                    if (talkover) {
+                    if (talkover && !pauseForSpeech) {
                         duckedFrom = duckSpotifyVolume(targetPercent = 32)
                     }
 
                     val voice = store.voiceId
+                    val speakTalkover = talkover && !pauseForSpeech
                     val speakJson = JSONObject().apply {
                         put("wait", true)
                         put("voice_id", voice)
                         put("language", "en")
-                        put("talkover", talkover)
+                        put("talkover", speakTalkover)
                         if (!bakedPath.isNullOrBlank() && File(bakedPath!!).isFile) {
                             put("audio_path", bakedPath)
                             // Consume the bake — delete after play.
@@ -4664,7 +5033,7 @@ class SpotifyLiveDjService : Service() {
                                 .put("wait", true)
                                 .put("voice_id", voice)
                                 .put("language", "en")
-                                .put("talkover", talkover)
+                                .put("talkover", speakTalkover)
                                 .toString()
                             val fbRaw = HostAiClient.speak(applicationContext, line, fallbackJson)
                             speak = runCatching { JSONObject(fbRaw) }.getOrElse { JSONObject() }
@@ -4722,7 +5091,7 @@ class SpotifyLiveDjService : Service() {
                         lastUri == banterNext.uri
                     val advanced = when {
                         alreadyOnBanterNext -> true
-                        talkover && !isSkipReason && !isIdleKick -> {
+                        talkover && !isSkipReason && !isIdleKick && !pauseForSpeech -> {
                             // Let the cut finish under/after the line, then start next.
                             // Budget scales with real remaining time — a fixed 12s used to
                             // force-next while ~15–25s of outro was still playing.
@@ -4895,10 +5264,13 @@ class SpotifyLiveDjService : Service() {
             // Keep treating empty/paused flickers as between-song buffer, not user pause.
             armInterTrackGrace(14_000L)
             transitioning.set(false)
+            skipInFlight = false
+            abortBanter.set(false)
             // Always flush countdown after a handoff so UI + leave/return stay honest.
             store.songsSinceBanter = songsSinceBanter
             store.banterEvery = banterEvery
             persistRuntimeState()
+            maybeLaunchBanterPrefetch()
             publish(
                 transitioning = false,
                 status = SpotifyDjBus.state.value.status.let { s ->
@@ -6001,7 +6373,8 @@ class SpotifyLiveDjService : Service() {
                 val ids = artistIdsOf(t)
                 val arts = artistsOf(t)
                 val aUri = artistUriOf(t)
-                if (uri.isBlank() || isPlayed(uri) || isDisliked(uri, ids, arts, aUri) ||
+                if (uri.isBlank() || isPlayed(uri) ||
+                    isDisliked(uri, ids, arts, aUri, t.optString("name", "")) ||
                     queue.any { it.uri == uri }
                 ) {
                     continue
@@ -6120,7 +6493,7 @@ class SpotifyLiveDjService : Service() {
             val ids = artistIdsOf(t)
             val arts = artistsOf(t)
             val aUri = artistUriOf(t)
-            if (isDisliked(uri, ids, arts, aUri)) return
+            if (isDisliked(uri, ids, arts, aUri, t.optString("name", ""))) return
             into.add(
                 DjQueueTrack(
                     uri = uri,
@@ -6498,6 +6871,7 @@ class SpotifyLiveDjService : Service() {
         val newHead = synchronized(queue) { queue.firstOrNull()?.uri }
         if (prevHead != newHead) invalidateStaleBanterCaches(newHead)
         persistRuntimeState()
+        maybeLaunchBanterPrefetch()
         val n = finalList.size
         val sameN = finalList.count { it.reason.contains("same artist") }
         val relN = finalList.count {
@@ -6572,7 +6946,7 @@ class SpotifyLiveDjService : Service() {
         progressMs: Long = 0L,
         durationMs: Long = 0L,
     ) {
-        val title = track.name.ifBlank { track.uri }
+        val title = track.name.takeIf { djIsUsableLabel(it) }.orEmpty().ifBlank { "Unknown track" }
         val body = buildString {
             append(title)
             if (track.artists.isNotBlank()) append("\n").append(track.artists)
@@ -6799,12 +7173,11 @@ class SpotifyLiveDjService : Service() {
                 batch = pickFromPool(pool, curForPool, (if (replace) 8 else 6) + (0..3).random())
                 aiBanterLine = null
             }
-            // Never re-add already heard / disliked when those sources are enabled
+            // Never re-add already heard / disliked (dislikes are always honored).
             val honorHistory = store.isQueueSourceEnabled(DjQueueSource.History)
-            val honorExcluded = store.isQueueSourceEnabled(DjQueueSource.Excluded)
             batch = batch.filter {
                 (!honorHistory || !isPlayed(it.uri)) &&
-                    (!honorExcluded || !isDisliked(it)) &&
+                    !isDisliked(it) &&
                     it.uri != curForPool?.uri
             }
             val prevHead = synchronized(queue) { queue.firstOrNull()?.uri }
@@ -6812,7 +7185,7 @@ class SpotifyLiveDjService : Service() {
                 batch.forEach { t ->
                     if (queue.none { it.uri == t.uri } &&
                         (!honorHistory || !isPlayed(t.uri)) &&
-                        (!honorExcluded || !isDisliked(t))
+                        !isDisliked(t)
                     ) {
                         queue.addLast(t)
                     }
@@ -6830,6 +7203,7 @@ class SpotifyLiveDjService : Service() {
                 pendingBanterForUri = newHead
             }
             persistRuntimeState()
+            maybeLaunchBanterPrefetch()
             if (batch.isNotEmpty()) {
                 publish(
                     status = if (replace) {
@@ -6935,7 +7309,9 @@ class SpotifyLiveDjService : Service() {
                 val ids = artistIdsOf(t)
                 val arts = artistsOf(t)
                 val aUri = artistUriOf(t)
-                if (isDisliked(uri, ids, arts, aUri) || store.isArtistIdBlocked(aid)) continue
+                if (isDisliked(uri, ids, arts, aUri, t.optString("name", "")) ||
+                    store.isArtistIdBlocked(aid)
+                ) continue
                 val reason = if (show.isNotBlank()) {
                     "in town near $city · $show"
                 } else {
@@ -6981,7 +7357,8 @@ class SpotifyLiveDjService : Service() {
         val src = store.queueSourcesEnabled
         fun on(s: DjQueueSource): Boolean = s.id in src
         val honorHistory = on(DjQueueSource.History)
-        val honorExcluded = on(DjQueueSource.Excluded)
+        // Dislikes are never optional — the queue-source chip cannot turn them off.
+        val honorExcluded = true
         // Abort expansion once Spotify 429s so we don't dig a deeper rate-limit hole.
         fun rateLimitedOut(): Boolean = isRateLimited()
 
@@ -7000,7 +7377,7 @@ class SpotifyLiveDjService : Service() {
             if (uri.isBlank() || uri.contains("local:")) return
             if (!seen.add(uri)) return
             if (honorHistory && isPlayed(uri)) return
-            if (honorExcluded && isDisliked(uri, artistIds, artists, artistUri)) return
+            if (honorExcluded && isDisliked(uri, artistIds, artists, artistUri, name)) return
             if (current?.uri == uri) return
             // Still allow as seed-only when artist is blocked? No — skip entirely.
             val t = DjQueueTrack(
@@ -7073,7 +7450,7 @@ class SpotifyLiveDjService : Service() {
                         // Seed for song_radio expansion only — not a queue candidate
                         val arts = artistsOf(t)
                         val aUri = artistUriOf(t)
-                        val blocked = honorExcluded && isDisliked(uri, ids, arts, aUri)
+                        val blocked = honorExcluded && isDisliked(uri, ids, arts, aUri, t.optString("name", ""))
                         if (uri.isNotBlank() && !blocked) {
                             seedTracks.add(
                                 DjQueueTrack(
@@ -7478,14 +7855,13 @@ class SpotifyLiveDjService : Service() {
         val picks = json.optJSONArray("picks") ?: return null
         val byUri = sample.associateBy { it.uri }
         val honorHistory = store.isQueueSourceEnabled(DjQueueSource.History)
-        val honorExcluded = store.isQueueSourceEnabled(DjQueueSource.Excluded)
         val out = ArrayList<DjQueueTrack>()
         for (i in 0 until picks.length()) {
             val p = picks.optJSONObject(i) ?: continue
             val uri = p.optString("uri", "")
             val hit = byUri[uri] ?: continue
             if (honorHistory && isPlayed(hit.uri)) continue
-            if (honorExcluded && isDisliked(hit)) continue
+            if (isDisliked(hit)) continue
             // Keep original pool reason (liked / top / artist radio / chat:…) for attribution.
             // Never let AI banter_note overwrite source — that made the DJ claim "you queued" DJ picks.
             out.add(hit)
@@ -7518,16 +7894,15 @@ class SpotifyLiveDjService : Service() {
                 pendingBanterForUri = null
                 val cleaned = sanitizeSpoken(pending)
                 if (cleaned.isNotBlank() && looksLikeSpokenLine(cleaned)) {
-                    return cleaned.take(320)
+                    return cleaned.take(900)
                 }
             } else {
-                // Stale or unkeyed — never speak a line that names the wrong cut.
+                // Leave it — 2-ahead generate is for a later URI; pending stays
+                // keyed to the current head until invalidate or consume.
                 Log.i(
                     TAG,
-                    "skip pending banter (for=$pendingUri next=${next?.uri})",
+                    "leave pending banter (for=$pendingUri next=${next?.uri})",
                 )
-                pendingBanter = null
-                pendingBanterForUri = null
             }
         }
         val ai = aiBanterLine(
@@ -7537,8 +7912,15 @@ class SpotifyLiveDjService : Service() {
             upcoming = upcoming,
             tracksUntilTalk = tracksUntilTalk,
         )
-        if (!ai.isNullOrBlank()) return sanitizeSpoken(ai).take(360)
-        return localBanterLine(prev, next)
+        val local = localBanterLine(
+            prev,
+            next,
+            talkingPointHint = collectBanterTalkingPoints(store.loadPromptTemplates())
+                .filter { !it.builtIn }
+                .joinToString(" · ") { it.label }
+                .take(80),
+        )
+        return chooseSpokenBanter(ai, local)
     }
 
     /**
@@ -7582,7 +7964,10 @@ class SpotifyLiveDjService : Service() {
         val nameLine = listenerName.trim()
         // Random pack from user-enabled research templates (custom + built-in).
         val angleTemplates = pickResearchTemplates(store.loadPromptTemplates())
-        val angleLabels = angleTemplates.joinToString(" + ") { it.label }
+        val customAngles = angleTemplates.filter { !it.builtIn }
+        val angleLabels = angleTemplates.joinToString(" + ") { t ->
+            if (t.builtIn) t.label else "${t.label} (custom)"
+        }
         val angleIds = angleTemplates.map { it.id }.toSet()
         val angleBriefs = buildString {
             angleTemplates.forEachIndexed { i, a ->
@@ -7590,14 +7975,21 @@ class SpotifyLiveDjService : Service() {
                     a.body,
                     mapOf("CITY" to cityLine.ifBlank { "(not set)" }),
                 )
-                append("${i + 1}) $brief\n")
+                val tag = if (a.builtIn) "" else " [CUSTOM — put findings in custom_notes/news]"
+                append("${i + 1}) ${a.label}$tag: $brief\n")
             }
         }
         val system = applyPromptPlaceholders(
             store.systemTemplate(DjPromptKind.ResearchSystem).body
                 .ifBlank { DjPromptDefaults.researchSystem().body },
             mapOf("ANGLE_BRIEFS" to angleBriefs.trimEnd()),
-        )
+        ) + if (customAngles.isNotEmpty()) {
+            "\nCUSTOM ANGLES ARE REQUIRED this turn (${customAngles.joinToString { it.label }}). " +
+                "Put those findings in custom_notes (and news if they are news). " +
+                "Do not ignore a custom angle because it is not a song/album field."
+        } else {
+            ""
+        }
 
         val prompt = buildString {
             appendLine("RESEARCH ANGLES THIS TURN: $angleLabels")
@@ -7647,8 +8039,19 @@ class SpotifyLiveDjService : Service() {
             appendLine(
                 "Use web search / tools now for: $angleLabels. " +
                     "Skip angles not listed. " +
+                    if (customAngles.isNotEmpty()) {
+                        "Custom angles MUST produce custom_notes (and news if applicable). "
+                    } else {
+                        ""
+                    } +
                     if (cityLine.isNotBlank() &&
-                        angleIds.any { it.contains("show") || it.contains("tour") }
+                        (
+                            angleIds.any { it.contains("show") || it.contains("tour") } ||
+                                angleTemplates.any {
+                                    it.body.contains("SHOW", ignoreCase = true) ||
+                                        it.body.contains("TOUR", ignoreCase = true)
+                                }
+                            )
                     ) {
                         "For shows: check near $cityLine AND broader tour news."
                     } else {
@@ -7660,98 +8063,131 @@ class SpotifyLiveDjService : Service() {
         val opts = JSONObject()
             .put("system", system)
             .put("session_title", "· Spotify Live DJ Research")
+            // Tools + JSON — xhigh often times out or talks process instead of filling custom_notes.
+            .put("reasoning_effort", "medium")
             .toString()
 
         return try {
             val raw = HostAiClient.complete(applicationContext, prompt, opts)
             val env = runCatching { JSONObject(raw) }.getOrNull() ?: return emptyList()
-            if (!env.optBoolean("ok")) {
+            val text = hostAiCompletionText(env)
+            if (text.isBlank()) {
                 Log.w(TAG, "research facts failed: ${env.optString("error")}")
                 return emptyList()
             }
-            val text = env.optString("text", "").trim()
-            if (text.isBlank()) return emptyList()
-            val json = extractJson(text) ?: return emptyList()
-            val out = ArrayList<String>(14)
-            // Tag so banter knows what this pack focused on.
-            out.add("Research focus: $angleLabels")
-
-            fun addLabeled(label: String, value: String, max: Int = 180) {
-                val v = value.trim()
-                if (v.isNotBlank()) out.add("$label: ${v.take(max)}")
-            }
+            val json = extractDjJsonObject(text) ?: return emptyList()
             val wantLyrics = angleIds.any {
                 it.contains("lyric") || it.contains("theme") || it.contains("meaning")
             }
-            if (wantLyrics) {
-                addLabeled("Current song theme", json.optString("current_lyrics_theme", ""))
-                addLabeled("Next song theme", json.optString("next_lyrics_theme", ""))
-            }
-
-            // Always surface Spotify album meta we already know.
-            if (nextAlbum.isNotBlank()) {
-                val y = if (nextYear.isNotBlank()) " ($nextYear)" else ""
-                out.add("Next album: $nextAlbum$y")
-            }
-            if (prevAlbum.isNotBlank() && !prevAlbum.equals(nextAlbum, ignoreCase = true)) {
-                val y = if (prevYear.isNotBlank()) " ($prevYear)" else ""
-                out.add("Current album: $prevAlbum$y")
-            }
-
-            fun drainArray(key: String, prefix: String?, limit: Int) {
-                val arr = json.optJSONArray(key) ?: return
-                var n = 0
-                for (i in 0 until arr.length()) {
-                    if (n >= limit) break
-                    val f = arr.optString(i, "").trim()
-                    if (f.isBlank()) continue
-                    out.add(if (prefix != null) "$prefix: ${f.take(160)}" else f.take(160))
-                    n++
-                }
-            }
-            val wantAlbumArtist = angleIds.any {
-                it.contains("album") || it.contains("song_fact") || it.contains("artist_fact") ||
-                    it.contains("fact")
-            }
-            if (wantAlbumArtist || angleTemplates.isNotEmpty()) {
-                // Always try structured fields when present — custom angles may still fill them.
-                drainArray("album_facts", "Album", 2)
-                drainArray("facts", null, 4)
-            }
-            if (angleIds.any { it.contains("show") || it.contains("tour") } || angleTemplates.any {
+            val wantShows = angleIds.any { it.contains("show") || it.contains("tour") } ||
+                angleTemplates.any {
                     it.body.contains("SHOWS", ignoreCase = true) ||
                         it.body.contains("TOUR", ignoreCase = true)
                 }
-            ) {
-                drainArray("shows", "Upcoming", 3)
-            }
-            if (angleIds.any { it.contains("x_social") || it.contains("social") } ||
+            val wantSocial = angleIds.any { it.contains("x_social") || it.contains("social") } ||
                 angleTemplates.any {
                     it.body.contains("X / SOCIAL", ignoreCase = true) ||
                         it.body.contains("X/social", ignoreCase = true)
                 }
-            ) {
-                drainArray("x_social", "X/social", 3)
-            }
-            if (angleIds.any { it.contains("radio") || it.contains("host") || it.contains("color") } ||
-                angleTemplates.any { it.body.contains("RADIO HOST", ignoreCase = true) }
-            ) {
-                drainArray("radio_color", "Host color", 3)
-            }
-            drainArray("setlist_tease", "Later in set", 2)
-            // Flat fallback if angle fields empty
-            if (out.size <= 2) {
-                drainArray("bullets", null, 4)
+            val wantRadio = angleIds.any {
+                it.contains("radio") || it.contains("host") || it.contains("color")
+            } || angleTemplates.any { it.body.contains("RADIO HOST", ignoreCase = true) }
+            val wantAlbumArtist = angleIds.any {
+                it.contains("album") || it.contains("song_fact") || it.contains("artist_fact") ||
+                    it.contains("fact")
+            } || angleTemplates.isNotEmpty()
+            val customLabels = customAngles.map { it.label }
+            var out = formatDjResearchBullets(
+                json = json,
+                angleLabels = angleLabels,
+                customAngleLabels = customLabels,
+                nextAlbum = nextAlbum,
+                nextYear = nextYear,
+                prevAlbum = prevAlbum,
+                prevYear = prevYear,
+                includeLyrics = wantLyrics,
+                includeShows = wantShows,
+                includeSocial = wantSocial,
+                includeRadio = wantRadio,
+                includeAlbumArtist = wantAlbumArtist,
+            )
+            if (djResearchNeedsCustomRetry(out, customLabels)) {
+                val retryJson = researchCustomAngleOnly(
+                    customAngles = customAngles,
+                    city = cityLine,
+                    listenerName = nameLine,
+                )
+                if (retryJson != null) {
+                    val extra = formatDjResearchBullets(
+                        json = retryJson,
+                        angleLabels = "",
+                        customAngleLabels = customLabels,
+                    )
+                    val merged = ArrayList<String>(out.size + extra.size)
+                    merged.addAll(out)
+                    extra.filter { line ->
+                        !line.startsWith("Research focus", ignoreCase = true) &&
+                            merged.none { it.equals(line, ignoreCase = true) }
+                    }.forEach { merged.add(it) }
+                    out = merged
+                }
             }
             Log.i(
                 TAG,
                 "research facts next=“$nextArtist/$nextSong” angles=[$angleLabels] " +
-                    "city=$cityLine name=$nameLine → ${out.size} bullets",
+                    "city=$cityLine name=$nameLine → ${out.size} bullets " +
+                    "customBeat=${researchHasUsableCustomBeat(out)}",
             )
             out
         } catch (e: Exception) {
             Log.w(TAG, "researchMusicFacts: ${e.message}")
             emptyList()
+        }
+    }
+
+    /** Second-pass research when custom angles were requested but produced no notes. */
+    private fun researchCustomAngleOnly(
+        customAngles: List<DjPromptTemplate>,
+        city: String,
+        listenerName: String,
+    ): JSONObject? {
+        if (customAngles.isEmpty()) return null
+        val briefs = customAngles.joinToString("\n") { a ->
+            val body = applyPromptPlaceholders(
+                a.body,
+                mapOf("CITY" to city.ifBlank { "(not set)" }),
+            )
+            "- ${a.label}: $body"
+        }
+        val prompt = buildString {
+            appendLine("CUSTOM RESEARCH ONLY. Use web search. Reply JSON only.")
+            appendLine("Listener city (location, not a name): ${city.ifBlank { "(not set)" }}")
+            appendLine("Listener name: ${listenerName.ifBlank { "(not set)" }}")
+            appendLine("Angles:")
+            appendLine(briefs)
+            appendLine(
+                """Reply: {"custom_notes":["≤28 words"],"news":["≤22 words if news"]}""",
+            )
+            appendLine("Fill custom_notes (and news if the angle is news). No song trivia.")
+        }
+        val opts = JSONObject()
+            .put(
+                "system",
+                "You are a news/research desk for a live radio DJ. JSON only. " +
+                    "Never invent headlines. Use tools.",
+            )
+            .put("session_title", "· Spotify Live DJ Research")
+            .put("reasoning_effort", "medium")
+            .toString()
+        return try {
+            val raw = HostAiClient.complete(applicationContext, prompt, opts)
+            val env = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+            val text = hostAiCompletionText(env)
+            if (text.isBlank()) return null
+            extractDjJsonObject(text)
+        } catch (e: Exception) {
+            Log.w(TAG, "researchCustomAngleOnly: ${e.message}")
+            null
         }
     }
 
@@ -7827,8 +8263,10 @@ class SpotifyLiveDjService : Service() {
             tracksUntilTalk = tracksUntilTalk,
         )
 
+        val talkingPointsEarly = collectBanterTalkingPoints(store.loadPromptTemplates())
         val wordCap = when {
             unhingedMode -> 75
+            talkingPointsEarly.any { !it.builtIn } -> 70
             behaviorTpl.id == "comedy" -> 55
             behaviorTpl.id == "soothing" -> 48
             else -> 52
@@ -7858,110 +8296,68 @@ class SpotifyLiveDjService : Service() {
 
         val nextSource = queueSourceLabel(reason)
         val prevSource = queueSourceLabel(prev?.reason.orEmpty())
+        val talkingPoints = talkingPointsEarly
+        val talkingBlock = formatBanterTalkingPointsBlock(talkingPoints, city)
 
-        val system = applyPromptPlaceholders(
-            store.systemTemplate(DjPromptKind.BanterSystem).body
-                .ifBlank { DjPromptDefaults.banterSystem().body },
-            mapOf(
-                "WORD_CAP" to wordCap.toString(),
-                "BEHAVIOR_STYLE" to behaviorStyle,
-                "UNHINGED_EXTRA" to unhingedTaste,
-                "NAME_BLOCK" to nameBlock,
+        val system = appendBanterTalkingPointsToSystem(
+            applyPromptPlaceholders(
+                store.systemTemplate(DjPromptKind.BanterSystem).body
+                    .ifBlank { DjPromptDefaults.banterSystem().body },
+                mapOf(
+                    "WORD_CAP" to wordCap.toString(),
+                    "BEHAVIOR_STYLE" to behaviorStyle,
+                    "UNHINGED_EXTRA" to unhingedTaste,
+                    "NAME_BLOCK" to nameBlock,
+                ),
             ),
+            talkingBlock,
         )
 
-        val prompt = buildString {
-            appendLine("Behavior mode: $behaviorLabel")
-            appendLine(
-                "LISTENER NAME (person to address — NOT a place): " +
-                    listenerName.ifBlank { "(not set — say you/folks, never use city as name)" },
-            )
-            appendLine(
-                "LISTENER CITY (location only for shows/local color — NEVER a greeting name): " +
-                    city.ifBlank { "(not set)" },
-            )
-            val gens = store.selectedGenres
-            if (gens.isNotEmpty()) appendLine("Genre board (taste signal): ${gens.joinToString(", ")}")
-            appendLine("Just played:")
-            if (prev != null) {
-                appendLine("  raw title: ${prev.name}")
-                appendLine("  clean title: $prevTitle")
-                appendLine("  artists field: ${prev.artists}")
-                appendLine("  primary artist: $prevArtist")
-                appendLine("  SOURCE: $prevSource")
-                if (prev.reason.isNotBlank()) appendLine("  pick detail: ${prev.reason}")
-            } else {
-                appendLine("  (cold open / nothing specific)")
-            }
-            appendLine("Up next:")
-            if (next != null) {
-                appendLine("  raw title: ${next.name}")
-                appendLine("  clean title: $nextTitle")
-                appendLine("  artists field: $nextAllArtists")
-                appendLine("  primary artist: $nextArtist")
-                appendLine("  SOURCE: $nextSource")
-                if (reason.isNotBlank()) {
-                    appendLine(
-                        "  pick detail (internal — seed/radio reason, NOT proof the listener queued it): $reason",
-                    )
-                }
-            } else {
-                appendLine("  (still digging in the library)")
-            }
-            appendLine()
-            appendLine(
-                "BANTER COUNTDOWN: you are speaking at this handoff " +
-                    "(tracks-until-talk was $tracksUntilTalk before this line).",
-            )
-            val look = upcoming.filter { it.uri != next?.uri }.take(5)
-            if (look.isNotEmpty()) {
-                appendLine("SETLIST AHEAD (after the immediate next cut — tease 0–1 if natural):")
-                look.forEachIndexed { i, t ->
-                    appendLine(
-                        "  +${i + 2}: ${cleanTitle(t.name)} — ${primaryArtist(t.artists)}",
-                    )
-                }
-                appendLine(
-                    "Like a real radio DJ you MAY briefly tease something later " +
-                        "(\"after this we've got…\") but always introduce the IMMEDIATE next cut clearly.",
-                )
-            }
-            appendLine()
-            if (research.isNotEmpty()) {
-                appendLine(
-                    "RESEARCH (random angle pack this cycle — use at most one beat if it fits):",
-                )
-                research.forEachIndexed { i, f -> appendLine("  ${i + 1}. $f") }
-            } else {
-                appendLine("RESEARCH: (none solid — pure handoff, no invented news)")
-            }
-            appendLine()
-            appendLine(
-                "Write the on-air line in $behaviorLabel style: close out the previous vibe, " +
-                    "optionally drop one researched beat (whichever angle this pack has), " +
-                    if (unhingedMode) {
-                        "roast their taste, "
-                    } else {
-                        ""
-                    } +
-                    "then introduce the next track clearly. " +
-                    "Filter delivery through $behaviorLabel personality only after research is chosen.",
-            )
-            appendLine("On-air DJ line only:")
-        }
+        val look = upcoming.filter { it.uri != next?.uri }.take(5)
+        val prompt = buildBanterUserPrompt(
+            DjBanterUserPromptInput(
+                behaviorLabel = behaviorLabel,
+                listenerName = listenerName,
+                city = city,
+                genres = store.selectedGenres,
+                prevRawTitle = prev?.name.orEmpty(),
+                prevCleanTitle = prevTitle,
+                prevArtists = prev?.artists.orEmpty(),
+                prevPrimary = prevArtist,
+                prevSource = prevSource,
+                prevReason = prev?.reason.orEmpty(),
+                nextRawTitle = next?.name.orEmpty(),
+                nextCleanTitle = nextTitle,
+                nextArtists = nextAllArtists,
+                nextPrimary = nextArtist,
+                nextSource = nextSource,
+                nextReason = reason,
+                tracksUntilTalk = tracksUntilTalk,
+                upcoming = look.map { cleanTitle(it.name) to primaryArtist(it.artists) },
+                research = research,
+                talkingPoints = talkingPoints,
+                unhinged = unhingedMode,
+                hasPrev = prev != null,
+                hasNext = next != null,
+            ),
+        )
 
         val opts = JSONObject()
             .put("system", system)
             .put("session_title", "· Spotify Live DJ Banter")
+            // High is enough for a 1–3 sentence line; xhigh often never finishes in time.
+            .put("reasoning_effort", "high")
             .toString()
         return try {
             val raw = HostAiClient.complete(applicationContext, prompt, opts)
             val res = runCatching { JSONObject(raw) }.getOrNull() ?: return null
-            if (!res.optBoolean("ok")) return null
-            val text = res.optString("text", "").trim()
-            if (text.isBlank()) return null
+            val text = hostAiCompletionText(res)
+            if (text.isBlank()) {
+                Log.w(TAG, "ai banter failed: ${res.optString("error")}")
+                return null
+            }
             // Strip accidental JSON / fences, then drop process-narration sentences.
-            val cleaned = stripMetaNarration(
+            val cleaned = sanitizeSpokenBanter(
                 text
                     .replace(Regex("^```(?:json)?\\s*", RegexOption.IGNORE_CASE), "")
                     .replace(Regex("```\\s*$"), "")
@@ -7969,7 +8365,7 @@ class SpotifyLiveDjService : Service() {
                     .removeSurrounding("\"")
                     .removeSurrounding("'"),
             )
-            if (!looksLikeSpokenLine(cleaned)) return null
+            if (cleaned.isBlank()) return null
             cleaned
         } catch (e: Exception) {
             Log.w(TAG, "ai banter failed: ${e.message}")
@@ -7977,7 +8373,11 @@ class SpotifyLiveDjService : Service() {
         }
     }
 
-    private fun localBanterLine(prev: DjQueueTrack?, next: DjQueueTrack?): String {
+    private fun localBanterLine(
+        prev: DjQueueTrack?,
+        next: DjQueueTrack?,
+        talkingPointHint: String = "",
+    ): String {
         val prevArt = prev?.let { primaryArtist(it.artists) }.orEmpty()
         val nextArt = next?.let { primaryArtist(it.artists) }.orEmpty()
         val nextTitle = next?.let { cleanTitle(it.name) }.orEmpty()
@@ -7995,6 +8395,12 @@ class SpotifyLiveDjService : Service() {
             ).random()
         }
 
+        val mid = if (talkingPointHint.isNotBlank()) {
+            "Holding a beat for $talkingPointHint."
+        } else {
+            ""
+        }
+
         val open = when {
             nextArt.isNotBlank() && nextTitle.isNotBlank() -> listOf(
                 "Up next, $nextArt — here's $nextTitle.",
@@ -8009,77 +8415,12 @@ class SpotifyLiveDjService : Service() {
             else -> "Give me a second while I dig through your library."
         }
 
-        return sanitizeSpoken("$close $open").take(280)
+        return sanitizeSpoken("$close $mid $open").take(900)
     }
 
-    private fun looksLikeSpokenLine(s: String): Boolean {
-        // Evaluate the on-air remainder after dropping process-narration.
-        val body = stripMetaNarration(s).ifBlank { s.trim() }
-        if (body.length < 8 || body.length > 400) return false
-        if (body.startsWith("{") || body.startsWith("[")) return false
-        if (body.contains("```")) return false
-        // Reject if nothing usable remains but the raw text was pure meta.
-        if (isMetaNarrationSentence(body)) return false
-        return true
-    }
+    private fun looksLikeSpokenLine(s: String): Boolean = looksLikeSpokenBanter(s)
 
-    /**
-     * Drop model "thinking out loud" / research-process sentences that leak into
-     * TTS (e.g. "Checking for a real public tidbit… before writing the DJ line.").
-     */
-    private fun stripMetaNarration(s: String): String {
-        val raw = s.trim()
-        if (raw.isEmpty()) return raw
-        // Prefer sentence splits; also split on newlines the model sometimes leaves.
-        val parts = raw
-            .replace(Regex("[\\r\\n]+"), " ")
-            .split(Regex("(?<=[.!?…])\\s+"))
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-        if (parts.isEmpty()) return ""
-        val kept = parts.filterNot { isMetaNarrationSentence(it) }
-        return kept.joinToString(" ").trim()
-    }
-
-    private fun isMetaNarrationSentence(sentence: String): Boolean {
-        val t = sentence.trim()
-        if (t.isEmpty()) return false
-        // Whole-line / sentence openers that are process talk, not radio copy.
-        if (
-            META_NARRATION_OPENER.containsMatchIn(t) ||
-            META_NARRATION_PHRASE.containsMatchIn(t)
-        ) {
-            return true
-        }
-        return false
-    }
-
-    /**
-     * Normalize DJ talk for chat + TTS: collapse whitespace and fix common
-     * model glitches like "word.Next" (missing space after punctuation) or
-     * "word ." (space before punctuation). Also strips process-narration leaks.
-     */
-    private fun sanitizeSpoken(s: String): String {
-        var t = stripMetaNarration(s)
-            .replace('\u00A0', ' ')
-            .replace(Regex("[\\t\\r\\n]+"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        // Strip wrapping quotes the model sometimes adds around the whole line.
-        if ((t.startsWith("\"") && t.endsWith("\"")) || (t.startsWith("'") && t.endsWith("'"))) {
-            t = t.substring(1, t.length - 1).trim()
-        }
-        // No space before sentence / clause punctuation.
-        t = t.replace(Regex("\\s+([,.;:!?…])"), "$1")
-        // Space after sentence-ending punctuation when the next token starts a word.
-        // Avoid digits so we don't break "3.14" / track numbers.
-        t = t.replace(Regex("([.!?…])([A-Za-z\"'“‘])"), "$1 $2")
-        // Space after commas / semicolons / colons when missing (letters only).
-        t = t.replace(Regex("([,;:])([A-Za-z\"'“‘])"), "$1 $2")
-        // Collapse runs of spaces introduced above.
-        t = t.replace(Regex("\\s+"), " ").trim()
-        return t
-    }
+    private fun sanitizeSpoken(s: String): String = sanitizeSpokenBanter(s)
 
     /** Drop (feat./ft./with/…) and trailing - feat tags so TTS doesn't double-credit. */
     private fun cleanTitle(name: String): String {
@@ -8129,14 +8470,15 @@ class SpotifyLiveDjService : Service() {
     private fun isPlayed(uri: String): Boolean = playedUris.containsKey(uri)
 
     private fun isDisliked(t: DjQueueTrack): Boolean =
-        store.isDisliked(t.uri, t.artistIds, t.artists, t.artistUri)
+        store.isDisliked(t.uri, t.artistIds, t.artists, t.artistUri, t.name)
 
     private fun isDisliked(
         uri: String,
         artistIds: List<String> = emptyList(),
         artists: String = "",
         artistUri: String = "",
-    ): Boolean = store.isDisliked(uri, artistIds, artists, artistUri)
+        name: String = "",
+    ): Boolean = store.isDisliked(uri, artistIds, artists, artistUri, name)
 
     /**
      * Persist dislike reasons, purge matching UP NEXT rows, mark the cut heard.
@@ -8161,9 +8503,25 @@ class SpotifyLiveDjService : Service() {
             artistIdFromUri(cur.artistUri)?.let { ids.add(it) }
         }
         artistIdFromUri(artistUri)?.let { ids.add(it) }
-        val name = trackName.ifBlank { if (cur?.uri == uri) cur.name else "" }
-        val arts = artists.ifBlank { if (cur?.uri == uri) cur.artists else "" }
-        val aUri = artistUri.ifBlank { if (cur?.uri == uri) cur.artistUri else "" }
+        var name = trackName.takeIf { djIsUsableLabel(it) }.orEmpty()
+            .ifBlank { if (cur?.uri == uri) cur.name.takeIf { djIsUsableLabel(it) }.orEmpty() else "" }
+        var arts = artists.takeIf { djIsUsableLabel(it) }.orEmpty()
+            .ifBlank { if (cur?.uri == uri) cur.artists.takeIf { djIsUsableLabel(it) }.orEmpty() else "" }
+        var aUri = artistUri.ifBlank { if (cur?.uri == uri) cur.artistUri else "" }
+        if ((!djIsUsableLabel(name) || !djIsUsableLabel(arts) || ids.isEmpty()) && uri.isNotBlank()) {
+            val id = spotifyTrackIdFromUri(uri)
+            if (id.isNotBlank()) {
+                val json = spotifyGet("/v1/tracks/$id").json
+                if (json != null) {
+                    if (!djIsUsableLabel(name)) name = json.optString("name", "")
+                    if (!djIsUsableLabel(arts)) arts = artistsOf(json)
+                    artistIdsOf(json).forEach { if (it.isNotBlank()) ids.add(it) }
+                    if (aUri.isBlank()) {
+                        artistIdsOf(json).firstOrNull()?.let { aUri = "spotify:artist:$it" }
+                    }
+                }
+            }
+        }
 
         val summary = store.applyDislike(
             trackUri = uri,
@@ -8385,18 +8743,7 @@ class SpotifyLiveDjService : Service() {
         return ids
     }
 
-    private fun extractJson(text: String): JSONObject? {
-        if (text.isBlank()) return null
-        val trimmed = text.trim()
-        // fenced block
-        val fence = Regex("```(?:json)?\\s*([\\s\\S]*?)```", RegexOption.IGNORE_CASE)
-            .find(trimmed)
-        val candidate = fence?.groupValues?.getOrNull(1)?.trim() ?: trimmed
-        val start = candidate.indexOf('{')
-        val end = candidate.lastIndexOf('}')
-        if (start < 0 || end <= start) return null
-        return runCatching { JSONObject(candidate.substring(start, end + 1)) }.getOrNull()
-    }
+    private fun extractJson(text: String): JSONObject? = extractDjJsonObject(text)
 
     private data class ApiResult(
         val ok: Boolean,
@@ -8870,17 +9217,44 @@ class SpotifyLiveDjService : Service() {
 
     private fun handleMediaSessionCommand(kind: String) {
         if (SystemClock.elapsedRealtime() < ignoreMediaButtonsUntilMs) return
+        if (kind == "next" && (skipInFlight || transitioning.get())) {
+            abortBanter.set(true)
+            forceBanter = false
+            HostAiClient.stopSpeaking(this)
+            publish(status = "Hard skip — cutting research/banter", persist = false)
+            Log.i(TAG, "mediaSession next during handoff — hard skip")
+            return
+        }
         if (!mediaSessionBusy.compareAndSet(false, true)) {
-            Log.d(TAG, "mediaSession busy, drop $kind")
+            if (kind == "next") {
+                abortBanter.set(true)
+                forceBanter = false
+                HostAiClient.stopSpeaking(this)
+                publish(status = "Hard skip — cutting research/banter", persist = false)
+            } else {
+                Log.d(TAG, "mediaSession busy, drop $kind")
+            }
             return
         }
         Log.i(TAG, "mediaSession command=$kind")
         when (kind) {
             "next" -> {
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val doubleTap = lastSkipRequestMs > 0L &&
+                    nowElapsed - lastSkipRequestMs < DOUBLE_SKIP_MS
+                lastSkipRequestMs = nowElapsed
                 forceBanter = false
+                skipInFlight = true
+                val reason = if (doubleTap) {
+                    abortBanter.set(true)
+                    HostAiClient.stopSpeaking(this)
+                    "hard_skip"
+                } else {
+                    "skip"
+                }
                 scope.launch {
                     try {
-                        runTransition("skip")
+                        runTransition(reason)
                     } finally {
                         mediaSessionBusy.set(false)
                         syncMediaSession(force = true)
@@ -9201,6 +9575,8 @@ class SpotifyLiveDjService : Service() {
         const val ACTION_DJ_SKIP = "io.grokify.os.SPOTIFY_DJ_SKIP"
         /** Intent extra for [ACTION_DJ_SKIP]: true = Skip + talk (force banter). */
         const val EXTRA_FORCE_TALK = "force_talk"
+        /** Intent extra for [ACTION_DJ_SKIP]: true = silent skip, cut research/banter. */
+        const val EXTRA_HARD_SKIP = "hard_skip"
         const val ACTION_DJ_REFILL = "io.grokify.os.SPOTIFY_DJ_REFILL"
         const val ACTION_DJ_NEW_QUEUE = "io.grokify.os.SPOTIFY_DJ_NEW_QUEUE"
         const val ACTION_DJ_REMOVE_TRACK = "io.grokify.os.SPOTIFY_DJ_REMOVE_TRACK"

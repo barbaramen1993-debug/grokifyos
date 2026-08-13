@@ -8,6 +8,7 @@ import io.grokify.os.GrokifyApp
 import io.grokify.os.apps.plugin.BuiltinPluginCatalog
 import io.grokify.os.apps.plugin.isInternalAppSessionTitle
 import io.grokify.os.chat.BridgeClient
+import io.grokify.os.chat.ChatHistoryWindow
 import io.grokify.os.chat.GrokReasoning
 import io.grokify.os.data.ApiKeyEntry
 import io.grokify.os.data.ApiKeyIds
@@ -3041,9 +3042,11 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun buildHistoryPayload(sid: String): List<JSONObject> {
         return try {
-            val h = withContext(Dispatchers.IO) { api.listMessages(sid) }
+            val h = withContext(Dispatchers.IO) {
+                api.listMessages(sid, limit = ChatHistoryWindow.MAX_MESSAGES + 2)
+            }
             val arr = h.optJSONArray("messages") ?: return emptyList()
-            val out = mutableListOf<JSONObject>()
+            val raw = mutableListOf<ChatHistoryWindow.Turn>()
             for (i in 0 until arr.length()) {
                 val m = arr.optJSONObject(i) ?: continue
                 if (m.optInt("excluded_from_context", 0) != 0) continue
@@ -3053,22 +3056,27 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 if (role == "assistant" && meta?.optBoolean("streaming") == true) continue
                 var content = m.optString("content")
                 if (role == "assistant" && meta != null) {
-                    content = expandAssistantContent(content, meta)
+                    content = expandAssistantContent(content, meta, forContext = true)
                 }
-                // Skip trailing user message we just saved (same text last)
-                out += JSONObject().put("role", role).put("content", content)
+                raw += ChatHistoryWindow.Turn(role, content)
             }
             // Drop last if it's the just-sent user message (keep prior context)
-            if (out.isNotEmpty() && out.last().optString("role") == "user") {
-                out.removeAt(out.lastIndex)
+            if (raw.isNotEmpty() && raw.last().role == "user") {
+                raw.removeAt(raw.lastIndex)
             }
-            out
+            ChatHistoryWindow.fit(raw).map { t ->
+                JSONObject().put("role", t.role).put("content", t.content)
+            }
         } catch (_: Exception) {
             emptyList()
         }
     }
 
-    private fun expandAssistantContent(content: String, meta: JSONObject): String {
+    private fun expandAssistantContent(
+        content: String,
+        meta: JSONObject,
+        forContext: Boolean = false,
+    ): String {
         val timeline = meta.optJSONArray("timeline")
         if (timeline != null && timeline.length() > 0) {
             val parts = mutableListOf<String>()
@@ -3076,15 +3084,22 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
                 val seg = timeline.optJSONObject(i) ?: continue
                 when (seg.optString("type")) {
                     "thinking" -> {
+                        if (forContext) continue
                         val c = seg.optString("content")
                         if (c.isNotBlank()) parts += "<thinking>\n$c\n</thinking>"
                     }
                     "tool" -> {
-                        parts += "[${seg.optString("tool")}] ${seg.optString("detail")} → ${
-                            seg.optString("info").ifBlank {
-                                if (seg.optBoolean("success")) "ok" else ""
-                            }
-                        }"
+                        val tool = seg.optString("tool")
+                        val detail = seg.optString("detail")
+                        val info = seg.optString("info").ifBlank {
+                            if (seg.optBoolean("success")) "ok" else ""
+                        }
+                        if (forContext) {
+                            val shortDetail = if (detail.length > 240) detail.take(240) + "…" else detail
+                            parts += "[$tool] $shortDetail"
+                        } else {
+                            parts += "[$tool] $detail → $info"
+                        }
                     }
                     "text" -> {
                         val c = seg.optString("content")
@@ -3095,9 +3110,11 @@ class GrokifyViewModel(app: Application) : AndroidViewModel(app) {
             if (parts.isNotEmpty()) return parts.joinToString("\n\n")
         }
         var result = content
-        val thinking = meta.optString("thinking")
-        if (thinking.isNotBlank()) {
-            result = "<thinking>\n$thinking\n</thinking>\n\n$result"
+        if (!forContext) {
+            val thinking = meta.optString("thinking")
+            if (thinking.isNotBlank()) {
+                result = "<thinking>\n$thinking\n</thinking>\n\n$result"
+            }
         }
         return result
     }

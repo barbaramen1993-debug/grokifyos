@@ -77,6 +77,35 @@
     return t.charAt(0) === '·' || t.charAt(0) === '•';
   }
 
+  /** Cap WS history so long chats cannot E2BIG the bridge spawn argv. */
+  const HISTORY_MAX_MESSAGES = 20;
+  const HISTORY_MAX_CHARS = 80000;
+  const HISTORY_MSG_MAX_CHARS = 8000;
+
+  function compactHistoryContent(raw) {
+    let s = String(raw || '').replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim();
+    s = s.replace(/\n{3,}/g, '\n\n');
+    if (s.length > HISTORY_MSG_MAX_CHARS) s = '…' + s.slice(-HISTORY_MSG_MAX_CHARS);
+    return s;
+  }
+
+  function fitHistoryWindow(turns) {
+    const cleaned = (turns || [])
+      .map((t) => {
+        const role = String((t && t.role) || '').toLowerCase();
+        if (role !== 'user' && role !== 'assistant' && role !== 'system') return null;
+        const content = compactHistoryContent(t && t.content);
+        if (!content) return null;
+        return { role, content };
+      })
+      .filter(Boolean)
+      .slice(-HISTORY_MAX_MESSAGES);
+    while (cleaned.length > 1 && cleaned.reduce((n, t) => n + t.content.length, 0) > HISTORY_MAX_CHARS) {
+      cleaned.shift();
+    }
+    return cleaned;
+  }
+
   function visibleSessions(sessions) {
     return (sessions || []).filter((s) => !isInternalAppSessionTitle(s && s.title));
   }
@@ -2413,48 +2442,40 @@
     if (useHistory) {
       try {
         const h = await apiGet('/admin-system-chat-messages.php?session_id=' + encodeURIComponent(currentSessionId));
-        history = (h.messages || [])
-          .filter((m) => {
-            if (m.excluded_from_context && m.excluded_from_context !== 0) return false;
-            if (m.role === 'assistant' && m.metadata) {
-              const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata;
-              if (meta && meta.streaming) return false;
-            }
-            return true;
-          })
-          .slice(0, -1)
-          .map((m) => {
-            let content = m.content || '';
-            if (m.role === 'assistant' && m.metadata) {
-              const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata;
-              if (meta && meta.timeline && meta.timeline.length) {
-                const parts = [];
-                meta.timeline.forEach((seg) => {
-                  if (seg.type === 'thinking' && seg.content) {
-                    parts.push('<thinking>\n' + seg.content + '\n</thinking>');
-                  } else if (seg.type === 'tool') {
-                    parts.push(
-                      '[' + (seg.tool || '') + '] ' + (seg.detail || '') + ' → ' + (seg.info || (seg.success ? 'ok' : ''))
-                    );
-                  } else if (seg.type === 'text' && seg.content) {
-                    parts.push(seg.content);
-                  }
-                });
-                content = parts.join('\n\n');
-              } else {
-                if (meta && meta.thinking) {
-                  content = '<thinking>\n' + meta.thinking + '\n</thinking>\n\n' + content;
-                }
-                if (meta && meta.tools && meta.tools.length) {
-                  const toolSummary = meta.tools
-                    .map((t) => '[' + (t.tool || '') + '] ' + (t.detail || '') + ' → ' + (t.info || (t.success ? 'ok' : '')))
-                    .join('\n');
-                  content = '<tool_results>\n' + toolSummary + '\n</tool_results>\n\n' + content;
+        history = fitHistoryWindow(
+          (h.messages || [])
+            .filter((m) => {
+              if (m.excluded_from_context && m.excluded_from_context !== 0) return false;
+              if (m.role === 'assistant' && m.metadata) {
+                const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata;
+                if (meta && meta.streaming) return false;
+              }
+              return true;
+            })
+            .slice(0, -1)
+            .map((m) => {
+              let content = m.content || '';
+              if (m.role === 'assistant' && m.metadata) {
+                const meta = typeof m.metadata === 'string' ? JSON.parse(m.metadata) : m.metadata;
+                if (meta && meta.timeline && meta.timeline.length) {
+                  const parts = [];
+                  meta.timeline.forEach((seg) => {
+                    if (seg.type === 'thinking') return;
+                    if (seg.type === 'tool') {
+                      const detail = String(seg.detail || '');
+                      parts.push(
+                        '[' + (seg.tool || '') + '] ' + (detail.length > 240 ? detail.slice(0, 240) + '…' : detail)
+                      );
+                    } else if (seg.type === 'text' && seg.content) {
+                      parts.push(seg.content);
+                    }
+                  });
+                  content = parts.join('\n\n');
                 }
               }
-            }
-            return { role: m.role, content };
-          });
+              return { role: m.role, content };
+            })
+        );
       } catch (_) {}
     }
 

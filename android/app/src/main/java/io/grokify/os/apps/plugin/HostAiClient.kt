@@ -4,9 +4,14 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.speech.tts.TextToSpeech
 import android.util.Log
+import io.grokify.os.apps.banterPlayWaitMs
+import io.grokify.os.apps.estimateBanterSpeechMs
+import io.grokify.os.apps.estimateMp3DurationFromSize
+import io.grokify.os.apps.pickAudioDurationMs
 import io.grokify.os.BuildConfig
 import io.grokify.os.GrokifyApp
 import io.grokify.os.chat.BridgeClient
@@ -67,6 +72,8 @@ object HostAiClient {
     private val ttsReady = AtomicReference(false)
     private val mediaPlayer = AtomicReference<MediaPlayer?>(null)
     private val focusRequestRef = AtomicReference<AudioFocusRequest?>(null)
+    /** Set by [stopSpeaking] so a blocking [speak] wait unblocks immediately. */
+    private val speakAbort = AtomicBoolean(false)
 
     /** Speech stream attrs — must duck/interrupt Spotify so banter is audible. */
     private fun speechAudioAttributes(): AudioAttributes =
@@ -537,7 +544,28 @@ object HostAiClient {
      * - audio_path: play a previously synthesized file (skips network TTS)
      * - keep_file: keep the mp3 after play (default false; true when synthesize_only)
      */
+    /**
+     * Cut in-progress DJ banter (MediaPlayer + device TTS) so a hard skip
+     * does not wait out the spoken line.
+     */
+    fun stopSpeaking(ctx: Context? = null) {
+        speakAbort.set(true)
+        mediaPlayer.getAndSet(null)?.run {
+            runCatching {
+                stop()
+                release()
+            }
+        }
+        ttsRef.get()?.let { engine ->
+            runCatching { engine.stop() }
+        }
+        if (ctx != null) {
+            runCatching { abandonSpeechFocus(ctx.applicationContext) }
+        }
+    }
+
     fun speak(ctx: Context, text: String?, optionsJson: String? = null): String {
+        speakAbort.set(false)
         val opts = runCatching {
             if (optionsJson.isNullOrBlank()) JSONObject() else JSONObject(optionsJson)
         }.getOrElse { JSONObject() }
@@ -568,6 +596,7 @@ object HostAiClient {
                     wait,
                     talkover,
                     deleteAfter = !keepFile,
+                    expectedDurationMs = durationMs,
                 )
                 JSONObject()
                     .put("ok", true)
@@ -617,7 +646,7 @@ object HostAiClient {
         }
 
         if (synthesizeOnly) {
-            val est = (msg.split(Regex("\\s+")).size * 320L + 1200L).coerceIn(1500L, 45_000L)
+            val est = estimateBanterSpeechMs(msg)
             return JSONObject()
                 .put("ok", false)
                 .put("error", "device_tts_no_synthesize")
@@ -645,16 +674,47 @@ object HostAiClient {
     /** Media duration without playback (ms). 0 if unreadable. */
     private fun measureAudioDurationMs(file: File): Long {
         if (!file.isFile || file.length() <= 0L) return 0L
+        val sizeMs = estimateMp3DurationFromSize(file.length())
+        val mpMs = mediaPlayerDurationMs(file)
+        val metaMs = metadataDurationMs(file)
+        val measured = maxOf(mpMs, metaMs)
+        val picked = pickAudioDurationMs(measuredMs = measured, sizeMs = sizeMs)
+        if (picked != mpMs) {
+            Log.i(
+                TAG,
+                "tts duration mp=${mpMs}ms meta=${metaMs}ms size=${sizeMs}ms → ${picked}ms",
+            )
+        }
+        return picked
+    }
+
+    private fun mediaPlayerDurationMs(file: File): Long {
         val mp = MediaPlayer()
         return try {
             mp.setDataSource(file.absolutePath)
             mp.prepare()
             mp.duration.toLong().coerceAtLeast(0L)
         } catch (e: Exception) {
-            Log.w(TAG, "measureAudioDurationMs: ${e.message}")
+            Log.w(TAG, "mediaPlayerDurationMs: ${e.message}")
             0L
         } finally {
             runCatching { mp.release() }
+        }
+    }
+
+    private fun metadataDurationMs(file: File): Long {
+        val r = MediaMetadataRetriever()
+        return try {
+            r.setDataSource(file.absolutePath)
+            r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+                ?.coerceAtLeast(0L)
+                ?: 0L
+        } catch (e: Exception) {
+            Log.w(TAG, "metadataDurationMs: ${e.message}")
+            0L
+        } finally {
+            runCatching { r.release() }
         }
     }
 
@@ -720,7 +780,14 @@ object HostAiClient {
                             "Pre-baked Grok Voice TTS — play later via audio_path.",
                         )
                 }
-                playAudioFile(ctx, out, wait, talkover, deleteAfter = !keepFile)
+                playAudioFile(
+                    ctx,
+                    out,
+                    wait,
+                    talkover,
+                    deleteAfter = !keepFile,
+                    expectedDurationMs = durationMs,
+                )
                 JSONObject()
                     .put("ok", true)
                     .put("mode", "xai_tts")
@@ -748,6 +815,7 @@ object HostAiClient {
         wait: Boolean,
         talkover: Boolean = false,
         deleteAfter: Boolean = true,
+        expectedDurationMs: Long = 0L,
     ) {
         val done = CountDownLatch(1)
         val focusHeld = AtomicBoolean(false)
@@ -789,10 +857,46 @@ object HostAiClient {
             }
             mediaPlayer.set(mp)
             if (wait) {
-                // Cap wait so a hung MediaPlayer can't freeze the caller forever
-                val ok = done.await(90, TimeUnit.SECONDS)
-                if (!ok) {
-                    Log.w(TAG, "playAudioFile wait timed out")
+                // Wait the real clip (+ pad). The old flat 90s kill cut long news lines.
+                // Poll so [stopSpeaking] (hard skip) unblocks instead of waiting out TTS.
+                // If the player is still going, keep waiting — never stop mid-sentence.
+                var deadline = System.currentTimeMillis() + banterPlayWaitMs(expectedDurationMs)
+                var finished = false
+                while (true) {
+                    if (done.await(200, TimeUnit.MILLISECONDS)) {
+                        finished = true
+                        break
+                    }
+                    if (speakAbort.get()) {
+                        Log.i(TAG, "playAudioFile aborted (hard skip)")
+                        runCatching {
+                            mp.stop()
+                            mp.release()
+                        }
+                        mediaPlayer.compareAndSet(mp, null)
+                        if (deleteAfter) file.delete()
+                        if (focusHeld.getAndSet(false)) abandonSpeechFocus(ctx)
+                        done.countDown()
+                        finished = true
+                        break
+                    }
+                    val now = System.currentTimeMillis()
+                    if (now < deadline) continue
+                    val stillPlaying = runCatching { mp.isPlaying }.getOrDefault(false)
+                    val pos = runCatching { mp.currentPosition.toLong() }.getOrDefault(-1L)
+                    if (stillPlaying) {
+                        Log.i(
+                            TAG,
+                            "playAudioFile extending wait — still playing pos=${pos}ms " +
+                                "expected=${expectedDurationMs}ms",
+                        )
+                        deadline = now + 15_000L
+                        continue
+                    }
+                    Log.w(
+                        TAG,
+                        "playAudioFile wait timed out pos=${pos}ms expected=${expectedDurationMs}ms",
+                    )
                     runCatching {
                         mp.stop()
                         mp.release()
@@ -800,6 +904,7 @@ object HostAiClient {
                     mediaPlayer.compareAndSet(mp, null)
                     if (deleteAfter) file.delete()
                     if (focusHeld.getAndSet(false)) abandonSpeechFocus(ctx)
+                    break
                 }
             }
         } catch (e: Exception) {
@@ -847,15 +952,30 @@ object HostAiClient {
                     }
                 },
             )
-            val code = tts.speak(msg.take(800), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+            val code = tts.speak(msg.take(2000), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
             if (code != TextToSpeech.SUCCESS) {
                 abandonSpeechFocus(ctx)
                 return JSONObject().put("ok", false).put("error", "tts_speak_code_$code")
             }
             if (wait) {
-                // Estimate fallback if listener never fires
-                val estMs = (msg.split(Regex("\\s+")).size * 320L + 1200L).coerceIn(1500L, 45000L)
-                val finished = done.await(estMs + 2000L, TimeUnit.MILLISECONDS)
+                // Estimate fallback if listener never fires — follow the real word count.
+                val estMs = estimateBanterSpeechMs(msg)
+                var deadline = System.currentTimeMillis() + banterPlayWaitMs(estMs)
+                var finished = false
+                while (true) {
+                    if (done.await(200, TimeUnit.MILLISECONDS)) {
+                        finished = true
+                        break
+                    }
+                    if (speakAbort.get()) {
+                        runCatching { tts.stop() }
+                        abandonSpeechFocus(ctx)
+                        done.countDown()
+                        finished = true
+                        break
+                    }
+                    if (System.currentTimeMillis() >= deadline) break
+                }
                 if (!finished) abandonSpeechFocus(ctx)
             } else {
                 // Non-blocking: abandon after estimated duration so Spotify can resume later

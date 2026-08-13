@@ -427,6 +427,56 @@ Issues and PRs welcome. Prefer small, focused changes. Keep secrets out of the t
 
 Android host versions (`versionName` / `versionCode` in `android/app/build.gradle.kts`). Wear and watch-face channels keep **independent** version streams (`android/wear`, `android/wear-face`). Newest first. OTA notes on the phone/watch come from `publish.sh --changelog`; this section is the longer human history.
 
+### 0.1.273 — Live DJ: custom banter no longer replaced by the canned fallback
+
+**Phone host `0.1.273` (versionCode 273)** — Spotify Live DJ inner app + chat/bridge history cap.
+
+- A real AI line was being thrown out: anything over **400 characters**, or a sentence with everyday radio/news wording (`let me`, `tool`, `verifying that`), counted as “process talk” and the booth spoke the canned “finishing up with some X / up next Y” instead.
+- Spoken lines may now be up to **900 characters**. Only true research-process leaks are stripped.
+- Research JSON is parsed even when the model thinks out loud first. A custom angle with no `custom_notes`/`news` is retried once. Timeout partials are used.
+- Live handoff waits up to **90s** when a custom angle is still researching, and will research at the mic if the bake missed — it no longer skips straight to the local fallback.
+- **Chat / bridge:** long sessions no longer pass the whole history as `grok -p` (that hit Linux `MAX_ARG_STRLEN` / `E2BIG` and killed the worker). Android sends a capped window (last **20** turns, **80k** chars, thinking stripped). The bridge clips prompt + history and keeps the argv `-p` under the kernel limit.
+
+### 0.1.272 — Live DJ: long banter is not cut off
+
+**Phone host `0.1.272` (versionCode 272)** — Spotify Live DJ inner app.
+
+- Banter length no longer clamps to **18s**. Word-count estimate, baked TTS duration, and MP3 size are combined so a long custom-angle clip keeps its real length.
+- Talk-over starts with enough outro for that clip (up to 90s). If the line will outlast the track, Spotify is paused so autoplay cannot talk over the last sentences.
+- TTS wait follows the clip (and keeps waiting while audio is still playing) instead of killing the player at 90s.
+
+### 0.1.270 — Live DJ: bake banter two songs ahead
+
+**Phone host `0.1.270` (versionCode 270)** — Spotify Live DJ inner app.
+
+- Research + TTS start when talk is **two songs away** and the clip is **held** until that handoff.
+- Silent skip/advance of the earlier cut keeps the bake. Skip on the song *before* banter plays the ready clip immediately, then the next track as usual.
+- Double-tap / hard skip still dumps the hold and jumps.
+
+### 0.1.269 — Live DJ: Banter bits + custom/edited templates actually go on-air
+
+**Phone host `0.1.269` (versionCode 269)** — Spotify Live DJ inner app.
+
+- Spoken lines were hardcoded to “close the last song, name the next one,” so Banter system edits and custom templates never landed on-air.
+- Each cycle now builds **required talking points**: enabled custom **Banter bits** always fire; built-ins rotate; custom research angles (e.g. USA news) are required beats, not optional color.
+- Settings → Prompt templates → **Banter bits** to enable/edit, or **+ Add banter bit**. The Banter system template is still the rules layer.
+
+### 0.1.268 — Live DJ: BLOCKS tab shows song name + artists
+
+**Phone host `0.1.268` (versionCode 268)** — Spotify Live DJ inner app.
+
+- BLOCKS was storing Spotify URIs only, so the list showed the last 22 characters of each URI (the track id).
+- Rows now show **song name — artist(s)** (and real names in the artist list). Opening the tab backfills titles from DJ chat / queue, then Spotify, and saves them. New dislikes store title and credits up front.
+
+### 0.1.267 — Live DJ: custom research, hard skip, dislike blocks
+
+**Phone host `0.1.267` (versionCode 267)** — Spotify Live DJ inner app.
+
+- **Custom research angles always fire** when enabled (they are no longer a 1-in-7 lottery). Findings land in `custom_notes` / `news` and banter is required to use them instead of glossing over with a song fact.
+- **Double-tap skip** (booth, queue SKIP+TALK, headset next) cuts upcoming research / banter and plays the next cut now.
+- **Dislikes stick**: remasters and `Artist & Guest` vs `Artist, Guest` match the same block; counts + last-seen timestamps; tired cooldown is title-aware. The queue-system “Disliked” chip can no longer be turned off (that used to re-queue blocked artists).
+- New Live DJ tab **BLOCKS** to list / clear songs, artists, and 14-day cooldowns.
+
 ### 0.1.266 — grok-4.6 default + per-model reasoning effort
 
 **Phone host `0.1.266` (versionCode 266)** — Settings → **MODEL** now has a **REASONING** row. Options follow the selected Grok Build model so `grok-4.5` never receives `xhigh` (that combination is a CLI error).

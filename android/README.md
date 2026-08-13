@@ -148,7 +148,7 @@ See root **[README.md § Changelog](../README.md#changelog)** for full history. 
 
 | Channel | versionName | versionCode | Notes |
 |---------|-------------|-------------|--------|
-| **phone** | **0.1.265** | **265** | Watch Deploy, multi-channel OTA, Data Layer key/token sync |
+| **phone** | **0.1.273** | **273** | Live DJ: custom research / Banter bits, hard skip, BLOCKS, two-song bake; chat history cap |
 | **wear** | **0.1.8** | **8** | Standalone AI + radial HUD; on-watch Update app |
 | **wear-face** | **0.1.1** | **1** | WFF always-on face (time + HR/steps complications) |
 | phone | 0.1.250 | 250 | Grok logout + re-login; Companion world; Android Auto |

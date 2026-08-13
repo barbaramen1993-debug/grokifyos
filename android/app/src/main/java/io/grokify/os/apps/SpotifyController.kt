@@ -1985,7 +1985,7 @@ fun SpotifyControllerPane(
         mutableStateOf(!HostApiKeyStore.getValue(appCtx, ApiKeyIds.SPACEXAI).isNullOrBlank())
     }
     var djChatDraft by remember { mutableStateOf("") }
-    /** 0 = Chat, 1 = Queue, 2 = Settings (inner Live DJ tabs) */
+    /** 0 = Chat, 1 = Queue, 2 = Blocks, 3 = Settings (inner Live DJ tabs) */
     var djSubTab by remember { mutableStateOf(0) }
     val djChatListState = rememberLazyListState()
 
@@ -2776,6 +2776,7 @@ fun SpotifyControllerPane(
                                         name = now.title,
                                         artists = now.artist,
                                         artistUri = now.artistUri,
+                                        artistIds = listOfNotNull(djSpotifyArtistId(now.artistUri)),
                                         skipIfPlaying = true,
                                     )
                                 },
@@ -3251,7 +3252,7 @@ fun SpotifyControllerPane(
 
                 Spacer(Modifier.height(6.dp))
 
-                // Inner tabs: CHAT · QUEUE · SETTINGS
+                // Inner tabs: CHAT · QUEUE · BLOCKS · SETTINGS
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -3261,10 +3262,15 @@ fun SpotifyControllerPane(
                         .padding(3.dp),
                     horizontalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
-                    listOf("CHAT", "QUEUE", "SETTINGS").forEachIndexed { i, label ->
+                    val blockCount = remember(dislikeRevision) {
+                        val (songs, artists, tired) = djStore.dislikeCounts()
+                        songs + artists + tired
+                    }
+                    listOf("CHAT", "QUEUE", "BLOCKS", "SETTINGS").forEachIndexed { i, label ->
                         val selected = djSubTab == i
                         val badge = when (i) {
                             1 -> if (djState.queue.isNotEmpty()) " ${djState.queue.size}" else ""
+                            2 -> if (blockCount > 0) " $blockCount" else ""
                             else -> ""
                         }
                         Box(
@@ -3382,6 +3388,7 @@ fun SpotifyControllerPane(
                                             uri = msgUri,
                                             artists = msg.trackArtists.orEmpty(),
                                             artistUri = msg.artistUri.orEmpty(),
+                                            name = msg.trackName.orEmpty(),
                                         )
                                 }
                                 DjChatBubble(
@@ -3389,6 +3396,7 @@ fun SpotifyControllerPane(
                                     onPrev = { spotifyLiveDjPrevious(appCtx) },
                                     onPauseToggle = { spotifyLiveDjPauseToggle(appCtx) },
                                     onSkip = { spotifyLiveDjSkip(appCtx, forceTalk = false) },
+                                    onHardSkip = { spotifyLiveDjSkip(appCtx, forceTalk = false, hardSkip = true) },
                                     liked = msgLiked,
                                     likeBusy = msgLikeBusy,
                                     disliked = msgDisliked,
@@ -3491,6 +3499,7 @@ fun SpotifyControllerPane(
                                             name = name,
                                             artists = artists,
                                             artistUri = aUri,
+                                            artistIds = listOfNotNull(djSpotifyArtistId(aUri)),
                                             skipIfPlaying = m.isNowPlaying || uri == now.trackUri,
                                         )
                                     },
@@ -3627,8 +3636,18 @@ fun SpotifyControllerPane(
                             ) {
                                 Text("REFILL", color = GrokifyColors.GlowCyan, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                             }
+                            var lastQueueSkipAt by remember { mutableLongStateOf(0L) }
                             TextButton(
-                                onClick = { spotifyLiveDjSkip(appCtx, forceTalk = true) },
+                                onClick = {
+                                    val nowMs = android.os.SystemClock.elapsedRealtime()
+                                    val hard = lastQueueSkipAt > 0L && nowMs - lastQueueSkipAt < 1_600L
+                                    lastQueueSkipAt = nowMs
+                                    spotifyLiveDjSkip(
+                                        appCtx,
+                                        forceTalk = !hard && djState.banterEnabled,
+                                        hardSkip = hard,
+                                    )
+                                },
                             ) {
                                 Text(
                                     if (djState.banterEnabled) "SKIP+TALK" else "SKIP",
@@ -3776,8 +3795,23 @@ fun SpotifyControllerPane(
                                 }
                             }
                         }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "double-tap skip cuts research / banter",
+                            color = GrokifyColors.TextDim,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
                         Spacer(Modifier.height(12.dp))
                     }
+
+                    // ── Blocks / dislikes ────────────────────────────────
+                    2 -> LiveDjBlocksTab(
+                        modifier = Modifier.weight(1f, fill = true),
+                        djStore = djStore,
+                        revision = dislikeRevision,
+                        onRevision = { dislikeRevision += 1 },
+                    )
 
                     // ── Settings ──────────────────────────────────────────
                     else -> LiveDjSettingsTab(
@@ -4604,6 +4638,7 @@ private fun DjChatBubble(
     onPrev: () -> Unit,
     onPauseToggle: () -> Unit,
     onSkip: () -> Unit,
+    onHardSkip: () -> Unit = onSkip,
     liked: Boolean = false,
     likeBusy: Boolean = false,
     disliked: Boolean = false,
@@ -4880,10 +4915,21 @@ private fun DjChatBubble(
                                     tint = GrokifyColors.GlowMint,
                                 )
                             }
-                            IconButton(onClick = onSkip) {
+                            var lastSkipAt by remember { mutableLongStateOf(0L) }
+                            IconButton(
+                                onClick = {
+                                    val nowMs = android.os.SystemClock.elapsedRealtime()
+                                    if (lastSkipAt > 0L && nowMs - lastSkipAt < 1_600L) {
+                                        onHardSkip()
+                                    } else {
+                                        onSkip()
+                                    }
+                                    lastSkipAt = nowMs
+                                },
+                            ) {
                                 Icon(
                                     Icons.Default.SkipNext,
-                                    contentDescription = "Skip (countdown −1, no forced talk)",
+                                    contentDescription = "Skip · double-tap cuts research/banter",
                                     tint = GrokifyColors.TextPrimary,
                                 )
                             }
@@ -5048,6 +5094,221 @@ private fun DjChatBubble(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun LiveDjBlocksTab(
+    modifier: Modifier = Modifier,
+    djStore: SpotifyDjStore,
+    revision: Int,
+    onRevision: () -> Unit,
+) {
+    val songs = remember(revision) { djStore.listBlockedTracks() }
+    val artists = remember(revision) { djStore.listBlockedArtists() }
+    val tired = remember(revision) { djStore.listTiredTracks() }
+    var lookingUp by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        val needs =
+            djStore.listBlockedTracks().any { djBlockedTrackNeedsLabel(it) } ||
+                djStore.listBlockedArtists().any { djBlockedArtistNeedsLabel(it) } ||
+                djStore.listTiredTracks().any { djTiredTrackNeedsLabel(it) }
+        if (!needs) return@LaunchedEffect
+        lookingUp = true
+        val changed = withContext(Dispatchers.IO) {
+            djStore.resolveBlockedLabelsFromSpotify()
+        }
+        lookingUp = false
+        if (changed) onRevision()
+    }
+    Column(
+        modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState()),
+    ) {
+        Text(
+            "DISLIKES & COOLDOWNS",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowAmber,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Songs, artists, and 14-day cooldowns Live DJ will not queue. " +
+                "Counts + last time help catch repeats. Remasters and “A & B” vs “A, B” " +
+                "credit lines match the same block.",
+            color = GrokifyColors.TextDim,
+            fontSize = 10.sp,
+        )
+        if (lookingUp) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Looking up song and artist names…",
+                color = GrokifyColors.GlowCyan,
+                fontSize = 10.sp,
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+
+        Text(
+            "SONGS (${songs.size})",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        Spacer(Modifier.height(4.dp))
+        if (songs.isEmpty()) {
+            Text(
+                "none blocked",
+                color = GrokifyColors.TextMuted,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+            )
+        } else {
+            songs.forEach { t ->
+                DjBlockRow(
+                    title = djBlockedTrackTitle(t),
+                    subtitle = buildString {
+                        val who = djBlockedTrackArtists(t)
+                        if (who.isNotBlank()) append(who)
+                        val why = t.reasons.joinToString(" · ") { DjDislikeReason.label(it) }
+                        if (why.isNotBlank()) {
+                            if (isNotEmpty()) append(" · ")
+                            append(why)
+                        }
+                        append(" · ×${t.count}")
+                        val whenLabel = formatDjRelativeTime(t.lastTs)
+                        if (whenLabel.isNotBlank()) append(" · $whenLabel")
+                    },
+                    onClear = {
+                        djStore.removeBlockedTrack(t.uri)
+                        onRevision()
+                    },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "ARTISTS (${artists.size})",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        Spacer(Modifier.height(4.dp))
+        if (artists.isEmpty()) {
+            Text(
+                "none blocked",
+                color = GrokifyColors.TextMuted,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+            )
+        } else {
+            artists.forEach { a ->
+                DjBlockRow(
+                    title = djBlockedArtistTitle(a),
+                    subtitle = buildString {
+                        append("×${a.count}")
+                        val whenLabel = formatDjRelativeTime(a.lastTs)
+                        if (whenLabel.isNotBlank()) append(" · $whenLabel")
+                        val also = a.aliases
+                            .filter { djIsUsableLabel(it) && it != a.name.trim().lowercase() }
+                            .take(3)
+                        if (also.isNotEmpty()) {
+                            append(" · also ")
+                            append(also.joinToString())
+                        }
+                    },
+                    onClear = {
+                        djStore.removeBlockedArtist(a.key)
+                        onRevision()
+                    },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "TIRED FOR NOW (${tired.size})",
+            style = MaterialTheme.typography.labelSmall,
+            color = GrokifyColors.GlowCyan,
+        )
+        Spacer(Modifier.height(4.dp))
+        if (tired.isEmpty()) {
+            Text(
+                "no cooldowns",
+                color = GrokifyColors.TextMuted,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+            )
+        } else {
+            tired.forEach { t ->
+                DjBlockRow(
+                    title = djTiredTrackTitle(t),
+                    subtitle = buildString {
+                        val who = djTiredTrackArtists(t)
+                        if (who.isNotBlank()) append(who).append(" · ")
+                        append(djTiredRemainingLabel(t.until))
+                        append(" · ×${t.count}")
+                    },
+                    clearLabel = "Allow now",
+                    onClear = {
+                        djStore.removeTiredTrack(t.uri)
+                        onRevision()
+                    },
+                )
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun DjBlockRow(
+    title: String,
+    subtitle: String,
+    clearLabel: String = "Clear",
+    onClear: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                color = GrokifyColors.TextPrimary,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (subtitle.isNotBlank()) {
+                Text(
+                    subtitle,
+                    color = GrokifyColors.TextDim,
+                    fontSize = 10.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        TextButton(onClick = onClear) {
+            Text(clearLabel, color = GrokifyColors.GlowAmber, fontSize = 11.sp)
+        }
+    }
+}
+
+private fun formatDjRelativeTime(ms: Long, now: Long = System.currentTimeMillis()): String {
+    if (ms <= 0L) return ""
+    val delta = (now - ms).coerceAtLeast(0L)
+    val min = 60_000L
+    val hour = 60 * min
+    val day = 24 * hour
+    return when {
+        delta < min -> "just now"
+        delta < hour -> "${delta / min}m ago"
+        delta < day -> "${delta / hour}h ago"
+        delta < 14 * day -> "${delta / day}d ago"
+        else -> formatDjChatTimestamp(ms).substringBefore(" ·")
     }
 }
 
@@ -5887,12 +6148,18 @@ private fun DjQueueSystemSection(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         DjQueueSource.entries.forEach { src ->
-            val on = src.id in queueSourcesOn
+            val lockedOn = src == DjQueueSource.Excluded
+            val on = lockedOn || src.id in queueSourcesOn
             FilterChip(
                 selected = on,
                 onClick = {
+                    if (lockedOn) {
+                        onMsgChange("Dislikes stay on — manage them in the BLOCKS tab")
+                        return@FilterChip
+                    }
                     val next = queueSourcesOn.toMutableSet()
                     if (on) next.remove(src.id) else next.add(src.id)
+                    next.add(DjQueueSource.Excluded.id)
                     onSourcesChange(next)
                     djStore.queueSourcesEnabled = next
                     onMsgChange(
@@ -6139,9 +6406,10 @@ private fun DjPromptTemplatesSection(
     )
     Spacer(Modifier.height(4.dp))
     Text(
-        "Full control: research angles (random pack), behaviors, and the " +
+        "Full control: research angles, banter bits, behaviors, and the " +
             "system prompts for banter / research / chat / queue rank (AI pick). " +
-            "Toggle research angles on for the random list, edit any body, or add your own.",
+            "Enabled custom research + banter bits are always used — they are not " +
+            "a lottery. Built-ins still rotate. Edit any body or add your own.",
         color = GrokifyColors.TextDim,
         fontSize = 10.sp,
     )
@@ -6218,7 +6486,9 @@ private fun DjPromptTemplatesSection(
                         )
                     }
                 }
-                if (promptEditorKind == DjPromptKind.Research) {
+                if (promptEditorKind == DjPromptKind.Research ||
+                    promptEditorKind == DjPromptKind.Banter
+                ) {
                     Switch(
                         checked = tpl.enabled,
                         onCheckedChange = { on ->
@@ -6389,7 +6659,10 @@ private fun DjPromptTemplatesSection(
             }
         }
     }
-    if (promptEditorKind == DjPromptKind.Research || promptEditorKind == DjPromptKind.Behavior) {
+    if (promptEditorKind == DjPromptKind.Research ||
+        promptEditorKind == DjPromptKind.Behavior ||
+        promptEditorKind == DjPromptKind.Banter
+    ) {
         Spacer(Modifier.height(4.dp))
         TextButton(
             onClick = {
@@ -6398,19 +6671,25 @@ private fun DjPromptTemplatesSection(
                 val draft = DjPromptTemplate(
                     id = id,
                     kind = promptEditorKind,
-                    label = if (promptEditorKind == DjPromptKind.Research) {
-                        "Custom angle"
-                    } else {
-                        "Custom behavior"
+                    label = when (promptEditorKind) {
+                        DjPromptKind.Research -> "Custom angle"
+                        DjPromptKind.Banter -> "Custom banter"
+                        else -> "Custom behavior"
                     },
                     blurb = "Your template",
-                    body = if (promptEditorKind == DjPromptKind.Research) {
-                        "CUSTOM ANGLE: Research one vivid, verified fact about " +
-                            "these artists/songs useful for a radio handoff. " +
-                            "≤22 words. City context: {{CITY}}."
-                    } else {
-                        "PERSONALITY: Describe how the DJ should sound on mic. " +
-                            "Keep handoffs clear. No hate speech."
+                    body = when (promptEditorKind) {
+                        DjPromptKind.Research ->
+                            "CUSTOM ANGLE: Research one vivid, verified fact about " +
+                                "these artists/songs useful for a radio handoff. " +
+                                "≤22 words. City context: {{CITY}}."
+                        DjPromptKind.Banter ->
+                            "BANTER BIT: Say this on air this cycle. Cover the topic in " +
+                                "1–2 short clauses, then still name the next cut. " +
+                                "City context: {{CITY}}. Do not invent specific headlines " +
+                                "or scores unless RESEARCH lists them."
+                        else ->
+                            "PERSONALITY: Describe how the DJ should sound on mic. " +
+                                "Keep handoffs clear. No hate speech."
                     },
                     enabled = true,
                     builtIn = false,
@@ -6425,10 +6704,10 @@ private fun DjPromptTemplatesSection(
             },
         ) {
             Text(
-                if (promptEditorKind == DjPromptKind.Research) {
-                    "+ Add research angle"
-                } else {
-                    "+ Add behavior"
+                when (promptEditorKind) {
+                    DjPromptKind.Research -> "+ Add research angle"
+                    DjPromptKind.Banter -> "+ Add banter bit"
+                    else -> "+ Add behavior"
                 },
                 fontSize = 12.sp,
                 color = GrokifyColors.GlowAmber,
