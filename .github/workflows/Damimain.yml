@@ -3,101 +3,130 @@ name: Android CI - Build APK
 on:
   push:
     branches: [ main ]
+    paths:
+      - "android/**"
+      - ".github/workflows/Damimain.yml"
+
   workflow_dispatch:
     inputs:
       variant:
-        description: 'build variant (debug or release)'
-        required: false
-        default: 'debug'
+        description: "Build variant"
+        required: true
+        type: choice
+        options:
+          - debug
+          - release
+        default: debug
+
       target:
-        description: 'target module: phone | wear | wear-face | all'
-        required: false
-        default: 'phone'
+        description: "Target module"
+        required: true
+        type: choice
+        options:
+          - phone
+          - wear
+          - wear-face
+          - all
+        default: phone
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    env:
-      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
-      GRADLE_USER_HOME: ${{ runner.temp }}/.gradle
+    name: Build ${{ inputs.target || 'phone' }} (${{ inputs.variant || 'debug' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.GRADLE_USER_HOME }}
-          key: gradle-cache-${{ runner.os }}-build-
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Install Android command-line tools & SDK
+      - name: Install Android SDK 35
         run: |
-          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
-          cd $ANDROID_SDK_ROOT
-          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o cmdline.zip
-          unzip -q cmdline.zip
-          mkdir -p cmdline-tools/latest
-          mv tools cmdline-tools/latest/
-          export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
-          yes | sdkmanager --licenses
-          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Show Gradle wrapper
-        run: ls -la android/gradlew || true
-
-      - name: Decode signing keystore (optional)
-        if: ${{ secrets.SIGNING_KEY != '' }}
+      - name: Verify Android and Java environment
         run: |
-          echo "Decoding SIGNING_KEY to keystore.jks"
-          base64 --decode <<<"${{ secrets.SIGNING_KEY }}" > $GITHUB_WORKSPACE/keystore.jks
+          java -version
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+          sdkmanager --list_installed | grep -E "platforms;android-35|build-tools;35.0.0" || true
 
-      - name: Make build script executable
-        run: chmod +x android/scripts/build.sh android/scripts/publish.sh || true
+      - name: Make Gradle executable
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          chmod +x ./scripts/build.sh
 
-      - name: Build APK(s)
+      - name: Build selected APK
+        working-directory: android
+        env:
+          VARIANT: ${{ inputs.variant || 'debug' }}
+          TARGET: ${{ inputs.target || 'phone' }}
         run: |
           set -euo pipefail
-          cd android
-          # use workflow_dispatch inputs when invoked manually, default to debug/phone otherwise
-          VARIANT="${{ github.event.inputs.variant || 'debug' }}"
-          TARGET="${{ github.event.inputs.target || 'phone' }}"
+
+          echo "========================================"
+          echo "GrokifyOS Android Build"
+          echo "Variant: $VARIANT"
+          echo "Target:  $TARGET"
+          echo "========================================"
+
           ./scripts/build.sh "$VARIANT" "$TARGET"
-        shell: bash
 
-      - name: Sign release APKs with apksigner (optional)
-        if: ${{ (github.event.inputs.variant == 'release') && (secrets.SIGNING_KEY != '') }}
+      - name: Collect APKs
         run: |
           set -euo pipefail
-          export BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/33.0.2"
-          APKS=(
-            "android/app/build/outputs/apk/release/app-release-unsigned.apk"
-            "android/wear/build/outputs/apk/release/wear-release-unsigned.apk"
-            "android/wear-face/build/outputs/apk/release/wear-face-release-unsigned.apk"
-          )
-          for APK in "${APKS[@]}"; do
-            if [[ -f "$APK" ]]; then
-              SIGNED="${APK/unsigned/signed}"
-              "$BUILD_TOOLS/apksigner" sign \
-                --ks "$GITHUB_WORKSPACE/keystore.jks" \
-                --ks-pass pass:${{ secrets.SIGNING_STORE_PASSWORD }} \
-                --ks-key-alias "${{ secrets.SIGNING_KEY_ALIAS }}" \
-                --key-pass pass:${{ secrets.SIGNING_KEY_PASSWORD }} \
-                --out "$SIGNED" "$APK"
-              echo "Signed: $SIGNED"
-            fi
-          done
+
+          mkdir -p dist
+
+          find android \
+            -type f \
+            -path "*/build/outputs/apk/*.apk" \
+            -print \
+            -exec cp {} dist/ \;
+
+          echo "========================================"
+          echo "Generated APKs:"
+          echo "========================================"
+
+          ls -lh dist
+
+          test -n "$(find dist -name "*.apk" -print -quit)"
+
+          sha256sum dist/*.apk > dist/SHA256SUMS.txt
+
+          echo "========================================"
+          echo "SHA256:"
+          echo "========================================"
+
+          cat dist/SHA256SUMS.txt
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: grokifyos-apks
+          name: grokifyos-${{ inputs.target || 'phone' }}-${{ inputs.variant || 'debug' }}-${{ github.run_number }}
+
           path: |
-            android/app/build/outputs/**/*.apk
-            android/wear/build/outputs/**/*.apk
-            android/wear-face/build/outputs/**/*.apk
+            dist/*.apk
+            dist/SHA256SUMS.txt
+
+          if-no-files-found: error
+          retention-days: 30
