@@ -1,0 +1,103 @@
+name: Android CI - Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'build variant (debug or release)'
+        required: false
+        default: 'debug'
+      target:
+        description: 'target module: phone | wear | wear-face | all'
+        required: false
+        default: 'phone'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+      GRADLE_USER_HOME: ${{ runner.temp }}/.gradle
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GRADLE_USER_HOME }}
+          key: gradle-cache-${{ runner.os }}-build-
+
+      - name: Install Android command-line tools & SDK
+        run: |
+          mkdir -p $ANDROID_SDK_ROOT/cmdline-tools
+          cd $ANDROID_SDK_ROOT
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o cmdline.zip
+          unzip -q cmdline.zip
+          mkdir -p cmdline-tools/latest
+          mv tools cmdline-tools/latest/
+          export PATH=$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH
+          yes | sdkmanager --licenses
+          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+
+      - name: Show Gradle wrapper
+        run: ls -la android/gradlew || true
+
+      - name: Decode signing keystore (optional)
+        if: ${{ secrets.SIGNING_KEY != '' }}
+        run: |
+          echo "Decoding SIGNING_KEY to keystore.jks"
+          base64 --decode <<<"${{ secrets.SIGNING_KEY }}" > $GITHUB_WORKSPACE/keystore.jks
+
+      - name: Make build script executable
+        run: chmod +x android/scripts/build.sh android/scripts/publish.sh || true
+
+      - name: Build APK(s)
+        run: |
+          set -euo pipefail
+          cd android
+          # use workflow_dispatch inputs when invoked manually, default to debug/phone otherwise
+          VARIANT="${{ github.event.inputs.variant || 'debug' }}"
+          TARGET="${{ github.event.inputs.target || 'phone' }}"
+          ./scripts/build.sh "$VARIANT" "$TARGET"
+        shell: bash
+
+      - name: Sign release APKs with apksigner (optional)
+        if: ${{ (github.event.inputs.variant == 'release') && (secrets.SIGNING_KEY != '') }}
+        run: |
+          set -euo pipefail
+          export BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/33.0.2"
+          APKS=(
+            "android/app/build/outputs/apk/release/app-release-unsigned.apk"
+            "android/wear/build/outputs/apk/release/wear-release-unsigned.apk"
+            "android/wear-face/build/outputs/apk/release/wear-face-release-unsigned.apk"
+          )
+          for APK in "${APKS[@]}"; do
+            if [[ -f "$APK" ]]; then
+              SIGNED="${APK/unsigned/signed}"
+              "$BUILD_TOOLS/apksigner" sign \
+                --ks "$GITHUB_WORKSPACE/keystore.jks" \
+                --ks-pass pass:${{ secrets.SIGNING_STORE_PASSWORD }} \
+                --ks-key-alias "${{ secrets.SIGNING_KEY_ALIAS }}" \
+                --key-pass pass:${{ secrets.SIGNING_KEY_PASSWORD }} \
+                --out "$SIGNED" "$APK"
+              echo "Signed: $SIGNED"
+            fi
+          done
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grokifyos-apks
+          path: |
+            android/app/build/outputs/**/*.apk
+            android/wear/build/outputs/**/*.apk
+            android/wear-face/build/outputs/**/*.apk
